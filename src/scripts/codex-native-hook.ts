@@ -989,6 +989,9 @@ function buildAdditionalContextMessage(
   const deepInterviewPromptActivationNote = skillState?.initialized_mode === "deep-interview"
     ? buildDeepInterviewQuestionBridgeInstruction(cwd, payload)
     : null;
+  const explicitUlwRoutingNote = skillState?.ulw_routing === "ralplan->team"
+    ? "Explicit `ulw` alias routing: run ralplan-style consensus/planning first, then hand off execution through team mode. Keep the approved plan as the handoff contract; do not treat `ulw` as direct standalone ultrawork execution."
+    : null;
   const ultraworkPromptActivationNote = skillState?.initialized_mode === "ultrawork"
     ? "Ultrawork protocol: ground the task before editing, define pass/fail acceptance criteria, keep shared-file work local, and use direct-tool plus background evidence lanes only for truly independent work. Direct ultrawork provides lightweight verification only; Ralph owns persistence and the full verified-completion promise."
     : null;
@@ -1018,6 +1021,7 @@ function buildAdditionalContextMessage(
         ? `planning preserved over simultaneous execution follow-up; deferred skills: ${deferredSkills.join(", ")}.`
         : null,
       promptPriorityMessage,
+      explicitUlwRoutingNote,
       skillState.initialized_mode && skillState.initialized_state_path
         ? `skill: ${skillState.initialized_mode} activated and initial state initialized at ${skillState.initialized_state_path}; write subsequent updates via omx_state MCP.`
         : null,
@@ -1042,6 +1046,7 @@ function buildAdditionalContextMessage(
       promptPriorityMessage,
       initializedStateMessage,
       deepInterviewPromptActivationNote,
+      explicitUlwRoutingNote,
       ultraworkPromptActivationNote,
       buildTeamRuntimeInstruction(cwd, payload),
       buildTeamHelpInstruction(cwd, payload),
@@ -1059,6 +1064,7 @@ function buildAdditionalContextMessage(
       promptPriorityMessage,
       `skill: ${skillState.initialized_mode} activated and initial state initialized at ${skillState.initialized_state_path}; write subsequent updates via omx_state MCP.`,
       deepInterviewPromptActivationNote,
+      explicitUlwRoutingNote,
       ultraworkPromptActivationNote,
       ralphPromptActivationNote,
       "Follow AGENTS.md routing and preserve workflow transition and planning-safety rules.",

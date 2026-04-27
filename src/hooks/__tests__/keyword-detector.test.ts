@@ -57,6 +57,12 @@ describe('keyword detector swarm/team compatibility', () => {
     assert.deepEqual(matches.map((m) => m.keyword), ['$oh-my-codex:ralplan', '$ralph']);
   });
 
+  it('keeps explicit $ulw detection compatible with ultrawork aliasing', () => {
+    const matches = detectKeywords('$ulw implement this');
+    assert.deepEqual(matches.map((m) => m.skill), ['ultrawork']);
+    assert.deepEqual(matches.map((m) => m.keyword), ['$ulw']);
+  });
+
   it('keeps recognized tokens on both sides of an unknown plugin-prefixed token in the same contiguous block', () => {
     const matches = detectKeywords('$oh-my-codex:ralplan $oh-my-codex:unknown $ralph');
     assert.deepEqual(matches.map((m) => m.skill), ['ralplan', 'ralph']);
@@ -625,6 +631,37 @@ describe('keyword detector skill-active-state lifecycle', () => {
         await readFile(join(stateDir, 'sessions', 'sess-visible', SKILL_ACTIVE_STATE_FILE), 'utf-8'),
       ) as { active_skills?: Array<{ skill: string }> };
       assert.deepEqual(persisted.active_skills?.map((entry) => entry.skill), ['team', 'ralph', 'ultrawork']);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('routes explicit $ulw through ralplan first and defers team execution', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-keyword-state-ulw-ralplan-team-'));
+    const stateDir = join(cwd, '.omx', 'state');
+    try {
+      await mkdir(stateDir, { recursive: true });
+      const result = await recordSkillActivation({
+        stateDir,
+        text: '$ulw implement the requested change',
+        sessionId: 'sess-ulw-rt',
+        threadId: 'thread-ulw-rt',
+        turnId: 'turn-ulw-rt',
+        nowIso: '2026-04-28T00:00:00.000Z',
+      });
+
+      assert.ok(result);
+      assert.equal(result.skill, 'ralplan');
+      assert.equal(result.keyword, '$ralplan');
+      assert.equal(result.ulw_routing, 'ralplan->team');
+      assert.equal(result.requested_skills, undefined);
+      assert.deepEqual(result.deferred_skills, ['team']);
+      assert.deepEqual(result.active_skills?.map((entry) => entry.skill), ['ralplan']);
+      assert.equal(result.initialized_mode, 'ralplan');
+      assert.equal(result.initialized_state_path, '.omx/state/sessions/sess-ulw-rt/ralplan-state.json');
+      assert.equal(existsSync(join(stateDir, 'sessions', 'sess-ulw-rt', 'ralplan-state.json')), true);
+      assert.equal(existsSync(join(stateDir, 'team-state.json')), false);
+      assert.equal(existsSync(join(stateDir, 'sessions', 'sess-ulw-rt', 'ultrawork-state.json')), false);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

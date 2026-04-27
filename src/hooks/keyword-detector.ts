@@ -518,6 +518,10 @@ function normalizeExplicitSkillToken(token: string): string {
   return token === 'swarm' ? 'team' : token === 'ulw' ? 'ultrawork' : token;
 }
 
+function isExplicitUlwAliasKeyword(keyword: string): boolean {
+  return /^\$(?:oh-my-codex:)?ulw$/i.test(keyword.trim());
+}
+
 function parseExplicitSkillInvocations(text: string): ExplicitSkillParseResult {
   const results: KeywordMatch[] = [];
   const regex = /(?:^|[^\w])\$(?:(?:oh-my-codex:)?([a-z][a-z0-9-]*))\b/gi;
@@ -784,8 +788,12 @@ export async function recordSkillActivation(input: RecordSkillActivationInput): 
     const workflowMatches = parseExplicitSkillInvocations(normalizedInputText).matches
       .map((entry) => entry.skill)
       .filter(isTrackedWorkflowMode);
+    const explicitUlwAlias = isExplicitUlwAliasKeyword(match.keyword)
+      && /\$(?:oh-my-codex:)?ulw\b/i.test(input.text);
     const { requestedSkills: requestedWorkflowSkills, deferredSkills } = resolveRequestedWorkflowSkills(
-      workflowMatches.length > 0 ? workflowMatches : [match.skill],
+      explicitUlwAlias
+        ? ['ralplan', 'team']
+        : (workflowMatches.length > 0 ? workflowMatches : [match.skill]),
     );
 
     let nextWorkflowEntries = previousWorkflowEntries.map((entry) => ({ ...entry }));
@@ -888,6 +896,7 @@ export async function recordSkillActivation(input: RecordSkillActivationInput): 
       thread_id: input.threadId,
       turn_id: input.turnId,
       active_skills: nextWorkflowEntries,
+      ...(explicitUlwAlias ? { ulw_routing: 'ralplan->team' } : {}),
       ...(transitionMessages[0] ? { transition_message: transitionMessages[0] } : {}),
       ...(transitionMessages.length > 0 ? { transition_messages: [...new Set(transitionMessages)] } : {}),
       ...(requestedWorkflowSkills.length > 1 ? { requested_skills: requestedWorkflowSkills } : {}),
