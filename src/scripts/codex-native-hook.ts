@@ -1957,7 +1957,9 @@ async function buildStopHookOutput(
         );
       }
 
-      const canonicalTeam = await findCanonicalActiveTeamForSession(cwd, canonicalSessionId);
+      const canonicalTeam = await readCanonicalTerminalRunStateForStop(cwd, canonicalSessionId, "team")
+        ? null
+        : await findCanonicalActiveTeamForSession(cwd, canonicalSessionId);
       if (canonicalTeam) {
         const canonicalTeamOutput = buildTeamStopOutputForPhase(
           canonicalTeam.teamName,
