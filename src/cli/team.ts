@@ -12,6 +12,7 @@ import {
   type TeamApiOperation,
 } from '../team/api-interop.js';
 import { teamReadConfig as readTeamConfig } from '../team/team-ops.js';
+import { resolveTeamNameForCurrentContext } from '../team/team-identity.js';
 
 interface TeamCliOptions {
   verbose?: boolean;
@@ -23,6 +24,7 @@ interface ParsedTeamArgs {
   explicitAgentType: boolean;
   task: string;
   teamName: string;
+  displayName?: string;
   ralph: boolean;
 }
 
@@ -274,7 +276,7 @@ function parseTeamArgs(args: string[]): ParsedTeamArgs {
   }
 
   const teamName = sanitizeTeamName(slugifyTask(task));
-  return { workerCount, agentType, explicitAgentType, task, teamName, ralph };
+  return { workerCount, agentType, explicitAgentType, task, teamName, displayName: teamName, ralph };
 }
 
 export function parseTeamStartArgs(args: string[]): ParsedTeamStartArgs {
@@ -403,6 +405,7 @@ async function ensureTeamModeState(
       current_phase: 'team-exec',
       linked_ralph: parsed.ralph,
       team_name: parsed.teamName,
+      display_name: parsed.displayName ?? parsed.teamName,
       agent_count: parsed.workerCount,
       agent_types: roleDistribution,
     });
@@ -414,6 +417,7 @@ async function ensureTeamModeState(
     current_phase: 'team-exec',
     linked_ralph: parsed.ralph,
     team_name: parsed.teamName,
+    display_name: parsed.displayName ?? parsed.teamName,
     agent_count: parsed.workerCount,
     agent_types: roleDistribution,
   });
@@ -517,7 +521,8 @@ export async function teamCommand(args: string[], options: TeamCliOptions = {}):
   if (subcommand === 'status') {
     const name = teamArgs[1];
     if (!name) throw new Error('Usage: omx team status <team-name>');
-    const snapshot = await monitorTeam(name, cwd);
+    const resolvedName = resolveTeamNameForCurrentContext(name, cwd);
+    const snapshot = await monitorTeam(resolvedName, cwd);
     if (!snapshot) {
       console.log(`No team state found for ${name}`);
       return;
@@ -543,7 +548,8 @@ export async function teamCommand(args: string[], options: TeamCliOptions = {}):
       ? Math.max(1, Number.parseInt(teamArgs[timeoutIdx + 1]!, 10) || 0)
       : 30_000;
     const afterEventId = afterIdx >= 0 ? (teamArgs[afterIdx + 1] || '') : '';
-    const config = await readTeamConfig(name, cwd);
+    const resolvedName = resolveTeamNameForCurrentContext(name, cwd);
+    const config = await readTeamConfig(resolvedName, cwd);
     if (!config) {
       if (wantsJson) {
         console.log(JSON.stringify({ team_name: name, status: 'missing', cursor: afterEventId || '', event: null }));
@@ -553,7 +559,7 @@ export async function teamCommand(args: string[], options: TeamCliOptions = {}):
       return;
     }
 
-    const result = await waitForTeamEvent(name, cwd, {
+    const result = await waitForTeamEvent(resolvedName, cwd, {
       afterEventId: afterEventId || undefined,
       timeoutMs,
       pollMs: 100,
@@ -562,7 +568,7 @@ export async function teamCommand(args: string[], options: TeamCliOptions = {}):
 
     if (wantsJson) {
       console.log(JSON.stringify({
-        team_name: sanitizeTeamName(name),
+        team_name: resolvedName,
         status: result.status,
         cursor: result.cursor,
         event: result.event ?? null,
@@ -577,7 +583,7 @@ export async function teamCommand(args: string[], options: TeamCliOptions = {}):
 
     const event = result.event!;
     const context = [
-      `team=${name}`,
+      `team=${resolvedName}`,
       `event=${event.type}`,
       `worker=${event.worker}`,
       event.state ? `state=${event.state}` : '',
@@ -607,6 +613,7 @@ export async function teamCommand(args: string[], options: TeamCliOptions = {}):
       agentType: runtime.config.agent_type,
       explicitAgentType: false,
       teamName: runtime.teamName,
+      displayName: runtime.config.display_name ?? runtime.teamName,
       ralph: preservedRalph,
     });
     await renderStartSummary(runtime);
@@ -620,7 +627,7 @@ export async function teamCommand(args: string[], options: TeamCliOptions = {}):
     const ralphFlag = teamArgs.includes('--ralph');
     const ralphFromState = !ralphFlag
       ? await readModeState('team').then(
-          (s) => s?.active === true && s?.linked_ralph === true && s?.team_name === name,
+          (s) => s?.active === true && s?.linked_ralph === true && s?.team_name === resolveTeamNameForCurrentContext(name, cwd),
           () => false,
         )
       : false;
@@ -651,7 +658,7 @@ export async function teamCommand(args: string[], options: TeamCliOptions = {}):
     { worktreeMode: parsedWorktree.mode, ralph: parsed.ralph },
   );
 
-  await ensureTeamModeState(parsed, tasks);
+  await ensureTeamModeState({ ...parsed, teamName: runtime.teamName, displayName: runtime.config.display_name ?? parsed.displayName }, tasks);
   if (options.verbose) {
     console.log(`linked_ralph=${parsed.ralph}`);
   }

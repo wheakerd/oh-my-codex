@@ -326,7 +326,7 @@ sleep 5
         '--approval-mode',
         'yolo',
         '-i',
-        'Read and follow the instructions in .omx/state/team/team-gemini-prompt/workers/worker-1/inbox.md',
+        `Read and follow the instructions in .omx/state/team/${runtime.teamName}/workers/worker-1/inbox.md`,
       ]);
 
       await shutdownTeam(runtime.teamName, cwd, { force: true });

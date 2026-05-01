@@ -873,9 +873,11 @@ export function buildDetachedSessionBootstrapSteps(
   workerLaunchArgs: string | null,
   codexHomeOverride?: string,
   notifyTempContractRaw?: string | null,
+  sessionId?: string,
 ): DetachedSessionTmuxStep[] {
   const newSessionArgs: string[] = [
     'new-session', '-d', '-s', sessionName, '-c', cwd,
+    ...(sessionId ? ['-e', `OMX_SESSION_ID=${sessionId}`] : []),
     ...(workerLaunchArgs ? ['-e', `${TEAM_WORKER_LAUNCH_ARGS_ENV}=${workerLaunchArgs}`] : []),
     ...(codexHomeOverride ? ['-e', `CODEX_HOME=${codexHomeOverride}`] : []),
     ...(notifyTempContractRaw ? ['-e', `${OMX_NOTIFY_TEMP_CONTRACT_ENV}=${notifyTempContractRaw}`] : []),
@@ -1088,9 +1090,11 @@ function runCodex(
     inheritLeaderFlags,
     workerDefaultModel,
   );
-  const codexBaseEnv = codexHomeOverride
-    ? { ...process.env, CODEX_HOME: codexHomeOverride }
-    : process.env;
+  const codexBaseEnv = {
+    ...process.env,
+    ...(codexHomeOverride ? { CODEX_HOME: codexHomeOverride } : {}),
+    OMX_SESSION_ID: sessionId,
+  };
   const codexEnv = workerLaunchArgs
     ? { ...codexBaseEnv, [TEAM_WORKER_LAUNCH_ARGS_ENV]: workerLaunchArgs }
     : codexBaseEnv;
@@ -1161,6 +1165,7 @@ function runCodex(
         workerLaunchArgs,
         codexHomeOverride,
         notifyTempContractRaw,
+        sessionId,
       );
       for (const step of bootstrapSteps) {
         const output = execFileSync('tmux', step.args, { stdio: step.name === 'new-session' ? 'ignore' : 'pipe', encoding: 'utf-8' });

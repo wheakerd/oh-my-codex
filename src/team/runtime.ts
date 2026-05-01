@@ -1,6 +1,6 @@
 import { join, resolve } from 'path';
 import { existsSync } from 'fs';
-import { readdir, readFile } from 'fs/promises';
+import { readdir } from 'fs/promises';
 import { performance } from 'perf_hooks';
 import { spawn, type ChildProcessByStdio } from 'child_process';
 import type { Writable } from 'stream';
@@ -96,6 +96,7 @@ import {
   splitWorkerLaunchArgs,
 } from './model-contract.js';
 import { resolveCanonicalTeamStateRoot } from './state-root.js';
+import { buildInternalTeamName, resolveTeamIdentityScope, resolveTeamNameForCurrentContext } from './team-identity.js';
 import { inferPhaseTargetFromTaskCounts, reconcilePhaseStateForMonitor } from './phase-controller.js';
 import { getTeamTmuxSessions } from '../notifications/tmux.js';
 import { hasStructuredVerificationEvidence } from '../verification/verifier.js';
@@ -505,7 +506,9 @@ export async function startTeam(
   }
 
   const leaderCwd = resolve(cwd);
-  const sanitized = sanitizeTeamName(teamName);
+  const displayName = sanitizeTeamName(teamName);
+  const identityScope = resolveTeamIdentityScope(process.env);
+  const sanitized = buildInternalTeamName(displayName, identityScope);
   const teamStateRoot = resolveCanonicalTeamStateRoot(leaderCwd);
   const activeWorktreeMode: 'detached' | 'named' | null =
     options.worktreeMode?.enabled
@@ -546,7 +549,7 @@ export async function startTeam(
     }
   }
 
-  const leaderSessionId = await resolveLeaderSessionId(leaderCwd);
+  const leaderSessionId = identityScope.sessionId || identityScope.paneId || identityScope.tmuxTarget || identityScope.runId;
 
   // Topology guard: one active team per leader session/process context.
   const activeTeams = await findActiveTeams(leaderCwd, leaderSessionId);
@@ -576,11 +579,19 @@ export async function startTeam(
       workerCount,
       leaderCwd,
       DEFAULT_MAX_WORKERS,
-      { ...process.env, OMX_TEAM_DISPLAY_MODE: displayMode, OMX_TEAM_WORKER_LAUNCH_MODE: workerLaunchMode },
+      {
+        ...process.env,
+        OMX_SESSION_ID: leaderSessionId,
+        OMX_TEAM_DISPLAY_MODE: displayMode,
+        OMX_TEAM_WORKER_LAUNCH_MODE: workerLaunchMode,
+      },
       {
         leader_cwd: leaderCwd,
         team_state_root: teamStateRoot,
         workspace_mode: workspaceMode,
+        display_name: displayName,
+        requested_name: displayName,
+        identity_source: identityScope.source,
       },
     );
     if (!config) {
@@ -589,6 +600,9 @@ export async function startTeam(
     config.leader_cwd = leaderCwd;
     config.team_state_root = teamStateRoot;
     config.workspace_mode = workspaceMode;
+    config.display_name = displayName;
+    config.requested_name = displayName;
+    config.identity_source = identityScope.source;
 
     // 4. Create tasks
     for (const t of tasks) {
@@ -937,7 +951,7 @@ export async function startTeam(
  */
 export async function monitorTeam(teamName: string, cwd: string): Promise<TeamSnapshot | null> {
   const monitorStartMs = performance.now();
-  const sanitized = sanitizeTeamName(teamName);
+  const sanitized = resolveTeamNameForCurrentContext(teamName, cwd);
   const config = await readTeamConfig(sanitized, cwd);
   if (!config) return null;
   const manifest = await readTeamManifestV2(sanitized, cwd);
@@ -1238,7 +1252,7 @@ export async function reassignTask(
 export async function shutdownTeam(teamName: string, cwd: string, options: ShutdownOptions = {}): Promise<void> {
   const force = options.force === true;
   const ralph = options.ralph === true;
-  const sanitized = sanitizeTeamName(teamName);
+  const sanitized = resolveTeamNameForCurrentContext(teamName, cwd);
   const config = await readTeamConfig(sanitized, cwd);
   if (!config) {
     // No config -- just try to kill tmux session and clean up
@@ -1469,7 +1483,7 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
  * Resume monitoring an existing team.
  */
 export async function resumeTeam(teamName: string, cwd: string): Promise<TeamRuntime | null> {
-  const sanitized = sanitizeTeamName(teamName);
+  const sanitized = resolveTeamNameForCurrentContext(teamName, cwd);
   const config = await readTeamConfig(sanitized, cwd);
   if (!config) return null;
 
@@ -1547,23 +1561,6 @@ async function findActiveTeams(cwd: string, leaderSessionId: string): Promise<st
     if (sessions.has(tmuxSession)) active.push(teamName);
   }
   return active;
-}
-
-async function resolveLeaderSessionId(cwd: string): Promise<string> {
-  const fromEnv = process.env.OMX_SESSION_ID || process.env.CODEX_SESSION_ID || process.env.SESSION_ID;
-  if (fromEnv && fromEnv.trim() !== '') return fromEnv.trim();
-
-  const p = join(cwd, '.omx', 'state', 'session.json');
-  if (!existsSync(p)) return '';
-  try {
-    const raw = await readFile(p, 'utf-8');
-    const parsed = JSON.parse(raw) as { session_id?: unknown };
-    if (typeof parsed.session_id === 'string' && parsed.session_id.trim() !== '') return parsed.session_id.trim();
-  } catch (err) {
-    process.stderr.write(`[team/runtime] operation failed: ${err}\n`);
-    return '';
-  }
-  return '';
 }
 
 async function isTaskApprovedForExecution(teamName: string, taskId: string, cwd: string): Promise<boolean> {

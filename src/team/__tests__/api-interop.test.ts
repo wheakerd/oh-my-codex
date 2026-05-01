@@ -111,6 +111,31 @@ describe('validateCommonFields', () => {
     }
   });
 
+  it('resolves a long display team_name before applying internal key validation', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-api-long-display-'));
+    try {
+      await initTeamState('long-display-aaaaaaaa', 'test task', 'executor', 1, cwd, undefined, { OMX_SESSION_ID: 'session-long' }, {
+        display_name: 'this-is-a-long-display-name-that-exceeds-thirty-chars',
+        requested_name: 'this-is-a-long-display-name-that-exceeds-thirty-chars',
+        identity_source: 'env-session',
+      });
+      const previousSessionId = process.env.OMX_SESSION_ID;
+      try {
+        process.env.OMX_SESSION_ID = 'session-long';
+        const result = await executeTeamApiOperation('list-tasks', {
+          team_name: 'this-is-a-long-display-name-that-exceeds-thirty-chars',
+        }, cwd);
+        assert.equal(result.ok, true);
+        if (result.ok) assert.equal(result.data.count, 0);
+      } finally {
+        if (previousSessionId === undefined) delete process.env.OMX_SESSION_ID;
+        else process.env.OMX_SESSION_ID = previousSessionId;
+      }
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it('rejects invalid worker name pattern', async () => {
     const { cwd, cleanup } = await setupTeam('validate-worker');
     try {
