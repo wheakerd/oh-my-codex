@@ -134,6 +134,32 @@ describe("omx setup refresh summary and dry-run behavior", () => {
     }
   });
 
+  it("installs goal workflow skills during project-scoped legacy setup", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-setup-refresh-"));
+    try {
+      await runSetupInTempDir(wd, { scope: "project", installMode: "legacy" });
+
+      for (const skillName of [
+        "performance-goal",
+        "autoresearch-goal",
+        "ultragoal",
+      ]) {
+        const skillPath = join(wd, ".codex", "skills", skillName, "SKILL.md");
+        assert.equal(
+          existsSync(skillPath),
+          true,
+          `expected omx setup to install ${skillName}`,
+        );
+        assert.match(await readFile(skillPath, "utf-8"), /^description: "\[OMX\] /m);
+      }
+
+      const config = await readFile(join(wd, ".codex", "config.toml"), "utf-8");
+      assert.match(config, /^goals = true$/m);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
   it("appends missing OMX project ignore rules to an existing project .gitignore without duplicating them", async () => {
     const wd = await mkdtemp(join(tmpdir(), "omx-setup-refresh-"));
     try {

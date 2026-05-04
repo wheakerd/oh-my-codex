@@ -256,6 +256,9 @@ describe('official Codex plugin layout', () => {
 
     assert.deepEqual(actualSkillNames, expectedSkillNames);
     assert.ok(actualSkillNames.includes('worker'), 'internal setup-installed worker skill should be mirrored');
+    assert.ok(actualSkillNames.includes('performance-goal'), 'performance-goal should be available through setup/plugin skill delivery');
+    assert.ok(actualSkillNames.includes('autoresearch-goal'), 'autoresearch-goal should be available through setup/plugin skill delivery');
+    assert.ok(actualSkillNames.includes('ultragoal'), 'ultragoal should remain available through setup/plugin skill delivery');
     assert.equal(actualSkillNames.includes('ecomode'), false, 'merged skills should not be mirrored');
     assert.equal(actualSkillNames.includes('swarm'), false, 'alias skills should not be mirrored');
     assert.equal(actualSkillNames.includes('configure-discord'), false, 'merged notification aliases should not be mirrored');
