@@ -56,6 +56,7 @@ import {
   writeWorkerWorktreeRootAgentsFile,
   removeWorkerWorktreeRootAgentsFile,
 } from './worker-bootstrap.js';
+import { buildTeamWorkerGoalInstruction } from './goal-workflow.js';
 import { loadRolePrompt } from './role-router.js';
 import { composeRoleInstructionsForRole } from '../agents/native-config.js';
 import { codexPromptsDir } from '../utils/paths.js';
@@ -469,6 +470,7 @@ export async function scaleUp(
         workerRole: runtimeRole,
         rolePromptContent: rawRolePromptContent ?? undefined,
         worktreeRootAgentsCanonical: Boolean(workerWorkspace?.worktreePath),
+        workerGoalInstruction: buildTeamWorkerGoalInstruction(sanitized, workerName, workerTasks, { teamStateRoot }),
       });
 
       const triggerDirective = buildTriggerDirective(

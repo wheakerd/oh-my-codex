@@ -12,6 +12,10 @@ import { sleep } from "../utils/sleep.js";
 import type { ApprovedRepositoryContextSummary } from "../planning/artifacts.js";
 import type { TeamReminderDirective } from "./reminder-intents.js";
 import type { TaskHintSummary } from "./repo-aware-decomposition.js";
+import {
+  renderTeamWorkerGoalInstruction,
+  type TeamWorkerGoalInstruction,
+} from "./goal-workflow.js";
 
 const TEAM_OVERLAY_START = "<!-- OMX:TEAM:WORKER:START -->";
 const TEAM_OVERLAY_END = "<!-- OMX:TEAM:WORKER:END -->";
@@ -701,6 +705,7 @@ export function generateInitialInbox(
     worktreeRootAgentsCanonical?: boolean;
     taskHints?: Record<string, TaskHintSummary>;
     approvedContextSummary?: ApprovedRepositoryContextSummary;
+    workerGoalInstruction?: TeamWorkerGoalInstruction;
   } = {},
 ): string {
   const taskList = tasks
@@ -740,6 +745,7 @@ export function generateInitialInbox(
   const leaderCwd = options.leaderCwd || "<leader_cwd>";
   const displayRole = options.workerRole ?? agentType;
   const delegationSection = renderDelegationContracts(tasks);
+  const workerGoalSection = renderTeamWorkerGoalInstruction(options.workerGoalInstruction);
 
   const approvedContextSection = options.approvedContextSummary
     ? `
@@ -766,7 +772,7 @@ ${options.approvedContextSummary.content}
 ## Your Assigned Tasks
 
 ${taskList}
-${approvedContextSection}
+${approvedContextSection}${workerGoalSection}
 ## Instructions
 
 1. Load and follow the worker skill from the first existing path:
@@ -848,6 +854,25 @@ export function generateTaskAssignmentInbox(
     : taskOrId;
   const taskId = task.id;
   const taskDescription = task.description;
+  const workerGoalSection = renderTeamWorkerGoalInstruction(
+    typeof taskOrId === "string"
+      ? undefined
+      : {
+          teamName,
+          workerName,
+          objective: `Complete assigned OMX team task ${task.id} with verified evidence, preserving leader-owned audit.`,
+          taskIds: [task.id],
+          taskReferences: [{
+            id: task.id,
+            subject: task.subject,
+            status: task.status,
+            claimOwner: task.claim?.owner,
+            claimLeasedUntil: task.claim?.leased_until,
+          }],
+          artifactPath: `<team_state_root>/goals/team/${teamName}/workers/${workerName}.json`,
+          leaderAuditPath: `<team_state_root>/goals/team/${teamName}/leader-audit.json`,
+        },
+  );
   const delegationSection = renderDelegationContracts([task as TeamTask]);
 
   return `# New Task Assignment
@@ -858,7 +883,7 @@ export function generateTaskAssignmentInbox(
 ## Task Description
 
 ${taskDescription}
-
+${workerGoalSection}
 ## Instructions
 
 1. Resolve canonical team state root and read the task file at \`<team_state_root>/team/${teamName}/tasks/task-${taskId}.json\`

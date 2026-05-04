@@ -24,6 +24,7 @@ import {
   buildLeaderMailboxTriggerDirective,
 } from "../worker-bootstrap.js";
 import { composeRoleInstructionsForRole } from "../../agents/native-config.js";
+import { buildTeamWorkerGoalInstruction } from "../goal-workflow.js";
 import type { TeamTask } from "../state.js";
 
 function setMockCodexHome(codexHomePath: string): () => void {
@@ -279,6 +280,46 @@ describe("worker bootstrap", () => {
   });
 
 
+
+
+  it("generateInitialInbox includes scrum/team worker goal handoff tied to task IDs and claims", () => {
+    const tasks: TeamTask[] = [{
+      id: "4",
+      subject: "Implement team goal workflow",
+      description: "Wire per-worker goals into bootstrap",
+      status: "in_progress",
+      owner: "worker-4",
+      created_at: new Date(0).toISOString(),
+      claim: {
+        owner: "worker-4",
+        token: "claim-token",
+        leased_until: "2026-05-04T12:32:13.456Z",
+      },
+    }];
+
+    const workerGoalInstruction = buildTeamWorkerGoalInstruction(
+      "team-goal",
+      "worker-4",
+      tasks,
+      { teamStateRoot: "/tmp/.omx/state" },
+    );
+    const inbox = generateInitialInbox("worker-4", "team-goal", "executor", tasks, {
+      teamStateRoot: "/tmp/.omx/state",
+      workerGoalInstruction,
+    });
+
+    assert.match(inbox, /## Scrum \/ Team Goal Workflow/);
+    assert.match(inbox, /task IDs 4 instead of creating a duplicate task list/);
+    assert.match(inbox, /Task 4: Implement team goal workflow/);
+    assert.match(inbox, /active claim owner: worker-4 until 2026-05-04T12:32:13\.456Z/);
+    assert.match(inbox, /\/tmp\/\.omx\/state\/goals\/team\/team-goal\/workers\/worker-4\.json/);
+    assert.match(inbox, /get_goal/);
+    assert.match(inbox, /create_goal.*only when no active goal exists/i);
+    assert.match(inbox, /update_goal\(\{status: "complete"\}\).*verification evidence/i);
+    assert.match(inbox, /shell\/team APIs persist only OMX artifacts and task state/);
+  });
+
+
   it("generateInitialInbox includes repo-aware decomposition ownership hints", () => {
     const inbox = generateInitialInbox(
       "worker-1",
@@ -497,6 +538,29 @@ describe("worker bootstrap", () => {
     assert.match(inbox, /PASS\/FAIL/);
   });
 
+
+
+
+
+  it("generateTaskAssignmentInbox includes worker goal handoff for task-object follow-ups", () => {
+    const inbox = generateTaskAssignmentInbox(
+      "worker-2",
+      "team-followup-goal",
+      {
+        id: "9",
+        subject: "Finish worker audit",
+        description: "Complete the worker audit slice",
+        status: "pending",
+        created_at: new Date(0).toISOString(),
+      },
+    );
+
+    assert.match(inbox, /## Scrum \/ Team Goal Workflow/);
+    assert.match(inbox, /Task 9: Finish worker audit/);
+    assert.match(inbox, /claim required before work/);
+    assert.match(inbox, /<team_state_root>\/goals\/team\/team-followup-goal\/workers\/worker-2\.json/);
+    assert.match(inbox, /leader-audit\.json/);
+  });
 
 
   it("generateTaskAssignmentInbox includes delegation contract for follow-up task object", () => {

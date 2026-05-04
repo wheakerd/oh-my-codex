@@ -109,6 +109,7 @@ import {
   buildLeaderMailboxTriggerDirective,
   writeWorkerRoleInstructionsFile,
 } from './worker-bootstrap.js';
+import { buildTeamWorkerGoalInstruction } from './goal-workflow.js';
 import { synthesizeDelegationPlan } from './delegation-policy.js';
 import { loadRolePrompt } from './role-router.js';
 import { composeRoleInstructionsForRole } from '../agents/native-config.js';
@@ -2461,6 +2462,7 @@ export async function startTeam(
         worktreeRootAgentsCanonical: Boolean(workerWorkspace.worktreePath),
         taskHints: effectiveDecompositionMetadata?.task_hints,
         approvedContextSummary: effectiveDecompositionMetadata?.approved_context_summary,
+        workerGoalInstruction: buildTeamWorkerGoalInstruction(sanitized, workerName, workerTasks, { teamStateRoot }),
       });
       const triggerDirective = buildTriggerDirective(
         workerName,
