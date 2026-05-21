@@ -39,7 +39,7 @@ OMX already has `$plan`, `$ralplan`, and `$deep-interview`. Prometheus Strict ex
 - Stay planning-only. Do not edit source code during this skill unless the user starts a separate execution workflow afterward.
 - Preserve clean-room boundaries. Do not copy or imitate OMO wording, source, prompts, runtime behavior, or control flow.
 - Keep non-goals visible: No hook implementation. No Sisyphus/start-work port. No automatic external-production actions.
-- Ask one question at a time only when the answer materially changes scope, safety, or validation.
+- Ask high-leverage questions as a batched round when the answers materially change scope, safety, or validation. Reserve one-at-a-time questioning only for dependent question chains where the next question depends on the previous answer.
 - If a safe assumption is available, state it and continue.
 - Use repository reads when needed to make paths, tests, and handoff commands concrete.
 - Recommend `$team` only when Oracle identifies independent, bounded, verifiable lanes.
@@ -49,10 +49,20 @@ OMX already has `$plan`, `$ralplan`, and `$deep-interview`. Prometheus Strict ex
 Every Metis/Momus/Oracle question to the user MUST go through the surface-appropriate structured question path. Plain prose questioning is the last fallback, not the default.
 
 - In attached-tmux OMX runtime, use `omx question` as the OMX-owned structured question surface (this is the `AskUserQuestion` equivalent for Prometheus Strict). From attached-tmux Bash/tool paths, prefix the command with `OMX_QUESTION_RETURN_PANE=$TMUX_PANE` (or a concrete `%pane` value) so the leader-pane return target is preserved.
-- Wait for the `omx question` JSON answer before scoring ambiguity, asking another round, or handing off; prefer `answers[0].answer` / `answers[]`, and use the legacy top-level `answer` only as a compatibility fallback.
+- **Batch independent high-leverage questions into a single `questions[]` array call**: scope, constraints, non-goals, deliverables, safety bounds, and acceptance criteria are normally independent and MUST be batched into one structured form so the user answers them in a single panel. Reserve one-at-a-time only for dependent question chains where the next question depends on the previous answer.
+- Wait for the `omx question` JSON answer before checking the clearance rule, asking another round, or handing off; prefer `answers[]` / `answers[i].answer`, and use the legacy top-level `answer` only as a compatibility fallback.
 - Outside tmux, use the native structured input tool when one is available.
-- Only when neither structured surface can render, ask exactly one concise plain-text question and wait for the answer.
-- Never batch multiple interview rounds into a single `questions[]` form; Prometheus Strict is one round at a time, like deep-interview.
+- When neither structured surface can render (non-tmux Codex CLI, piped runs, CI), list the round's independent questions as a numbered prose block (`Q1: ... Q2: ... Q3: ...`) and wait for all answers in one user turn; do not split into separate round-trips.
+- Multiple interview rounds ARE expected when clearance is not yet reached; each round is one batched form (or its prose fallback), never split across forms.
+
+### Rule-Based Clearance
+
+The interview is governed by a deterministic clearance rule, not by subjective "feels enough" judgement. Exit the Metis interview loop when **both** of:
+
+- `unresolved_blocker_count == 0` (no high-leverage question remains that materially changes scope, safety, or validation).
+- `answered_high_leverage_question_count >= 3` (at least three distinct high-leverage answers are on record), or every high-leverage question identified at intake has been answered (whichever comes first).
+
+Cap interview rounds at **5** to prevent runaway. If clearance is not reached by round 5, hand the remaining blockers to Oracle as explicitly carried-forward unresolved items.
 </Execution_Policy>
 
 <Steps>
@@ -62,25 +72,52 @@ Restate the target result, known constraints, deliverables, validation expectati
 
 If the prompt contains destructive, credential-gated, external-production, or materially scope-changing decisions, hold those decisions for explicit user confirmation. Otherwise, continue through the planning loop.
 
-### 2. Metis Interview
+### 2. Metis Interview (Iterative, Rule-Clearance)
 
 Use `prometheus-strict-metis` as the interview voice. When native subagents are available, invoke the dedicated agent; otherwise run the same role in-context without editing files.
 
-Metis discovers success criteria, non-goals, evidence versus assumptions, required artifacts, likely execution lanes, and missing decisions. Ask exactly one high-leverage question only when needed.
+Metis discovers success criteria, non-goals, evidence versus assumptions, required artifacts, likely execution lanes, and missing decisions.
 
-### 3. Momus Challenge
+Run the interview as a bounded loop:
+
+1. Identify every currently-unanswered high-leverage question (those whose answers would materially change scope, safety, or validation).
+2. Batch the round's independent questions into a single Structured Question Surface call (`questions[]` array, or numbered prose fallback outside tmux).
+3. Collect the structured `answers[]`, update evidence vs. assumption, mark resolved blockers.
+4. Evaluate the **Rule-Based Clearance** (`<Execution_Policy>`): exit when `unresolved_blocker_count == 0` AND `answered_high_leverage_question_count >= 3` (or all intake-identified high-leverage questions are answered).
+5. If clearance is not reached, return to step 1 with the next round. Cap at 5 rounds; on cap, carry the remaining blockers forward to Oracle as explicit unresolved items.
+
+### 3. Momus Challenge (Bounded Retry)
 
 Use `prometheus-strict-momus` as the adversarial critique voice. When native subagents are available, invoke the dedicated agent; otherwise run the same role in-context without editing files.
 
 Momus challenges underspecified acceptance criteria, unsafe assumptions, hidden destructive steps, overbroad scope, missing verification, ownership conflicts, and `$ultragoal`/`$team` handoff ambiguity.
 
-### 4. Oracle Synthesis
+**Bounded retry contract**: after Oracle synthesizes in §4, re-invoke Momus on the synthesized plan to verify that Oracle's resolutions did not introduce new risks (scope addition without matching verification, lane split that creates dependency cycles, safety reinforcement that contradicts stop conditions). Repeat the Momus → Oracle re-synthesis cycle up to **3 times total**. If blocking objections remain after the 3rd cycle, mark them as carried-forward in the final plan and proceed to §5.
+
+### 4. Oracle Synthesis (Two-Pass: Synthesis + Self-Verification)
 
 Use `prometheus-strict-oracle` as the synthesis voice. When native subagents are available, invoke the dedicated agent; otherwise run the same role in-context without editing files.
 
-Oracle produces the final objective, scope and non-goals, accepted assumptions, resolved critique, sequenced steps or lanes, verification matrix, rollback/escalation conditions, and recommended OMX handoff.
+**Pass 1 — Synthesis.** Oracle produces the final objective, scope and non-goals, accepted assumptions, resolved critique, sequenced steps or lanes, verification matrix, rollback/escalation conditions, and recommended OMX handoff.
 
-### 5. Handoff
+**Pass 2 — Self-Verification (machine-checkable acceptance contract).** Oracle re-reads its own Pass 1 output and asserts:
+
+- Every claim in the verification matrix has an explicit evidence source (test/build/lint/e2e/doc).
+- Every step lists its owner / lane / executor; no shared-file conflicts between parallel lanes.
+- Stop, rollback, and acceptance criteria are mutually consistent (no acceptance criterion is satisfied by a state that also triggers rollback).
+- No destructive, credential-gated, or external-production step is unauthorized.
+- The handoff command is concrete (callable verbatim) and points at an existing workflow (`$ultragoal`, `$team`, or `none`).
+- Clean-room credit is preserved.
+
+If any Pass 2 check fails, Oracle MUST loop back to Pass 1 to repair before emitting the plan. Cap Pass 1 ↔ Pass 2 cycles at **3**; on cycle 3 failure, emit the plan with the failing gates annotated as carried-forward and escalate to the user.
+
+### 5. Post-Plan Gap Check (Metis Re-Invocation)
+
+Before handing off, re-invoke `prometheus-strict-metis` on the finalized Oracle plan with a single charge: identify ambiguities that surfaced **only after** the plan was rendered — for example, new lane assignments that overlap, verification matrix gaps revealed by stop conditions, acceptance criteria that contradict the rollback contract.
+
+If post-plan Metis surfaces any blocking gap, return to §4 Pass 1 with the new question. Otherwise proceed to §6.
+
+### 6. Handoff
 
 Prometheus Strict stops with a plan unless the user explicitly invokes or authorizes the next workflow. Prefer this sequence:
 
@@ -107,9 +144,11 @@ Do not create hook state, Sisyphus state, or `start-work` compatibility state fo
 - [ ] Target result is explicit.
 - [ ] Scope and non-goals are explicit.
 - [ ] Acceptance criteria are measurable.
-- [ ] Metis clarification has no unresolved blocking question.
-- [ ] Momus objections are resolved or carried forward as explicit blockers.
+- [ ] Metis interview loop reached rule-based clearance (`unresolved_blocker_count == 0` AND `answered_high_leverage_question_count >= 3`), or the 5-round cap was reached with explicit unresolved-item handoff.
+- [ ] Momus objections are resolved or carried forward as explicit blockers, with at most 3 Momus → Oracle re-synthesis cycles consumed.
 - [ ] Oracle plan includes a verification matrix.
+- [ ] Oracle Pass 2 self-verification completed; every machine-checkable contract item passes or is annotated as carried-forward.
+- [ ] Post-plan Metis gap check produced no blocking objections (or all are carried forward).
 - [ ] Handoff recommends `$ultragoal` and `$team` only when warranted.
 - [ ] Clean-room credit is preserved.
 - [ ] No hook implementation or Sisyphus/start-work port was introduced.

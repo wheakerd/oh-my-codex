@@ -138,13 +138,23 @@ describe('prometheus-strict clean-room contract', () => {
     );
     assert.match(
       skill,
-      /plain[-\s]?text/i,
-      'skill must document the plain-text last-resort fallback',
+      /plain[-\s]?text|numbered prose/i,
+      'skill must document the plain-text/numbered-prose last-resort fallback',
     );
     assert.match(
       skill,
       /attached[-\s]?tmux/i,
       'skill must name the attached-tmux precondition for `omx question`',
+    );
+    assert.match(
+      skill,
+      /batch[\s\S]{0,80}independent[\s\S]{0,200}questions\[\]/i,
+      'skill must require batching independent questions into a single questions[] call',
+    );
+    assert.match(
+      skill,
+      /Codex CLI|non-tmux|piped runs|CI/i,
+      'skill must call out the non-tmux Codex CLI / piped / CI fallback path',
     );
 
     for (const promptName of promptNames) {
@@ -157,10 +167,131 @@ describe('prometheus-strict clean-room contract', () => {
       );
       assert.match(
         content,
-        /native structured input|plain[-\s]?text/i,
+        /native structured input|plain[-\s]?text|numbered prose/i,
         `${promptName} must reference at least one documented question fallback`,
       );
+      assert.match(
+        content,
+        /batch[\s\S]{0,120}independent|independent[\s\S]{0,80}batch/i,
+        `${promptName} must require batching independent questions through questions[]`,
+      );
     }
+  });
+
+  it('enforces the strengthened operator contract: iterative interview, rule-clearance, post-plan Metis, Momus bounded retry, and Oracle 2-pass', () => {
+    const skill = readRepoFile(skillPath);
+    const metis = readRepoFile(join(repoRoot, 'prompts', 'prometheus-strict-metis.md'));
+    const momus = readRepoFile(join(repoRoot, 'prompts', 'prometheus-strict-momus.md'));
+    const oracle = readRepoFile(join(repoRoot, 'prompts', 'prometheus-strict-oracle.md'));
+
+    // Gate 1: Metis interview is iterative with multiple rounds capped at 5
+    assert.match(
+      skill,
+      /Iterative|iterative loop|multiple interview rounds|interview rounds ARE expected/i,
+      'skill Steps §2 must declare an iterative Metis interview',
+    );
+    assert.match(
+      skill,
+      /5 rounds|cap[\s\S]{0,40}5|round 5/i,
+      'skill must cap Metis interview rounds at 5',
+    );
+    assert.match(
+      metis,
+      /multiple interview rounds|Run multiple interview rounds|next round/i,
+      'metis prompt must declare multi-round operation',
+    );
+    assert.match(metis, /5 rounds|round[s]?[\s\S]{0,20}cap|cap[\s\S]{0,40}5/i, 'metis prompt must cap rounds at 5');
+
+    // Gate 2: Rule-based clearance is deterministic, not subjective
+    const clearanceRule = /unresolved[_\s-]?blocker[_\s-]?count\s*==\s*0[\s\S]{0,200}answered[_\s-]?high[_\s-]?leverage[_\s-]?question[_\s-]?count\s*>=\s*3/i;
+    assert.match(
+      skill,
+      clearanceRule,
+      'skill must declare the rule-based clearance gate (unresolved_blocker_count == 0 AND answered_high_leverage_question_count >= 3)',
+    );
+    assert.match(
+      metis,
+      clearanceRule,
+      'metis prompt must declare the rule-based clearance gate',
+    );
+
+    // Gate 3: Post-plan Metis gap check before handoff
+    assert.match(
+      skill,
+      /Post-Plan Gap Check|post-plan Metis gap check|Metis Re-Invocation|post-plan re-invocation/i,
+      'skill must include a post-plan Metis gap check before handoff',
+    );
+    assert.match(
+      metis,
+      /post-plan re-invocation|Post-plan re-invocation|post-plan gap check|finalized plan|finalized Oracle plan/i,
+      'metis prompt must document its post-plan re-invocation mode',
+    );
+
+    // Gate 4: Momus bounded retry after Oracle synthesis, capped at 3 cycles
+    assert.match(
+      skill,
+      /Bounded Retry|bounded retry|Momus\s*→\s*Oracle re-synthesis|3 (times|cycles)/i,
+      'skill Steps §3 must declare a bounded Momus retry contract',
+    );
+    assert.match(
+      skill,
+      /3 (times|cycles) total|up to[\s\S]{0,30}3 times|cycles at[\s\S]{0,10}3/i,
+      'skill must cap Momus → Oracle re-synthesis at 3 cycles',
+    );
+    assert.match(
+      momus,
+      /bounded[-\s]?retry|re-invocation after Oracle synthesis|Oracle's resolutions did not introduce new risks/i,
+      'momus prompt must declare the bounded-retry re-invocation contract',
+    );
+    assert.match(momus, /3 (times|cycles)|cycle 3/i, 'momus prompt must cap retry cycles at 3');
+
+    // Gate 5: Oracle 2-pass (synthesis + self-verification) with 3-cycle cap
+    assert.match(
+      skill,
+      /Two-?Pass|Pass 1[\s\S]{0,30}Synthesis[\s\S]{0,500}Pass 2/i,
+      'skill Steps §4 must declare an Oracle 2-pass (synthesis + self-verification) loop',
+    );
+    assert.match(
+      skill,
+      /Self-?Verification|self-verification|machine-checkable acceptance contract/i,
+      'skill must name Oracle Pass 2 as machine-checkable self-verification',
+    );
+    assert.match(
+      skill,
+      /Pass 1[\s\S]{0,20}↔[\s\S]{0,20}Pass 2[\s\S]{0,80}3|cycles? at[\s\S]{0,10}3/i,
+      'skill must cap Pass 1 ↔ Pass 2 cycles at 3',
+    );
+    assert.match(
+      oracle,
+      /Pass 1[\s\S]{0,30}Synthesis[\s\S]{0,800}Pass 2[\s\S]{0,80}Self-?Verification/i,
+      'oracle prompt must split execution into Pass 1 (Synthesis) and Pass 2 (Self-Verification)',
+    );
+    assert.match(
+      oracle,
+      /machine-checkable acceptance contract/i,
+      'oracle prompt must label Pass 2 as the machine-checkable acceptance contract',
+    );
+    assert.match(
+      oracle,
+      /verification matrix has an explicit evidence source/i,
+      'oracle Pass 2 must require explicit evidence sources for every verification-matrix claim',
+    );
+    assert.match(
+      oracle,
+      /shared-file conflicts between parallel lanes/i,
+      'oracle Pass 2 must guard against shared-file conflicts between parallel lanes',
+    );
+    assert.match(
+      oracle,
+      /mutually consistent|acceptance criterion is satisfied by a state that also triggers rollback/i,
+      'oracle Pass 2 must require stop/rollback/acceptance mutual consistency',
+    );
+    assert.match(oracle, /cap[\s\S]{0,40}3|cycles? at[\s\S]{0,10}3/i, 'oracle prompt must cap Pass 1 ↔ Pass 2 cycles at 3');
+
+    // Gate 6: Final_Checklist reflects the strengthened gates
+    assert.match(skill, /rule-based clearance/i, 'Final_Checklist must reference rule-based clearance');
+    assert.match(skill, /Oracle Pass 2 self-verification/i, 'Final_Checklist must reference Oracle Pass 2 self-verification');
+    assert.match(skill, /Post-plan Metis gap check/i, 'Final_Checklist must reference the post-plan Metis gap check');
   });
 
   it('pins the public docs entry for the skill handoff path', () => {
