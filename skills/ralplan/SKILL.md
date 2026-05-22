@@ -163,9 +163,10 @@ The gate auto-passes when it detects **any** concrete signal. You do not need al
    - **Architect** reviews for soundness
    - **Critic** validates quality and testability
 5. On consensus approval, user chooses execution path:
-   - **ralph**: sequential execution with verification
-   - **team**: parallel coordinated agents
-6. Execution begins with a clear, bounded plan
+   - **ultragoal**: default durable follow-up for sequential goal execution with ledger checkpoints
+   - **team**: coordinated parallel execution for stories that need multiple lanes, with evidence ready for Ultragoal checkpoints
+   - **ralph**: explicit single-owner fallback only when the user intentionally wants a persistent verification/completion loop instead of the default durable goal ledger
+6. Execution begins with a clear, bounded plan through the selected handoff path
 
 ### Troubleshooting
 
