@@ -188,8 +188,24 @@ describe('Pipeline Orchestrator', () => {
                   recommendation: clean ? 'APPROVE' : 'REQUEST CHANGES',
                   architectural_status: 'CLEAR',
                   clean,
+                  stage: 'code-review',
+                  artifact_path: '.omx/reviews/review-loop.json',
                 },
                 return_to_ralplan_reason: clean ? null : 'Review requested a plan update.',
+              },
+              duration_ms: 0,
+            };
+          },
+        },
+        {
+          name: 'ultraqa',
+          async run(): Promise<StageResult> {
+            order.push('ultraqa');
+            return {
+              status: 'completed',
+              artifacts: {
+                qa_verdict: { stage: 'ultraqa', clean: true, skipped: false, url: 'https://github.com/Yeachan-Heo/oh-my-codex/actions/runs/1' },
+                return_to_ralplan_reason: null,
               },
               duration_ms: 0,
             };
@@ -206,7 +222,7 @@ describe('Pipeline Orchestrator', () => {
       });
 
       assert.equal(result.status, 'completed');
-      assert.deepEqual(order, ['ralplan', 'ralph', 'code-review', 'ralplan', 'ralph', 'code-review']);
+      assert.deepEqual(order, ['ralplan', 'ralph', 'code-review', 'ralplan', 'ralph', 'code-review', 'ultraqa']);
 
       const ext = await readPipelineState(tempDir);
       assert.equal(ext?.review_cycle, 1);
@@ -237,7 +253,7 @@ describe('Pipeline Orchestrator', () => {
         makeStage('ultragoal', { artifacts: { implemented: true } }),
         makeStage('code-review', {
           artifacts: {
-            review_verdict: { recommendation: 'APPROVE', architectural_status: 'CLEAR', clean: true },
+            review_verdict: { stage: 'code-review', recommendation: 'APPROVE', architectural_status: 'CLEAR', clean: true, artifact_path: '.omx/reviews/default-quality.json' },
             return_to_ralplan_reason: null,
           },
         }),
@@ -250,7 +266,7 @@ describe('Pipeline Orchestrator', () => {
             return {
               status: 'completed',
               artifacts: {
-                qa_verdict: { clean, skipped: false, summary: clean ? 'QA clean.' : 'QA found a regression.' },
+                qa_verdict: { stage: 'ultraqa', clean, skipped: false, summary: clean ? 'QA clean.' : 'QA found a regression.', url: 'https://github.com/Yeachan-Heo/oh-my-codex/actions/runs/2' },
                 return_to_ralplan_reason: clean ? null : 'QA found a regression.',
               },
               duration_ms: 0,

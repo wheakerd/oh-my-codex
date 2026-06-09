@@ -21,6 +21,7 @@ import { evaluateRalphCompletionAuditEvidence } from '../ralph/completion-audit.
 import { ensureCanonicalRalphArtifacts } from '../ralph/persistence.js';
 import { RALPH_PHASES, validateAndNormalizeRalphState } from '../ralph/contract.js';
 import { applyRunOutcomeContract } from '../runtime/run-outcome.js';
+import { isAutopilotSuccessfulTerminalState, validateAutopilotCompletionTransition } from '../autopilot/completion-gate.js';
 import { readUltragoalState } from '../hud/state.js';
 import {
   SKILL_ACTIVE_STATE_MODE,
@@ -44,7 +45,6 @@ import {
 import {
   type AutopilotChildPhase,
   deriveAutopilotChildPhase,
-  normalizeAutopilotPhase,
 } from '../autopilot/fsm.js';
 import {
   buildAutopilotRalplanUltragoalGateError,
@@ -82,10 +82,6 @@ function isNextAutopilotPhase(
   const currentOrder = autopilotPhaseOrder(currentPhase);
   const nextOrder = autopilotPhaseOrder(nextPhase);
   return currentOrder >= 0 && nextOrder === currentOrder + 1;
-}
-
-function isAutopilotCompletePhase(state: Record<string, unknown>): boolean {
-  return normalizeAutopilotPhase(state.current_phase) === 'complete';
 }
 
 export const SUPPORTED_STATE_READ_MODES = [
@@ -394,6 +390,7 @@ export async function executeStateOperation(
             ...fields,
             ...((customState as Record<string, unknown>) || {}),
           } as Record<string, unknown>;
+          delete mergedRaw.trustedPipelineProgress;
           if (!hasExplicitStateField(fields, customState, 'run_outcome')) {
             delete mergedRaw.run_outcome;
           }
@@ -459,7 +456,7 @@ export async function executeStateOperation(
           if (
             mode === 'autopilot'
             && currentAutopilotChildPhase === 'deep-interview'
-            && isAutopilotCompletePhase(mergedRaw)
+            && isAutopilotSuccessfulTerminalState(mergedRaw)
           ) {
             validationError = 'Cannot complete Autopilot before ralplan gate: deep-interview may only advance to ralplan.';
             return;
@@ -468,10 +465,21 @@ export async function executeStateOperation(
           if (
             mode === 'autopilot'
             && currentAutopilotChildPhase === 'ralplan'
-            && isAutopilotCompletePhase(mergedRaw)
+            && isAutopilotSuccessfulTerminalState(mergedRaw)
           ) {
             validationError = 'Cannot complete Autopilot before ultragoal gate: ralplan may only advance to ultragoal.';
             return;
+          }
+
+          if (mode === 'autopilot') {
+            const completionTransitionError = validateAutopilotCompletionTransition(
+              existing as Record<string, unknown>,
+              mergedRaw,
+            );
+            if (completionTransitionError) {
+              validationError = completionTransitionError;
+              return;
+            }
           }
 
           if (
