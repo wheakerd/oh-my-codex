@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { subagentTrackingPath } from '../subagents/tracker.js';
+import { getBaseStateDir, resolveWorkingDirectoryForState } from '../state/paths.js';
 
 export const RALPLAN_CONSENSUS_BLOCKED_REASONS = {
   nativeSubagentEvidenceMissing: 'native_subagent_consensus_evidence_missing',
@@ -141,10 +142,15 @@ export function readLocalRalplanConsensusStateCandidates(
 ): RalplanConsensusSource[] {
   const explicitSession = sessionId !== undefined;
   const sessionIdList = explicitSession ? validateLocalSessionId(sessionId) : readLocalCurrentSessionIds(cwd);
+  const scopedStateDir = getBaseStateDir(cwd);
+  const localStateDir = localBaseStateDir(cwd);
   if (explicitSession && sessionIdList.length === 0) return [];
   const stateRoots = sessionIdList.length > 0
-    ? sessionIdList.map((id) => join(cwd, '.omx', 'state', 'sessions', id))
-    : [join(cwd, '.omx', 'state')];
+    ? uniquePaths(sessionIdList.flatMap((id) => [
+      join(scopedStateDir, 'sessions', id),
+      join(localStateDir, 'sessions', id),
+    ]))
+    : [localStateDir];
 
   const paths = stateRoots.flatMap((dir) => [
     join(dir, 'ralplan-state.json'),
@@ -185,7 +191,17 @@ function extractSequentialConsensusEvidence(value: unknown): {
     }
   }
 
-  const stateHandoffArtifacts = asRecord(asRecord(record.state)?.handoff_artifacts);
+  const handoffArtifactsAreStale = isReturnToRalplanCycle(record);
+  const topLevelHandoffArtifacts = handoffArtifactsAreStale ? null : asRecord(record.handoff_artifacts);
+  if (topLevelHandoffArtifacts) {
+    const evidence = extractSequentialConsensusEvidence(topLevelHandoffArtifacts);
+    if (evidence) return evidence;
+  }
+
+  const stateRecord = asRecord(record.state);
+  const stateHandoffArtifacts = handoffArtifactsAreStale || (stateRecord && isReturnToRalplanCycle(stateRecord))
+    ? null
+    : asRecord(stateRecord?.handoff_artifacts);
   if (stateHandoffArtifacts) {
     const evidence = extractSequentialConsensusEvidence(stateHandoffArtifacts);
     if (evidence) return evidence;
@@ -438,7 +454,7 @@ function trackerBackedNativeReviewProblem(
 
 function currentSessionNativeLeaderThreadId(cwd: string | undefined): string {
   if (!cwd) return '';
-  const sessionState = readJsonState(join(cwd, '.omx', 'state', 'session.json'));
+  const sessionState = readJsonState(join(getBaseStateDir(cwd), 'session.json'));
   return typeof sessionState?.native_session_id === 'string' ? sessionState.native_session_id.trim() : '';
 }
 
@@ -475,10 +491,26 @@ function hasBlockingReviewSignal(value: Record<string, unknown>): boolean {
 }
 
 function readLocalCurrentSessionIds(cwd: string): string[] {
-  const state = readJsonState(join(cwd, '.omx', 'state', 'session.json'));
+  const state = readJsonState(join(getBaseStateDir(cwd), 'session.json'));
   if (typeof state?.cwd === 'string' && state.cwd !== cwd) return [];
   const sessionId = typeof state?.session_id === 'string' ? state.session_id : undefined;
   return sessionId ? validateLocalSessionId(sessionId) : [];
+}
+
+function localBaseStateDir(cwd: string): string {
+  return join(resolveWorkingDirectoryForState(cwd), '.omx', 'state');
+}
+
+function uniquePaths(paths: string[]): string[] {
+  return [...new Set(paths)];
+}
+
+function isReturnToRalplanCycle(record: Record<string, unknown>): boolean {
+  const currentPhase = String(record.current_phase ?? record.currentPhase ?? '').toLowerCase();
+  const reason = record.return_to_ralplan_reason ?? record.returnToRalplanReason;
+  return currentPhase === 'ralplan'
+    && typeof reason === 'string'
+    && reason.trim().length > 0;
 }
 
 function readJsonState(path: string): Record<string, unknown> | null {
