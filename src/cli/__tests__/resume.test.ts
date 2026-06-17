@@ -178,6 +178,63 @@ if [ -f "$CODEX_HOME/sessions/2026/06/17/rollout-runtime-session.jsonl" ]; then 
     }
   });
 
+  it('does not duplicate generated runtime history across repeated plain resume cleanup', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-resume-runtime-history-dedupe-'));
+    try {
+      const home = join(wd, 'home');
+      const projectCodexHome = join(wd, '.codex');
+      const runtimeCodexHome = join(wd, '.omx', 'runtime', 'codex-home', 'omx-existing-runtime');
+      const fakeBin = join(wd, 'bin');
+      const fakeCodexPath = join(fakeBin, 'codex');
+      const fakePsPath = join(fakeBin, 'ps');
+      const runtimeRolloutPath = join(runtimeCodexHome, 'sessions', '2026', '06', '17', 'rollout-runtime-session.jsonl');
+
+      await mkdir(home, { recursive: true });
+      await mkdir(fakeBin, { recursive: true });
+      await mkdir(join(wd, '.omx'), { recursive: true });
+      await mkdir(projectCodexHome, { recursive: true });
+      await mkdir(dirname(runtimeRolloutPath), { recursive: true });
+      await writeFile(join(wd, '.omx', 'setup-scope.json'), JSON.stringify({ scope: 'project' }));
+      await writeFile(join(projectCodexHome, 'config.toml'), 'model = "gpt-5.5"\n');
+      await writeFile(join(projectCodexHome, 'history.jsonl'), '{"session_id":"project-session"}\n');
+      await writeFile(join(projectCodexHome, 'session_index.jsonl'), '{"id":"project-session"}\n');
+      await writeFile(runtimeRolloutPath, '{"type":"session_meta","payload":{"id":"runtime-session"}}\n');
+      await writeFile(join(runtimeCodexHome, 'history.jsonl'), '{"session_id":"runtime-session"}\n');
+      await writeFile(join(runtimeCodexHome, 'session_index.jsonl'), '{"id":"runtime-session"}\n');
+
+      await writeFile(fakeCodexPath, `#!/bin/sh
+printf 'fake-codex:%s\n' "$*"
+`);
+      await chmod(fakeCodexPath, 0o755);
+      await writeFile(fakePsPath, '#!/bin/sh\nexit 0\n');
+      await chmod(fakePsPath, 0o755);
+
+      const env = {
+        HOME: home,
+        PATH: `${fakeBin}:/usr/bin:/bin`,
+        OMX_AUTO_UPDATE: '0',
+        OMX_NOTIFY_FALLBACK: '0',
+        OMX_HOOK_DERIVED_SIGNALS: '0',
+      };
+
+      const first = runOmx(wd, ['resume'], env);
+      assert.equal(first.status, 0, first.error || first.stderr || first.stdout);
+      const second = runOmx(wd, ['resume'], env);
+      assert.equal(second.status, 0, second.error || second.stderr || second.stdout);
+
+      assert.equal(
+        await readFile(join(projectCodexHome, 'history.jsonl'), 'utf-8'),
+        '{"session_id":"project-session"}\n{"session_id":"runtime-session"}\n',
+      );
+      assert.equal(
+        await readFile(join(projectCodexHome, 'session_index.jsonl'), 'utf-8'),
+        '{"id":"project-session"}\n{"id":"runtime-session"}\n',
+      );
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
   it('uses --codex-home as an explicit resume escape hatch', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-resume-codex-home-'));
     try {

@@ -846,6 +846,25 @@ function shouldPersistProjectLaunchRuntimeEntry(entryName: string): boolean {
   return PROJECT_LAUNCH_PERSISTED_RUNTIME_ENTRY_NAMES.has(entryName);
 }
 
+function uniqueJsonlLines(contents: string): string[] {
+  const seen = new Set<string>();
+  const lines: string[] = [];
+  for (const line of contents.split(/\r?\n/)) {
+    if (line === "" || seen.has(line)) continue;
+    seen.add(line);
+    lines.push(line);
+  }
+  return lines;
+}
+
+async function persistProjectLaunchRuntimeJsonlArtifact(source: string, destination: string): Promise<void> {
+  const existing = existsSync(destination) ? await readFile(destination, "utf-8").catch(() => "") : "";
+  const sourceContents = await readFile(source, "utf-8");
+  const separator = existing === "" || existing.endsWith("\n") || sourceContents === "" ? "" : "\n";
+  const lines = uniqueJsonlLines(`${existing}${separator}${sourceContents}`);
+  await writeFile(destination, lines.length > 0 ? `${lines.join("\n")}\n` : "", "utf-8");
+}
+
 async function persistProjectLaunchRuntimeHistoryArtifacts(
   runtimeCodexHome: string | undefined,
   projectCodexHome: string | undefined,
@@ -862,6 +881,10 @@ async function persistProjectLaunchRuntimeHistoryArtifacts(
     const destination = join(projectCodexHome, entryName);
     if (sourceStat.isDirectory()) {
       await cp(source, destination, { recursive: true, force: true, verbatimSymlinks: true });
+      continue;
+    }
+    if (entryName === "history.jsonl" || entryName === "session_index.jsonl") {
+      await persistProjectLaunchRuntimeJsonlArtifact(source, destination);
       continue;
     }
     if (sourceStat.isFile()) {
