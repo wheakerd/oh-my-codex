@@ -76,6 +76,7 @@ import {
   resolveCodexHomeForLaunch,
   resolveProjectLocalCodexHomeForLaunch,
 } from "./codex-home.js";
+import { discoverProjectRuntimeCodexHomes } from "./project-runtime-codex-homes.js";
 import { escapeTomlString, readTopLevelTomlString, upsertTopLevelTomlString } from "../utils/toml.js";
 
 export {
@@ -223,10 +224,10 @@ Usage:
   omx auth      Manage Codex OAuth auth slots (add|list|use)
   omx question  OMX-owned blocking question UI entrypoint for agent-invoked user questions
   omx adapt     Scaffold OMX-owned adapter foundations for persistent external targets
-  omx resume    Resume a previous interactive Codex session
+  omx resume    Resume Codex sessions (supports --project and --codex-home <path>)
   omx explore   DEPRECATED compatibility command; use normal repo inspection or omx sparkshell
   omx api       Run native omx-api localhost gateway commands (serve|status|stop|generate)
-  omx session   Search prior local session transcripts and history artifacts
+  omx session   Search prior local session transcripts (--codex-home <path> escape hatch)
   omx agents-init [path]
                 Bootstrap lightweight AGENTS.md files for a repo/subtree
   omx agents    Manage Codex native agent TOML files
@@ -887,6 +888,49 @@ async function ensureProjectLaunchRuntimeHistoryLinks(
   }
 }
 
+async function materializeProjectLaunchRuntimeHistoryEntries(
+  runtimeCodexHome: string,
+  sourceCodexHome: string,
+): Promise<void> {
+  for (const entryName of PROJECT_LAUNCH_DURABLE_HISTORY_ENTRY_NAMES) {
+    const source = join(sourceCodexHome, entryName);
+    if (!existsSync(source)) continue;
+    const destination = join(runtimeCodexHome, entryName);
+    await rm(destination, { recursive: true, force: true });
+    const sourceStat = await lstat(source);
+    if (sourceStat.isDirectory()) {
+      await cp(source, destination, { recursive: true, force: true, dereference: true });
+      continue;
+    }
+    await copyFile(source, destination);
+  }
+}
+
+async function mergeProjectLaunchRuntimeHistoryEntries(
+  runtimeCodexHome: string,
+  sourceCodexHome: string,
+): Promise<void> {
+  for (const entryName of PROJECT_LAUNCH_DURABLE_HISTORY_ENTRY_NAMES) {
+    const source = join(sourceCodexHome, entryName);
+    if (!existsSync(source)) continue;
+    const destination = join(runtimeCodexHome, entryName);
+    const sourceStat = await lstat(source);
+    if (sourceStat.isDirectory()) {
+      await mkdir(destination, { recursive: true });
+      await cp(source, destination, { recursive: true, force: true, dereference: true });
+      continue;
+    }
+    if (existsSync(destination)) {
+      const existing = await readFile(destination, "utf-8").catch(() => "");
+      const addition = await readFile(source, "utf-8");
+      const separator = existing === "" || existing.endsWith("\n") || addition === "" ? "" : "\n";
+      await writeFile(destination, `${existing}${separator}${addition}`, "utf-8");
+      continue;
+    }
+    await copyFile(source, destination);
+  }
+}
+
 export async function persistProjectLaunchRuntimeAuthState(
   runtimeCodexHome: string | undefined,
   projectCodexHome: string | undefined,
@@ -909,6 +953,7 @@ export async function persistProjectLaunchRuntimeAuthState(
  */
 export interface PrepareRuntimeCodexHomeForProjectLaunchOptions {
   includeHistoryArtifacts?: boolean;
+  extraHistoryCodexHomes?: string[];
 }
 
 export async function prepareRuntimeCodexHomeForProjectLaunch(
@@ -947,6 +992,12 @@ export async function prepareRuntimeCodexHomeForProjectLaunch(
     await linkOrCopyCodexHomeEntry(source, destination);
   }
   await ensureProjectLaunchRuntimeHistoryLinks(runtimeCodexHome, projectCodexHome);
+  if (options.includeHistoryArtifacts === true && (options.extraHistoryCodexHomes?.length ?? 0) > 0) {
+    await materializeProjectLaunchRuntimeHistoryEntries(runtimeCodexHome, projectCodexHome);
+    for (const extraCodexHome of options.extraHistoryCodexHomes ?? []) {
+      await mergeProjectLaunchRuntimeHistoryEntries(runtimeCodexHome, extraCodexHome);
+    }
+  }
 
 
   return runtimeCodexHome;
@@ -963,6 +1014,7 @@ function resolveProjectSqliteHomeForLaunch(
 
 export interface PrepareCodexHomeForLaunchOptions {
   includeHistoryArtifacts?: boolean;
+  extraHistoryCodexHomes?: string[];
 }
 
 export async function prepareCodexHomeForLaunch(
@@ -977,7 +1029,7 @@ export async function prepareCodexHomeForLaunch(
       cwd,
       sessionId,
       projectLocalCodexHomeForCleanup,
-      { includeHistoryArtifacts: options.includeHistoryArtifacts },
+      { includeHistoryArtifacts: options.includeHistoryArtifacts, extraHistoryCodexHomes: options.extraHistoryCodexHomes },
     );
     return {
       codexHomeOverride: runtimeCodexHome,
@@ -991,6 +1043,98 @@ export async function prepareCodexHomeForLaunch(
     codexHomeOverride: resolveCodexHomeForLaunch(cwd, env),
     projectLocalCodexHomeForCleanup,
   };
+}
+
+export interface ResumeCodexHomeSelection {
+  args: string[];
+  explicitCodexHome?: string;
+  projectOnly: boolean;
+}
+
+export function parseResumeCodexHomeSelection(args: string[]): ResumeCodexHomeSelection {
+  const nextArgs: string[] = [];
+  let explicitCodexHome: string | undefined;
+  let projectOnly = false;
+
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg === "--codex-home") {
+      const value = args[index + 1];
+      if (!value || value.startsWith("-")) {
+        throw new Error("Missing value after --codex-home.");
+      }
+      explicitCodexHome = value;
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith("--codex-home=")) {
+      explicitCodexHome = arg.slice("--codex-home=".length);
+      if (explicitCodexHome.trim() === "") {
+        throw new Error("Missing value after --codex-home.");
+      }
+      continue;
+    }
+    if (arg === "--project") {
+      projectOnly = true;
+      continue;
+    }
+    nextArgs.push(arg);
+  }
+
+  return {
+    args: nextArgs,
+    explicitCodexHome,
+    projectOnly,
+  };
+}
+
+async function prepareResumeCodexHomeForLaunch(
+  cwd: string,
+  sessionId: string,
+  args: string[],
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<{ args: string[]; prepared: PreparedCodexHomeForLaunch }> {
+  const selection = parseResumeCodexHomeSelection(args);
+  if (selection.explicitCodexHome) {
+    return {
+      args: selection.args,
+      prepared: {
+        codexHomeOverride: resolve(selection.explicitCodexHome),
+      },
+    };
+  }
+
+  const projectHomes = await discoverProjectRuntimeCodexHomes(cwd);
+  if (selection.projectOnly) {
+    if (projectHomes.length === 0) {
+      const emptyRuntimeCodexHome = runtimeCodexHomePath(cwd, sessionId);
+      await rm(emptyRuntimeCodexHome, { recursive: true, force: true });
+      await mkdir(join(emptyRuntimeCodexHome, "sessions"), { recursive: true });
+      return {
+        args: selection.args,
+        prepared: {
+          codexHomeOverride: emptyRuntimeCodexHome,
+          runtimeCodexHomeForCleanup: emptyRuntimeCodexHome,
+        },
+      };
+    }
+    const runtimeCodexHome = await prepareRuntimeCodexHomeForProjectLaunch(cwd, sessionId, projectHomes[0].path, {
+      includeHistoryArtifacts: true,
+      extraHistoryCodexHomes: projectHomes.slice(1).map((home) => home.path),
+    });
+    return {
+      args: selection.args,
+      prepared: {
+        codexHomeOverride: runtimeCodexHome,
+      },
+    };
+  }
+
+  const prepared = await prepareCodexHomeForLaunch(cwd, sessionId, env, {
+    includeHistoryArtifacts: true,
+    extraHistoryCodexHomes: projectHomes.map((home) => home.path),
+  });
+  return { args: selection.args, prepared };
 }
 
 export async function persistProjectLaunchRuntimeProjectTrustState(
@@ -2635,7 +2779,7 @@ export async function launchWithHud(args: string[]): Promise<void> {
     notifyTempResult.passthroughArgs,
     persistentCodexHomeForLaunch,
   );
-  const normalizedArgs = normalizeCodexLaunchArgs(
+  let normalizedArgs = normalizeCodexLaunchArgs(
     notifyTempResult.passthroughArgs,
   );
   let cwd = launchCwd;
@@ -2701,7 +2845,13 @@ export async function launchWithHud(args: string[]): Promise<void> {
     // Non-fatal: repair failure must not block launch
   }
 
-  const preparedCodexHome = await prepareCodexHomeForLaunch(launchCwd, sessionId, process.env, {
+  const resumePrepared = normalizedArgs[0] === "resume"
+    ? await prepareResumeCodexHomeForLaunch(launchCwd, sessionId, normalizedArgs, process.env)
+    : null;
+  if (resumePrepared) {
+    normalizedArgs = resumePrepared.args;
+  }
+  const preparedCodexHome = resumePrepared?.prepared ?? await prepareCodexHomeForLaunch(launchCwd, sessionId, process.env, {
     includeHistoryArtifacts: normalizedArgs[0] === "resume",
   });
   const codexHomeOverride = preparedCodexHome.codexHomeOverride;

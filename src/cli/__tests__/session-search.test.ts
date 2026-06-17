@@ -37,10 +37,11 @@ function runOmx(cwd: string, argv: string[], envOverrides: Record<string, string
 
 describe('parseSessionSearchArgs', () => {
   it('parses query tokens and flags', () => {
-    const parsed = parseSessionSearchArgs(['team', 'api', '--limit', '5', '--project=current', '--json']);
+    const parsed = parseSessionSearchArgs(['team', 'api', '--limit', '5', '--project=current', '--codex-home', '/tmp/codex', '--json']);
     assert.equal(parsed.options.query, 'team api');
     assert.equal(parsed.options.limit, 5);
     assert.equal(parsed.options.project, 'current');
+    assert.equal(parsed.options.codexHomeDir, '/tmp/codex');
     assert.equal(parsed.json, true);
   });
 });
@@ -82,6 +83,70 @@ describe('omx session search', () => {
       assert.equal(parsed.results[0].session_id, 'session-a');
       assert.equal(parsed.results[0].cwd, cwd);
       assert.match(parsed.results[0].snippet, /team api/i);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('searches generated project runtime Codex homes in a project repo', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-session-search-cli-project-'));
+    const home = join(cwd, 'home');
+    const defaultCodexHome = join(home, '.codex');
+    const runtimeCodexHome = join(cwd, '.omx', 'runtime', 'codex-home', 'omx-runtime-a');
+    try {
+      await writeRollout(defaultCodexHome, '2026-03-10T12:00:00.000Z', 'rollout-default.jsonl', [
+        {
+          type: 'session_meta',
+          payload: { id: 'default-session', timestamp: '2026-03-10T12:00:00.000Z', cwd },
+        },
+        { type: 'event_msg', payload: { type: 'user_message', message: 'generated project search default' } },
+      ]);
+      await writeRollout(runtimeCodexHome, '2026-03-11T12:00:00.000Z', 'rollout-runtime.jsonl', [
+        {
+          type: 'session_meta',
+          payload: { id: 'runtime-session', timestamp: '2026-03-11T12:00:00.000Z', cwd },
+        },
+        { type: 'event_msg', payload: { type: 'user_message', message: 'generated project search runtime' } },
+      ]);
+
+      const result = runOmx(cwd, ['session', 'search', 'generated project search', '--json'], {
+        HOME: home,
+      });
+
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+      const parsed = JSON.parse(result.stdout) as {
+        results: Array<{ session_id: string }>;
+        sources: Array<{ codex_home: string }>;
+      };
+      assert.deepEqual(parsed.results.map((result) => result.session_id).sort(), ['default-session', 'runtime-session']);
+      assert.ok(parsed.sources.some((source) => source.codex_home === defaultCodexHome));
+      assert.ok(parsed.sources.some((source) => source.codex_home === runtimeCodexHome));
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('searches only the explicit --codex-home path', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-session-search-cli-codex-home-'));
+    const home = join(cwd, 'home');
+    const explicitCodexHome = join(cwd, 'explicit-codex-home');
+    try {
+      await writeRollout(join(home, '.codex'), '2026-03-10T12:00:00.000Z', 'rollout-default.jsonl', [
+        { type: 'session_meta', payload: { id: 'default-session', timestamp: '2026-03-10T12:00:00.000Z', cwd } },
+        { type: 'event_msg', payload: { type: 'user_message', message: 'explicit codex home target default' } },
+      ]);
+      await writeRollout(explicitCodexHome, '2026-03-11T12:00:00.000Z', 'rollout-explicit.jsonl', [
+        { type: 'session_meta', payload: { id: 'explicit-session', timestamp: '2026-03-11T12:00:00.000Z', cwd } },
+        { type: 'event_msg', payload: { type: 'user_message', message: 'explicit codex home target chosen' } },
+      ]);
+
+      const result = runOmx(cwd, ['session', 'search', 'explicit codex home target', '--codex-home', explicitCodexHome, '--json'], {
+        HOME: home,
+      });
+
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+      const parsed = JSON.parse(result.stdout) as { results: Array<{ session_id: string }> };
+      assert.deepEqual(parsed.results.map((entry) => entry.session_id), ['explicit-session']);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
