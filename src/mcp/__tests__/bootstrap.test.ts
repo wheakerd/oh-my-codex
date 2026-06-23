@@ -17,6 +17,7 @@ import {
   shouldSelfExitForDuplicateSibling,
   shouldSelfExitForPreTrafficSiblingHardCap,
   shouldSelfExitForPostTrafficSiblingHardCap,
+  shouldPersistDuplicateSiblingWatchdogAfterTraffic,
   type McpServerName,
 } from '../bootstrap.js';
 import {
@@ -103,16 +104,21 @@ describe('mcp parent watchdog liveness checks', () => {
 });
 
 describe('mcp shared stdio lifecycle contract', () => {
-  it('keeps server connection immediate and duplicate process-table scans delayed', async () => {
+  it('keeps server connection immediate and duplicate process-table scans startup-scoped', async () => {
     const src = await readFile(join(process.cwd(), 'src/mcp/bootstrap.ts'), 'utf8');
     const connectIndex = src.indexOf('server.connect(transport)');
     const duplicateDelayIndex = src.indexOf('duplicateSiblingInitialDelayTimer = setTimeout');
+    const trafficCleanupIndex = src.indexOf('clearInterval(duplicateSiblingWatchdog)');
 
     assert.ok(connectIndex > 0, 'bootstrap should still connect the MCP transport');
     assert.ok(duplicateDelayIndex > 0, 'bootstrap should delay duplicate-sibling process scans');
     assert.ok(
       connectIndex > duplicateDelayIndex,
       'duplicate-sibling scan delay must not wrap or delay server.connect',
+    );
+    assert.ok(
+      trafficCleanupIndex > duplicateDelayIndex,
+      'duplicate-sibling watchdog should be canceled after first stdio traffic by default',
     );
     assert.match(
       src,
@@ -160,6 +166,22 @@ describe('mcp shared stdio lifecycle contract', () => {
 });
 
 describe('mcp duplicate sibling detection', () => {
+  it('does not persist the duplicate sibling watchdog after stdio traffic unless explicitly requested', () => {
+    assert.equal(shouldPersistDuplicateSiblingWatchdogAfterTraffic({}), false);
+    assert.equal(
+      shouldPersistDuplicateSiblingWatchdogAfterTraffic({
+        OMX_MCP_DUPLICATE_SIBLING_WATCHDOG_PERSIST_AFTER_TRAFFIC: '1',
+      }),
+      true,
+    );
+    assert.equal(
+      shouldPersistDuplicateSiblingWatchdogAfterTraffic({
+        OMX_MCP_DUPLICATE_SIBLING_WATCHDOG_PERSIST_AFTER_TRAFFIC: 'true',
+      }),
+      true,
+    );
+  });
+
   it('resolves deterministic bounded initial duplicate scan delays', () => {
     const stateDelay = resolveDuplicateSiblingWatchdogInitialDelayMs(
       'state',
