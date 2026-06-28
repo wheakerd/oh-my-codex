@@ -890,6 +890,56 @@ describe('keyword detector skill-active-state lifecycle', () => {
     }
   });
 
+  it('does not let an implementation-phase keyword skip the code-review gate to ultraqa', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-keyword-ultraqa-skip-'));
+    const stateDir = join(cwd, '.omx', 'state');
+    const sessionId = 'sess-ultraqa-skip';
+    try {
+      await mkdir(join(stateDir, 'sessions', sessionId), { recursive: true });
+      // Supervised Autopilot in an implementation phase (ultragoal). The completion
+      // gate requires code-review before ultraqa.
+      await writeFile(
+        join(stateDir, 'sessions', sessionId, SKILL_ACTIVE_STATE_FILE),
+        JSON.stringify({
+          version: 1,
+          active: true,
+          skill: 'autopilot',
+          keyword: '$autopilot',
+          phase: 'ultragoal',
+          source: 'keyword-detector',
+          session_id: sessionId,
+          active_skills: [{ skill: 'autopilot', phase: 'ultragoal', active: true, session_id: sessionId }],
+        }, null, 2),
+      );
+      const autopilotStatePath = join(stateDir, 'sessions', sessionId, 'autopilot-state.json');
+      await writeFile(
+        autopilotStatePath,
+        JSON.stringify({ active: true, mode: 'autopilot', current_phase: 'ultragoal', session_id: sessionId }, null, 2),
+      );
+
+      const denied = await recordSkillActivation({
+        stateDir,
+        text: 'run $ultraqa now',
+        sessionId,
+        threadId: 'thread-ultraqa-skip',
+        turnId: 'turn-ultraqa-skip',
+        nowIso: '2026-02-25T00:01:00.000Z',
+      });
+
+      const afterAdvance = JSON.parse(await readFile(autopilotStatePath, 'utf-8')) as { current_phase: string };
+      assert.equal(afterAdvance.current_phase, 'ultragoal', 'keyword handoff must not skip the code-review gate');
+      assert.equal(denied?.phase, 'ultragoal');
+      assert.deepEqual(denied?.active_skills?.map((entry) => [entry.skill, entry.phase]), [['autopilot', 'ultragoal']]);
+      const canonical = JSON.parse(
+        await readFile(join(stateDir, 'sessions', sessionId, SKILL_ACTIVE_STATE_FILE), 'utf-8'),
+      ) as { phase?: string; active_skills?: Array<{ skill?: string; phase?: string }> };
+      assert.equal(canonical.phase, 'ultragoal');
+      assert.deepEqual(canonical.active_skills?.map((entry) => [entry.skill, entry.phase]), [['autopilot', 'ultragoal']]);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it('seeds dedicated planner routing in Autopilot state when main is cheap', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-keyword-autopilot-planner-routing-'));
     const stateDir = join(cwd, '.omx', 'state');

@@ -48,6 +48,7 @@ import { resolveAutopilotPlannerRouting } from '../autopilot/planner-routing.js'
 import { deriveAutopilotChildPhase, AUTOPILOT_CHILD_PHASES } from '../autopilot/fsm.js';
 import { canAdvanceAutopilotDeepInterviewToRalplan } from '../autopilot/deep-interview-gate.js';
 import { canAdvanceAutopilotRalplanToUltragoal } from '../autopilot/ralplan-gate.js';
+import { validateAutopilotCompletionTransition } from '../autopilot/completion-gate.js';
 
 export interface KeywordMatch {
   keyword: string;
@@ -1101,6 +1102,14 @@ async function resolveGatedSupervisedChildPhase(
   const currentChildPhase = deriveAutopilotChildPhase(existing);
   const heldPhase = safeString(existing.current_phase).trim() || requestedChildSkill;
   const nextState = { ...existing, current_phase: requestedChildSkill };
+
+  // Reuse the same semantic completion-gate the state_write backend enforces, so
+  // the keyword path can't skip it either — e.g. an implementation phase
+  // (ultragoal/rework/team/ralph) may not jump straight to ultraqa; code-review
+  // must run first.
+  if (validateAutopilotCompletionTransition(existing, nextState)) {
+    return heldPhase;
+  }
 
   if (currentChildPhase === 'deep-interview' && requestedChildSkill === 'ralplan') {
     const gate = await canAdvanceAutopilotDeepInterviewToRalplan({
