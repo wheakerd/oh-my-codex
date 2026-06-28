@@ -773,7 +773,7 @@ describe('keyword detector skill-active-state lifecycle', () => {
       // A bare `$ralplan` keyword handoff must not advance current_phase across the
       // deep-interview -> ralplan gate while the gate is unsatisfied. The keyword
       // path now defers to the same gate as the state_write backend.
-      await recordSkillActivation({
+      const denied = await recordSkillActivation({
         stateDir,
         text: 'continue with $ralplan',
         sessionId: 'sess-gate',
@@ -788,6 +788,17 @@ describe('keyword detector skill-active-state lifecycle', () => {
         'deep-interview',
         'keyword handoff must not skip the deep-interview gate',
       );
+
+      // The visible canonical skill-active state must stay aligned with the held
+      // detail phase (no drift to ralplan) — both the returned state and the
+      // persisted skill-active-state.json mirror.
+      assert.equal(denied?.phase, 'deep-interview');
+      assert.deepEqual(denied?.active_skills?.map((entry) => [entry.skill, entry.phase]), [['autopilot', 'deep-interview']]);
+      const canonical = JSON.parse(
+        await readFile(join(stateDir, 'sessions', 'sess-gate', SKILL_ACTIVE_STATE_FILE), 'utf-8'),
+      ) as { phase?: string; active_skills?: Array<{ skill?: string; phase?: string }> };
+      assert.equal(canonical.phase, 'deep-interview');
+      assert.deepEqual(canonical.active_skills?.map((entry) => [entry.skill, entry.phase]), [['autopilot', 'deep-interview']]);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -824,6 +835,56 @@ describe('keyword detector skill-active-state lifecycle', () => {
       assert.equal(autopilotState.current_phase, 'deep-interview', 'forward skip must be held');
       // skill-active phase is kept in sync with the held autopilot phase.
       assert.equal(result?.phase, 'deep-interview');
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('does not advance or drift canonical state past an unsatisfied ralplan -> ultragoal gate', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-keyword-ralplan-gate-'));
+    const stateDir = join(cwd, '.omx', 'state');
+    const sessionId = 'sess-ralplan-gate';
+    try {
+      await mkdir(join(stateDir, 'sessions', sessionId), { recursive: true });
+      // Supervised Autopilot already in ralplan, with no ralplan consensus evidence
+      // (the ralplan -> ultragoal gate is unsatisfied).
+      await writeFile(
+        join(stateDir, 'sessions', sessionId, SKILL_ACTIVE_STATE_FILE),
+        JSON.stringify({
+          version: 1,
+          active: true,
+          skill: 'autopilot',
+          keyword: '$autopilot',
+          phase: 'ralplan',
+          source: 'keyword-detector',
+          session_id: sessionId,
+          active_skills: [{ skill: 'autopilot', phase: 'ralplan', active: true, session_id: sessionId }],
+        }, null, 2),
+      );
+      const autopilotStatePath = join(stateDir, 'sessions', sessionId, 'autopilot-state.json');
+      await writeFile(
+        autopilotStatePath,
+        JSON.stringify({ active: true, mode: 'autopilot', current_phase: 'ralplan', session_id: sessionId }, null, 2),
+      );
+
+      const denied = await recordSkillActivation({
+        stateDir,
+        text: 'advance to $ultragoal',
+        sessionId,
+        threadId: 'thread-ralplan-gate',
+        turnId: 'turn-ralplan-gate',
+        nowIso: '2026-02-25T00:01:00.000Z',
+      });
+
+      const afterAdvance = JSON.parse(await readFile(autopilotStatePath, 'utf-8')) as { current_phase: string };
+      assert.equal(afterAdvance.current_phase, 'ralplan', 'keyword handoff must not skip the ralplan -> ultragoal gate');
+      assert.equal(denied?.phase, 'ralplan');
+      assert.deepEqual(denied?.active_skills?.map((entry) => [entry.skill, entry.phase]), [['autopilot', 'ralplan']]);
+      const canonical = JSON.parse(
+        await readFile(join(stateDir, 'sessions', sessionId, SKILL_ACTIVE_STATE_FILE), 'utf-8'),
+      ) as { phase?: string; active_skills?: Array<{ skill?: string; phase?: string }> };
+      assert.equal(canonical.phase, 'ralplan');
+      assert.deepEqual(canonical.active_skills?.map((entry) => [entry.skill, entry.phase]), [['autopilot', 'ralplan']]);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
