@@ -6791,10 +6791,9 @@ exit 0
         );
       }
 
-      // `omx state write` routes through the validated state_write backend, which
-      // enforces the Autopilot phase gate for every transport. The hook defers to
-      // that gate rather than blocking the CLI transport (raw writes to the
-      // protected state files above stay blocked).
+      // A non-deactivating `omx state write` routes through the validated
+      // state_write backend (which enforces the Autopilot phase gate for every
+      // transport), so the hook defers rather than blocking the CLI transport.
       const allowedStateCliMutation = await dispatchCodexNativeHook(
         {
           hook_event_name: "PreToolUse",
@@ -6802,11 +6801,55 @@ exit 0
           session_id: "sess-di-artifact",
           tool_name: "Bash",
           tool_use_id: "tool-di-state-cli-write",
-          tool_input: { command: "omx state write --input '{\"mode\":\"deep-interview\",\"active\":false}' --json" },
+          tool_input: { command: "omx state write --input '{\"mode\":\"autopilot\",\"current_phase\":\"ralplan\"}' --json" },
         },
         { cwd },
       );
       assert.equal(allowedStateCliMutation.outputJson, null);
+
+      // A deactivating `omx state write` (or `omx state clear`) ends the planning
+      // phase, which the backend does not gate for standalone modes; the hook
+      // rejects these deactivation vectors at the transport boundary.
+      const blockedStateDeactivation = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "PreToolUse",
+          cwd,
+          session_id: "sess-di-artifact",
+          tool_name: "Bash",
+          tool_use_id: "tool-di-state-cli-deactivate",
+          tool_input: { command: "omx state write --input '{\"mode\":\"deep-interview\",\"active\":false}' --json" },
+        },
+        { cwd },
+      );
+      assert.equal((blockedStateDeactivation.outputJson as { decision?: string } | null)?.decision, "block");
+
+      const blockedStateClear = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "PreToolUse",
+          cwd,
+          session_id: "sess-di-artifact",
+          tool_name: "Bash",
+          tool_use_id: "tool-di-state-cli-clear",
+          tool_input: { command: "omx state clear --json" },
+        },
+        { cwd },
+      );
+      assert.equal((blockedStateClear.outputJson as { decision?: string } | null)?.decision, "block");
+
+      // An implementation write smuggled alongside an allowed `omx state` command
+      // must not be short-circuited through the allowance.
+      const blockedChainedWrite = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "PreToolUse",
+          cwd,
+          session_id: "sess-di-artifact",
+          tool_name: "Bash",
+          tool_use_id: "tool-di-state-cli-chained",
+          tool_input: { command: "printf 'x' > src/evil.ts && omx state read --json" },
+        },
+        { cwd },
+      );
+      assert.equal((blockedChainedWrite.outputJson as { decision?: string } | null)?.decision, "block");
 
       const allowedStateRead = await dispatchCodexNativeHook(
         {
@@ -7257,13 +7300,19 @@ exit 0
         );
       }
 
-      // `omx state` mutations defer to the gate-enforcing state_write backend
-      // (same enforcement for CLI and MCP); the hook no longer blocks the
-      // transport. Raw writes to the protected state files stay blocked above.
+      // A non-deactivating `omx state write` defers to the gate-enforcing
+      // state_write backend (same enforcement for CLI and MCP).
       const allowedStateCliMutation = await preToolUse("Bash", "tool-ralplan-state-cli-write", {
-        command: "omx state clear --json",
+        command: "omx state write --input '{\"mode\":\"autopilot\",\"current_phase\":\"ultragoal\"}' --json",
       });
       assert.equal(allowedStateCliMutation.outputJson, null);
+
+      // Deactivation vectors (`omx state clear`, `active:false`) are still
+      // rejected at the transport boundary.
+      const blockedStateClear = await preToolUse("Bash", "tool-ralplan-state-cli-clear", {
+        command: "omx state clear --json",
+      });
+      assert.equal((blockedStateClear.outputJson as { decision?: string } | null)?.decision, "block");
 
       const allowedPatchAdd = await preToolUse("apply_patch", "tool-ralplan-patch-add", {
         input: "*** Begin Patch\n*** Add File: .omx/plans/issue-2863.md\n+# Plan\n*** End Patch\n",

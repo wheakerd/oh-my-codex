@@ -3569,15 +3569,28 @@ function describeImplementationToolBlock(
   return formatPlanningWriteBlockDetail(operationClass, blockedPath, RALPLAN_ALLOWED_WRITE_PREFIXES);
 }
 
+// `omx state` mutations normally route through the gate-enforcing `state_write`
+// backend, so the hook defers to that gate rather than blocking the transport.
+// The backend does NOT gate standalone deep-interview/ralplan *deactivation*,
+// however, so a command that ends the active planning phase from a tool call
+// (`omx state clear`, or an `omx state write` that flips `active` off) is still
+// blocked here. Robustly gating standalone deactivation (and other skip vectors)
+// belongs in the backend; this is transport-level defense-in-depth.
+function commandEndsPlanningPhase(command: string): boolean {
+  return /\bomx\s+state\s+clear\b/.test(command)
+    || (/\bomx\s+state\s+write\b/.test(command) && /["']?active["']?\s*:\s*false\b/.test(command));
+}
+
 function isAllowedDeepInterviewBashWrite(cwd: string, command: string): boolean {
+  if (commandEndsPlanningPhase(command)) return false;
   if (!commandHasDeepInterviewWriteIntent(command)) return true;
-  // `omx state` mutations route through the validated `state_write` backend,
-  // which enforces the Autopilot phase gate (ordering + completion/skip
-  // evidence) for every transport. Defer to that gate here instead of blocking
-  // the transport; raw writes to the protected planning-state files are still
-  // rejected below via isAllowedDeepInterviewArtifactPath.
-  if (/\bomx\s+(?:state\s+(?:read|write|clear)|question)\b/.test(command)) return true;
   const targets = extractDeepInterviewCommandWriteTargets(command);
+  // A disallowed write target chained alongside an allowed `omx state`/`omx
+  // question` command must not be smuggled through the allowance below.
+  if (targets.some((target) => !isAllowedDeepInterviewArtifactPath(cwd, target))) return false;
+  // `omx state` read/write/clear and `omx question` defer to the backend gate;
+  // deactivation is already rejected above.
+  if (/\bomx\s+(?:state\s+(?:read|write|clear)|question)\b/.test(command)) return true;
   return targets.length > 0 && targets.every((target) => isAllowedDeepInterviewArtifactPath(cwd, target));
 }
 
@@ -3682,9 +3695,13 @@ function isAllowedRalplanBashWrite(cwd: string, command: string): boolean {
   if (beadsCommand.present) {
     return beadsCommand.allowed && (targets.length === 0 || hasAllowedTargets);
   }
+  if (commandEndsPlanningPhase(command)) return false;
   if (!commandHasDeepInterviewWriteIntent(command)) return true;
+  // A disallowed write target chained alongside an allowed `omx state`/`omx
+  // question` command must not be smuggled through the allowance below.
+  if (targets.some((target) => !isAllowedRalplanArtifactPath(cwd, target))) return false;
   // See isAllowedDeepInterviewBashWrite: defer `omx state` mutations to the
-  // gate-enforcing state_write backend rather than blocking the CLI transport.
+  // gate-enforcing state_write backend (deactivation already rejected above).
   if (/\bomx\s+(?:state\s+(?:read|write|clear)|question)\b/.test(command)) return true;
   return hasAllowedTargets;
 }

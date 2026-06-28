@@ -793,6 +793,42 @@ describe('keyword detector skill-active-state lifecycle', () => {
     }
   });
 
+  it('does not let a keyword jump ahead past a planning gate (forward skip)', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-keyword-skip-ahead-'));
+    const stateDir = join(cwd, '.omx', 'state');
+    try {
+      await mkdir(stateDir, { recursive: true });
+      await recordSkillActivation({
+        stateDir,
+        text: 'please run $autopilot',
+        sessionId: 'sess-skip',
+        threadId: 'thread-skip',
+        turnId: 'turn-1',
+        nowIso: '2026-02-25T00:00:00.000Z',
+      });
+
+      // `$ultragoal` while in deep-interview skips the ralplan gate entirely; the
+      // keyword handoff must hold the current phase rather than jump ahead.
+      const result = await recordSkillActivation({
+        stateDir,
+        text: 'jump straight to $ultragoal',
+        sessionId: 'sess-skip',
+        threadId: 'thread-skip',
+        turnId: 'turn-2',
+        nowIso: '2026-02-25T00:01:00.000Z',
+      });
+
+      const autopilotState = JSON.parse(
+        await readFile(join(stateDir, 'sessions', 'sess-skip', 'autopilot-state.json'), 'utf-8'),
+      ) as { current_phase: string };
+      assert.equal(autopilotState.current_phase, 'deep-interview', 'forward skip must be held');
+      // skill-active phase is kept in sync with the held autopilot phase.
+      assert.equal(result?.phase, 'deep-interview');
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it('seeds dedicated planner routing in Autopilot state when main is cheap', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-keyword-autopilot-planner-routing-'));
     const stateDir = join(cwd, '.omx', 'state');
