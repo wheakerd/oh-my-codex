@@ -1632,7 +1632,6 @@ const PROMPT_WORKER_EXIT_POLL_MS = 100;
 const STARTUP_DISPATCH_RETRIES = 3;
 const STARTUP_DISPATCH_RETRY_DELAY_S = 3;
 const PROMPT_MODE_CODEX_UNSUPPORTED_REASON = 'prompt_mode_codex_requires_tty';
-const OMX_TEAM_WORKER_CLI_MAP_ENV = 'OMX_TEAM_WORKER_CLI_MAP';
 // Test-only escape hatch for fake prompt workers that intentionally do not require a real TTY.
 const PROMPT_MODE_CODEX_TEST_ALLOW_ENV = 'OMX_TEST_ALLOW_NONTTY_CODEX_PROMPT';
 
