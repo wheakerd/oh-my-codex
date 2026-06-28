@@ -12,6 +12,7 @@ import {
   buildWorkerProcessLaunchSpec,
   scrubTeamWorkerHudOwnershipEnv,
   resolveTeamWorkerCli,
+  resolveTeamWorkerCliForResolvedLaunchArgs,
   type TeamWorkerCli,
   resolveTeamWorkerLaunchMode,
   type TeamSession,
@@ -137,6 +138,8 @@ import { hasStructuredVerificationEvidence } from '../verification/verifier.js';
 import { buildRebalanceDecisions } from './rebalance-policy.js';
 import { getStatePath } from '../mcp/state-paths.js';
 import { readModeState, updateModeState } from '../modes/base.js';
+
+export { resolveTeamWorkerCliForResolvedLaunchArgs };
 import {
   buildApprovedTeamHandoffSection,
   buildApprovedTeamExecutionBinding,
@@ -2399,63 +2402,6 @@ function resolveEffectiveWorkerCliForStartupLog(
   }
 
   return resolveTeamWorkerCli(resolvedLaunchArgs, env);
-}
-
-export function resolveTeamWorkerCliForResolvedLaunchArgs(
-  workerIndex: number,
-  workerCount: number,
-  resolvedLaunchArgs: string[],
-  env: NodeJS.ProcessEnv = process.env,
-): TeamWorkerCli {
-  if (!Number.isInteger(workerCount) || workerCount < 1) {
-    throw new Error(`workerCount must be >= 1 (got ${workerCount})`);
-  }
-  if (!Number.isInteger(workerIndex) || workerIndex < 1 || workerIndex > workerCount) {
-    throw new Error(`workerIndex must be within 1..${workerCount} (got ${workerIndex})`);
-  }
-
-  const rawMap = String(env.OMX_TEAM_WORKER_CLI_MAP ?? '').trim();
-  const autoCli = resolveTeamWorkerCli(resolvedLaunchArgs, {
-    ...env,
-    OMX_TEAM_WORKER_CLI: 'auto',
-  });
-  const normalizeEntry = (entry: string): TeamWorkerCli | 'auto' | null => {
-    const normalized = entry.trim().toLowerCase();
-    if (normalized === 'auto' || normalized === 'codex' || normalized === 'claude' || normalized === 'gemini') {
-      return normalized;
-    }
-    return null;
-  };
-  const invalidMapError = () => new Error(
-    `Invalid ${OMX_TEAM_WORKER_CLI_MAP_ENV} value "${env[OMX_TEAM_WORKER_CLI_MAP_ENV]}". `
-      + `Expected comma-separated values: auto|codex|claude|gemini.`,
-  );
-
-  if (rawMap === '') {
-    return resolveTeamWorkerCli(resolvedLaunchArgs, env);
-  }
-
-  const entries = rawMap.split(',').map((part) => part.trim());
-  if (entries.length === 0 || entries.every((part) => part.length === 0)) {
-    throw invalidMapError();
-  }
-  if (entries.some((part) => part.length === 0)) {
-    throw new Error(
-      `Invalid ${OMX_TEAM_WORKER_CLI_MAP_ENV} value "${env[OMX_TEAM_WORKER_CLI_MAP_ENV]}". `
-        + `Empty entries are not allowed.`,
-    );
-  }
-  if (entries.length !== 1 && entries.length !== workerCount) {
-    throw new Error(
-      `Invalid ${OMX_TEAM_WORKER_CLI_MAP_ENV} length ${entries.length}; `
-        + `expected 1 or ${workerCount} comma-separated values.`,
-    );
-  }
-
-  const entry = entries.length === 1 ? entries[0] as string : entries[workerIndex - 1];
-  const mode = normalizeEntry(entry);
-  if (!mode) throw invalidMapError();
-  return mode === 'auto' ? autoCli : mode;
 }
 
 

@@ -24,6 +24,7 @@ import {
   buildWorkerStartupCommand,
   trustWorkerMiseConfigIfAvailable,
   writeWorkerStartupScriptCommand,
+  resolveTeamWorkerCliForResolvedLaunchArgs,
   tagPaneTeamOwner,
 } from './tmux-session.js';
 import { execFileSync, spawnSync } from 'child_process';
@@ -72,7 +73,6 @@ import {
   TEAM_WORKER_INHERITED_MODEL_ENV,
   type TeamReasoningEffort,
 } from './model-contract.js';
-import { resolveTeamWorkerCliForResolvedLaunchArgs } from './runtime.js';
 import { resolveCanonicalTeamStateRoot } from './state-root.js';
 import {
   ensureWorktree,
@@ -279,7 +279,6 @@ export async function scaleUp(
 
     const maxWorkers = config.max_workers;
     const currentCount = config.workers.length;
-    const targetWorkerCount = currentCount + count;
     if (currentCount + count > maxWorkers) {
       return {
         ok: false,
@@ -438,7 +437,7 @@ export async function scaleUp(
       const preferredReasoning = resolveAgentReasoningEffort(runtimeRole, codexHomeOverride)
         ?? resolveAgentReasoningEffort(agentType, codexHomeOverride);
       const workerLaunchArgs = resolveWorkerLaunchArgsForScaling(launchEnv, runtimeRole, preferredReasoning, codexHomeOverride);
-      const workerCli = resolveTeamWorkerCliForResolvedLaunchArgs(workerIndex, targetWorkerCount, workerLaunchArgs, launchEnv);
+      const workerCli = resolveTeamWorkerCliForResolvedLaunchArgs(i + 1, count, workerLaunchArgs, launchEnv);
       const resolvedWorkerModel = parseTeamWorkerLaunchArgs(workerLaunchArgs).modelOverride ?? undefined;
       const rolePromptContent = rawRolePromptContent
         ? composeRoleInstructionsForRole(runtimeRole, rawRolePromptContent, resolvedWorkerModel)

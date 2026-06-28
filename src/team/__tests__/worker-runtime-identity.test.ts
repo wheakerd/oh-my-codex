@@ -335,7 +335,7 @@ process.on('SIGTERM', () => process.exit(0));
         subject: 'architecture follow-up',
         description: 'exact-role scale-up regression',
         status: 'pending',
-        owner: 'worker-2',
+        owner: 'worker-3',
         role: 'architect',
       }, cwd);
 
@@ -345,6 +345,7 @@ process.on('SIGTERM', () => process.exit(0));
       config.tmux_session = 'omx-team-exact-role-cli';
       config.leader_pane_id = '%11';
       config.workers[0]!.pane_id = '%21';
+      config.next_worker_index = 3;
       await saveTeamConfig(config, cwd);
 
       const manifestPath = join(cwd, '.omx', 'state', 'team', 'exact-role-cli', 'manifest.v2.json');
@@ -359,7 +360,7 @@ process.on('SIGTERM', () => process.exit(0));
         'exact-role-cli',
         1,
         'executor',
-        [{ subject: 'architecture follow-up', description: 'exact-role scale-up regression', owner: 'worker-2', role: 'architect' }],
+        [{ subject: 'architecture follow-up', description: 'exact-role scale-up regression', owner: 'worker-3', role: 'architect' }],
         cwd,
         {
           OMX_TEAM_SCALING_ENABLED: '1',
@@ -371,17 +372,17 @@ process.on('SIGTERM', () => process.exit(0));
       assert.equal(result.ok, true);
       if (!result.ok) return;
 
-      const workerIdentity = JSON.parse(await readFile(join(cwd, '.omx', 'state', 'team', 'exact-role-cli', 'workers', 'worker-2', 'identity.json'), 'utf-8')) as { worker_cli?: string; role?: string };
+      const workerIdentity = JSON.parse(await readFile(join(cwd, '.omx', 'state', 'team', 'exact-role-cli', 'workers', 'worker-3', 'identity.json'), 'utf-8')) as { worker_cli?: string; role?: string };
       assert.equal(workerIdentity.role, 'architect');
       assert.equal(workerIdentity.worker_cli, 'codex');
 
-      const startupScript = await readFile(join(cwd, '.omx', 'state', 'team', 'exact-role-cli', 'runtime', 'worker-2-startup.sh'), 'utf-8');
+      const startupScript = await readFile(join(cwd, '.omx', 'state', 'team', 'exact-role-cli', 'runtime', 'worker-3-startup.sh'), 'utf-8');
       assert.match(startupScript, /codex/);
       assert.doesNotMatch(startupScript, /\bclaude\b/);
       assert.doesNotMatch(startupScript, /\bgemini\b/);
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
-      assert.match(tmuxLog, /worker-2-startup\.sh/);
+      assert.match(tmuxLog, /worker-3-startup\.sh/);
       assert.doesNotMatch(tmuxLog, /\bclaude\b/);
       assert.doesNotMatch(tmuxLog, /\bgemini\b/);
     } finally {
