@@ -748,6 +748,51 @@ describe('keyword detector skill-active-state lifecycle', () => {
     }
   });
 
+  it('does not advance the supervised child phase past an unsatisfied deep-interview gate via keyword handoff', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-keyword-supervised-gate-'));
+    const stateDir = join(cwd, '.omx', 'state');
+    try {
+      await mkdir(stateDir, { recursive: true });
+
+      // Activate Autopilot: seeds autopilot-state.json at current_phase=deep-interview
+      // with deep_interview_gate.status="required" (gate not satisfied).
+      const activated = await recordSkillActivation({
+        stateDir,
+        text: 'please run $autopilot',
+        sessionId: 'sess-gate',
+        threadId: 'thread-gate',
+        turnId: 'turn-1',
+        nowIso: '2026-02-25T00:00:00.000Z',
+      });
+      assert.equal(activated?.phase, 'deep-interview');
+
+      const autopilotStatePath = join(stateDir, 'sessions', 'sess-gate', 'autopilot-state.json');
+      const beforeAdvance = JSON.parse(await readFile(autopilotStatePath, 'utf-8')) as { current_phase: string };
+      assert.equal(beforeAdvance.current_phase, 'deep-interview');
+
+      // A bare `$ralplan` keyword handoff must not advance current_phase across the
+      // deep-interview -> ralplan gate while the gate is unsatisfied. The keyword
+      // path now defers to the same gate as the state_write backend.
+      await recordSkillActivation({
+        stateDir,
+        text: 'continue with $ralplan',
+        sessionId: 'sess-gate',
+        threadId: 'thread-gate',
+        turnId: 'turn-2',
+        nowIso: '2026-02-25T00:01:00.000Z',
+      });
+
+      const afterAdvance = JSON.parse(await readFile(autopilotStatePath, 'utf-8')) as { current_phase: string };
+      assert.equal(
+        afterAdvance.current_phase,
+        'deep-interview',
+        'keyword handoff must not skip the deep-interview gate',
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it('seeds dedicated planner routing in Autopilot state when main is cheap', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-keyword-autopilot-planner-routing-'));
     const stateDir = join(cwd, '.omx', 'state');

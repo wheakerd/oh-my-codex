@@ -45,6 +45,9 @@ import {
 } from '../config/deep-interview.js';
 import { inferTerminalLifecycleOutcome } from '../runtime/run-outcome.js';
 import { resolveAutopilotPlannerRouting } from '../autopilot/planner-routing.js';
+import { deriveAutopilotChildPhase } from '../autopilot/fsm.js';
+import { canAdvanceAutopilotDeepInterviewToRalplan } from '../autopilot/deep-interview-gate.js';
+import { canAdvanceAutopilotRalplanToUltragoal } from '../autopilot/ralplan-gate.js';
 
 export interface KeywordMatch {
   keyword: string;
@@ -1081,7 +1084,50 @@ const AUTOPILOT_SUPERVISED_TRACKED_CHILD_SKILLS: TrackedWorkflowMode[] = [
   'ultraqa',
 ];
 
+// Mirror the `state_write` backend: an Autopilot phase advance across a planning
+// gate boundary (deep-interview -> ralplan, ralplan -> ultragoal) must satisfy
+// the same gate regardless of transport. The keyword handoff previously wrote
+// `current_phase` directly here, bypassing the gate that CLI/MCP `state_write`
+// enforces. When the gate is not satisfied we keep the current phase (do not
+// advance) so a `$child` keyword alone cannot skip the gate.
+async function resolveGatedSupervisedChildPhase(
+  cwd: string,
+  stateDir: string,
+  sessionId: string | undefined,
+  existing: Record<string, unknown> | null,
+  requestedChildSkill: string,
+): Promise<string> {
+  if (!existing) return requestedChildSkill;
+  const currentChildPhase = deriveAutopilotChildPhase(existing);
+  const heldPhase = safeString(existing.current_phase).trim() || requestedChildSkill;
+  const nextState = { ...existing, current_phase: requestedChildSkill };
+
+  if (currentChildPhase === 'deep-interview' && requestedChildSkill === 'ralplan') {
+    const gate = await canAdvanceAutopilotDeepInterviewToRalplan({
+      cwd,
+      sessionId,
+      baseStateDir: stateDir,
+      currentState: existing,
+      nextState,
+    });
+    return gate.allowed ? requestedChildSkill : heldPhase;
+  }
+
+  if (currentChildPhase === 'ralplan' && requestedChildSkill === 'ultragoal') {
+    const gate = canAdvanceAutopilotRalplanToUltragoal({
+      cwd,
+      sessionId,
+      currentState: existing,
+      nextState,
+    });
+    return gate.allowed ? requestedChildSkill : heldPhase;
+  }
+
+  return requestedChildSkill;
+}
+
 async function persistAutopilotSupervisedChildPhaseState(
+  cwd: string,
   stateDir: string,
   sessionId: string | undefined,
   childSkill: string,
@@ -1100,6 +1146,14 @@ async function persistAutopilotSupervisedChildPhaseState(
     throw new Error(`Cannot advance supervised Autopilot child phase: expected autopilot detail state, found ${existingMode || 'unknown'}`);
   }
 
+  const effectivePhase = await resolveGatedSupervisedChildPhase(
+    cwd,
+    stateDir,
+    sessionId,
+    existing,
+    childSkill,
+  );
+
   await mkdir(dirname(absolutePath), { recursive: true });
   await writeFile(absolutePath, JSON.stringify(withModeRuntimeContext(
     existing ?? {},
@@ -1107,7 +1161,7 @@ async function persistAutopilotSupervisedChildPhaseState(
       ...(existing ?? {}),
       active: true,
       mode: 'autopilot',
-      current_phase: childSkill,
+      current_phase: effectivePhase,
       started_at: safeString(existing?.started_at).trim() || nowIso,
       updated_at: nowIso,
       session_id: (sessionId ?? safeString(existing?.session_id).trim()) || undefined,
@@ -1127,7 +1181,7 @@ async function reconcileAutopilotSupervisedChildModeStates(
   options: { threadId?: string; turnId?: string } = {},
 ): Promise<string[]> {
   if (!isTrackedWorkflowMode(childSkill)) {
-    await persistAutopilotSupervisedChildPhaseState(stateDir, sessionId, childSkill, nowIso, options);
+    await persistAutopilotSupervisedChildPhaseState(cwd, stateDir, sessionId, childSkill, nowIso, options);
     return [];
   }
 
@@ -1152,7 +1206,7 @@ async function reconcileAutopilotSupervisedChildModeStates(
     sessionId,
     source: 'autopilot-supervised-child',
   });
-  await persistAutopilotSupervisedChildPhaseState(stateDir, sessionId, childSkill, nowIso, options);
+  await persistAutopilotSupervisedChildPhaseState(cwd, stateDir, sessionId, childSkill, nowIso, options);
   return transition.completedPaths;
 }
 

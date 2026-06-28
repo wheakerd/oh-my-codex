@@ -3528,7 +3528,6 @@ function commandHasDeepInterviewWriteIntent(command: string): boolean {
     || /\btee\s+(?:-a\s+)?[^\s&|;]+/.test(command)
     || /\bsed\s+(?:[^\n;&|]*\s)?-i(?:\b|['"])/.test(command)
     || /\b(?:python3?|node|perl|ruby)\b[\s\S]{0,260}\b(?:writeFileSync|writeFile|write_text|open\([^)]*["']w|File\.write|Path\()/.test(command)
-    || /\bomx\s+state\s+(?:write|clear)\b/.test(command)
     || /\b(?:git\s+(?:checkout|switch|restore|reset|apply|am|merge|rebase)|npm\s+(?:install|i|ci)|pnpm\s+(?:install|i)|yarn\s+(?:install|add))\b/.test(command);
 }
 
@@ -3572,8 +3571,12 @@ function describeImplementationToolBlock(
 
 function isAllowedDeepInterviewBashWrite(cwd: string, command: string): boolean {
   if (!commandHasDeepInterviewWriteIntent(command)) return true;
-  if (/\bomx\s+(?:state\s+read|question)\b/.test(command)) return true;
-  if (/\bomx\s+state\s+(?:write|clear)\b/.test(command)) return false;
+  // `omx state` mutations route through the validated `state_write` backend,
+  // which enforces the Autopilot phase gate (ordering + completion/skip
+  // evidence) for every transport. Defer to that gate here instead of blocking
+  // the transport; raw writes to the protected planning-state files are still
+  // rejected below via isAllowedDeepInterviewArtifactPath.
+  if (/\bomx\s+(?:state\s+(?:read|write|clear)|question)\b/.test(command)) return true;
   const targets = extractDeepInterviewCommandWriteTargets(command);
   return targets.length > 0 && targets.every((target) => isAllowedDeepInterviewArtifactPath(cwd, target));
 }
@@ -3680,8 +3683,9 @@ function isAllowedRalplanBashWrite(cwd: string, command: string): boolean {
     return beadsCommand.allowed && (targets.length === 0 || hasAllowedTargets);
   }
   if (!commandHasDeepInterviewWriteIntent(command)) return true;
-  if (/\bomx\s+(?:state\s+read|question)\b/.test(command)) return true;
-  if (/\bomx\s+state\s+(?:write|clear)\b/.test(command)) return false;
+  // See isAllowedDeepInterviewBashWrite: defer `omx state` mutations to the
+  // gate-enforcing state_write backend rather than blocking the CLI transport.
+  if (/\bomx\s+(?:state\s+(?:read|write|clear)|question)\b/.test(command)) return true;
   return hasAllowedTargets;
 }
 
@@ -3701,9 +3705,6 @@ function buildRalplanBashBlockedDetail(cwd: string, command: string): string {
   }
   if (beadsCommand.present) {
     return "Beads tracker command also performs an implementation write outside allowed planning metadata";
-  }
-  if (/\bomx\s+state\s+(?:write|clear)\b/.test(command)) {
-    return "omx state mutation is not model-writable during gated planning; write planning artifacts instead";
   }
   return "Bash write intent did not identify an allowed planning artifact path or metadata path";
 }

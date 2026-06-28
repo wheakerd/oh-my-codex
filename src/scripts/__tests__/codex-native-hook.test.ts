@@ -6791,7 +6791,11 @@ exit 0
         );
       }
 
-      const blockedStateCliMutation = await dispatchCodexNativeHook(
+      // `omx state write` routes through the validated state_write backend, which
+      // enforces the Autopilot phase gate for every transport. The hook defers to
+      // that gate rather than blocking the CLI transport (raw writes to the
+      // protected state files above stay blocked).
+      const allowedStateCliMutation = await dispatchCodexNativeHook(
         {
           hook_event_name: "PreToolUse",
           cwd,
@@ -6802,7 +6806,7 @@ exit 0
         },
         { cwd },
       );
-      assert.equal((blockedStateCliMutation.outputJson as { decision?: string } | null)?.decision, "block");
+      assert.equal(allowedStateCliMutation.outputJson, null);
 
       const allowedStateRead = await dispatchCodexNativeHook(
         {
@@ -7253,14 +7257,13 @@ exit 0
         );
       }
 
-      const blockedStateCliMutation = await preToolUse("Bash", "tool-ralplan-state-cli-write", {
+      // `omx state` mutations defer to the gate-enforcing state_write backend
+      // (same enforcement for CLI and MCP); the hook no longer blocks the
+      // transport. Raw writes to the protected state files stay blocked above.
+      const allowedStateCliMutation = await preToolUse("Bash", "tool-ralplan-state-cli-write", {
         command: "omx state clear --json",
       });
-      assert.equal((blockedStateCliMutation.outputJson as { decision?: string } | null)?.decision, "block");
-      assert.match(
-        String((blockedStateCliMutation.outputJson as { reason?: string } | null)?.reason ?? ""),
-        /omx state mutation is not model-writable/,
-      );
+      assert.equal(allowedStateCliMutation.outputJson, null);
 
       const allowedPatchAdd = await preToolUse("apply_patch", "tool-ralplan-patch-add", {
         input: "*** Begin Patch\n*** Add File: .omx/plans/issue-2863.md\n+# Plan\n*** End Patch\n",
