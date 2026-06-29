@@ -7098,6 +7098,97 @@ exit 0
       );
       assert.equal((blockedRepeatedInputFileDeactivation.outputJson as { decision?: string } | null)?.decision, "block");
 
+      const terminalCurrentPhaseAliases = ["done", "blocked", "cancelled", "canceled", "aborted"] as const;
+      for (const alias of terminalCurrentPhaseAliases) {
+        const blockedStateWriteCurrentPhaseAlias = await dispatchCodexNativeHook(
+          {
+            hook_event_name: "PreToolUse",
+            cwd,
+            session_id: "sess-di-artifact",
+            tool_name: "Bash",
+            tool_use_id: `tool-di-state-cli-current-phase-alias-${alias}`,
+            tool_input: {
+              command: `omx state write --input '${JSON.stringify({ mode: "deep-interview", current_phase: alias })}' --json`,
+            },
+          },
+          { cwd },
+        );
+        assert.equal(
+          (blockedStateWriteCurrentPhaseAlias.outputJson as { decision?: string } | null)?.decision,
+          "block",
+          `${alias} current_phase should deactivate protected deep-interview planning`,
+        );
+      }
+
+      const blockedCurrentPhaseAliasInputFile = join(cwd, "blocked-current-phase-alias-input-file.json");
+      await writeJson(blockedCurrentPhaseAliasInputFile, { mode: "deep-interview", current_phase: "done" });
+      const blockedStateWriteCurrentPhaseAliasFile = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "PreToolUse",
+          cwd,
+          session_id: "sess-di-artifact",
+          tool_name: "Bash",
+          tool_use_id: "tool-di-state-cli-current-phase-alias-input-file",
+          tool_input: { command: `omx state write --input-file ${blockedCurrentPhaseAliasInputFile} --json` },
+        },
+        { cwd },
+      );
+      assert.equal((blockedStateWriteCurrentPhaseAliasFile.outputJson as { decision?: string } | null)?.decision, "block");
+
+      const terminalOutcomeAliasPayloads = [
+        { runOutcome: "done" },
+        { lifecycleOutcome: "blocked" },
+        { terminalOutcome: "aborted" },
+      ] as const;
+      for (const [index, aliasPayload] of terminalOutcomeAliasPayloads.entries()) {
+        const blockedCamelCaseOutcomeAlias = await dispatchCodexNativeHook(
+          {
+            hook_event_name: "PreToolUse",
+            cwd,
+            session_id: "sess-di-artifact",
+            tool_name: "Bash",
+            tool_use_id: `tool-di-state-cli-camel-terminal-outcome-${index}`,
+            tool_input: {
+              command: `omx state write --input '${JSON.stringify({ mode: "deep-interview", ...aliasPayload })}' --json`,
+            },
+          },
+          { cwd },
+        );
+        assert.equal(
+          (blockedCamelCaseOutcomeAlias.outputJson as { decision?: string } | null)?.decision,
+          "block",
+          `${Object.keys(aliasPayload)[0]} should deactivate protected deep-interview planning`,
+        );
+      }
+
+      const blockedCamelCaseOutcomeInputFile = join(cwd, "blocked-camel-case-outcome-input-file.json");
+      await writeJson(blockedCamelCaseOutcomeInputFile, { mode: "deep-interview", lifecycleOutcome: "finished" });
+      const blockedStateWriteCamelCaseOutcomeFile = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "PreToolUse",
+          cwd,
+          session_id: "sess-di-artifact",
+          tool_name: "Bash",
+          tool_use_id: "tool-di-state-cli-camel-terminal-outcome-input-file",
+          tool_input: { command: `omx state write --input-file ${blockedCamelCaseOutcomeInputFile} --json` },
+        },
+        { cwd },
+      );
+      assert.equal((blockedStateWriteCamelCaseOutcomeFile.outputJson as { decision?: string } | null)?.decision, "block");
+
+      const blockedCrossModeActivation = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "PreToolUse",
+          cwd,
+          session_id: "sess-di-artifact",
+          tool_name: "Bash",
+          tool_use_id: "tool-di-state-cli-cross-mode-activation",
+          tool_input: { command: "omx state write --input '{\"mode\":\"ralph\",\"active\":true}' --json" },
+        },
+        { cwd },
+      );
+      assert.equal((blockedCrossModeActivation.outputJson as { decision?: string } | null)?.decision, "block");
+
       const cwdRelativeInputFileRootSafe = join(cwd, "cwd-relative-input-file-safe.json");
       const cwdRelativeInputFileSubdir = join(cwd, "cwd-relative-input-file-subdir");
       await mkdir(cwdRelativeInputFileSubdir, { recursive: true });
@@ -7115,6 +7206,25 @@ exit 0
         { cwd },
       );
       assert.equal((blockedCwdRelativeInputFileAfterCd.outputJson as { decision?: string } | null)?.decision, "block");
+
+      const blockedRewrittenInputFile = join(cwd, "rewritten-input-file.json");
+      await writeJson(blockedRewrittenInputFile, { mode: "deep-interview", active: true });
+      const blockedRewrittenInputFileMutation = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "PreToolUse",
+          cwd,
+          session_id: "sess-di-artifact",
+          tool_name: "Bash",
+          tool_use_id: "tool-di-state-cli-rewritten-input-file",
+          tool_input: {
+            command:
+              "printf '{\"mode\":\"deep-interview\",\"active\":false}' > rewritten-input-file.json && "
+              + "omx state write --input-file rewritten-input-file.json --json",
+          },
+        },
+        { cwd },
+      );
+      assert.equal((blockedRewrittenInputFileMutation.outputJson as { decision?: string } | null)?.decision, "block");
 
       const blockedNestedStateDeactivation = await dispatchCodexNativeHook(
         {
@@ -7221,6 +7331,44 @@ exit 0
       );
       assert.equal((blockedNestedMcpStateWrite.outputJson as { decision?: string } | null)?.decision, "block");
 
+      for (const alias of terminalCurrentPhaseAliases) {
+        const blockedMcpCurrentPhaseAlias = await dispatchCodexNativeHook(
+          {
+            hook_event_name: "PreToolUse",
+            cwd,
+            session_id: "sess-di-artifact",
+            tool_name: "mcp__omx_state__state_write",
+            tool_use_id: `tool-di-mcp-state-write-current-phase-alias-${alias}`,
+            tool_input: { mode: "deep-interview", state: { currentPhase: alias } },
+          },
+          { cwd },
+        );
+        assert.equal(
+          (blockedMcpCurrentPhaseAlias.outputJson as { decision?: string } | null)?.decision,
+          "block",
+          `${alias} currentPhase should deactivate protected deep-interview planning`,
+        );
+      }
+
+      for (const [index, aliasPayload] of terminalOutcomeAliasPayloads.entries()) {
+        const blockedMcpCamelCaseOutcomeAlias = await dispatchCodexNativeHook(
+          {
+            hook_event_name: "PreToolUse",
+            cwd,
+            session_id: "sess-di-artifact",
+            tool_name: "mcp__omx_state__state_write",
+            tool_use_id: `tool-di-mcp-state-write-camel-terminal-outcome-${index}`,
+            tool_input: { mode: "deep-interview", state: aliasPayload },
+          },
+          { cwd },
+        );
+        assert.equal(
+          (blockedMcpCamelCaseOutcomeAlias.outputJson as { decision?: string } | null)?.decision,
+          "block",
+          `${Object.keys(aliasPayload)[0]} MCP write should deactivate protected deep-interview planning`,
+        );
+      }
+
       const blockedMcpStateClear = await dispatchCodexNativeHook(
         {
           hook_event_name: "PreToolUse",
@@ -7246,6 +7394,192 @@ exit 0
         { cwd },
       );
       assert.equal((blockedStateClear.outputJson as { decision?: string } | null)?.decision, "block");
+
+      const stateDeactivationInput = "'{\"mode\":\"deep-interview\",\"active\":false}'";
+      const cliWrapperPlanningDeactivationCommands = [
+        ["node-wrapper-clear", "node dist/cli/omx.js state clear --json"],
+        ["node-wrapper-write", `node dist/cli/omx.js state write --input ${stateDeactivationInput} --json`],
+        ["node-wrapper-option-clear", "node --enable-source-maps dist/cli/omx.js state clear --json"],
+        ["node-wrapper-require-clear", "node --require tsx/cjs dist/cli/omx.js state clear --json"],
+        ["bun-wrapper-path-variant", "bun ./dist/cli/omx.js state clear --json"],
+        ["tsx-wrapper-write", `tsx dist/cli/omx.js state write --input ${stateDeactivationInput} --json`],
+        ["direct-wrapper-clear", "./dist/cli/omx.js state clear --json"],
+        ["path-qualified-omx-clear", "./node_modules/.bin/omx state clear --json"],
+        ["quoted-node-wrapper-clear", 'node "dist/cli/omx.js" state clear --json'],
+        ["quoted-direct-wrapper-clear", '"./dist/cli/omx.js" state clear --json'],
+        ["quoted-node-wrapper-write", `node "dist/cli/omx.js" state write --input ${stateDeactivationInput} --json`],
+        ["env-wrapper-clear", "env FOO=bar node dist/cli/omx.js state clear --json"],
+        ["path-qualified-env-wrapper-clear", "/usr/bin/env node dist/cli/omx.js state clear --json"],
+        ["path-qualified-env-split-wrapper-clear", "/usr/bin/env -S 'omx state clear --json'"],
+        ["env-unset-wrapper-clear", "env -u FOO node dist/cli/omx.js state clear --json"],
+        ["env-chdir-wrapper-clear", `env -C ${cwd} node dist/cli/omx.js state clear --json`],
+        ["command-wrapper-write", `command node dist/cli/omx.js state write --input ${stateDeactivationInput} --json`],
+        ["exec-wrapper-clear", "exec node dist/cli/omx.js state clear --json"],
+        ["pipeline-clear", "printf 'x' | omx state clear --json"],
+        ["pipeline-write", `printf 'x' | omx state write --input ${stateDeactivationInput} --json`],
+        ["pipeline-node-wrapper-clear", "printf 'x' | node dist/cli/omx.js state clear --json"],
+        ["pipeline-node-wrapper-write", `printf 'x' | node dist/cli/omx.js state write --input ${stateDeactivationInput} --json`],
+        ["pipeline-command-wrapper-clear", "printf 'x' | command node dist/cli/omx.js state clear --json"],
+        ["pipeline-stderr-clear", "printf 'x' |& omx state clear --json"],
+        ["pipeline-stderr-write", `printf 'x' |& omx state write --input ${stateDeactivationInput} --json`],
+        ["pipeline-stderr-node-wrapper-clear", "printf 'x' |& node dist/cli/omx.js state clear --json"],
+        ["pipeline-stderr-node-wrapper-write", `printf 'x' |& node dist/cli/omx.js state write --input ${stateDeactivationInput} --json`],
+        ["subshell-clear", "(omx state clear --json)"],
+        ["subshell-write", `(omx state write --input ${stateDeactivationInput} --json)`],
+        ["subshell-node-wrapper-clear", "(node dist/cli/omx.js state clear --json)"],
+        ["subshell-node-wrapper-write", `(node dist/cli/omx.js state write --input ${stateDeactivationInput} --json)`],
+        ["brace-group-clear", "{ omx state clear --json; }"],
+        ["brace-group-write", `{ omx state write --input ${stateDeactivationInput} --json; }`],
+        ["pipeline-to-subshell-clear", "printf 'x' | (omx state clear --json)"],
+        ["pipeline-stderr-to-subshell-write", `printf 'x' |& (node dist/cli/omx.js state write --input ${stateDeactivationInput} --json)`],
+        ["if-condition-clear", "if omx state clear --json; then :; fi"],
+        ["if-condition-write", `if node dist/cli/omx.js state write --input ${stateDeactivationInput} --json; then :; fi`],
+        ["background-clear", "sleep 0 & omx state clear --json"],
+        ["background-node-wrapper-write", `sleep 0 & node dist/cli/omx.js state write --input ${stateDeactivationInput} --json`],
+        ["nested-command-env-wrapper-clear", "command env node dist/cli/omx.js state clear --json"],
+        ["nested-exec-env-wrapper-clear", "exec env node dist/cli/omx.js state clear --json"],
+        ["nested-env-option-wrapper-clear", "env -i env node dist/cli/omx.js state clear --json"],
+      ] as const;
+
+      for (const [name, command] of cliWrapperPlanningDeactivationCommands) {
+        const blockedCliWrapperPlanningDeactivation = await dispatchCodexNativeHook(
+          {
+            hook_event_name: "PreToolUse",
+            cwd,
+            session_id: "sess-di-artifact",
+            tool_name: "Bash",
+            tool_use_id: `tool-di-state-cli-${name}`,
+            tool_input: { command },
+          },
+          { cwd },
+        );
+        assert.equal(
+          (blockedCliWrapperPlanningDeactivation.outputJson as { decision?: string } | null)?.decision,
+          "block",
+          `${command} should be normalized to a protected omx state operation`,
+        );
+      }
+
+      const safeStateWriteInput = "'{\"mode\":\"deep-interview\",\"active\":true,\"current_phase\":\"intent-first\"}'";
+      const safeCliWrapperStateWriteCommands = [
+        ["env-wrapper-safe-write", `env FOO=bar node dist/cli/omx.js state write --input ${safeStateWriteInput} --json`],
+        ["command-wrapper-safe-write", `command node dist/cli/omx.js state write --input ${safeStateWriteInput} --json`],
+        ["exec-wrapper-safe-write", `exec node dist/cli/omx.js state write --input ${safeStateWriteInput} --json`],
+        ["nested-command-env-wrapper-safe-write", `command env node dist/cli/omx.js state write --input ${safeStateWriteInput} --json`],
+        ["nested-env-command-wrapper-safe-write", `env -i command node dist/cli/omx.js state write --input ${safeStateWriteInput} --json`],
+      ] as const;
+
+      for (const [name, command] of safeCliWrapperStateWriteCommands) {
+        const allowedCliWrapperStateWrite = await dispatchCodexNativeHook(
+          {
+            hook_event_name: "PreToolUse",
+            cwd,
+            session_id: "sess-di-artifact",
+            tool_name: "Bash",
+            tool_use_id: `tool-di-state-cli-${name}`,
+            tool_input: { command },
+          },
+          { cwd },
+        );
+        assert.equal(allowedCliWrapperStateWrite.outputJson, null, `${command} should defer to backend validation`);
+      }
+
+      const safeArtifactInputFile = join(cwd, ".omx", "context", "safe-state-input-file.json");
+      await mkdir(dirname(safeArtifactInputFile), { recursive: true });
+      await writeJson(safeArtifactInputFile, { mode: "deep-interview", active: true, current_phase: "intent-first" });
+      const safeCliWrapperInputFileStateWriteCommands = [
+        ["env-unset-wrapper-safe-input-file", `env -u FOO node dist/cli/omx.js state write --input-file ${safeArtifactInputFile} --json`],
+        ["env-chdir-wrapper-safe-input-file", `env -C ${cwd} node dist/cli/omx.js state write --input-file ${safeArtifactInputFile} --json`],
+        ["command-wrapper-safe-input-file", `command node dist/cli/omx.js state write --input-file ${safeArtifactInputFile} --json`],
+        ["exec-wrapper-safe-input-file", `exec node dist/cli/omx.js state write --input-file ${safeArtifactInputFile} --json`],
+      ] as const;
+
+      for (const [name, command] of safeCliWrapperInputFileStateWriteCommands) {
+        const allowedCliWrapperInputFileStateWrite = await dispatchCodexNativeHook(
+          {
+            hook_event_name: "PreToolUse",
+            cwd,
+            session_id: "sess-di-artifact",
+            tool_name: "Bash",
+            tool_use_id: `tool-di-state-cli-${name}`,
+            tool_input: { command },
+          },
+          { cwd },
+        );
+        assert.equal(allowedCliWrapperInputFileStateWrite.outputJson, null, `${command} should defer to backend validation`);
+      }
+
+      const rewrittenArtifactInputFile = join(cwd, ".omx", "context", "rewritten-state-input-file.json");
+      await mkdir(dirname(rewrittenArtifactInputFile), { recursive: true });
+      await writeJson(rewrittenArtifactInputFile, { mode: "deep-interview", active: true });
+      const blockedNestedArtifactInputFileRewriteBeforeStateWriteCommands = [
+        ["bash-c", `printf '{"mode":"deep-interview","active":false}' > ${rewrittenArtifactInputFile} && bash -c 'omx state write --input-file ${rewrittenArtifactInputFile} --json'`],
+        ["env-split", `printf '{"mode":"deep-interview","active":false}' > ${rewrittenArtifactInputFile} && env -S 'omx state write --input-file ${rewrittenArtifactInputFile} --json'`],
+        ["command-substitution", `printf '{"mode":"deep-interview","active":false}' > ${rewrittenArtifactInputFile} && echo $(omx state write --input-file ${rewrittenArtifactInputFile} --json)`],
+        ["backtick-substitution", "printf '{\"mode\":\"deep-interview\",\"active\":false}' > " + rewrittenArtifactInputFile + " && echo `omx state write --input-file " + rewrittenArtifactInputFile + " --json`"],
+      ] as const;
+
+      for (const [name, command] of blockedNestedArtifactInputFileRewriteBeforeStateWriteCommands) {
+        const blockedNestedArtifactInputFileRewriteBeforeStateWrite = await dispatchCodexNativeHook(
+          {
+            hook_event_name: "PreToolUse",
+            cwd,
+            session_id: "sess-di-artifact",
+            tool_name: "Bash",
+            tool_use_id: `tool-di-state-cli-nested-artifact-input-file-rewrite-${name}`,
+            tool_input: { command },
+          },
+          { cwd },
+        );
+        assert.equal(
+          (blockedNestedArtifactInputFileRewriteBeforeStateWrite.outputJson as { decision?: string } | null)?.decision,
+          "block",
+          `${command} should fail closed because nested --input-file writes cannot be read safely before execution`,
+        );
+      }
+
+      const blockedArtifactInputFileRewriteBeforeStateWrite = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "PreToolUse",
+          cwd,
+          session_id: "sess-di-artifact",
+          tool_name: "Bash",
+          tool_use_id: "tool-di-state-cli-artifact-input-file-rewrite-before-write",
+          tool_input: {
+            command:
+              `printf '{"mode":"deep-interview","active":false}' > ${rewrittenArtifactInputFile} && `
+              + `omx state write --input-file ${rewrittenArtifactInputFile} --json`,
+          },
+        },
+        { cwd },
+      );
+      assert.equal(
+        (blockedArtifactInputFileRewriteBeforeStateWrite.outputJson as { decision?: string } | null)?.decision,
+        "block",
+      );
+
+      const repeatedArtifactInputFile = join(cwd, ".omx", "context", "repeated-state-input-file.json");
+      await writeJson(repeatedArtifactInputFile, { mode: "deep-interview", active: true });
+      const blockedRepeatedArtifactInputFileRewriteBeforeSecondStateWrite = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "PreToolUse",
+          cwd,
+          session_id: "sess-di-artifact",
+          tool_name: "Bash",
+          tool_use_id: "tool-di-state-cli-repeated-artifact-input-file-rewrite",
+          tool_input: {
+            command:
+              `omx state write --input-file ${repeatedArtifactInputFile} --json && `
+              + `printf '{"mode":"deep-interview","active":false}' > ${repeatedArtifactInputFile} && `
+              + `omx state write --input-file ${repeatedArtifactInputFile} --json`,
+          },
+        },
+        { cwd },
+      );
+      assert.equal(
+        (blockedRepeatedArtifactInputFileRewriteBeforeSecondStateWrite.outputJson as { decision?: string } | null)?.decision,
+        "block",
+      );
 
       // An implementation write smuggled alongside an allowed `omx state` command
       // must not be short-circuited through the allowance.
@@ -7380,6 +7714,158 @@ exit 0
         { cwd },
       );
       assert.equal((blockedShellStdinHeredoc.outputJson as { decision?: string } | null)?.decision, "block");
+
+      const blockedShellStdinPipe = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "PreToolUse",
+          cwd,
+          session_id: "sess-di-artifact",
+          tool_name: "Bash",
+          tool_use_id: "tool-di-state-cli-shell-stdin-pipe",
+          tool_input: { command: "printf 'omx state clear --json' | bash" },
+        },
+        { cwd },
+      );
+      assert.equal((blockedShellStdinPipe.outputJson as { decision?: string } | null)?.decision, "block");
+
+      for (const [index, command] of [
+        "printf 'omx state clear --json'|bash",
+        "printf 'omx state clear --json' |bash",
+        "printf 'omx state clear --json'| bash",
+      ].entries()) {
+        const blockedCompactShellStdinPipe = await dispatchCodexNativeHook(
+          {
+            hook_event_name: "PreToolUse",
+            cwd,
+            session_id: "sess-di-artifact",
+            tool_name: "Bash",
+            tool_use_id: `tool-di-state-cli-shell-stdin-compact-pipe-${index}`,
+            tool_input: { command },
+          },
+          { cwd },
+        );
+        assert.equal(
+          (blockedCompactShellStdinPipe.outputJson as { decision?: string } | null)?.decision,
+          "block",
+          `${command} should be treated as shell stdin flow`,
+        );
+      }
+
+      const blockedEnvDispatcherShell = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "PreToolUse",
+          cwd,
+          session_id: "sess-di-artifact",
+          tool_name: "Bash",
+          tool_use_id: "tool-di-state-cli-env-dispatcher-shell",
+          tool_input: { command: "env FOO=bar bash -c \"omx state clear --json\"" },
+        },
+        { cwd },
+      );
+      assert.equal((blockedEnvDispatcherShell.outputJson as { decision?: string } | null)?.decision, "block");
+
+      const blockedEnvSplitStringStateClear = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "PreToolUse",
+          cwd,
+          session_id: "sess-di-artifact",
+          tool_name: "Bash",
+          tool_use_id: "tool-di-state-cli-env-split-string-clear",
+          tool_input: { command: "env -S 'omx state clear --json'" },
+        },
+        { cwd },
+      );
+      assert.equal((blockedEnvSplitStringStateClear.outputJson as { decision?: string } | null)?.decision, "block");
+
+      const blockedEnvSplitStringShellStateClear = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "PreToolUse",
+          cwd,
+          session_id: "sess-di-artifact",
+          tool_name: "Bash",
+          tool_use_id: "tool-di-state-cli-env-split-string-shell-clear",
+          tool_input: { command: "env -S 'bash -c \"omx state clear --json\"'" },
+        },
+        { cwd },
+      );
+      assert.equal((blockedEnvSplitStringShellStateClear.outputJson as { decision?: string } | null)?.decision, "block");
+
+      const blockedEnvSplitStringStateWrite = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "PreToolUse",
+          cwd,
+          session_id: "sess-di-artifact",
+          tool_name: "Bash",
+          tool_use_id: "tool-di-state-cli-env-split-string-write",
+          tool_input: {
+            command: "env --split-string 'omx state write --input \"{\\\"mode\\\":\\\"deep-interview\\\",\\\"current_phase\\\":\\\"done\\\"}\" --json'",
+          },
+        },
+        { cwd },
+      );
+      assert.equal((blockedEnvSplitStringStateWrite.outputJson as { decision?: string } | null)?.decision, "block");
+
+      const blockedEnvSplitStringEqualsStateClear = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "PreToolUse",
+          cwd,
+          session_id: "sess-di-artifact",
+          tool_name: "Bash",
+          tool_use_id: "tool-di-state-cli-env-split-string-equals-clear",
+          tool_input: { command: "env --split-string='omx state clear --json'" },
+        },
+        { cwd },
+      );
+      assert.equal((blockedEnvSplitStringEqualsStateClear.outputJson as { decision?: string } | null)?.decision, "block");
+
+      const blockedEnvSplitStringAttachedStateClear = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "PreToolUse",
+          cwd,
+          session_id: "sess-di-artifact",
+          tool_name: "Bash",
+          tool_use_id: "tool-di-state-cli-env-split-string-attached-clear",
+          tool_input: { command: "env -S'omx state clear --json'" },
+        },
+        { cwd },
+      );
+      assert.equal((blockedEnvSplitStringAttachedStateClear.outputJson as { decision?: string } | null)?.decision, "block");
+
+      const blockedShellStdinStderrPipe = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "PreToolUse",
+          cwd,
+          session_id: "sess-di-artifact",
+          tool_name: "Bash",
+          tool_use_id: "tool-di-state-cli-shell-stdin-stderr-pipe",
+          tool_input: { command: "printf 'omx state clear --json' |& bash" },
+        },
+        { cwd },
+      );
+      assert.equal((blockedShellStdinStderrPipe.outputJson as { decision?: string } | null)?.decision, "block");
+
+      for (const [index, command] of [
+        "printf 'omx state clear --json'|&bash",
+        "printf 'omx state clear --json' |&bash",
+        "printf 'omx state clear --json'|& bash",
+      ].entries()) {
+        const blockedCompactShellStdinStderrPipe = await dispatchCodexNativeHook(
+          {
+            hook_event_name: "PreToolUse",
+            cwd,
+            session_id: "sess-di-artifact",
+            tool_name: "Bash",
+            tool_use_id: `tool-di-state-cli-shell-stdin-compact-stderr-pipe-${index}`,
+            tool_input: { command },
+          },
+          { cwd },
+        );
+        assert.equal(
+          (blockedCompactShellStdinStderrPipe.outputJson as { decision?: string } | null)?.decision,
+          "block",
+          `${command} should be treated as shell stderr/stdin flow`,
+        );
+      }
 
       const blockedDotProcessSubstitution = await dispatchCodexNativeHook(
         {
@@ -7866,6 +8352,28 @@ exit 0
       );
       assert.equal((blocked.outputJson as { decision?: string } | null)?.decision, "block");
 
+      const terminalCurrentPhaseAliases = ["done", "blocked", "cancelled", "canceled", "aborted"] as const;
+      for (const alias of terminalCurrentPhaseAliases) {
+        const blockedAliasPayload = join(cwd, `ralplan-blocked-state-${alias}.json`);
+        await writeJson(blockedAliasPayload, { mode: "ralplan", current_phase: alias });
+        const blockedAliasFile = await dispatchCodexNativeHook(
+          {
+            hook_event_name: "PreToolUse",
+            cwd,
+            session_id: "sess-ralplan-input-file",
+            tool_name: "Bash",
+            tool_use_id: `tool-ralplan-state-input-file-blocked-alias-${alias}`,
+            tool_input: { command: `omx state write --input-file ${blockedAliasPayload} --json` },
+          },
+          { cwd },
+        );
+        assert.equal(
+          (blockedAliasFile.outputJson as { decision?: string } | null)?.decision,
+          "block",
+          `${alias} current_phase input-file write should deactivate protected ralplan planning`,
+        );
+      }
+
       const blockedModeFlagTerminal = await dispatchCodexNativeHook(
         {
           hook_event_name: "PreToolUse",
@@ -7878,6 +8386,64 @@ exit 0
         { cwd },
       );
       assert.equal((blockedModeFlagTerminal.outputJson as { decision?: string } | null)?.decision, "block");
+
+      for (const alias of terminalCurrentPhaseAliases) {
+        const blockedModeFlagAlias = await dispatchCodexNativeHook(
+          {
+            hook_event_name: "PreToolUse",
+            cwd,
+            session_id: "sess-ralplan-input-file",
+            tool_name: "Bash",
+            tool_use_id: `tool-ralplan-state-mode-flag-terminal-alias-${alias}`,
+            tool_input: { command: `omx state write --mode ralplan --input '${JSON.stringify({ current_phase: alias })}' --json` },
+          },
+          { cwd },
+        );
+        assert.equal(
+          (blockedModeFlagAlias.outputJson as { decision?: string } | null)?.decision,
+          "block",
+          `${alias} current_phase --input write should deactivate protected ralplan planning`,
+        );
+      }
+
+      const terminalOutcomeAliasPayloads = [
+        { runOutcome: "done" },
+        { lifecycleOutcome: "blocked" },
+        { terminalOutcome: "aborted" },
+      ] as const;
+      for (const [index, aliasPayload] of terminalOutcomeAliasPayloads.entries()) {
+        const blockedModeFlagOutcomeAlias = await dispatchCodexNativeHook(
+          {
+            hook_event_name: "PreToolUse",
+            cwd,
+            session_id: "sess-ralplan-input-file",
+            tool_name: "Bash",
+            tool_use_id: `tool-ralplan-state-mode-flag-terminal-outcome-${index}`,
+            tool_input: { command: `omx state write --mode ralplan --input '${JSON.stringify(aliasPayload)}' --json` },
+          },
+          { cwd },
+        );
+        assert.equal(
+          (blockedModeFlagOutcomeAlias.outputJson as { decision?: string } | null)?.decision,
+          "block",
+          `${Object.keys(aliasPayload)[0]} --input write should deactivate protected ralplan planning`,
+        );
+      }
+
+      const blockedOutcomeAliasPayload = join(cwd, "ralplan-blocked-state-camel-terminal-outcome.json");
+      await writeJson(blockedOutcomeAliasPayload, { mode: "ralplan", terminalOutcome: "finished" });
+      const blockedOutcomeAliasFile = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "PreToolUse",
+          cwd,
+          session_id: "sess-ralplan-input-file",
+          tool_name: "Bash",
+          tool_use_id: "tool-ralplan-state-input-file-blocked-camel-terminal-outcome",
+          tool_input: { command: `omx state write --input-file ${blockedOutcomeAliasPayload} --json` },
+        },
+        { cwd },
+      );
+      assert.equal((blockedOutcomeAliasFile.outputJson as { decision?: string } | null)?.decision, "block");
 
       const allowedModeFlagSafe = await dispatchCodexNativeHook(
         {
@@ -7917,6 +8483,44 @@ exit 0
         { cwd },
       );
       assert.equal((blockedNestedRalplanMcpStateWrite.outputJson as { decision?: string } | null)?.decision, "block");
+
+      for (const alias of terminalCurrentPhaseAliases) {
+        const blockedNestedRalplanMcpAlias = await dispatchCodexNativeHook(
+          {
+            hook_event_name: "PreToolUse",
+            cwd,
+            session_id: "sess-ralplan-input-file",
+            tool_name: "mcp__omx_state__state_write",
+            tool_use_id: `tool-ralplan-mcp-state-write-nested-terminal-alias-${alias}`,
+            tool_input: { mode: "ralplan", state: { currentPhase: alias } },
+          },
+          { cwd },
+        );
+        assert.equal(
+          (blockedNestedRalplanMcpAlias.outputJson as { decision?: string } | null)?.decision,
+          "block",
+          `${alias} currentPhase MCP write should deactivate protected ralplan planning`,
+        );
+      }
+
+      for (const [index, aliasPayload] of terminalOutcomeAliasPayloads.entries()) {
+        const blockedNestedRalplanMcpOutcomeAlias = await dispatchCodexNativeHook(
+          {
+            hook_event_name: "PreToolUse",
+            cwd,
+            session_id: "sess-ralplan-input-file",
+            tool_name: "mcp__omx_state__state_write",
+            tool_use_id: `tool-ralplan-mcp-state-write-nested-terminal-outcome-${index}`,
+            tool_input: { mode: "ralplan", state: aliasPayload },
+          },
+          { cwd },
+        );
+        assert.equal(
+          (blockedNestedRalplanMcpOutcomeAlias.outputJson as { decision?: string } | null)?.decision,
+          "block",
+          `${Object.keys(aliasPayload)[0]} MCP write should deactivate protected ralplan planning`,
+        );
+      }
 
       const allowedNestedRalplanMcpStateWrite = await dispatchCodexNativeHook(
         {
