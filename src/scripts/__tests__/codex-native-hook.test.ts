@@ -6807,6 +6807,21 @@ exit 0
       );
       assert.equal(allowedStateCliMutation.outputJson, null);
 
+      const allowedStateInputFile = join(cwd, "allowed-state-input.json");
+      await writeJson(allowedStateInputFile, { mode: "deep-interview", current_phase: "intent-first", active: true });
+      const allowedStateInputFileMutation = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "PreToolUse",
+          cwd,
+          session_id: "sess-di-artifact",
+          tool_name: "Bash",
+          tool_use_id: "tool-di-state-cli-input-file-allowed",
+          tool_input: { command: `omx state write --input-file ${allowedStateInputFile} --json` },
+        },
+        { cwd },
+      );
+      assert.equal(allowedStateInputFileMutation.outputJson, null);
+
       // A deactivating `omx state write` (or `omx state clear`) ends the planning
       // phase, which the backend does not gate for standalone modes; the hook
       // rejects these deactivation vectors at the transport boundary.
@@ -6822,6 +6837,21 @@ exit 0
         { cwd },
       );
       assert.equal((blockedStateDeactivation.outputJson as { decision?: string } | null)?.decision, "block");
+
+      const blockedStateInputFile = join(cwd, "blocked-state-input.json");
+      await writeJson(blockedStateInputFile, { mode: "deep-interview", active: false });
+      const blockedStateDeactivationFile = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "PreToolUse",
+          cwd,
+          session_id: "sess-di-artifact",
+          tool_name: "Bash",
+          tool_use_id: "tool-di-state-cli-input-file-blocked",
+          tool_input: { command: `omx state write --input-file ${blockedStateInputFile} --json` },
+        },
+        { cwd },
+      );
+      assert.equal((blockedStateDeactivationFile.outputJson as { decision?: string } | null)?.decision, "block");
 
       const blockedStateClear = await dispatchCodexNativeHook(
         {
@@ -6876,6 +6906,62 @@ exit 0
         { cwd },
       );
       assert.equal((blockedBash.outputJson as { decision?: string } | null)?.decision, "block");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks deactivating ralplan state writes from --input-file while allowing non-deactivating ones", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-pretool-ralplan-state-input-file-"));
+    try {
+      const stateDir = join(cwd, ".omx", "state");
+      const sessionDir = join(stateDir, "sessions", "sess-ralplan-input-file");
+      await mkdir(sessionDir, { recursive: true });
+      await writeJson(join(stateDir, "session.json"), { session_id: "sess-ralplan-input-file", cwd });
+      await writeJson(join(sessionDir, "skill-active-state.json"), {
+        version: 1,
+        active: true,
+        skill: "ralplan",
+        phase: "planning",
+        session_id: "sess-ralplan-input-file",
+        active_skills: [{ skill: "ralplan", phase: "planning", active: true, session_id: "sess-ralplan-input-file" }],
+      });
+      await writeJson(join(sessionDir, "ralplan-state.json"), {
+        active: true,
+        mode: "ralplan",
+        current_phase: "critic-review",
+        session_id: "sess-ralplan-input-file",
+      });
+
+      const allowedPayload = join(cwd, "ralplan-allowed-state.json");
+      await writeJson(allowedPayload, { mode: "ralplan", current_phase: "critic-review", active: true });
+      const allowed = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "PreToolUse",
+          cwd,
+          session_id: "sess-ralplan-input-file",
+          tool_name: "Bash",
+          tool_use_id: "tool-ralplan-state-input-file-allowed",
+          tool_input: { command: `omx state write --input-file ${allowedPayload} --json` },
+        },
+        { cwd },
+      );
+      assert.equal(allowed.outputJson, null);
+
+      const blockedPayload = join(cwd, "ralplan-blocked-state.json");
+      await writeJson(blockedPayload, { mode: "ralplan", current_phase: "complete" });
+      const blocked = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "PreToolUse",
+          cwd,
+          session_id: "sess-ralplan-input-file",
+          tool_name: "Bash",
+          tool_use_id: "tool-ralplan-state-input-file-blocked",
+          tool_input: { command: `omx state write --input-file ${blockedPayload} --json` },
+        },
+        { cwd },
+      );
+      assert.equal((blocked.outputJson as { decision?: string } | null)?.decision, "block");
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

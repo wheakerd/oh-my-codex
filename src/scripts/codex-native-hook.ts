@@ -3573,24 +3573,89 @@ function describeImplementationToolBlock(
 // backend, so the hook defers to that gate rather than blocking the transport.
 // The backend does NOT gate standalone deep-interview/ralplan *deactivation*,
 // however, so a command that ends the active planning phase from a tool call
-// (`omx state clear`, or an `omx state write` that flips `active` off) is still
-// blocked here. Robustly gating standalone deactivation (and other skip vectors)
-// belongs in the backend; this is transport-level defense-in-depth.
-function commandEndsPlanningPhase(command: string): boolean {
-  return /\bomx\s+state\s+clear\b/.test(command)
-    || (/\bomx\s+state\s+write\b/.test(command) && /["']?active["']?\s*:\s*false\b/.test(command));
+// (`omx state clear`, or an `omx state write` that flips `active` off or writes
+// a terminal planning phase) is still blocked here. Robustly gating standalone
+// deactivation belongs in the backend; this is transport-level defense-in-depth.
+function readStateWriteInputPayload(cwd: string, command: string): Record<string, unknown> | null {
+  if (!/\bomx\s+state\s+write\b/.test(command)) return null;
+
+  const inlineInputMatch = command.match(/--input(?:=|\s+)(?:"([\s\S]*?)"|'([\s\S]*?)'|([^\s;&|]+))/);
+  if (inlineInputMatch) {
+    try {
+      const raw = safeString(inlineInputMatch[1] ?? inlineInputMatch[2] ?? inlineInputMatch[3]);
+      const parsed = JSON.parse(raw);
+      return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+        ? parsed as Record<string, unknown>
+        : null;
+    } catch {
+      return null;
+    }
+  }
+
+  const inputFileMatch = command.match(/--input-file(?:=|\s+)(?:"([^"]+)"|'([^']+)'|([^\s;&|]+))/);
+  if (!inputFileMatch) return null;
+
+  try {
+    const rawPath = safeString(inputFileMatch[1] ?? inputFileMatch[2] ?? inputFileMatch[3]).trim();
+    const raw = readFileSync(resolve(cwd, rawPath), "utf-8");
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function isPlanningPhaseDeactivationPayload(payload: Record<string, unknown>): boolean {
+  const mode = safeString(payload.mode).trim().toLowerCase();
+  if (mode !== "deep-interview" && mode !== "ralplan") return false;
+
+  if (payload.active === false) return true;
+
+  const currentPhase = normalizeAutopilotPhase(payload.current_phase ?? payload.currentPhase);
+  if (currentPhase === "complete" || currentPhase === "failed") return true;
+
+  const runOutcome = safeString(payload.run_outcome ?? payload.runOutcome).trim().toLowerCase();
+  if (
+    runOutcome === "finish"
+    || runOutcome === "finished"
+    || runOutcome === "complete"
+    || runOutcome === "completed"
+    || runOutcome === "done"
+    || runOutcome === "blocked_on_user"
+    || runOutcome === "blocked-on-user"
+    || runOutcome === "blocked"
+    || runOutcome === "failed"
+    || runOutcome === "cancelled"
+    || runOutcome === "canceled"
+    || runOutcome === "cancel"
+    || runOutcome === "aborted"
+    || runOutcome === "abort"
+  ) {
+    return true;
+  }
+
+  const lifecycleOutcome = safeString(payload.lifecycle_outcome ?? payload.lifecycleOutcome).trim().toLowerCase();
+  return lifecycleOutcome === "finished"
+    || lifecycleOutcome === "blocked"
+    || lifecycleOutcome === "failed"
+    || lifecycleOutcome === "userinterlude"
+    || lifecycleOutcome === "askuserquestion"
+    || lifecycleOutcome === "ask-user-question";
+}
+
+function commandEndsPlanningPhase(cwd: string, command: string): boolean {
+  if (/\bomx\s+state\s+clear\b/.test(command)) return true;
+  const payload = readStateWriteInputPayload(cwd, command);
+  return payload ? isPlanningPhaseDeactivationPayload(payload) : false;
 }
 
 function isAllowedDeepInterviewBashWrite(cwd: string, command: string): boolean {
-  if (commandEndsPlanningPhase(command)) return false;
+  if (commandEndsPlanningPhase(cwd, command)) return false;
   if (!commandHasDeepInterviewWriteIntent(command)) return true;
   const targets = extractDeepInterviewCommandWriteTargets(command);
-  // A disallowed write target chained alongside an allowed `omx state`/`omx
-  // question` command must not be smuggled through the allowance below.
   if (targets.some((target) => !isAllowedDeepInterviewArtifactPath(cwd, target))) return false;
-  // `omx state` read/write/clear and `omx question` defer to the backend gate;
-  // deactivation is already rejected above.
-  if (/\bomx\s+(?:state\s+(?:read|write|clear)|question)\b/.test(command)) return true;
   return targets.length > 0 && targets.every((target) => isAllowedDeepInterviewArtifactPath(cwd, target));
 }
 
@@ -3695,14 +3760,9 @@ function isAllowedRalplanBashWrite(cwd: string, command: string): boolean {
   if (beadsCommand.present) {
     return beadsCommand.allowed && (targets.length === 0 || hasAllowedTargets);
   }
-  if (commandEndsPlanningPhase(command)) return false;
+  if (commandEndsPlanningPhase(cwd, command)) return false;
   if (!commandHasDeepInterviewWriteIntent(command)) return true;
-  // A disallowed write target chained alongside an allowed `omx state`/`omx
-  // question` command must not be smuggled through the allowance below.
   if (targets.some((target) => !isAllowedRalplanArtifactPath(cwd, target))) return false;
-  // See isAllowedDeepInterviewBashWrite: defer `omx state` mutations to the
-  // gate-enforcing state_write backend (deactivation already rejected above).
-  if (/\bomx\s+(?:state\s+(?:read|write|clear)|question)\b/.test(command)) return true;
   return hasAllowedTargets;
 }
 
