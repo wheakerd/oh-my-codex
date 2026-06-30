@@ -435,6 +435,38 @@ describe('keyword detector team compatibility', () => {
     assert.equal(match.keyword.toLowerCase(), 'stop');
   });
 
+  it('treats explicit slash stop commands as cancel intent', () => {
+    const match = detectPrimaryKeyword('/stop');
+
+    assert.ok(match);
+    assert.equal(match.skill, 'cancel');
+    assert.equal(match.keyword.toLowerCase(), 'stop');
+  });
+
+  it('treats comma-delimited slash stop commands as cancel intent', () => {
+    for (const prompt of ['/stop, please', 'Please /stop, now']) {
+      const match = detectPrimaryKeyword(prompt);
+
+      assert.ok(match, `expected cancel match for ${prompt}`);
+      assert.equal(match.skill, 'cancel');
+      assert.equal(match.keyword.toLowerCase(), 'stop');
+    }
+  });
+
+  it('does not trigger cancel from stop inside filenames or paths', () => {
+    assert.equal(
+      detectPrimaryKeyword('inspect .omx/context/stop-hook-invalid-json-handoff-20260629T210626Z.md'),
+      null,
+    );
+    assert.equal(
+      detectPrimaryKeyword('Please summarize /tmp/stop-hook-invalid-json-handoff-20260629T210626Z.md'),
+      null,
+    );
+    assert.equal(detectPrimaryKeyword('inspect /stop.md'), null);
+    assert.equal(detectPrimaryKeyword('inspect /abort.md'), null);
+    assert.equal(detectPrimaryKeyword('inspect /stop:hook.md'), null);
+  });
+
   it('does not trigger cancel from incidental stop/abort test-log prose', () => {
     assert.equal(detectPrimaryKeyword('FAIL should stop retrying after max attempts'), null);
     assert.equal(detectPrimaryKeyword('PASS request aborted when upstream returns 499'), null);
