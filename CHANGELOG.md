@@ -4,6 +4,29 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.18.17] - 2026-07-01
+
+Patch release for the post-`0.18.16` runtime reliability train: Ultragoal null-goal recovery, MSYS/Windows Team startup handling, Ralplan terminal state, planning-gate write guards, and profile mention fallback behavior are tightened while preserving the existing CLI/package contract.
+
+### Changed
+
+- **Planning and conductor guardrails are stricter** — planning-gate state-write guards and exact-role worker routing reduce stale or unsafe planning writes in long-running workflows.
+- **Windows and MSYS workflow handling is sturdier** — psmux question rendering and Team worker startup paths are fixed for Windows/MSYS environments.
+
+### Fixed
+
+- **Ultragoal null-goal loops recover cleanly** — repeated `get_goal` null-result loops now have recovery behavior instead of leaving sessions stuck.
+- **Ralplan terminal session state is safer** — Ralplan terminal state handling avoids stale or mismatched continuation state.
+- **Stop keyword and profile mention edge cases are quieter** — path false positives and Discord mention fallback behavior are corrected.
+
+### PRs
+
+- #3020, #3017, #3015, #3014, #3012, #3011, #3009, #3008, #3006, #3004, #3003, #3000, #2999, #2998, #2997, #2996, #2991, #2990, #2989, #2987, #2986, #2985, #2982, #2981, #2979
+
+### Verification
+
+- Release readiness evidence is tracked in `docs/qa/release-readiness-0.18.17.md`.
+
 ## [0.18.16] - 2026-06-27
 
 Patch release for the post-`0.18.15` diagnostics and stale-state hardening train: local session friction reporting is available, stale HUD/Ralph continuation state is guarded, and doctor artifact ownership warnings are safer.
