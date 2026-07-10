@@ -88,7 +88,6 @@ function detectOmxConfigArtifacts(config: string): {
     /^\s*developer_instructions\s*=.*oh-my-codex/m.test(config);
 
   const hasFeatureFlags =
-    /^\s*multi_agent\s*=\s*true/m.test(config) ||
     /^\s*child_agents_md\s*=\s*true/m.test(config) ||
     /^\s*hooks\s*=\s*true/m.test(config) ||
     /^\s*codex_hooks\s*=\s*true/m.test(config) ||
@@ -249,7 +248,7 @@ async function cleanConfig(
   config = stripOmxSeededBehavioralDefaults(config);
 
   // Strip feature flags
-  config = stripOmxFeatureFlags(config);
+  config = stripOmxFeatureFlags(config, { preserveMultiAgent: true });
   if (shouldRestoreHooksFeatureFlag) {
     config = upsertCodexHooksFeatureFlag(
       config,
@@ -504,7 +503,7 @@ function printSummary(summary: UninstallSummary, dryRun: boolean): void {
     }
     if (summary.featureFlagsRemoved) {
       console.log(
-        "    Feature flags (multi_agent, child_agents_md, goals; hooks preserved when user hooks remain)",
+        "    Feature flags (child_agents_md, goals; multi_agent and hooks are preserved when user-owned)",
       );
     }
   } else if (!summary.configCleaned && summary.mcpServersRemoved.length === 0) {

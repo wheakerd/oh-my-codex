@@ -228,9 +228,10 @@ describe("omx setup scope behavior", () => {
       assert.equal(existsSync(agentsMdPath), true);
 
       const configToml = await readFile(localConfig, "utf-8");
-      assert.match(configToml, /^\[agents\]$/m);
-      assert.match(configToml, /^max_threads = 6$/m);
-      assert.match(configToml, /^max_depth = 2$/m);
+      assert.doesNotMatch(configToml, /^\[agents\]$/m);
+      assert.doesNotMatch(configToml, /^multi_agent\s*=/m);
+      assert.doesNotMatch(configToml, /^max_threads\s*=/m);
+      assert.doesNotMatch(configToml, /^max_depth\s*=/m);
       assert.doesNotMatch(configToml, /^\[env\]$/m);
       assert.match(configToml, /^\[shell_environment_policy\.set\]$/m);
       assert.match(configToml, /^USE_OMX_EXPLORE_CMD = "0"$/m);
@@ -302,6 +303,17 @@ describe("omx setup scope behavior", () => {
       await writeFile(
         join(codexDir, "config.toml"),
         [
+          "[features]",
+          "multi_agent = false",
+          "custom_feature = true",
+          "",
+          "[agents]",
+          "max_threads = 17",
+          "max_depth = 5",
+          "",
+          "[agents.custom_role]",
+          'description = "keep me"',
+          "",
           "[hooks.state.\"custom:/hooks.json:stop:0:0\"]",
           "trusted_hash = \"sha256:user\"",
           "enabled = false",
@@ -350,6 +362,13 @@ describe("omx setup scope behavior", () => {
         configToml,
         /^\[hooks\.state\.".*\/\.codex\/hooks\.json:stop:0:0"\]$/m,
       );
+      assert.match(configToml, /^multi_agent = false$/m);
+      assert.match(configToml, /^custom_feature = true$/m);
+      assert.match(configToml, /^\[agents\]$/m);
+      assert.match(configToml, /^max_threads = 17$/m);
+      assert.match(configToml, /^max_depth = 5$/m);
+      assert.match(configToml, /^\[agents\.custom_role\]$/m);
+      assert.match(configToml, /^description = "keep me"$/m);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
@@ -448,6 +467,11 @@ describe("omx setup scope behavior", () => {
         "utf-8",
       );
       assert.match(agentsMd, /~\/\.codex\/skills/);
+      const userConfigToml = await readFile(join(home, ".codex", "config.toml"), "utf-8");
+      assert.doesNotMatch(userConfigToml, /^multi_agent\s*=/m);
+      assert.doesNotMatch(userConfigToml, /^\[agents\]$/m);
+      assert.doesNotMatch(userConfigToml, /^max_threads\s*=/m);
+      assert.doesNotMatch(userConfigToml, /^max_depth\s*=/m);
       assert.equal(
         await readFile(join(wd, "AGENTS.md"), "utf-8"),
         existingAgents,

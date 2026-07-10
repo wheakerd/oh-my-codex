@@ -175,7 +175,7 @@ describe('config generator', () => {
 
       // Features correct
       assert.equal((rerun.match(/^\[features\]$/gm) ?? []).length, 1);
-      assert.match(rerun, /^multi_agent = true$/m);
+      assert.doesNotMatch(rerun, /^multi_agent\s*=/m);
       assert.match(rerun, /^child_agents_md = true$/m);
 
       // User content preserved
@@ -259,24 +259,24 @@ describe('config generator', () => {
       // User's feature flag preserved
       assert.match(toml, /^web_search = true$/m);
 
-      // OMX feature flags added
-      assert.match(toml, /^multi_agent = true$/m);
+      // OMX feature flags added without legacy multi-agent configuration
+      assert.doesNotMatch(toml, /^multi_agent\s*=/m);
       assert.match(toml, /^goals = true$/m);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
   });
 
-  it('writes a global [agents] section with OMX defaults', async () => {
+  it('does not write retired global [agents] defaults', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-config-gen-'));
     try {
       const configPath = join(wd, 'config.toml');
       await mergeConfig(configPath, wd);
       const toml = await readFile(configPath, 'utf-8');
 
-      assert.match(toml, /^\[agents\]$/m);
-      assert.match(toml, /^max_threads = 6$/m);
-      assert.match(toml, /^max_depth = 2$/m);
+      assert.doesNotMatch(toml, /^\[agents\]$/m);
+      assert.doesNotMatch(toml, /^max_threads\s*=/m);
+      assert.doesNotMatch(toml, /^max_depth\s*=/m);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
@@ -303,8 +303,8 @@ describe('config generator', () => {
       // collab must be gone
       assert.ok(!/^\s*collab\s*=/m.test(toml), 'deprecated collab key should be removed');
 
-      // multi_agent replaces it
-      assert.match(toml, /^multi_agent = true$/m);
+      // The retired flag is removed without introducing multi_agent.
+      assert.doesNotMatch(toml, /^multi_agent\s*=/m);
 
       // other user flags preserved
       assert.match(toml, /^web_search = true$/m);
@@ -375,7 +375,7 @@ describe('config generator', () => {
 
       assert.equal((merged.match(/^\[features\]$/gm) ?? []).length, 1);
       assert.match(merged, /^custom_user_flag = false$/m);
-      assert.match(merged, /^multi_agent = true$/m);
+      assert.doesNotMatch(merged, /^multi_agent\s*=/m);
       assert.match(merged, /^child_agents_md = true$/m);
       assert.match(merged, /^hooks = true$/m);
       assert.match(merged, /^goals = true$/m);

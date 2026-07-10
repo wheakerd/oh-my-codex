@@ -246,6 +246,14 @@ describe("omx setup/uninstall shared ownership for native hooks", () => {
       const initial = runOmx(wd, ["setup", "--scope", "project"], { HOME: home });
       if (shouldSkipForSpawnPermissions(initial.error)) return;
       assert.equal(initial.status, 0, initial.stderr || initial.stdout);
+      const configPath = join(wd, ".codex", "config.toml");
+      const customAgentPath = join(wd, ".codex", "agents", "custom-role.toml");
+      const generatedConfig = await readFile(configPath, "utf-8");
+      await writeFile(
+        configPath,
+        `${generatedConfig.replace(/^\[features\]$/m, "[features]\nmulti_agent = true").trimEnd()}\n\n[agents]\nmax_threads = 6\nmax_depth = 2\n\n[agents.custom_role]\ndescription = "custom role"\n`,
+      );
+      await writeFile(customAgentPath, 'model = "custom"\n');
 
       const hooksPath = join(wd, ".codex", "hooks.json");
       const generated = await readHooksJson(hooksPath);
@@ -281,16 +289,69 @@ describe("omx setup/uninstall shared ownership for native hooks", () => {
         "uninstall should strip only OMX-managed wrappers",
       );
 
-      const config = await readFile(join(wd, ".codex", "config.toml"), "utf-8");
+      const config = await readFile(configPath, "utf-8");
       assert.match(
         config,
         /^hooks = true$/m,
         "uninstall should keep native Codex hooks enabled for preserved user hooks",
       );
       assert.doesNotMatch(config, /^codex_hooks = true$/m);
-      assert.doesNotMatch(config, /^multi_agent\s*=/m);
+      assert.match(config, /^multi_agent = true$/m);
       assert.doesNotMatch(config, /^child_agents_md\s*=/m);
       assert.doesNotMatch(config, /^goals\s*=/m);
+      assert.match(config, /^max_threads = 6$/m);
+      assert.match(config, /^max_depth = 2$/m);
+      assert.match(config, /^\[agents\.custom_role\]$/m);
+      assert.match(config, /^description = "custom role"$/m);
+      assert.equal(await readFile(customAgentPath, "utf-8"), 'model = "custom"\n');
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+  it("plugin transition preserves historical multi-agent configuration and custom roles", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-plugin-config-preservation-"));
+    try {
+      const home = join(wd, "home");
+      const codexDir = join(wd, ".codex");
+      await mkdir(join(codexDir, "agents"), { recursive: true });
+      await mkdir(home, { recursive: true });
+      await writeFile(
+        join(codexDir, "config.toml"),
+        [
+          "[features]",
+          "multi_agent = false",
+          "custom_feature = true",
+          "child_agents_md = true",
+          "",
+          "[agents]",
+          "max_threads = 17",
+          "max_depth = 5",
+          "",
+          "[agents.custom_role]",
+          'description = "custom role"',
+          "",
+        ].join("\n"),
+      );
+      await writeFile(join(codexDir, "agents", "custom-role.toml"), "model = \"custom\"\n");
+
+      const result = runOmx(wd, ["setup", "--scope", "project", "--plugin"], {
+        HOME: home,
+      });
+      if (shouldSkipForSpawnPermissions(result.error)) return;
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+
+      const config = await readFile(join(codexDir, "config.toml"), "utf-8");
+      assert.match(config, /^multi_agent = false$/m);
+      assert.match(config, /^custom_feature = true$/m);
+      assert.match(config, /^\[agents\]$/m);
+      assert.match(config, /^max_threads = 17$/m);
+      assert.match(config, /^max_depth = 5$/m);
+      assert.match(config, /^\[agents\.custom_role\]$/m);
+      assert.match(config, /^description = "custom role"$/m);
+      assert.equal(
+        await readFile(join(codexDir, "agents", "custom-role.toml"), "utf-8"),
+        "model = \"custom\"\n",
+      );
     } finally {
       await rm(wd, { recursive: true, force: true });
     }

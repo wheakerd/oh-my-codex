@@ -32,6 +32,7 @@ import { getPackageRoot } from "../utils/package.js";
 import {
 	hasLegacyOmxTeamRunTable,
 	getModelContextRecommendation,
+	analyzeLegacyMultiAgentConfig,
 } from "../config/generator.js";
 import {
 	MANAGED_HOOK_EVENTS,
@@ -325,7 +326,13 @@ export async function doctor(options: DoctorOptions = {}): Promise<void> {
 	checks.push(checkDirectory("Codex home", paths.codexHomeDir));
 
 	// Check 4: Config file
-	checks.push(await checkConfig(paths.configPath));
+	const configCheck = await checkConfig(paths.configPath);
+	checks.push(configCheck);
+	const multiAgentCompatibilityCheck = await checkLegacyMultiAgentCompatibility(
+		paths.configPath,
+		scopeResolution.scope,
+	);
+	if (multiAgentCompatibilityCheck) checks.push(multiAgentCompatibilityCheck);
 
 	// Check 4.1: Model context recommendation
 	const contextRecommendationCheck = await checkModelContextRecommendation(
@@ -1125,6 +1132,41 @@ function validateToml(content: string): string | null {
 			return error.message;
 		}
 		return "unknown TOML parse error";
+	}
+}
+
+export async function checkLegacyMultiAgentCompatibility(
+	configPath: string,
+	scope: DoctorSetupScope,
+): Promise<Check | null> {
+	if (!existsSync(configPath)) return null;
+
+	try {
+		const content = await readFile(configPath, "utf-8");
+		if (validateToml(content)) return null;
+
+		const affected = Object.values(analyzeLegacyMultiAgentConfig(content).assessments).filter(
+			(assessment) => assessment.state !== "absent",
+		);
+		if (affected.length === 0) return null;
+
+		const details = affected
+			.map(
+				({ key, state, reasonCode }) =>
+					`${key} (${state}; ${reasonCode})`,
+			)
+			.join(", ");
+		return {
+			name: "GPT-5.6 multi-agent compatibility",
+			status: "warn",
+			message:
+				`${scope} scope config at ${configPath}: ${details}. ` +
+				"OMX preserves these settings because historical ownership cannot be proven. " +
+				`Back up ${configPath}, remove only keys you confirm OMX authored, rerun omx setup --scope ${scope}, then omx doctor. ` +
+				"Setup does not auto-delete them.",
+		};
+	} catch {
+		return null;
 	}
 }
 

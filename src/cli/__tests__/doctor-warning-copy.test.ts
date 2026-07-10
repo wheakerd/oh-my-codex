@@ -24,6 +24,7 @@ import {
 	buildPostCompactSmokeSpawnInvocation,
 	checkNativeHookDistSmoke,
 	classifyPostCompactHookStdout,
+	checkLegacyMultiAgentCompatibility,
 } from "../doctor.js";
 import { buildManagedCodexNativeHookCommand } from "../../config/codex-hooks.js";
 
@@ -1963,6 +1964,114 @@ command = "node"
 				/Legacy skill roots: ~\/\.agents\/skills links to canonical .*\.codex[\\/]+skills; treating both paths as one shared skill root/,
 			);
 			assert.doesNotMatch(res.stdout, /\[!!\] Legacy skill roots:/);
+		} finally {
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
+	it("reports retained and custom GPT-5.6 multi-agent settings without diagnosing a clean config", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-doctor-multi-agent-"));
+		try {
+			const cleanPath = join(wd, "clean.toml");
+			await writeFile(cleanPath, 'model = "gpt-5.6"\n');
+			assert.equal(
+				await checkLegacyMultiAgentCompatibility(cleanPath, "user"),
+				null,
+			);
+
+			const userPath = join(wd, "user.toml");
+			await writeFile(
+				userPath,
+				"[features]\nmulti_agent = true\n\n[agents]\nmax_threads = 6\nmax_depth = 2\n",
+			);
+			const userCheck = await checkLegacyMultiAgentCompatibility(userPath, "user");
+			assert.ok(userCheck);
+			assert.equal(userCheck.name, "GPT-5.6 multi-agent compatibility");
+			assert.equal(userCheck.status, "warn");
+			assert.match(userCheck.message, new RegExp(`user scope config at ${userPath}`));
+			assert.match(userCheck.message, /features\.multi_agent \(retained-legacy; exact-legacy-value\)/);
+			assert.match(userCheck.message, /agents\.max_threads \(retained-legacy; exact-legacy-value\)/);
+			assert.match(userCheck.message, /agents\.max_depth \(retained-legacy; exact-legacy-value\)/);
+			assert.match(userCheck.message, /historical ownership cannot be proven/);
+			assert.match(userCheck.message, /remove only keys you confirm OMX authored/);
+			assert.match(userCheck.message, /omx setup --scope user/);
+			assert.match(userCheck.message, /Setup does not auto-delete them/);
+
+			const projectPath = join(wd, "project.toml");
+			await writeFile(projectPath, "[agents]\nmax_threads = 8\n");
+			const projectCheck = await checkLegacyMultiAgentCompatibility(projectPath, "project");
+			assert.ok(projectCheck);
+			assert.match(projectCheck.message, new RegExp(`project scope config at ${projectPath}`));
+			assert.match(projectCheck.message, /agents\.max_threads \(custom; custom-value\)/);
+			assert.doesNotMatch(projectCheck.message, /All checks passed/);
+		} finally {
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
+
+	it("reports project-scoped custom values once through the full doctor command", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-doctor-project-multi-agent-"));
+		try {
+			const home = join(wd, "home");
+			const codexDir = join(wd, ".codex");
+			await mkdir(home, { recursive: true });
+			await mkdir(codexDir, { recursive: true });
+			await mkdir(join(wd, ".omx"), { recursive: true });
+			await writeFile(
+				join(wd, ".omx", "setup-scope.json"),
+				`${JSON.stringify({ scope: "project" }, null, 2)}\n`,
+			);
+			const configPath = join(codexDir, "config.toml");
+			await writeFile(
+				configPath,
+				"[features]\nmulti_agent = false\n\n[agents]\nmax_threads = 17\nmax_depth = 5\n",
+			);
+
+			const res = runOmx(wd, ["doctor"], { HOME: home });
+			if (shouldSkipForSpawnPermissions(res.error)) return;
+			assert.equal(res.status, 0, res.stderr || res.stdout);
+			assert.match(
+				res.stdout,
+				/Resolved setup scope: project \(from \.omx\/setup-scope\.json\)/,
+			);
+			assert.equal(
+				res.stdout.match(/\[!!\] GPT-5\.6 multi-agent compatibility:/g)?.length,
+				1,
+			);
+			assert.match(res.stdout, new RegExp(`project scope config at ${configPath}`));
+			assert.match(res.stdout, /features\.multi_agent \(custom; custom-value\)/);
+			assert.match(res.stdout, /agents\.max_threads \(custom; custom-value\)/);
+			assert.match(res.stdout, /agents\.max_depth \(custom; custom-value\)/);
+			assert.match(res.stdout, /historical ownership cannot be proven/);
+			assert.match(res.stdout, /remove only keys you confirm OMX authored/);
+			assert.match(res.stdout, /omx setup --scope project/);
+			assert.match(res.stdout, /Setup does not auto-delete them/);
+			assert.match(res.stdout, /Results: \d+ passed, [1-9]\d* warnings, \d+ failed/);
+			assert.doesNotMatch(res.stdout, /All checks passed!/);
+		} finally {
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
+
+	it("counts the multi-agent compatibility warning and suppresses the all-clear footer", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-doctor-multi-agent-footer-"));
+		try {
+			const home = join(wd, "home");
+			const codexDir = join(home, ".codex");
+			await mkdir(codexDir, { recursive: true });
+			await writeFile(
+				join(codexDir, "config.toml"),
+				"[features]\nmulti_agent = true\n",
+			);
+
+			const res = runOmx(wd, ["doctor"], {
+				HOME: home,
+				CODEX_HOME: codexDir,
+			});
+			if (shouldSkipForSpawnPermissions(res.error)) return;
+			assert.equal(res.status, 0, res.stderr || res.stdout);
+			assert.match(res.stdout, /\[!!\] GPT-5\.6 multi-agent compatibility:/);
+			assert.match(res.stdout, /Results: \d+ passed, [1-9]\d* warnings, \d+ failed/);
+			assert.doesNotMatch(res.stdout, /All checks passed!/);
 		} finally {
 			await rm(wd, { recursive: true, force: true });
 		}

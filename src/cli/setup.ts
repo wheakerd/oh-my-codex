@@ -2015,7 +2015,7 @@ async function cleanupPluginModeLegacyConfig(
 		options.developerInstructionsDecision,
 	);
 	config = stripOmxSeededBehavioralDefaults(config);
-	config = stripOmxFeatureFlags(config);
+	config = stripOmxFeatureFlags(config, { preserveMultiAgent: true });
 	config = stripManagedCodexHookTrustState(config);
 	config = stripOmxEnvSettings(config);
 	if (preservedFirstPartyMcp) {
@@ -3124,7 +3124,7 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 			"  4. The AGENTS.md orchestration brain is loaded automatically",
 		);
 		console.log(
-			"  5. Native agent defaults configured in config.toml [agents] and TOML files written to .codex/agents/",
+			"  5. Native agent role TOML files written to .codex/agents/; use explicit agent_type when spawning OMX roles",
 		);
 	}
 	console.log(

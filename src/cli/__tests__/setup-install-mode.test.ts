@@ -984,7 +984,7 @@ describe("omx setup install mode behavior", () => {
 				assert.match(output, /Next steps:/);
 				assert.match(
 					output,
-					/Native agent defaults configured in config\.toml \[agents\] and TOML files written to \.codex\/agents\//,
+					/Native agent role TOML files written to \.codex\/agents\/; use explicit agent_type when spawning OMX roles/,
 				);
 			});
 		} finally {
@@ -2667,7 +2667,7 @@ describe("omx setup install mode behavior", () => {
 					assert.doesNotMatch(pluginOutput, /user-scope skill delivery mode/);
 					assert.doesNotMatch(
 						pluginOutput,
-						/Native agent defaults configured.*TOML files written to \.codex\/agents\//,
+						/use explicit agent_type when spawning OMX roles/,
 					);
 					assert.doesNotMatch(
 						pluginOutput,
@@ -2702,7 +2702,7 @@ describe("omx setup install mode behavior", () => {
 						});
 						assert.match(
 							legacyOutput,
-							/Native agent defaults configured.*TOML files written to \.codex\/agents\//,
+							/Native agent role TOML files written to \.codex\/agents\//,
 						);
 						assert.match(
 							legacyOutput,

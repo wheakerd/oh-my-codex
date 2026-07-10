@@ -9,11 +9,13 @@ import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import TOML from "@iarna/toml";
 import {
+  analyzeLegacyMultiAgentConfig,
   buildMergedConfig,
   cleanCodexModelAvailabilityNuxIfNeeded,
   mergeConfig,
   repairConfigIfNeeded,
   stripManagedCodexHookTrustState,
+  stripOmxFeatureFlags,
   upsertManagedCodexHookTrustState,
 } from "../generator.js";
 import { buildManagedCodexHookTrustState } from "../codex-hooks.js";
@@ -242,13 +244,105 @@ describe("config generator idempotency (#384)", () => {
       const toml = await readFile(configPath, "utf-8");
 
       assertSingleOmxBlock(toml);
-      assert.match(toml, /^multi_agent = true$/m);
+      assert.doesNotMatch(toml, /^multi_agent\s*=/m);
       assert.match(toml, /^child_agents_md = true$/m);
       assert.match(toml, /^hooks = true$/m);
       assert.match(toml, /^goals = true$/m);
+      assert.doesNotMatch(toml, /^\[agents\]$/m);
+      assert.doesNotMatch(toml, /^max_threads\s*=/m);
+      assert.doesNotMatch(toml, /^max_depth\s*=/m);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
+  });
+
+  it("classifies legacy multi-agent keys without mutating config", () => {
+    const absent = analyzeLegacyMultiAgentConfig("");
+    assert.equal(absent.assessments["features.multi_agent"].state, "absent");
+
+    const legacy = analyzeLegacyMultiAgentConfig(
+      [
+        "[features]",
+        "multi_agent = true",
+        "",
+        "[agents]",
+        "max_threads = 6",
+        "max_depth = 2",
+      ].join("\n"),
+    );
+    assert.equal(
+      legacy.assessments["features.multi_agent"].state,
+      "retained-legacy",
+    );
+    assert.equal(legacy.assessments["agents.max_threads"].state, "retained-legacy");
+    assert.equal(legacy.assessments["agents.max_depth"].state, "retained-legacy");
+
+    const custom = analyzeLegacyMultiAgentConfig(
+      "[features]\nmulti_agent = false\n\n[agents]\nmax_threads = 8\nmax_depth = 3\n",
+    );
+    assert.equal(custom.assessments["features.multi_agent"].state, "custom");
+    assert.equal(custom.assessments["agents.max_threads"].state, "custom");
+    assert.equal(custom.assessments["agents.max_depth"].state, "custom");
+
+    const invalid = analyzeLegacyMultiAgentConfig("[features\nmulti_agent = true");
+    assert.equal(invalid.assessments["features.multi_agent"].state, "invalid/duplicate");
+
+    const duplicate = analyzeLegacyMultiAgentConfig(
+      "[features]\nmulti_agent = true\nmulti_agent = false\n",
+    );
+    assert.equal(duplicate.assessments["features.multi_agent"].state, "invalid/duplicate");
+    assert.equal(
+      duplicate.assessments["features.multi_agent"].reasonCode,
+      "toml-duplicate-key",
+    );
+  });
+
+  it("preserves legacy multi-agent values and all role tables across fixed-point merges", () => {
+    const existing = [
+      "[features]",
+      "multi_agent = false",
+      "",
+      "[agents]",
+      "max_threads = 8",
+      "max_depth = 3",
+      "",
+      "[agents.executor]",
+      'config_file = "/custom/executor.toml"',
+      "",
+      '[agents."review bot"]',
+      'config_file = "/custom/review.toml"',
+      "",
+    ].join("\n");
+
+    const merged = buildMergedConfig(existing, "/tmp/omx");
+    assert.match(merged, /^multi_agent = false$/m);
+    assert.match(merged, /^max_threads = 8$/m);
+    assert.match(merged, /^max_depth = 3$/m);
+    assert.match(merged, /^\[agents\.executor\]$/m);
+    assert.match(merged, /^\[agents\."review bot"\]$/m);
+    assert.match(merged, /^config_file = "\/custom\/executor\.toml"$/m);
+    assert.match(merged, /^config_file = "\/custom\/review\.toml"$/m);
+    const parsed = TOML.parse(merged) as {
+      agents?: Record<string, unknown>;
+    };
+    assert.equal(
+      (parsed.agents?.executor as { config_file?: string } | undefined)?.config_file,
+      "/custom/executor.toml",
+    );
+    assert.equal(
+      (parsed.agents?.["review bot"] as { config_file?: string } | undefined)?.config_file,
+      "/custom/review.toml",
+    );
+    assert.equal(buildMergedConfig(merged, "/tmp/omx"), merged);
+  });
+
+  it("can preserve multi_agent while stripping other OMX feature flags", () => {
+    const stripped = stripOmxFeatureFlags(
+      "[features]\nmulti_agent = false\nchild_agents_md = true\nhooks = true\ngoals = true\n",
+      { preserveMultiAgent: true },
+    );
+
+    assert.equal(stripped, "[features]\nmulti_agent = false\n");
   });
 
   it("emits first-party MCP blocks only when explicitly enabled", () => {
@@ -508,11 +602,10 @@ describe("config generator idempotency (#384)", () => {
       assertSingleOmxBlock(toml);
       assert.match(toml, /^\[user\.custom\]$/m, "user section preserved");
       assert.match(toml, /^name = "kept"$/m, "user key preserved");
-      assert.match(toml, /^\[agents\]$/m, "global agents settings added");
-      assert.match(toml, /^max_threads = 6$/m, "global agents max_threads seeded");
-      assert.match(toml, /^max_depth = 2$/m, "global agents max_depth seeded");
-      assert.doesNotMatch(toml, /^\[agents\.executor\]$/m, "legacy OMX agent entry removed");
-      assert.doesNotMatch(toml, /^\[agents\.explore\]$/m, "legacy OMX agent entry removed");
+      assert.match(toml, /^\[agents\.executor\]$/m, "known agent table preserved");
+      assert.match(toml, /^\[agents\.explore\]$/m, "known agent table preserved");
+      assert.match(toml, /^config_file = "\/old\/path\/executor\.toml"$/m);
+      assert.match(toml, /^config_file = "\/old\/path\/explore\.toml"$/m);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
@@ -917,17 +1010,16 @@ describe("config generator idempotency (#384)", () => {
     }
   });
 
-  it("writes only the global [agents] defaults into config", async () => {
+  it("does not write retired global [agents] defaults", async () => {
     const wd = await mkdtemp(join(tmpdir(), "omx-idem-"));
     try {
       const configPath = join(wd, "config.toml");
       await mergeConfig(configPath, wd);
       const toml = await readFile(configPath, "utf-8");
 
-      assert.match(toml, /^\[agents\]$/m, "global [agents] section present");
-      assert.match(toml, /^max_threads = 6$/m, "max_threads default written");
-      assert.match(toml, /^max_depth = 2$/m, "max_depth default written");
-      assert.doesNotMatch(toml, /^\[agents\.[^\]]+\]$/m, "legacy per-agent config_file entries omitted");
+      assert.doesNotMatch(toml, /^\[agents\]$/m);
+      assert.doesNotMatch(toml, /^max_threads\s*=/m);
+      assert.doesNotMatch(toml, /^max_depth\s*=/m);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }

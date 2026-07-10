@@ -14,7 +14,6 @@ import { readFile, writeFile } from "fs/promises";
 import { existsSync } from "fs";
 import { join, resolve } from "path";
 import TOML from "@iarna/toml";
-import { AGENT_DEFINITIONS } from "../agents/definitions.js";
 import { DEFAULT_FRONTIER_MODEL } from "./models.js";
 import type { UnifiedMcpRegistryServer } from "./mcp-registry.js";
 import {
@@ -106,8 +105,97 @@ export const OMX_PLUGIN_DEVELOPER_INSTRUCTIONS =
 const SHARED_MCP_REGISTRY_MARKER = "oh-my-codex (OMX) Shared MCP Registry Sync";
 const SHARED_MCP_REGISTRY_END_MARKER =
   "# End oh-my-codex shared MCP registry sync";
-const OMX_AGENTS_MAX_THREADS = 6;
-const OMX_AGENTS_MAX_DEPTH = 2;
+
+export type LegacyMultiAgentKey =
+  | "features.multi_agent"
+  | "agents.max_threads"
+  | "agents.max_depth";
+
+export type LegacyKeyState =
+  | "absent"
+  | "retained-legacy"
+  | "custom"
+  | "invalid/duplicate";
+
+export type LegacyReasonCode =
+  | "key-absent"
+  | "exact-legacy-value"
+  | "custom-value"
+  | "toml-parse-error"
+  | "toml-duplicate-key";
+
+export interface LegacyKeyAssessment {
+  key: LegacyMultiAgentKey;
+  state: LegacyKeyState;
+  reasonCode: LegacyReasonCode;
+  value?: unknown;
+}
+
+export interface LegacyMultiAgentAnalysis {
+  assessments: Record<LegacyMultiAgentKey, LegacyKeyAssessment>;
+}
+
+const LEGACY_MULTI_AGENT_KEYS: readonly LegacyMultiAgentKey[] = [
+  "features.multi_agent",
+  "agents.max_threads",
+  "agents.max_depth",
+];
+
+const LEGACY_MULTI_AGENT_VALUES: Record<LegacyMultiAgentKey, unknown> = {
+  "features.multi_agent": true,
+  "agents.max_threads": 6,
+  "agents.max_depth": 2,
+};
+
+export function analyzeLegacyMultiAgentConfig(
+  configText: string,
+): LegacyMultiAgentAnalysis {
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = TOML.parse(configText) as Record<string, unknown>;
+  } catch (error) {
+    const reasonCode: LegacyReasonCode =
+      /duplicate|redefine|already defined/i.test(String(error))
+        ? "toml-duplicate-key"
+        : "toml-parse-error";
+    return {
+      assessments: Object.fromEntries(
+        LEGACY_MULTI_AGENT_KEYS.map((key) => [
+          key,
+          { key, state: "invalid/duplicate", reasonCode },
+        ]),
+      ) as Record<LegacyMultiAgentKey, LegacyKeyAssessment>,
+    };
+  }
+
+  return {
+    assessments: Object.fromEntries(
+      LEGACY_MULTI_AGENT_KEYS.map((key) => {
+        const [table, entry] = key.split(".");
+        const value = isRecord(parsed[table]) ? parsed[table][entry] : undefined;
+        if (value === undefined) {
+          return [key, { key, state: "absent", reasonCode: "key-absent" }];
+        }
+        if (value === LEGACY_MULTI_AGENT_VALUES[key]) {
+          return [
+            key,
+            {
+              key,
+              state: "retained-legacy",
+              reasonCode: "exact-legacy-value",
+              value,
+            },
+          ];
+        }
+        return [
+          key,
+          { key, state: "custom", reasonCode: "custom-value", value },
+        ];
+      }),
+    ) as Record<LegacyMultiAgentKey, LegacyKeyAssessment>,
+  };
+}
+
 const OMX_EXPLORE_ROUTING_DEFAULT = "0";
 const OMX_EXPLORE_CMD_ENV = "USE_OMX_EXPLORE_CMD";
 const DEFAULT_LAUNCHER_MCP_STARTUP_TIMEOUT_SEC = 15;
@@ -734,7 +822,6 @@ function upsertFeatureFlags(
     const base = config.trimEnd();
     const featureBlock = [
       "[features]",
-      "multi_agent = true",
       "child_agents_md = true",
       hookFeatureFlagLine,
       "goals = true",
@@ -754,8 +841,7 @@ function upsertFeatureFlags(
     }
   }
 
-  // Remove deprecated 'collab' key (superseded by multi_agent) and
-  // the misspelled singular 'goal' flag written by unreleased PR builds.
+  // Remove deprecated collab and unreleased singular goal flags.
   for (let i = sectionEnd - 1; i > featuresStart; i--) {
     if (/^\s*(?:collab|goal)\s*=/.test(lines[i])) {
       lines.splice(i, 1);
@@ -763,21 +849,11 @@ function upsertFeatureFlags(
     }
   }
 
-  let multiAgentIdx = -1;
   let childAgentsIdx = -1;
   for (let i = featuresStart + 1; i < sectionEnd; i++) {
-    if (/^\s*multi_agent\s*=/.test(lines[i])) {
-      multiAgentIdx = i;
-    } else if (/^\s*child_agents_md\s*=/.test(lines[i])) {
+    if (/^\s*child_agents_md\s*=/.test(lines[i])) {
       childAgentsIdx = i;
     }
-  }
-
-  if (multiAgentIdx >= 0) {
-    lines[multiAgentIdx] = "multi_agent = true";
-  } else {
-    lines.splice(sectionEnd, 0, "multi_agent = true");
-    sectionEnd += 1;
   }
 
   if (childAgentsIdx >= 0) {
@@ -1468,58 +1544,15 @@ function upsertEnvSettings(config: string): string {
   return lines.join("\n");
 }
 
-function upsertAgentsSettings(config: string): string {
-  const lines = config.split(/\r?\n/);
-  const agentsStart = lines.findIndex((line) =>
-    /^\s*\[agents\]\s*$/.test(line),
-  );
-
-  if (agentsStart < 0) {
-    const base = config.trimEnd();
-    const agentsBlock = [
-      "[agents]",
-      `max_threads = ${OMX_AGENTS_MAX_THREADS}`,
-      `max_depth = ${OMX_AGENTS_MAX_DEPTH}`,
-      "",
-    ].join("\n");
-    if (base.length === 0) return agentsBlock;
-    return `${base}\n\n${agentsBlock}`;
-  }
-
-  let sectionEnd = lines.length;
-  for (let i = agentsStart + 1; i < lines.length; i++) {
-    if (/^\s*\[\[?[^\]]+\]?\]\s*$/.test(lines[i])) {
-      sectionEnd = i;
-      break;
-    }
-  }
-
-  let maxThreadsIdx = -1;
-  let maxDepthIdx = -1;
-  for (let i = agentsStart + 1; i < sectionEnd; i++) {
-    if (/^\s*max_threads\s*=/.test(lines[i])) {
-      maxThreadsIdx = i;
-    } else if (/^\s*max_depth\s*=/.test(lines[i])) {
-      maxDepthIdx = i;
-    }
-  }
-
-  if (maxThreadsIdx < 0) {
-    lines.splice(sectionEnd, 0, `max_threads = ${OMX_AGENTS_MAX_THREADS}`);
-    sectionEnd += 1;
-  }
-  if (maxDepthIdx < 0) {
-    lines.splice(sectionEnd, 0, `max_depth = ${OMX_AGENTS_MAX_DEPTH}`);
-  }
-
-  return lines.join("\n");
-}
-
 /**
  * Remove OMX-owned feature flags from the [features] section.
+ * If `preserveMultiAgent` is set, retain multi_agent unchanged.
  * If the section becomes empty after removal, remove the section header too.
  */
-export function stripOmxFeatureFlags(config: string): string {
+export function stripOmxFeatureFlags(
+  config: string,
+  options: { preserveMultiAgent?: boolean } = {},
+): string {
   const lines = config.split(/\r?\n/);
   const featuresStart = lines.findIndex((line) =>
     /^\s*\[features\]\s*$/.test(line),
@@ -1536,7 +1569,7 @@ export function stripOmxFeatureFlags(config: string): string {
   }
 
   const omxFlags = [
-    "multi_agent",
+    ...(options.preserveMultiAgent ? [] : ["multi_agent"]),
     "child_agents_md",
     "hooks",
     "codex_hooks",
@@ -1631,11 +1664,6 @@ export function stripOmxEnvSettings(config: string): string {
 // Orphaned OMX table sections (no marker block)
 // ---------------------------------------------------------------------------
 
-/**
- * Check whether a TOML table name belongs to a legacy OMX-managed agent entry.
- * Handles both `agents.name` and `agents."name"` forms.
- */
-
 function isOmxFirstPartyMcpSection(tableName: string): boolean {
   const match = tableName.match(/^mcp_servers\.(?:"([^"]+)"|([A-Za-z0-9_-]+))$/);
   const name = match?.[1] ?? match?.[2];
@@ -1646,20 +1674,11 @@ function isOmxFirstPartyMcpSection(tableName: string): boolean {
   );
 }
 
-function isLegacyOmxAgentSection(tableName: string): boolean {
-  const m = tableName.match(/^agents\.(?:"([^"]+)"|(\w[\w-]*))$/);
-  if (!m) return false;
-  const name = m[1] || m[2] || "";
-  return Object.prototype.hasOwnProperty.call(AGENT_DEFINITIONS, name);
-}
 
 /**
- * Strip OMX-owned table sections that exist outside the marker block.
+ * Strip first-party OMX MCP table sections that exist outside the marker block.
  * This covers legacy configs that were written before markers were added,
  * or configs where the marker was accidentally removed.
- *
- * Targets: exact first-party [mcp_servers.<name>] entries, retired
- * [mcp_servers.omx_team_run], and legacy [agents.<name>] entries.
  */
 function stripOrphanedOmxSections(config: string): string {
   const lines = config.split(/\r?\n/);
@@ -1675,9 +1694,7 @@ function stripOrphanedOmxSections(config: string): string {
       // Note: [tui] is NOT stripped here because it could be user-owned.
       // The marker-based stripExistingOmxBlocks already handles [tui]
       // when it lives inside the OMX marker block.
-      const isOmxSection =
-        isOmxFirstPartyMcpSection(tableName) ||
-        isLegacyOmxAgentSection(tableName);
+      const isOmxSection = isOmxFirstPartyMcpSection(tableName);
 
       if (isOmxSection) {
         // Remove preceding OMX comment lines and blank lines
@@ -2399,7 +2416,7 @@ function getOmxTablesBlock(
  *
  * Layout:
  *   1. OMX top-level keys (notify, model_reasoning_effort, developer_instructions)
- *   2. [features] with multi_agent + child_agents_md + hooks + goals
+ *   2. [features] with child_agents_md + hooks + goals
  *   3. [shell_environment_policy.set] with defaulted deprecated explore-routing opt-out
  *   4. … user sections …
  *   5. OMX [table] sections (mcp_servers, tui)
@@ -2438,11 +2455,11 @@ export function buildMergedConfig(
     !isOmxManagedNotifyCommand(getRootTomlArray(existing, "notify"), pkgRoot)
       ? getRootTomlArray(existing, "notify")
       : null;
-  existing = stripOmxTopLevelKeys(existing);
+  existing = stripOmxTopLevelKeys(existing).trimStart();
   if (userNotifyToPreserve) {
     existing = `${`notify = ${formatTomlStringArray(userNotifyToPreserve)}`}\n${existing.trimStart()}`;
   }
-  existing = stripOrphanedManagedNotify(existing, pkgRoot);
+  existing = stripOrphanedManagedNotify(existing, pkgRoot).trimStart();
   const managedTrustState = buildManagedCodexHookTrustStateForConfig(
     options.codexHooksFile,
     pkgRoot,
@@ -2464,7 +2481,6 @@ export function buildMergedConfig(
   }
   existing = upsertFeatureFlags(existing, options.codexHookFeatureFlag);
   existing = upsertEnvSettings(existing);
-  existing = upsertAgentsSettings(existing);
   const tuiUpsert = includeTui
     ? upsertTuiStatusLine(existing, statusLinePreset, {
         forceStatusLinePreset: options.forceStatusLinePreset,
@@ -2498,13 +2514,14 @@ export function buildMergedConfig(
     existing,
   );
 
-  let body = existing.trimEnd();
+  let body = existing.trim();
   if (sharedRegistryBlock) {
     body = body ? `${body}\n\n${sharedRegistryBlock}` : sharedRegistryBlock;
   }
+  const bodySeparator = body.length > 0 && !/^\s*\[/.test(body) ? "\n" : "\n\n";
 
   return addDefaultLauncherMcpStartupTimeouts(
-    topLines.join("\n") + "\n\n" + body + "\n" + tablesBlock,
+    topLines.join("\n") + bodySeparator + body + "\n" + tablesBlock,
   );
 }
 
