@@ -1016,6 +1016,181 @@ describe('omx uninstall', () => {
       await rm(wd, { recursive: true, force: true });
     }
   });
+  it('removes exact marked pairs and authorized singleton blocks during uninstall', async () => {
+    const cases = [
+      { lines: ['# oh-my-codex seeded behavioral defaults (uninstall removes unchanged defaults)', 'model_context_window = 250000', 'model_auto_compact_token_limit = 200000', '# End oh-my-codex seeded behavioral defaults'], removed: ['model_context_window', 'model_auto_compact_token_limit'], preserved: {} },
+      { lines: ['model_auto_compact_token_limit=777', '# oh-my-codex seeded behavioral defaults (uninstall removes unchanged defaults)', 'model_context_window = 250000', '# End oh-my-codex seeded behavioral defaults'], removed: ['model_context_window'], preserved: { model_auto_compact_token_limit: 777 } },
+      { lines: ['model_context_window = 123456', '# oh-my-codex seeded behavioral defaults (uninstall removes unchanged defaults)', 'model_auto_compact_token_limit = 200000', '# End oh-my-codex seeded behavioral defaults'], removed: ['model_auto_compact_token_limit'], preserved: { model_context_window: 123456 } },
+    ];
+    for (const fixture of cases) {
+      const wd = await mkdtemp(join(tmpdir(), 'omx-uninstall-defaults-'));
+      try {
+        const home = join(wd, 'home');
+        const configPath = join(home, '.codex', 'config.toml');
+        await mkdir(dirname(configPath), { recursive: true });
+        await writeFile(configPath, `${fixture.lines.join('\n')}\n`);
+        const res = runOmx(wd, ['uninstall'], { HOME: home });
+        if (shouldSkipForSpawnPermissions(res.error)) return;
+        assert.equal(res.status, 0, res.stderr || res.stdout);
+        const config = await readFile(configPath, 'utf-8');
+        const parsed = TOML.parse(config) as Record<string, unknown>;
+        assert.doesNotMatch(config, /seeded behavioral defaults/);
+        for (const key of fixture.removed) assert.equal(parsed[key], undefined);
+        for (const [key, value] of Object.entries(fixture.preserved)) assert.equal(parsed[key], value);
+      } finally {
+        await rm(wd, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it('preserves unmarked and edited values, retaining only ambiguous ownership markers', async () => {
+    const cases = [
+      {
+        lines: ['model_context_window = 250000', 'model_auto_compact_token_limit = 200000', '[user_table]', 'label = "unmarked"'],
+        preservedLines: ['model_context_window = 250000', 'model_auto_compact_token_limit = 200000', '[user_table]', 'label = "unmarked"'],
+        markers: false,
+      },
+      {
+        lines: ['# oh-my-codex seeded behavioral defaults (uninstall removes unchanged defaults)', 'model_context_window = 123456', 'model_auto_compact_token_limit = 200000', '# End oh-my-codex seeded behavioral defaults', '[user_table]', 'label = "edited"'],
+        preservedLines: ['model_context_window = 123456', 'model_auto_compact_token_limit = 200000', '[user_table]', 'label = "edited"'],
+        markers: false,
+      },
+      {
+        lines: ['model_auto_compact_token_limit = 1', 'model_auto_compact_token_limit = 2', '# oh-my-codex seeded behavioral defaults (uninstall removes unchanged defaults)', 'model_context_window = 250000', '# End oh-my-codex seeded behavioral defaults', '[user_table]', 'label = "ambiguous"'],
+        preservedLines: ['model_auto_compact_token_limit = 1', 'model_auto_compact_token_limit = 2', 'model_context_window = 250000', '[user_table]', 'label = "ambiguous"'],
+        markers: true,
+      },
+      {
+        lines: ['model_context_window = 999', '# oh-my-codex seeded behavioral defaults (uninstall removes unchanged defaults)', 'model_context_window = 250000', 'model_auto_compact_token_limit = 200000', '# End oh-my-codex seeded behavioral defaults', '[user_table]', 'label = "pair-duplicate-before"'],
+        preservedLines: ['model_context_window = 999', 'model_context_window = 250000', 'model_auto_compact_token_limit = 200000', '[user_table]', 'label = "pair-duplicate-before"'],
+        markers: true,
+      },
+      {
+        lines: ['# oh-my-codex seeded behavioral defaults (uninstall removes unchanged defaults)', 'model_context_window = 250000', 'model_auto_compact_token_limit = 200000', '# End oh-my-codex seeded behavioral defaults', 'model_auto_compact_token_limit = 999', '[user_table]', 'label = "pair-duplicate-after"'],
+        preservedLines: ['model_context_window = 250000', 'model_auto_compact_token_limit = 200000', 'model_auto_compact_token_limit = 999', '[user_table]', 'label = "pair-duplicate-after"'],
+        markers: true,
+      },
+      {
+        lines: ['# oh-my-codex seeded behavioral defaults (uninstall removes unchanged defaults)', 'model_context_window = 250000', '# End oh-my-codex seeded behavioral defaults', '[user_table]', 'label = "after-table"', 'model_auto_compact_token_limit = 777'],
+        preservedLines: ['model_context_window = 250000', '[user_table]', 'label = "after-table"', 'model_auto_compact_token_limit = 777'],
+        markers: false,
+      },
+    ];
+    for (const fixture of cases) {
+      const wd = await mkdtemp(join(tmpdir(), 'omx-uninstall-defaults-'));
+      try {
+        const home = join(wd, 'home');
+        const configPath = join(home, '.codex', 'config.toml');
+        await mkdir(dirname(configPath), { recursive: true });
+        await writeFile(configPath, `${fixture.lines.join('\n')}\n`);
+        const res = runOmx(wd, ['uninstall'], { HOME: home });
+        if (shouldSkipForSpawnPermissions(res.error)) return;
+        assert.equal(res.status, 0, res.stderr || res.stdout);
+        const config = await readFile(configPath, 'utf-8');
+        for (const line of fixture.preservedLines) assert.ok(config.includes(line), `missing preserved line: ${line}`);
+        fixture.markers ? assert.match(config, /seeded behavioral defaults/) : assert.doesNotMatch(config, /seeded behavioral defaults/);
+      } finally {
+        await rm(wd, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it('does not write during dry-run and is a fixed point after legacy-default cleanup', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-uninstall-defaults-'));
+    try {
+      const home = join(wd, 'home');
+      const configPath = join(home, '.codex', 'config.toml');
+      const original = ['# oh-my-codex seeded behavioral defaults (uninstall removes unchanged defaults)', 'model_context_window = 250000', 'model_auto_compact_token_limit = 200000', '# End oh-my-codex seeded behavioral defaults', ''].join('\n');
+      await mkdir(dirname(configPath), { recursive: true });
+      await writeFile(configPath, original);
+      const dryRun = runOmx(wd, ['uninstall', '--dry-run'], { HOME: home });
+      if (shouldSkipForSpawnPermissions(dryRun.error)) return;
+      assert.equal(dryRun.status, 0, dryRun.stderr || dryRun.stdout);
+      assert.equal(await readFile(configPath, 'utf-8'), original);
+      const first = runOmx(wd, ['uninstall'], { HOME: home });
+      assert.equal(first.status, 0, first.stderr || first.stdout);
+      const cleaned = await readFile(configPath, 'utf-8');
+      const second = runOmx(wd, ['uninstall'], { HOME: home });
+      assert.equal(second.status, 0, second.stderr || second.stdout);
+      assert.equal(await readFile(configPath, 'utf-8'), cleaned);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps singleton and bounded cleanup dry-run-safe, differential, and idempotent', async () => {
+    const start = '# oh-my-codex seeded behavioral defaults (uninstall removes unchanged defaults)';
+    const end = '# End oh-my-codex seeded behavioral defaults';
+    const fixtures = [
+      {
+        baseline: ['model_auto_compact_token_limit = 777', '[user_table]', 'label = "context-singleton"', ''].join('\n'),
+        migrated: ['model_auto_compact_token_limit = 777', start, 'model_context_window = 250000', end, '[user_table]', 'label = "context-singleton"', ''].join('\n'),
+      },
+      {
+        baseline: ['model_context_window = [', '  123456,', ']', '[user_table]', 'label = "auto-singleton"', ''].join('\n'),
+        migrated: ['model_context_window = [', '  123456,', ']', start, 'model_auto_compact_token_limit = 200000', end, '[user_table]', 'label = "auto-singleton"', ''].join('\n'),
+      },
+      {
+        baseline: ['before = "keep"', 'model_context_window = 123456', '# interior comment', '[user_table]', 'label = "bounded"', ''].join('\n'),
+        migrated: ['before = "keep"', start, 'model_context_window = 123456', '# interior comment', end, '[user_table]', 'label = "bounded"', ''].join('\n'),
+      },
+    ];
+
+    for (const fixture of fixtures) {
+      const wd = await mkdtemp(join(tmpdir(), 'omx-uninstall-defaults-'));
+      try {
+        const baselineHome = join(wd, 'baseline-home');
+        const migratedHome = join(wd, 'migrated-home');
+        const baselinePath = join(baselineHome, '.codex', 'config.toml');
+        const migratedPath = join(migratedHome, '.codex', 'config.toml');
+        await mkdir(dirname(baselinePath), { recursive: true });
+        await mkdir(dirname(migratedPath), { recursive: true });
+        await writeFile(baselinePath, fixture.baseline);
+        await writeFile(migratedPath, fixture.migrated);
+
+        const dryRun = runOmx(wd, ['uninstall', '--dry-run'], { HOME: migratedHome });
+        if (shouldSkipForSpawnPermissions(dryRun.error)) return;
+        assert.equal(dryRun.status, 0, dryRun.stderr || dryRun.stdout);
+        assert.equal(await readFile(migratedPath, 'utf-8'), fixture.migrated);
+
+        const baselineRun = runOmx(wd, ['uninstall'], { HOME: baselineHome });
+        assert.equal(baselineRun.status, 0, baselineRun.stderr || baselineRun.stdout);
+        const migratedRun = runOmx(wd, ['uninstall'], { HOME: migratedHome });
+        assert.equal(migratedRun.status, 0, migratedRun.stderr || migratedRun.stdout);
+        const cleaned = await readFile(migratedPath, 'utf-8');
+        assert.equal(cleaned, await readFile(baselinePath, 'utf-8'));
+
+        const repeated = runOmx(wd, ['uninstall'], { HOME: migratedHome });
+        assert.equal(repeated.status, 0, repeated.stderr || repeated.stdout);
+        assert.equal(await readFile(migratedPath, 'utf-8'), cleaned);
+      } finally {
+        await rm(wd, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it('preserves existing uninstall-pipeline semantics after removing a marked pair', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-uninstall-defaults-'));
+    try {
+      const baselineHome = join(wd, 'baseline-home');
+      const migratedHome = join(wd, 'migrated-home');
+      const baselinePath = join(baselineHome, '.codex', 'config.toml');
+      const migratedPath = join(migratedHome, '.codex', 'config.toml');
+      const baseline = buildMixedConfig();
+      await mkdir(dirname(baselinePath), { recursive: true });
+      await mkdir(dirname(migratedPath), { recursive: true });
+      await writeFile(baselinePath, baseline);
+      await writeFile(migratedPath, baseline.replace('model = "o4-mini"', ['model = "o4-mini"', '# oh-my-codex seeded behavioral defaults (uninstall removes unchanged defaults)', 'model_context_window = 250000', 'model_auto_compact_token_limit = 200000', '# End oh-my-codex seeded behavioral defaults'].join('\n')));
+      const baselineRun = runOmx(wd, ['uninstall'], { HOME: baselineHome });
+      if (shouldSkipForSpawnPermissions(baselineRun.error)) return;
+      assert.equal(baselineRun.status, 0, baselineRun.stderr || baselineRun.stdout);
+      const migratedRun = runOmx(wd, ['uninstall'], { HOME: migratedHome });
+      assert.equal(migratedRun.status, 0, migratedRun.stderr || migratedRun.stdout);
+      assert.deepEqual(TOML.parse(await readFile(migratedPath, 'utf-8')), TOML.parse(await readFile(baselinePath, 'utf-8')));
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('stripOmxFeatureFlags', () => {

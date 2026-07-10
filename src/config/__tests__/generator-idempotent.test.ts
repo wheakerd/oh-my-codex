@@ -12,11 +12,13 @@ import {
   analyzeLegacyMultiAgentConfig,
   buildMergedConfig,
   cleanCodexModelAvailabilityNuxIfNeeded,
+  hasExactOmxSeededBehavioralDefaultsPair,
   mergeConfig,
   repairConfigIfNeeded,
   stripManagedCodexHookTrustState,
   stripOmxFeatureFlags,
   upsertManagedCodexHookTrustState,
+  stripOmxSeededBehavioralDefaults,
 } from "../generator.js";
 import { buildManagedCodexHookTrustState } from "../codex-hooks.js";
 import { OMX_FIRST_PARTY_MCP_SERVER_NAMES } from "../omx-first-party-mcp.js";
@@ -849,66 +851,7 @@ describe("config generator idempotency (#384)", () => {
       await rm(wd, { recursive: true, force: true });
     }
   });
-  it("seeds context keys when root model is missing and both context keys are absent", async () => {
-    const wd = await mkdtemp(join(tmpdir(), "omx-idem-"));
-    try {
-      const configPath = join(wd, "config.toml");
-      await writeFile(configPath, 'approval_policy = "on-failure"\n');
-
-      await mergeConfig(configPath, wd);
-      const toml = await readFile(configPath, "utf-8");
-
-      assert.match(toml, /^model = "gpt-5.6-sol"$/m);
-      assert.match(
-        toml,
-        /^# oh-my-codex seeded behavioral defaults \(uninstall removes unchanged defaults\)$/m,
-      );
-      assert.match(toml, /^model_context_window = 250000$/m);
-      assert.match(toml, /^model_auto_compact_token_limit = 200000$/m);
-      assert.match(toml, /^# End oh-my-codex seeded behavioral defaults$/m);
-    } finally {
-      await rm(wd, { recursive: true, force: true });
-    }
-  });
-
-  it("can override gpt-5.6-terra to gpt-5.6-sol and seed 250k context defaults", async () => {
-    const wd = await mkdtemp(join(tmpdir(), "omx-idem-"));
-    try {
-      const toml = buildMergedConfig('model = \"gpt-5.6-terra\"\n', wd, {
-        modelOverride: "gpt-5.6-sol",
-      });
-
-      assert.match(toml, /^model = "gpt-5\.6-sol"$/m);
-      assert.doesNotMatch(toml, /^model = "gpt-5\.6-terra"$/m);
-      assert.match(
-        toml,
-        /^# oh-my-codex seeded behavioral defaults \(uninstall removes unchanged defaults\)$/m,
-      );
-      assert.match(toml, /^model_context_window = 250000$/m);
-      assert.match(toml, /^model_auto_compact_token_limit = 200000$/m);
-      assert.match(toml, /^# End oh-my-codex seeded behavioral defaults$/m);
-    } finally {
-      await rm(wd, { recursive: true, force: true });
-    }
-  });
-  it("does not seed 250k context defaults for non-gpt-5.6-sol models", async () => {
-    const wd = await mkdtemp(join(tmpdir(), "omx-idem-"));
-    try {
-      const configPath = join(wd, "config.toml");
-      await writeFile(configPath, 'model = "o3"\n');
-
-      await mergeConfig(configPath, wd);
-      const toml = await readFile(configPath, "utf-8");
-
-      assert.match(toml, /^model = "o3"$/m, "user model preserved");
-      assert.doesNotMatch(toml, /^model_context_window = 250000$/m);
-      assert.doesNotMatch(toml, /^model_auto_compact_token_limit = 200000$/m);
-    } finally {
-      await rm(wd, { recursive: true, force: true });
-    }
-  });
-
-  it("seeds missing auto compact limit without overwriting an existing context window", async () => {
+  it("does not seed context defaults and preserves explicit context settings", async () => {
     const wd = await mkdtemp(join(tmpdir(), "omx-idem-"));
     try {
       const configPath = join(wd, "config.toml");
@@ -920,93 +863,165 @@ describe("config generator idempotency (#384)", () => {
       await mergeConfig(configPath, wd);
       const toml = await readFile(configPath, "utf-8");
 
-      assert.match(toml, /^model = "gpt-5\.6-sol"$/m);
       assert.match(toml, /^model_context_window = 640000$/m);
-      assert.match(toml, /^model_auto_compact_token_limit = 200000$/m);
+      assert.doesNotMatch(toml, /^model_auto_compact_token_limit\s*=/m);
+      assert.doesNotMatch(toml, /seeded behavioral defaults/);
+
+      await mergeConfig(configPath, wd);
+      const repeated = await readFile(configPath, "utf-8");
+      assert.equal(repeated, toml);
+      assert.doesNotMatch(repeated, /^model_auto_compact_token_limit\s*=/m);
+      assert.doesNotMatch(repeated, /seeded behavioral defaults/);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
   });
 
-  it("seeds missing context window without overwriting an existing auto compact limit", async () => {
-    const wd = await mkdtemp(join(tmpdir(), "omx-idem-"));
-    try {
-      const configPath = join(wd, "config.toml");
-      await writeFile(
-        configPath,
-        ['model = "gpt-5.6-sol"', "model_auto_compact_token_limit = 150000", ""].join("\n"),
-      );
+  it("removes exact legacy source spans with LF, CRLF, and EOF variants", () => {
+    const start = "# oh-my-codex seeded behavioral defaults (uninstall removes unchanged defaults)";
+    const end = "# End oh-my-codex seeded behavioral defaults";
+    const fixtures = [
+      {
+        input: `before\n${start}\nmodel_context_window = 250000\nmodel_auto_compact_token_limit = 200000\n${end}\nafter`,
+        expected: "before\nafter",
+      },
+      {
+        input: `model_auto_compact_token_limit=123\r\n${start}\r\nmodel_context_window = 250000\r\n${end}\r\n[features]\r\nweb_search = true`,
+        expected: "model_auto_compact_token_limit=123\r\n[features]\r\nweb_search = true",
+      },
+      {
+        input: `model_context_window = [\n  1,\n]\n${start}\nmodel_auto_compact_token_limit = 200000\n${end}`,
+        expected: "model_context_window = [\n  1,\n]\n",
+      },
+    ];
 
-      await mergeConfig(configPath, wd);
-      const toml = await readFile(configPath, "utf-8");
-
-      assert.match(toml, /^model = "gpt-5\.6-sol"$/m);
-      assert.match(toml, /^model_context_window = 250000$/m);
-      assert.match(toml, /^model_auto_compact_token_limit = 150000$/m);
-    } finally {
-      await rm(wd, { recursive: true, force: true });
+    for (const { input, expected } of fixtures) {
+      const stripped = stripOmxSeededBehavioralDefaults(input);
+      assert.equal(stripped, expected);
+      assert.equal(stripOmxSeededBehavioralDefaults(stripped), stripped);
     }
   });
 
-  it("does not duplicate independently seeded defaults across reruns", async () => {
-    const wd = await mkdtemp(join(tmpdir(), "omx-idem-"));
-    try {
-      const configPath = join(wd, "config.toml");
-      await writeFile(
-        configPath,
-        ['model = "gpt-5.6-sol"', "model_context_window = 640000", ""].join("\n"),
-      );
+  it("strips bounded customized or siblingless singleton markers and preserves ambiguity", () => {
+    const start = "# oh-my-codex seeded behavioral defaults (uninstall removes unchanged defaults)";
+    const end = "# End oh-my-codex seeded behavioral defaults";
+    const customized = `before\r\n${start}\r\nmodel_context_window = 123\r\n${end}\r\nafter`;
+    assert.equal(
+      stripOmxSeededBehavioralDefaults(customized),
+      "before\r\nmodel_context_window = 123\r\nafter",
+    );
+    const siblingless = `${start}\nmodel_context_window = 250000\n${end}\n[features]\nmodel_auto_compact_token_limit = 999`;
+    assert.equal(
+      stripOmxSeededBehavioralDefaults(siblingless),
+      "model_context_window = 250000\n[features]\nmodel_auto_compact_token_limit = 999",
+    );
+    const ambiguous = `${start}\nmodel_context_window = 250000\n${end}\nmodel_auto_compact_token_limit = 1\nmodel_auto_compact_token_limit = 2`;
+    assert.equal(stripOmxSeededBehavioralDefaults(ambiguous), ambiguous);
+    const sameKeyOutside = `model_context_window = 1\n${start}\nmodel_context_window = 250000\n${end}\nmodel_auto_compact_token_limit = 2`;
+    assert.equal(stripOmxSeededBehavioralDefaults(sameKeyOutside), sameKeyOutside);
+    const malformed = `${start}\nmodel_context_window = 250000`;
+    assert.equal(stripOmxSeededBehavioralDefaults(malformed), malformed);
+  });
 
-      await mergeConfig(configPath, wd);
-      await mergeConfig(configPath, wd);
+  it("preserves every byte inside noncanonical bounded blocks", () => {
+    const start = "# oh-my-codex seeded behavioral defaults (uninstall removes unchanged defaults)";
+    const end = "# End oh-my-codex seeded behavioral defaults";
+    const bodies = [
+      ["model_context_window = 250000", "# user comment", "model_auto_compact_token_limit = 200000"],
+      ["model_context_window = 250000", "", "model_auto_compact_token_limit = 200000"],
+      [" model_context_window = 250000", "model_auto_compact_token_limit = 200000"],
+      ["model_context_window = 250000", "model_auto_compact_token_limit = 200000 "],
+      ["model_auto_compact_token_limit = 200000", "model_context_window = 250000"],
+      ["model_context_window = 250000", "model_context_window = 250000", "model_auto_compact_token_limit = 200000"],
+      ["model_context_window = 250000", "unexpected = true", "model_auto_compact_token_limit = 200000"],
+      ["model_context_window = 250_000", "model_auto_compact_token_limit = 200000"],
+      ["", "model_context_window = 250000", "model_auto_compact_token_limit = 200000", ""],
+    ];
 
-      const toml = await readFile(configPath, "utf-8");
-      assert.equal(count(toml, /^model_context_window = 640000$/gm), 1);
-      assert.equal(count(toml, /^model_auto_compact_token_limit = 200000$/gm), 1);
-      assert.doesNotMatch(toml, /^model_context_window = 250000$/m);
-    } finally {
-      await rm(wd, { recursive: true, force: true });
+    for (const body of bodies) {
+      const input = ["before", start, ...body, end, "after"].join("\n");
+      const expected = ["before", ...body, "after"].join("\n");
+      const stripped = stripOmxSeededBehavioralDefaults(input);
+      assert.equal(stripped, expected);
+      assert.equal(stripOmxSeededBehavioralDefaults(stripped), stripped);
     }
   });
 
-  it("does not duplicate seeded model defaults across reruns", async () => {
-    const wd = await mkdtemp(join(tmpdir(), "omx-idem-"));
-    try {
-      const configPath = join(wd, "config.toml");
-      await mergeConfig(configPath, wd);
-      await mergeConfig(configPath, wd);
+  it("fails closed for duplicate assignments and malformed marker topologies", () => {
+    const start = "# oh-my-codex seeded behavioral defaults (uninstall removes unchanged defaults)";
+    const end = "# End oh-my-codex seeded behavioral defaults";
+    const pair = [start, "model_context_window = 250000", "model_auto_compact_token_limit = 200000", end];
+    const unchanged = [
+      ["model_context_window = 999", ...pair, "after"].join("\n"),
+      [...pair, "model_auto_compact_token_limit = 999", "after"].join("\n"),
+      [start, start, "model_context_window = 250000", "model_auto_compact_token_limit = 200000", end, end].join("\n"),
+      [...pair, ...pair].join("\n"),
+    ];
 
-      const toml = await readFile(configPath, "utf-8");
-      assert.equal(
-        count(toml, /^model = "gpt-5\.6-sol"$/gm),
-        1,
-        "seeded model should appear once",
-      );
-      assert.equal(
-        count(toml, /^model_context_window = 250000$/gm),
-        1,
-        "seeded context window should appear once",
-      );
-      assert.equal(
-        count(toml, /^model_auto_compact_token_limit = 200000$/gm),
-        1,
-        "seeded auto compact limit should appear once",
-      );
-      assert.equal(
-        count(
-          toml,
-          /^# oh-my-codex seeded behavioral defaults \(uninstall removes unchanged defaults\)$/gm,
-        ),
-        1,
-        "seeded defaults start marker should appear once",
-      );
-      assert.equal(
-        count(toml, /^# End oh-my-codex seeded behavioral defaults$/gm),
-        1,
-        "seeded defaults end marker should appear once",
-      );
-    } finally {
-      await rm(wd, { recursive: true, force: true });
+    for (const input of unchanged) {
+      assert.equal(stripOmxSeededBehavioralDefaults(input), input);
+      assert.equal(hasExactOmxSeededBehavioralDefaultsPair(input), false);
+    }
+
+    const invalidSuffix = ["before", ...pair, "invalid = [", ""].join("\n");
+    const expected = "before\ninvalid = [\n";
+    assert.equal(stripOmxSeededBehavioralDefaults(invalidSuffix), expected);
+    assert.equal(stripOmxSeededBehavioralDefaults(expected), expected);
+  });
+
+  it("ignores marker-shaped text inside TOML values and fails closed on stray markers", () => {
+    const start = "# oh-my-codex seeded behavioral defaults (uninstall removes unchanged defaults)";
+    const end = "# End oh-my-codex seeded behavioral defaults";
+    const stringContent = [
+      'developer_instructions = """',
+      start,
+      "model_context_window = 250000",
+      "model_auto_compact_token_limit = 200000",
+      end,
+      '"""',
+      "",
+    ].join("\n");
+    assert.equal(stripOmxSeededBehavioralDefaults(stringContent), stringContent);
+    assert.equal(hasExactOmxSeededBehavioralDefaultsPair(stringContent), false);
+
+    const duplicateAfterTable = [
+      start,
+      "model_context_window = 250000",
+      "model_auto_compact_token_limit = 200000",
+      end,
+      "[tui]",
+      start,
+      "",
+    ].join("\n");
+    assert.equal(stripOmxSeededBehavioralDefaults(duplicateAfterTable), duplicateAfterTable);
+    assert.equal(hasExactOmxSeededBehavioralDefaultsPair(duplicateAfterTable), false);
+  });
+
+  it("migrates before reconstruction without incremental normalization", () => {
+    const start = "# oh-my-codex seeded behavioral defaults (uninstall removes unchanged defaults)";
+    const end = "# End oh-my-codex seeded behavioral defaults";
+    const fixtures = [
+      {
+        baseline: 'approval_policy = "on-failure"\n[features]\nweb_search = true\n',
+        migrated: `approval_policy = "on-failure"\n${start}\nmodel_context_window = 250000\nmodel_auto_compact_token_limit = 200000\n${end}\n[features]\nweb_search = true\n`,
+      },
+      {
+        baseline: "model_auto_compact_token_limit = [\n  999,\n]\n[features]\nweb_search = true\n",
+        migrated: `model_auto_compact_token_limit = [\n  999,\n]\n${start}\nmodel_context_window = 250000\n${end}\n[features]\nweb_search = true\n`,
+      },
+      {
+        baseline: "# explicit sibling\nmodel_context_window   =   640000\n[features]\nweb_search = true\n",
+        migrated: `# explicit sibling\nmodel_context_window   =   640000\n${start}\nmodel_auto_compact_token_limit = 200000\n${end}\n[features]\nweb_search = true\n`,
+      },
+    ];
+
+    for (const fixture of fixtures) {
+      const baseline = buildMergedConfig(fixture.baseline, "/tmp/omx");
+      const migrated = buildMergedConfig(fixture.migrated, "/tmp/omx");
+      assert.equal(migrated, baseline);
+      assert.equal(buildMergedConfig(migrated, "/tmp/omx"), migrated);
+      assert.doesNotMatch(migrated, /seeded behavioral defaults/);
+      assert.doesNotThrow(() => TOML.parse(migrated));
     }
   });
 
