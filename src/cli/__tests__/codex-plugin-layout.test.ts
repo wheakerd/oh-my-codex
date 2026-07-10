@@ -728,6 +728,38 @@ exit 7
       assert.doesNotMatch(result.stdout, /plugin_stop_hook_launcher/);
     });
   });
+  it('forwards the complete valid Stop child decision unchanged', async () => {
+    await withPluginCacheCopy(async (cachePluginRoot, cacheRoot) => {
+      const childOutput = {
+        decision: 'block',
+        reason: 'Autopilot workflow is still active.',
+        stopReason: 'autopilot_ultragoal',
+        systemMessage: 'Autopilot diagnostic: complete the active workflow before stopping.',
+      };
+      const childJson = JSON.stringify(childOutput);
+      const commandPath = join(cacheRoot, process.platform === 'win32' ? 'complete-valid-json.cmd' : 'complete-valid-json.sh');
+      if (process.platform === 'win32') {
+        await writeFile(commandPath, `@echo off\r\necho ${childJson}\r\nexit /b 0\r\n`, 'utf-8');
+      } else {
+        await writeFile(commandPath, `#!/bin/sh
+printf '${childJson}\n'
+`, 'utf-8');
+        await chmod(commandPath, 0o755);
+      }
+
+      const result = runPluginNativeHook(
+        cachePluginRoot,
+        JSON.stringify({ hook_event_name: 'Stop', session_id: 'sess-plugin-complete-valid-json-stop' }),
+        { OMX_NATIVE_HOOK_COMMAND: commandPath },
+      );
+
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+      assert.equal(result.stderr, '');
+      const output = parseSingleJsonStdout(result.stdout);
+      assert.deepEqual(Object.keys(output).sort(), ['decision', 'reason', 'stopReason', 'systemMessage']);
+      assert.deepEqual(output, childOutput);
+    });
+  });
 
   it('preserves valid pretty-printed Stop child JSON', async () => {
     await withPluginCacheCopy(async (cachePluginRoot, cacheRoot) => {

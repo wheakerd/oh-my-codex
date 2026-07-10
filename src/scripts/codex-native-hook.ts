@@ -130,7 +130,6 @@ import {
 } from "../question/deep-interview.js";
 import { readAutopilotDeepInterviewQuestionWaitState } from "../question/autopilot-wait.js";
 import {
-  buildDocumentRefreshAdvisoryOutput,
   evaluateFinalHandoffDocumentRefresh,
   isFinalHandoffDocumentRefreshCandidate,
 } from "../document-refresh/enforcer.js";
@@ -2740,8 +2739,6 @@ async function buildModeBasedStopOutput(
     reason: `OMX ${mode} is still active (phase: ${phase}; ${diagnostic}); continue the task and gather fresh verification evidence before stopping.`,
     stopReason: `${mode}_${phase}`,
     systemMessage,
-    statePath,
-    canonicalDisagreement,
   };
 }
 
@@ -9544,7 +9541,7 @@ async function buildStopHookOutput(
             documentRefreshWarning.triggeringPaths.join("|"),
             canonicalSessionId,
           ),
-          buildDocumentRefreshAdvisoryOutput(documentRefreshWarning, "Stop"),
+          { systemMessage: documentRefreshWarning.message },
           canonicalSessionId,
           { allowRepeatDuringStopHook: false },
         );

@@ -1584,13 +1584,56 @@ PY`,
         cwd,
         session_id: sessionId,
         thread_id: "thread-autopilot-diagnostic",
-      }, { cwd })) as { decision?: string; reason?: string; statePath?: string; canonicalDisagreement?: string };
+      }, { cwd }));
 
       assert.equal(output.decision, "block");
+      assert.equal(output.stopReason, "autopilot_ultragoal");
       assert.match(String(output.reason ?? ""), /state: \.omx\/state\/sessions\/sess-autopilot-diagnostic\/autopilot-state\.json/);
       assert.match(String(output.reason ?? ""), /canonical: canonical_agrees/);
-      assert.equal(output.statePath, ".omx/state/sessions/sess-autopilot-diagnostic/autopilot-state.json");
-      assert.equal(output.canonicalDisagreement, "canonical_agrees");
+      assert.match(String(output.systemMessage ?? ""), /state: \.omx\/state\/sessions\/sess-autopilot-diagnostic\/autopilot-state\.json/);
+      assert.match(String(output.systemMessage ?? ""), /canonical: canonical_agrees/);
+      assert.deepEqual(Object.keys(output).sort(), ["decision", "reason", "stopReason", "systemMessage"]);
+      assert.equal("statePath" in output, false);
+      assert.equal("canonicalDisagreement" in output, false);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps canonical phase disagreements in active Autopilot Stop diagnostics", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-autopilot-canonical-phase-"));
+    try {
+      const sessionId = "sess-autopilot-canonical-phase";
+      await writeJson(join(cwd, ".omx", "state", "session.json"), { session_id: sessionId, cwd });
+      await writeJson(join(cwd, ".omx", "state", "skill-active-state.json"), {
+        version: 1,
+        active: true,
+        skill: "autopilot",
+        phase: "execution",
+        session_id: sessionId,
+        active_skills: [{ skill: "autopilot", phase: "execution", active: true, session_id: sessionId }],
+      });
+      await writeJson(join(cwd, ".omx", "state", "sessions", sessionId, "autopilot-state.json"), {
+        active: true,
+        mode: "autopilot",
+        current_phase: "ultragoal",
+        session_id: sessionId,
+      });
+
+      const output = parseSingleJsonStdout(runNativeHookCli({
+        hook_event_name: "Stop",
+        cwd,
+        session_id: sessionId,
+        thread_id: "thread-autopilot-canonical-phase",
+      }, { cwd }));
+
+      assert.equal(output.decision, "block");
+      assert.equal(output.stopReason, "autopilot_ultragoal");
+      assert.match(String(output.reason ?? ""), /canonical: canonical_phase:execution/);
+      assert.match(String(output.systemMessage ?? ""), /canonical: canonical_phase:execution/);
+      assert.deepEqual(Object.keys(output).sort(), ["decision", "reason", "stopReason", "systemMessage"]);
+      assert.equal("statePath" in output, false);
+      assert.equal("canonicalDisagreement" in output, false);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -18387,21 +18430,20 @@ PY`,
       execFileSync("git", ["commit", "-m", "init"], { cwd, stdio: "ignore" });
       await writeFile(join(cwd, "src", "scripts", "codex-native-hook.ts"), "export const hook = 2;\n", "utf-8");
 
-      const result = await dispatchCodexNativeHook(
-        {
-          hook_event_name: "Stop",
-          cwd,
-          session_id: "sess-stop-doc-refresh",
-          last_assistant_message: "Launch-ready: yes",
-        },
-        { cwd },
-      );
+      const output = parseSingleJsonStdout(runNativeHookCli({
+        hook_event_name: "Stop",
+        cwd,
+        session_id: "sess-stop-doc-refresh",
+        last_assistant_message: "Launch-ready: yes",
+      }, { cwd }));
 
-      assert.equal(result.omxEventName, "stop");
-      assert.equal((result.outputJson as { decision?: string } | null)?.decision, undefined);
-      assert.equal((result.outputJson as { hookSpecificOutput?: { hookEventName?: string } } | null)?.hookSpecificOutput?.hookEventName, "Stop");
-      assert.match(JSON.stringify(result.outputJson), /Document-refresh warning/);
-      assert.match(JSON.stringify(result.outputJson), /staged \+ unstaged changes/);
+      assert.deepEqual(Object.keys(output).sort(), ["systemMessage"]);
+      assert.equal("hookSpecificOutput" in output, false);
+      assert.equal("decision" in output, false);
+      assert.equal("reason" in output, false);
+      assert.equal("stopReason" in output, false);
+      assert.match(String(output.systemMessage ?? ""), /Document-refresh warning/);
+      assert.match(String(output.systemMessage ?? ""), /staged \+ unstaged changes/);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
