@@ -9867,7 +9867,14 @@ export async function dispatchCodexNativeHook(
       });
     }
     // --- Triage classifier (advisory-only, non-keyword prompts) ---
-    if (prompt && skillState === null && !isSubagentPromptSubmit) {
+    if (
+      prompt
+      && skillState === null
+      && !isSubagentPromptSubmit
+      && promptClassification?.reservedInput === null
+      && promptClassification.hasExplicitLikeInvocation === false
+      && promptClassification.matches.length === 0
+    ) {
       try {
         if (readTriageConfig().enabled) {
           const normalized = prompt.trim().toLowerCase();

@@ -589,6 +589,8 @@ describe('keyword input classification direct grammar', () => {
       { text: '~~~\n$ralplan\n~~~', reason: 'fenced-code' },
       { text: '```\n$ralplan', reason: 'fenced-code' },
       { text: '~~~\n$ralplan', reason: 'fenced-code' },
+      { text: '    $ralplan plan this change', reason: 'indented-code' },
+      { text: '\t$ralplan plan this change', reason: 'indented-code' },
     ] as const;
     for (const testCase of structuralCases) {
       const classification = classifyKeywordInput(testCase.text);
@@ -653,6 +655,8 @@ describe('keyword input classification direct grammar', () => {
       '"$autopilot" is an example',
       '`$ralph` is a literal',
       '```\n$team\n```',
+      '    $ralplan plan this change',
+      '\t$ralplan plan this change',
       '> $ultrawork is quoted',
       '\\$autopilot',
       'Prose\n$ralplan implement this',
@@ -699,6 +703,7 @@ describe('keyword input classification direct grammar', () => {
     assert.equal(Object.isFrozen(KEYWORD_INERT_DIAGNOSTIC_ORDER), true);
     assert.deepEqual(KEYWORD_INERT_DIAGNOSTIC_ORDER, [
       'fenced-code',
+      'indented-code',
       'blockquote',
       'inline-code',
       'quote',
@@ -861,6 +866,51 @@ describe('keyword input classification direct grammar', () => {
           assert.equal(existsSync(join(sessionDir, 'ralplan-state.json')), false);
         }
       }
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps terminal marked answers from restarting stale active workflows', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-keyword-terminal-marked-answer-'));
+    const stateDir = join(cwd, '.omx', 'state');
+    const sessionId = 'terminal-marked-answer';
+    const sessionDir = join(stateDir, 'sessions', sessionId);
+    const statePath = join(sessionDir, SKILL_ACTIVE_STATE_FILE);
+    const detailPath = join(sessionDir, 'autopilot-state.json');
+    const rawState = JSON.stringify({
+      version: 1,
+      active: true,
+      skill: 'autopilot',
+      keyword: '$autopilot',
+      phase: 'completing',
+      activated_at: '2026-01-01T00:00:00.000Z',
+      updated_at: '2026-01-01T00:00:00.000Z',
+      session_id: sessionId,
+      active_skills: [{ skill: 'autopilot', phase: 'completing', active: true, session_id: sessionId }],
+    });
+    const rawDetail = JSON.stringify({
+      mode: 'autopilot',
+      active: false,
+      current_phase: 'complete',
+      completed_at: '2026-01-01T00:00:00.000Z',
+      session_id: sessionId,
+    });
+    try {
+      await mkdir(sessionDir, { recursive: true });
+      await writeFile(statePath, rawState);
+      await writeFile(detailPath, rawDetail);
+      const text = '[omx question answered] yes';
+      const result = await recordSkillActivation({
+        stateDir,
+        sourceCwd: cwd,
+        sessionId,
+        text,
+        classification: classifyKeywordInput(text),
+      });
+      assert.equal(result, null);
+      assert.equal(await readFile(statePath, 'utf-8'), rawState);
+      assert.equal(await readFile(detailPath, 'utf-8'), rawDetail);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

@@ -25062,7 +25062,7 @@ describe("codex native hook triage integration", () => {
           source: "codex-app",
           session_id: "triage-marked-answer-inert",
           thread_id: "thread-triage-marked-answer-inert",
-          prompt: "[omx question answered] $autopilot add dark mode toggle to the settings page",
+          prompt: "[omx question answered] explain this function?",
         },
         { cwd },
       );
@@ -25078,6 +25078,22 @@ describe("codex native hook triage integration", () => {
       );
       assert.equal(
         existsSync(join(cwd, ".omx", "state", "sessions", "triage-marked-answer-inert", "prompt-routing-state.json")),
+        false,
+      );
+      const promptsResult = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "UserPromptSubmit",
+          cwd,
+          source: "codex-app",
+          session_id: "triage-prompts-inert",
+          thread_id: "thread-triage-prompts-inert",
+          prompt: "/prompts:architect explain this function?",
+        },
+        { cwd },
+      );
+      assert.equal(promptsResult.skillState, null);
+      assert.equal(
+        existsSync(join(cwd, ".omx", "state", "sessions", "triage-prompts-inert", "prompt-routing-state.json")),
         false,
       );
     } finally {

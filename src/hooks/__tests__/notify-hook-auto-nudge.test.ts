@@ -2398,6 +2398,58 @@ exit 0
         assert.equal(existsSync(terminalRootSkillStatePath), false, 'same-turn replay must not create root canonical state');
       }
 
+      const markedSessionId = 'sess-notify-terminal-marked-answer';
+      const markedThreadId = 'thread-notify-terminal-marked-answer';
+      const markedTurnId = 'turn-notify-terminal-marked-answer';
+      const markedSessionDir = join(stateDir, 'sessions', markedSessionId);
+      const markedSkillPath = join(markedSessionDir, 'skill-active-state.json');
+      const markedDetailPath = join(markedSessionDir, 'autopilot-state.json');
+      await mkdir(markedSessionDir, { recursive: true });
+      await writeJson(markedSkillPath, {
+        version: 1,
+        active: true,
+        skill: 'autopilot',
+        keyword: '$autopilot',
+        phase: 'completing',
+        activated_at: '2026-05-31T20:24:39.005Z',
+        updated_at: '2026-05-31T20:24:39.005Z',
+        session_id: markedSessionId,
+        active_skills: [{ skill: 'autopilot', phase: 'completing', active: true, session_id: markedSessionId }],
+      });
+      await writeJson(markedDetailPath, {
+        mode: 'autopilot',
+        active: false,
+        current_phase: 'complete',
+        completed_at: '2026-05-31T20:24:39.005Z',
+        session_id: markedSessionId,
+      });
+      const markedSkillBefore = await readFile(markedSkillPath);
+      const markedDetailBefore = await readFile(markedDetailPath);
+      let markedWriterCalls = 0;
+      const markedResult = await recordNotifySkillActivation({
+        stateDir,
+        sourceCwd: cwd,
+        text: '[omx question answered] yes',
+        sessionId: markedSessionId,
+        threadId: markedThreadId,
+        turnId: markedTurnId,
+        payload: {
+          type: 'agent-turn-complete',
+          'thread-id': markedThreadId,
+          'turn-id': markedTurnId,
+          'last-assistant-message': 'Autopilot complete.',
+        },
+      }, {
+        recordSkillActivation: async (input) => {
+          markedWriterCalls += 1;
+          return recordSkillActivation(input);
+        },
+      });
+      assert.equal(markedWriterCalls, 1);
+      assert.equal(markedResult, null);
+      assert.deepEqual(await readFile(markedSkillPath), markedSkillBefore);
+      assert.deepEqual(await readFile(markedDetailPath), markedDetailBefore);
+
       for (const orderedCase of [
         { text: '$ralplan $autopilot plan this change', skill: 'ralplan' },
         { text: '$ralph $autopilot ship this change', skill: 'ralph' },
@@ -2415,6 +2467,28 @@ exit 0
           session_id: orderedSessionId,
           thread_id: orderedThreadId,
           turn_id: orderedTurnId,
+        });
+        const orderedAutopilotPath = join(orderedSessionDir, 'autopilot-state.json');
+        const orderedAutopilotBefore = await readFile(orderedAutopilotPath);
+        await writeJson(join(orderedSessionDir, 'skill-active-state.json'), {
+          version: 1,
+          active: true,
+          skill: 'autopilot',
+          keyword: '$autopilot',
+          phase: 'completing',
+          activated_at: '2026-05-31T20:24:39.005Z',
+          updated_at: '2026-05-31T20:24:39.005Z',
+          session_id: orderedSessionId,
+          thread_id: orderedThreadId,
+          turn_id: orderedTurnId,
+          active_skills: [{
+            skill: 'autopilot',
+            phase: 'completing',
+            active: true,
+            session_id: orderedSessionId,
+            thread_id: orderedThreadId,
+            turn_id: orderedTurnId,
+          }],
         });
         let orderedWriterCalls = 0;
         const orderedResult = await recordNotifySkillActivation({
@@ -2441,6 +2515,8 @@ exit 0
         assert.equal(orderedResult?.skill, orderedCase.skill, orderedCase.text);
         assert.equal(orderedResult?.active, true, orderedCase.text);
         assert.equal(existsSync(join(orderedSessionDir, 'skill-active-state.json')), true, orderedCase.text);
+        assert.equal(orderedResult?.active_skills?.some((entry) => entry.skill === 'autopilot'), false, orderedCase.text);
+        assert.deepEqual(await readFile(orderedAutopilotPath), orderedAutopilotBefore, orderedCase.text);
       }
 
       const restartText = '$autopilot new task — café';

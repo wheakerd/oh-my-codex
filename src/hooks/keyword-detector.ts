@@ -62,6 +62,7 @@ export type KeywordReservedInput = 'omx-question-answered' | 'prompts' | null;
 /** Stable diagnostic precedence for explicit candidates. */
 export const KEYWORD_INERT_DIAGNOSTIC_ORDER = Object.freeze([
   'fenced-code',
+  'indented-code',
   'blockquote',
   'inline-code',
   'quote',
@@ -958,6 +959,7 @@ type StructuralInertDiagnostic = Exclude<KeywordInertDiagnostic, 'escaped' | 'no
 
 const STRUCTURAL_INERT_DIAGNOSTICS: readonly StructuralInertDiagnostic[] = [
   'fenced-code',
+  'indented-code',
   'blockquote',
   'inline-code',
   'quote',
@@ -1035,6 +1037,21 @@ function markdownFenceAtStart(line: string): MarkdownFence | null {
 
 function isBlockquoteLine(line: string): boolean {
   return line[advanceSpaces(line, 0, 3)] === '>';
+}
+
+function collectIndentedCodeRanges(text: string): InertRange[] {
+  const ranges: InertRange[] = [];
+  let lineStart = 0;
+  while (lineStart <= text.length) {
+    const end = lineEnd(text, lineStart);
+    const line = text.slice(lineStart, end);
+    if (line.startsWith('\t') || line.startsWith('    ')) {
+      ranges.push({ start: lineStart, end, reason: 'indented-code' });
+    }
+    if (end === text.length) break;
+    lineStart = nextLineStart(text, end);
+  }
+  return ranges;
 }
 
 function collectFencedCodeRanges(text: string): InertRange[] {
@@ -1151,6 +1168,7 @@ function createInertRangeIndex(ranges: InertRange[]): InertRangeIndex {
 
 function collectInertRangeIndexes(text: string): Readonly<Record<StructuralInertDiagnostic, InertRangeIndex>> {
   return {
+    'indented-code': createInertRangeIndex(collectIndentedCodeRanges(text)),
     'fenced-code': createInertRangeIndex(collectFencedCodeRanges(text)),
     blockquote: createInertRangeIndex(collectBlockquoteRanges(text)),
     'inline-code': createInertRangeIndex(collectInlineCodeRanges(text)),
@@ -1755,10 +1773,12 @@ export async function recordSkillActivation(input: RecordSkillActivationInput): 
   const matchedModeTerminal = matchedSeedConfig
     ? isResettableTerminalModeState(matchedModeState as Record<string, unknown> | null, matchedSeedConfig.mode)
     : false;
+  if (classification.reservedInput === 'omx-question-answered' && matchedModeTerminal) return null;
   const preserveActivatedAt = sameSkill && !matchedModeTerminal && (sameKeyword || sameSkillContinuation);
   const previousEntries = listActiveSkills(previous ?? {});
   const previousWorkflowEntries = previousEntries.filter((entry) => (
     isTrackedWorkflowMode(entry.skill)
+    && (input.allowSecondaryAutopilot !== false || entry.skill !== 'autopilot' || entry.skill === match.skill)
     && (
       !input.sessionId
       || !safeString(entry.session_id).trim()
@@ -1797,7 +1817,7 @@ export async function recordSkillActivation(input: RecordSkillActivationInput): 
     ? reusableDeepInterviewConfig ?? resolveDeepInterviewRuntimeConfig({ cwd: sourceCwd, text: input.text })
     : null;
 
-  if (previous?.active === true && previous.skill === 'autopilot' && isAutopilotSupervisedChildSkill(match.skill)) {
+  if (input.allowSecondaryAutopilot !== false && previous?.active === true && previous.skill === 'autopilot' && isAutopilotSupervisedChildSkill(match.skill)) {
     try {
       // Reconcile first so skill-active phase reflects the gate-held phase the
       // autopilot detail state actually advanced to (a blocked advance keeps the
