@@ -690,8 +690,8 @@ function readPromptText(payload: CodexHookPayload): string {
     payload.userPrompt,
   ];
   for (const candidate of candidates) {
-    const value = safeString(candidate).trim();
-    if (value) return value;
+    const value = safeString(candidate);
+    if (value.trim()) return value;
   }
   return "";
 }

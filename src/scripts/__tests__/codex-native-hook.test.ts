@@ -1494,6 +1494,84 @@ PY`,
     }
   });
 
+  it("preserves exact prompt classification through compiled UserPromptSubmit state and Stop", async () => {
+    const cases = [
+      { name: "mixed-indent", prompt: " \t$ralplan plan this", expectedSkill: null },
+      { name: "documentation-suffix", prompt: "$ralplan.md is the workflow documentation file", expectedSkill: null },
+      { name: "path-suffix", prompt: "$autopilot/config", expectedSkill: null },
+      { name: "unicode-suffix", prompt: "$ralplan한글", expectedSkill: null },
+      { name: "direct-prompts-reservation", prompt: "/prompts:architect $ralplan plan this", expectedSkill: null },
+      { name: "list-documentation", prompt: "- $ralplan is the consensus-planning command", expectedSkill: null },
+      { name: "negative-then-positive", prompt: "Do not run $ralplan; instead $autopilot build issue #3140", expectedSkill: "autopilot" },
+      { name: "negative-line-then-positive", prompt: "Without $ralplan.\n$autopilot build it", expectedSkill: "autopilot" },
+      { name: "quoted-then-positive", prompt: "Quoted example: \"$ralplan plan it\".\n$autopilot build it", expectedSkill: "autopilot" },
+      { name: "inert-prompts-then-positive", prompt: "\"Use /prompts:architect\"\n$ralplan plan it", expectedSkill: "ralplan" },
+      {
+        name: "punctuation-multi-workflow",
+        prompt: "$ralplan, $autopilot build issue #3140",
+        expectedSkill: "ralplan",
+        expectedDeferredSkills: ["autopilot"],
+      },
+    ] as const;
+
+    for (const testCase of cases) {
+      const cwd = await mkdtemp(join(tmpdir(), `omx-native-compiled-classification-${testCase.name}-`));
+      const sessionId = `sess-compiled-${testCase.name}`;
+      const env = {
+        ...process.env,
+        OMX_ROOT: "",
+        OMX_STATE_ROOT: "",
+        OMX_SESSION_ID: "",
+        CODEX_SESSION_ID: "",
+      };
+      try {
+        const submit = parseSingleJsonStdout(runNativeHookCli({
+          hook_event_name: "UserPromptSubmit",
+          cwd,
+          source: "codex-app",
+          session_id: sessionId,
+          thread_id: `thread-${testCase.name}`,
+          turn_id: `turn-${testCase.name}`,
+          prompt: testCase.prompt,
+        }, { cwd, env }));
+        assert.equal(submit.continue, undefined, testCase.name);
+
+        const sessionDir = join(cwd, ".omx", "state", "sessions", sessionId);
+        const skillStatePath = join(sessionDir, "skill-active-state.json");
+        if (testCase.expectedSkill === null) {
+          assert.equal(existsSync(skillStatePath), false, testCase.name);
+          assert.equal(existsSync(join(sessionDir, "ralplan-state.json")), false, testCase.name);
+          assert.equal(existsSync(join(sessionDir, "autopilot-state.json")), false, testCase.name);
+        } else {
+          assert.equal(existsSync(skillStatePath), true, testCase.name);
+          const skillState = JSON.parse(await readFile(skillStatePath, "utf-8")) as {
+            active?: boolean;
+            skill?: string;
+            deferred_skills?: string[];
+          };
+          assert.equal(skillState.active, true, testCase.name);
+          assert.equal(skillState.skill, testCase.expectedSkill, testCase.name);
+          if ("expectedDeferredSkills" in testCase) {
+            assert.deepEqual(skillState.deferred_skills, testCase.expectedDeferredSkills, testCase.name);
+          }
+        }
+
+        const stop = parseSingleJsonStdout(runNativeHookCli({
+          hook_event_name: "Stop",
+          cwd,
+          source: "codex-app",
+          session_id: sessionId,
+          thread_id: `thread-${testCase.name}`,
+          turn_id: `stop-${testCase.name}`,
+        }, { cwd, env }));
+        if (testCase.expectedSkill === null) assert.deepEqual(stop, {}, testCase.name);
+        else assert.equal(stop.decision, "block", testCase.name);
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    }
+  });
+
   it("does not crash Stop hook dispatch when the exec follow-up queue is malformed", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-stop-exec-followup-corrupt-"));
     try {

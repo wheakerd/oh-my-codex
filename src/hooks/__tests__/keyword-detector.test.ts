@@ -556,6 +556,73 @@ describe('keyword input classification direct grammar', () => {
     }
   });
 
+  it('scans maximal explicit tokens and rejects documentation, paths, and Unicode suffixes', () => {
+    const cases = [
+      { text: '$ralplan.md is the workflow documentation file', rawKeyword: '$ralplan.md' },
+      { text: '$autopilot/config', rawKeyword: '$autopilot/config' },
+      { text: '$ralplan한글', rawKeyword: '$ralplan한글' },
+      { text: '$oh-my-codex:ralplan.md', rawKeyword: '$oh-my-codex:ralplan.md' },
+      { text: '$ralplan..md', rawKeyword: '$ralplan..md' },
+      { text: '$ralplan‐suffix', rawKeyword: '$ralplan‐suffix' },
+    ] as const;
+
+    for (const testCase of cases) {
+      const classification = classifyKeywordInput(testCase.text);
+      assert.deepEqual(classification.matches, [], testCase.text);
+      assert.equal(classification.candidates.length, 1, testCase.text);
+      assert.equal(classification.candidates[0]?.rawKeyword, testCase.rawKeyword, testCase.text);
+      assert.equal(classification.candidates[0]?.skill, null, testCase.text);
+      assert.deepEqual(classification.candidates[0]?.reasons, [], testCase.text);
+    }
+  });
+
+  it('accepts later directives after inert or negative mentions without reactivating them', () => {
+    const cases = [
+      { text: 'Do not run $ralplan; instead $autopilot build issue #3140', skills: ['autopilot'] },
+      { text: 'Without $ralplan.\n$autopilot build it', skills: ['autopilot'] },
+      { text: 'Quoted example: "$ralplan plan it".\n$autopilot build it', skills: ['autopilot'] },
+      { text: '`$ralplan` is inert.\n$autopilot build it', skills: ['autopilot'] },
+      { text: '"Use /prompts:architect"\n$ralplan plan it', skills: ['ralplan'] },
+    ] as const;
+
+    for (const testCase of cases) {
+      const classification = classifyKeywordInput(testCase.text);
+      assert.deepEqual(classification.matches.map((match) => match.skill), testCase.skills, testCase.text);
+      assert.equal(classification.reservedInput, null, testCase.text);
+    }
+  });
+
+  it('keeps prompt reservations and list documentation structural', () => {
+    const reserved = classifyKeywordInput('/prompts:architect analyze this issue');
+    assert.equal(reserved.reservedInput, 'prompts');
+    assert.deepEqual(reserved.matches, []);
+
+    for (const text of [
+      'Documentation mentions /prompts:architect and asks to analyze this issue',
+      '"/prompts:architect" is quoted documentation',
+      '- $ralplan is the consensus-planning command',
+      '1. $autopilot refers to the autonomous workflow command',
+      '- /prompts:architect is the prompt command documentation',
+    ]) {
+      const classification = classifyKeywordInput(text);
+      assert.equal(classification.reservedInput, null, text);
+      assert.deepEqual(classification.matches, [], text);
+    }
+
+    assert.deepEqual(detectKeywords('- $ralplan plan this').map((match) => match.skill), ['ralplan']);
+  });
+
+  it('defines punctuation-separated workflow directives as one ordered block', () => {
+    assert.deepEqual(
+      detectKeywords('$ralplan, $autopilot; $team build it').map((match) => match.skill),
+      ['ralplan', 'autopilot', 'team'],
+    );
+    assert.deepEqual(
+      detectKeywords('$ralplan plan it, then $team execute').map((match) => match.skill),
+      ['ralplan'],
+    );
+  });
+
   it('fails closed for balanced and unbalanced quote pairs', () => {
     const quotePairs = [
       { name: 'ASCII double', opening: '"', closing: '"' },
@@ -622,15 +689,18 @@ describe('keyword input classification direct grammar', () => {
 
       const blockquoted = classifyKeywordInput(`> $ralplan${lineTerminator}$team`);
       assert.deepEqual(blockquoted.candidates[0]?.reasons, ['blockquote', 'not-leading-region'], label);
-      assert.deepEqual(blockquoted.candidates[1]?.reasons, ['not-leading-region'], label);
+      assert.deepEqual(blockquoted.candidates[1]?.reasons, [], label);
+      assert.deepEqual(blockquoted.matches.map((match) => match.skill), ['team'], label);
 
       const inline = classifyKeywordInput(`\`$ralplan${lineTerminator}$team`);
       assert.deepEqual(inline.candidates[0]?.reasons, ['inline-code', 'not-leading-region'], label);
-      assert.deepEqual(inline.candidates[1]?.reasons, ['not-leading-region'], label);
+      assert.deepEqual(inline.candidates[1]?.reasons, [], label);
+      assert.deepEqual(inline.matches.map((match) => match.skill), ['team'], label);
 
       const quoted = classifyKeywordInput(`"$ralplan${lineTerminator}$team`);
       assert.deepEqual(quoted.candidates[0]?.reasons, ['quote', 'not-leading-region'], label);
-      assert.deepEqual(quoted.candidates[1]?.reasons, ['not-leading-region'], label);
+      assert.deepEqual(quoted.candidates[1]?.reasons, [], label);
+      assert.deepEqual(quoted.matches.map((match) => match.skill), ['team'], label);
     }
   });
 
@@ -681,7 +751,7 @@ describe('keyword input classification direct grammar', () => {
       { text: '$unknown /prompts:architect review', reservedInput: null, skills: [] },
       { text: '/prompts:architect, keep going', reservedInput: 'prompts', skills: [] },
       { text: '/prompts:unknown $ralplan plan this', reservedInput: 'prompts', skills: [] },
-      { text: 'Prose\n/prompts:architect\n$ralplan plan this', reservedInput: 'prompts', skills: [] },
+      { text: 'Prose\n/prompts:architect\n$ralplan plan this', reservedInput: null, skills: [] },
       { text: 'Do not run $autopilot', reservedInput: null, skills: [] },
     ] as const;
 
@@ -726,7 +796,8 @@ describe('keyword input classification direct grammar', () => {
 
     const blockquotedInline = classifyKeywordInput('> `$ralplan`\n$team');
     assert.deepEqual(blockquotedInline.candidates[0]?.reasons, ['blockquote', 'inline-code', 'not-leading-region']);
-    assert.deepEqual(blockquotedInline.candidates[1]?.reasons, ['not-leading-region']);
+    assert.deepEqual(blockquotedInline.candidates[1]?.reasons, []);
+    assert.deepEqual(blockquotedInline.matches.map((match) => match.skill), ['team']);
   });
 
   it('passes a supplied classification through recording, rejects mismatched text, and leaves rejected state bytes untouched', async () => {

@@ -939,8 +939,36 @@ const KEYWORD_INTENT_PATTERNS: Record<IntentKeyword, RegExp[]> = {
   ],
 };
 
-function hasExplicitPromptsInvocation(text: string): boolean {
-  return /(?:^|\s)\/prompts:[\w.-]+(?=[\s.,!?;:]|$)/i.test(text);
+const EXPLICIT_TOKEN_START = /\$(?:oh-my-codex:)?([A-Za-z][A-Za-z0-9_-]*)/giu;
+const TOKEN_CONTINUATION = /[\p{L}\p{N}\p{M}\p{Pc}\p{Pd}]/u;
+const DIRECTIVE_PUNCTUATION = /^[,;:!?]+$/u;
+const CLAUSE_TRANSITION = /^(?:instead|then|now|please)$/i;
+const LIST_DOCUMENTATION_SUFFIX = /^\s+(?:is|means|refers\s+to|denotes)\b.*\b(?:command|workflow|skill|mode|file|documentation)\b/i;
+
+function codePointAt(text: string, index: number): string {
+  const value = text.codePointAt(index);
+  return value === undefined ? '' : String.fromCodePoint(value);
+}
+
+function isExplicitTokenBoundary(text: string, index: number): boolean {
+  if (index >= text.length) return true;
+  const character = codePointAt(text, index);
+  if (/\s/u.test(character)) return true;
+  if (character === '$' || character === '/' || character === '\\') return false;
+  if (TOKEN_CONTINUATION.test(character)) return false;
+  if (character === '.') {
+    const next = codePointAt(text, index + character.length);
+    return !next || /\s/u.test(next) || next === '$';
+  }
+  return true;
+}
+
+function maximalExplicitTokenEnd(text: string, initialEnd: number): number {
+  let cursor = initialEnd;
+  while (cursor < text.length && !isExplicitTokenBoundary(text, cursor)) {
+    cursor += codePointAt(text, cursor).length;
+  }
+  return cursor;
 }
 
 /**
@@ -951,7 +979,7 @@ function hasExplicitPromptsInvocation(text: string): boolean {
  * as the canonical keyword without introducing broad transliteration surprises.
  */
 function normalizeWorkflowKeyboardTypos(text: string): string {
-  return text.replace(/ㅕㅣㅈ/g, 'ulw');
+  return text.replace(/\$ㅕㅣㅈ(?=로)/g, '$ulw ').replace(/ㅕㅣㅈ/g, 'ulw');
 }
 
 
@@ -1198,6 +1226,97 @@ function isInInertRange(index: InertRangeIndex, position: number): boolean {
   return lower > 0 && index.maximumEnds[lower - 1] > position;
 }
 
+function isStructurallyInert(
+  indexes: Readonly<Record<StructuralInertDiagnostic, InertRangeIndex>>,
+  position: number,
+): boolean {
+  return STRUCTURAL_INERT_DIAGNOSTICS.some((reason) => isInInertRange(indexes[reason], position));
+}
+
+function lineStartForPosition(text: string, position: number): number {
+  for (let cursor = position - 1; cursor >= 0; cursor -= 1) {
+    const character = text[cursor];
+    if (character === '\n' || character === '\r' || character === '\u2028' || character === '\u2029') return cursor + 1;
+  }
+  return 0;
+}
+
+function leadingDirectiveCursor(text: string, regionStart: number, allowLineBreaks: boolean): { cursor: number; listItem: boolean } {
+  const whitespacePattern = allowLineBreaks ? /^\s*/u : /^[^\S\r\n\u2028\u2029]*/u;
+  let cursor = regionStart + (whitespacePattern.exec(text.slice(regionStart))?.[0].length ?? 0);
+  const listMarker = /^(?:(?:[-*+][^\S\r\n\u2028\u2029]+)|(?:\d{1,3}[.)][^\S\r\n\u2028\u2029]+))/.exec(text.slice(cursor));
+  if (!listMarker) return { cursor, listItem: false };
+  cursor += listMarker[0].length;
+  return { cursor, listItem: true };
+}
+
+function punctuationSeparatedCandidateStart(text: string, cursor: number): number | null {
+  const horizontal = /^[^\S\r\n\u2028\u2029]*/u.exec(text.slice(cursor))?.[0].length ?? 0;
+  let next = cursor + horizontal;
+  if (text[next] === '$') return next;
+  const punctuation = /^[,;:!?]+/u.exec(text.slice(next));
+  if (!punctuation || !DIRECTIVE_PUNCTUATION.test(punctuation[0])) return null;
+  next += punctuation[0].length;
+  next += /^[^\S\r\n\u2028\u2029]*/u.exec(text.slice(next))?.[0].length ?? 0;
+  return text[next] === '$' ? next : null;
+}
+
+function clauseDirectiveStart(text: string, candidateStart: number): boolean {
+  const lineStart = lineStartForPosition(text, candidateStart);
+  const linePrefix = text.slice(lineStart, candidateStart);
+  if (/^[^\S\r\n\u2028\u2029]*$/u.test(linePrefix)) return true;
+
+  const delimiter = Math.max(
+    text.lastIndexOf(';', candidateStart - 1),
+    text.lastIndexOf('.', candidateStart - 1),
+    text.lastIndexOf('!', candidateStart - 1),
+    text.lastIndexOf('?', candidateStart - 1),
+  );
+  if (delimiter < lineStart) return false;
+  const prefix = text.slice(delimiter + 1, candidateStart).trim();
+  return prefix === '' || CLAUSE_TRANSITION.test(prefix);
+}
+
+function isNegativeExplicitMention(text: string, candidate: ExplicitCandidateScan): boolean {
+  const lineStart = lineStartForPosition(text, candidate.start);
+  const prefix = text.slice(lineStart, candidate.start);
+  return /(?:\b(?:do\s+not|don't|without|never|not)\b|не\s+(?:запускай|используй)|実行しないで|使わないで)/iu.test(prefix);
+}
+
+function isInertOrNegativeMention(text: string, candidate: ExplicitCandidateScan): boolean {
+  return candidate.reasons.size > 0 || isNegativeExplicitMention(text, candidate);
+}
+
+function isListItemDocumentation(text: string, candidateStart: number, blockEnd: number): boolean {
+  const lineStart = lineStartForPosition(text, candidateStart);
+  const leading = leadingDirectiveCursor(text, lineStart, false);
+  if (!leading.listItem || leading.cursor !== candidateStart) return false;
+  const end = lineEnd(text, blockEnd);
+  return LIST_DOCUMENTATION_SUFFIX.test(text.slice(blockEnd, end));
+}
+
+function hasDirectPromptsInvocation(
+  text: string,
+  inertRangeIndexes: Readonly<Record<StructuralInertDiagnostic, InertRangeIndex>>,
+): boolean {
+  const leading = leadingDirectiveCursor(text, 0, true);
+  if (isStructurallyInert(inertRangeIndexes, leading.cursor)) return false;
+  const match = /^\/prompts:[\w.-]+(?=[\s.,!?;:]|$)/iu.exec(text.slice(leading.cursor));
+  if (!match) return false;
+  return !leading.listItem || !isListItemDocumentation(text, leading.cursor, leading.cursor + match[0].length);
+}
+
+function structurallyInertPromptPositions(text: string): number[] {
+  const inertRangeIndexes = collectInertRangeIndexes(text);
+  const positions: number[] = [];
+  const pattern = /\/prompts:[\w.-]+/giu;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(text)) !== null) {
+    if (isStructurallyInert(inertRangeIndexes, match.index)) positions.push(match.index);
+  }
+  return positions;
+}
+
 function hasOddImmediateBackslashes(text: string, index: number): boolean {
   let count = 0;
   for (let cursor = index - 1; cursor >= 0 && text[cursor] === '\\'; cursor -= 1) count += 1;
@@ -1207,19 +1326,22 @@ function hasOddImmediateBackslashes(text: string, index: number): boolean {
 function scanExplicitCandidates(text: string): ExplicitCandidateScan[] {
   const inertRangeIndexes = collectInertRangeIndexes(text);
   const candidates: ExplicitCandidateScan[] = [];
-  const tokenPattern = /\$(?:oh-my-codex:)?([A-Za-z][A-Za-z0-9_-]*)/gi;
+  EXPLICIT_TOKEN_START.lastIndex = 0;
   let match: RegExpExecArray | null;
-  while ((match = tokenPattern.exec(text)) !== null) {
-    const rawKeyword = match[0];
+  while ((match = EXPLICIT_TOKEN_START.exec(text)) !== null) {
     const start = match.index;
-    const end = start + rawKeyword.length;
+    const canonicalEnd = start + match[0].length;
+    const end = maximalExplicitTokenEnd(text, canonicalEnd);
+    const rawKeyword = text.slice(start, end);
+    EXPLICIT_TOKEN_START.lastIndex = end;
     const reasons = new Set<KeywordInertDiagnostic>();
     for (const reason of STRUCTURAL_INERT_DIAGNOSTICS) {
       if (isInInertRange(inertRangeIndexes[reason], start)) reasons.add(reason);
     }
     if (hasOddImmediateBackslashes(text, start)) reasons.add('escaped');
-    const normalizedToken = (match[1] ?? '').toLowerCase();
-    const definition = getExplicitSkillDefinition(normalizedToken);
+    const canonicalToken = end === canonicalEnd ? (match[1] ?? '').toLowerCase() : '';
+    const normalizedToken = canonicalToken || rawKeyword.replace(/^\$(?:oh-my-codex:)?/iu, '').toLowerCase();
+    const definition = canonicalToken ? getExplicitSkillDefinition(canonicalToken) : undefined;
     candidates.push({
       rawKeyword,
       normalizedToken,
@@ -1233,28 +1355,44 @@ function scanExplicitCandidates(text: string): ExplicitCandidateScan[] {
   return candidates;
 }
 
-function directLeadingCandidateIndexes(text: string, candidates: ExplicitCandidateScan[]): Set<number> {
+function directCandidateIndexes(text: string, candidates: ExplicitCandidateScan[]): Set<number> {
   const candidateIndexByStart = new Map<number, number>();
   for (const [index, candidate] of candidates.entries()) candidateIndexByStart.set(candidate.start, index);
 
-  let cursor = /^\s*/.exec(text)?.[0].length ?? 0;
-  const listMarker = /^(?:(?:[-*+][^\S\r\n\u2028\u2029]+)|(?:\d{1,3}[.)][^\S\r\n\u2028\u2029]+))/.exec(text.slice(cursor));
-  if (listMarker) cursor += listMarker[0].length;
-
   const indexes = new Set<number>();
-  let candidateIndex = candidateIndexByStart.get(cursor);
-  if (candidateIndex === undefined || candidates[candidateIndex].reasons.size > 0) return indexes;
+  const addBlock = (start: number): void => {
+    let candidateIndex = candidateIndexByStart.get(start);
+    if (candidateIndex === undefined || candidates[candidateIndex].reasons.size > 0) return;
+    const added: number[] = [];
+    let blockEnd = start;
+    while (candidateIndex !== undefined && candidates[candidateIndex].reasons.size === 0) {
+      indexes.add(candidateIndex);
+      added.push(candidateIndex);
+      blockEnd = candidates[candidateIndex].end;
+      const nextStart = punctuationSeparatedCandidateStart(text, blockEnd);
+      if (nextStart === null) break;
+      candidateIndex = candidateIndexByStart.get(nextStart);
+    }
+    if (isListItemDocumentation(text, start, blockEnd)) {
+      for (const index of added) indexes.delete(index);
+    }
+  };
 
-  indexes.add(candidateIndex);
-  cursor = candidates[candidateIndex].end;
-  while (true) {
-    const whitespace = /^[^\S\r\n\u2028\u2029]+/.exec(text.slice(cursor));
-    if (!whitespace) break;
-    cursor += whitespace[0].length;
-    candidateIndex = candidateIndexByStart.get(cursor);
-    if (candidateIndex === undefined || candidates[candidateIndex].reasons.size > 0) break;
-    indexes.add(candidateIndex);
-    cursor = candidates[candidateIndex].end;
+  addBlock(leadingDirectiveCursor(text, 0, true).cursor);
+  const inertPromptPositions = structurallyInertPromptPositions(text);
+  let inertPromptCursor = 0;
+  let hasEarlierInertOrNegativeCandidate = false;
+  for (const candidate of candidates) {
+    while (inertPromptCursor < inertPromptPositions.length && inertPromptPositions[inertPromptCursor] < candidate.start) {
+      inertPromptCursor += 1;
+    }
+    const hasEarlierInertPrompt = inertPromptCursor > 0;
+    const candidateIndex = candidateIndexByStart.get(candidate.start);
+    if (candidateIndex !== undefined && !indexes.has(candidateIndex) && candidate.reasons.size === 0) {
+      const canOpenLaterDirective = indexes.size > 0 || hasEarlierInertOrNegativeCandidate || hasEarlierInertPrompt;
+      if (canOpenLaterDirective && clauseDirectiveStart(text, candidate.start)) addBlock(candidate.start);
+    }
+    hasEarlierInertOrNegativeCandidate ||= isInertOrNegativeMention(text, candidate);
   }
   return indexes;
 }
@@ -1314,7 +1452,7 @@ function hasIntentContextForKeyword(text: string, keyword: string): boolean {
 export function classifyKeywordInput(text: string): KeywordInputClassification {
   const normalizedText = normalizeWorkflowKeyboardTypos(text);
   const candidates = scanExplicitCandidates(normalizedText);
-  const directIndexes = directLeadingCandidateIndexes(normalizedText, candidates);
+  const directIndexes = directCandidateIndexes(normalizedText, candidates);
   for (const [index, candidate] of candidates.entries()) {
     if (!directIndexes.has(index)) candidate.reasons.add('not-leading-region');
   }
@@ -1337,7 +1475,7 @@ export function classifyKeywordInput(text: string): KeywordInputClassification {
     ? 'omx-question-answered'
     : directIndexes.size > 0
       ? null
-      : hasExplicitPromptsInvocation(normalizedText)
+      : hasDirectPromptsInvocation(normalizedText, collectInertRangeIndexes(normalizedText))
         ? 'prompts'
         : null;
   const hasExplicitLikeInvocation = candidates.length > 0;
