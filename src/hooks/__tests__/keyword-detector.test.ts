@@ -591,6 +591,9 @@ describe('keyword input classification direct grammar', () => {
       { text: '~~~\n$ralplan', reason: 'fenced-code' },
       { text: '    $ralplan plan this change', reason: 'indented-code' },
       { text: '\t$ralplan plan this change', reason: 'indented-code' },
+      { text: ' \t$ralplan plan this change', reason: 'indented-code' },
+      { text: '  \t$ralplan plan this change', reason: 'indented-code' },
+      { text: '   \t$ralplan plan this change', reason: 'indented-code' },
     ] as const;
     for (const testCase of structuralCases) {
       const classification = classifyKeywordInput(testCase.text);

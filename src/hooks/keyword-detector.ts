@@ -1039,13 +1039,24 @@ function isBlockquoteLine(line: string): boolean {
   return line[advanceSpaces(line, 0, 3)] === '>';
 }
 
+function hasMarkdownCodeIndent(line: string): boolean {
+  let columns = 0;
+  for (const character of line) {
+    if (character === ' ') columns += 1;
+    else if (character === '\t') columns += 4 - (columns % 4);
+    else break;
+    if (columns >= 4) return true;
+  }
+  return false;
+}
+
 function collectIndentedCodeRanges(text: string): InertRange[] {
   const ranges: InertRange[] = [];
   let lineStart = 0;
   while (lineStart <= text.length) {
     const end = lineEnd(text, lineStart);
     const line = text.slice(lineStart, end);
-    if (line.startsWith('\t') || line.startsWith('    ')) {
+    if (hasMarkdownCodeIndent(line)) {
       ranges.push({ start: lineStart, end, reason: 'indented-code' });
     }
     if (end === text.length) break;
