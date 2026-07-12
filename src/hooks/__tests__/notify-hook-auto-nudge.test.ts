@@ -6,6 +6,8 @@ import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildTmuxSessionName } from '../../cli/index.js';
+import { classifyKeywordInput, recordSkillActivation } from '../keyword-detector.js';
+import { recordNotifySkillActivation, recordNotifySkillActivationNonFatal } from '../../scripts/notify-hook.js';
 
 const NOTIFY_HOOK_SCRIPT = new URL('../../../dist/scripts/notify-hook.js', import.meta.url);
 const DEEP_INTERVIEW_BLOCKED_APPROVAL_INPUTS = ['yes', 'y', 'proceed', 'continue', 'ok', 'sure', 'go ahead', 'next i should'];
@@ -2331,6 +2333,256 @@ exit 0
     });
   });
 
+  it('shares immutable classification across the terminal replay activation matrix', async () => {
+    await withTempWorkingDir(async (cwd) => {
+      const stateDir = join(cwd, '.omx', 'state');
+      const sessionId = 'sess-notify-replay-matrix';
+      const sessionStateDir = join(stateDir, 'sessions', sessionId);
+      const terminalThreadId = 'thread-autopilot-complete';
+      const terminalTurnId = 'turn-autopilot-complete';
+      const terminalPayload = {
+        type: 'agent-turn-complete',
+        'thread-id': terminalThreadId,
+        'turn-id': terminalTurnId,
+        'last-assistant-message': 'Autopilot complete.',
+      };
+
+      await mkdir(sessionStateDir, { recursive: true });
+      await writeJson(join(sessionStateDir, 'autopilot-state.json'), {
+        mode: 'autopilot',
+        active: false,
+        current_phase: 'complete',
+        completed_at: '2026-05-31T20:24:39.005Z',
+        session_id: sessionId,
+        thread_id: terminalThreadId,
+        turn_id: terminalTurnId,
+      });
+      const terminalAutopilotStatePath = join(sessionStateDir, 'autopilot-state.json');
+      const terminalSessionSkillStatePath = join(sessionStateDir, 'skill-active-state.json');
+      const terminalRootSkillStatePath = join(stateDir, 'skill-active-state.json');
+
+
+      for (const text of ['$autopilot replay task café\r\n', 'autopilot mode — replay café']) {
+        const bytesBefore = Buffer.from(text, 'utf8');
+        const terminalStateBefore = await readFile(terminalAutopilotStatePath);
+
+        let classifierCalls = 0;
+        let classifierText = '';
+        let writerCalls = 0;
+        const result = await recordNotifySkillActivation({
+          stateDir,
+          sourceCwd: cwd,
+          text,
+          sessionId,
+          threadId: terminalThreadId,
+          turnId: terminalTurnId,
+          payload: terminalPayload,
+        }, {
+          classifyKeywordInput: (input) => {
+            classifierCalls += 1;
+            classifierText = input;
+            return classifyKeywordInput(input);
+          },
+          recordSkillActivation: async () => {
+            writerCalls += 1;
+            return null;
+          },
+        });
+
+        assert.equal(classifierCalls, 1, 'notify should classify each latest input once');
+        assert.equal(writerCalls, 0, 'same-turn terminal replay must not reach the writer');
+        assert.equal(result, null);
+        assert.deepEqual(Buffer.from(classifierText, 'utf8'), bytesBefore, 'classifier must receive the original input bytes');
+        assert.deepEqual(await readFile(terminalAutopilotStatePath), terminalStateBefore, 'same-turn replay must preserve terminal detail bytes');
+        assert.equal(existsSync(terminalSessionSkillStatePath), false, 'same-turn replay must not create session canonical state');
+        assert.equal(existsSync(terminalRootSkillStatePath), false, 'same-turn replay must not create root canonical state');
+      }
+
+      for (const orderedCase of [
+        { text: '$ralplan $autopilot plan this change', skill: 'ralplan' },
+        { text: '$ralph $autopilot ship this change', skill: 'ralph' },
+      ]) {
+        const orderedSessionId = `sess-notify-primary-${orderedCase.skill}`;
+        const orderedThreadId = `thread-notify-primary-${orderedCase.skill}`;
+        const orderedTurnId = `turn-notify-primary-${orderedCase.skill}`;
+        const orderedSessionDir = join(stateDir, 'sessions', orderedSessionId);
+        await mkdir(orderedSessionDir, { recursive: true });
+        await writeJson(join(orderedSessionDir, 'autopilot-state.json'), {
+          mode: 'autopilot',
+          active: false,
+          current_phase: 'complete',
+          completed_at: '2026-05-31T20:24:39.005Z',
+          session_id: orderedSessionId,
+          thread_id: orderedThreadId,
+          turn_id: orderedTurnId,
+        });
+        let orderedWriterCalls = 0;
+        const orderedResult = await recordNotifySkillActivation({
+          stateDir,
+          sourceCwd: cwd,
+          text: orderedCase.text,
+          sessionId: orderedSessionId,
+          threadId: orderedThreadId,
+          turnId: orderedTurnId,
+          payload: {
+            type: 'agent-turn-complete',
+            'thread-id': orderedThreadId,
+            'turn-id': orderedTurnId,
+            'last-assistant-message': 'Autopilot complete.',
+          },
+        }, {
+          recordSkillActivation: async (input) => {
+            orderedWriterCalls += 1;
+            return recordSkillActivation(input);
+          },
+        });
+
+        assert.equal(orderedWriterCalls, 1, `leading ${orderedCase.skill} must reach the writer`);
+        assert.equal(orderedResult?.skill, orderedCase.skill, orderedCase.text);
+        assert.equal(orderedResult?.active, true, orderedCase.text);
+        assert.equal(existsSync(join(orderedSessionDir, 'skill-active-state.json')), true, orderedCase.text);
+      }
+
+      const restartText = '$autopilot new task — café';
+      const restartBytes = Buffer.from(restartText, 'utf8');
+      let restartClassification: ReturnType<typeof classifyKeywordInput> | undefined;
+      let writerClassification: ReturnType<typeof classifyKeywordInput> | undefined;
+      let writerResult: Awaited<ReturnType<typeof recordSkillActivation>> | undefined;
+      let writerCalls = 0;
+      let writerText = '';
+      const restartResult = await recordNotifySkillActivation({
+        stateDir,
+        sourceCwd: cwd,
+        text: restartText,
+        sessionId,
+        threadId: terminalThreadId,
+        turnId: 'turn-autopilot-restart',
+        payload: {
+          ...terminalPayload,
+          'turn-id': 'turn-autopilot-restart',
+          'last-assistant-message': 'Autopilot complete text from a prior turn.',
+        },
+      }, {
+        classifyKeywordInput: (input) => {
+          restartClassification = classifyKeywordInput(input);
+          return restartClassification;
+        },
+        recordSkillActivation: async (input) => {
+          writerCalls += 1;
+          writerText = input.text;
+          writerClassification = input.classification;
+          writerResult = await recordSkillActivation(input);
+          return writerResult;
+        },
+      });
+
+      assert.equal(writerCalls, 1, 'a different turn must reach the writer');
+      assert.strictEqual(writerClassification, restartClassification, 'writer must receive the classifier object by identity');
+      assert.strictEqual(restartResult, writerResult, 'notify must return the writer result unchanged');
+      assert.deepEqual(Buffer.from(writerText, 'utf8'), restartBytes, 'writer must receive the original input bytes');
+      const reactivatedAutopilot = JSON.parse(await readFile(join(sessionStateDir, 'autopilot-state.json'), 'utf-8')) as {
+        active: boolean;
+        current_phase: string;
+        turn_id?: string;
+      };
+      assert.equal(reactivatedAutopilot.active, true);
+      assert.equal(reactivatedAutopilot.current_phase, 'deep-interview');
+      assert.equal(reactivatedAutopilot.turn_id, 'turn-autopilot-restart');
+
+      const sessionSkillStatePath = join(sessionStateDir, 'skill-active-state.json');
+      const autopilotStatePath = join(sessionStateDir, 'autopilot-state.json');
+      const rootSkillStatePath = join(stateDir, 'skill-active-state.json');
+      for (const [index, text] of ['do not start $autopilot — café', '"$autopilot" — quoted only'].entries()) {
+        const bytesBefore = Buffer.from(text, 'utf8');
+        const skillStateBefore = await readFile(sessionSkillStatePath);
+        const autopilotStateBefore = await readFile(autopilotStatePath);
+        let rejectedClassification: ReturnType<typeof classifyKeywordInput> | undefined;
+        let rejectedWriterClassification: ReturnType<typeof classifyKeywordInput> | undefined;
+        let rejectedWriterResult: Awaited<ReturnType<typeof recordSkillActivation>> | undefined;
+        let rejectedWriterCalls = 0;
+        let rejectedWriterText = '';
+        const rejectedResult = await recordNotifySkillActivation({
+          stateDir,
+          sourceCwd: cwd,
+          text,
+          sessionId,
+          threadId: terminalThreadId,
+          turnId: `turn-rejected-${index}`,
+          payload: {
+            type: 'agent-turn-complete',
+            'thread-id': terminalThreadId,
+            'turn-id': `turn-rejected-${index}`,
+            'last-assistant-message': 'Normal nonterminal reply.',
+          },
+        }, {
+          classifyKeywordInput: (input) => {
+            rejectedClassification = classifyKeywordInput(input);
+            return rejectedClassification;
+          },
+          recordSkillActivation: async (input) => {
+            rejectedWriterCalls += 1;
+            rejectedWriterText = input.text;
+            rejectedWriterClassification = input.classification;
+            rejectedWriterResult = await recordSkillActivation(input);
+            return rejectedWriterResult;
+          },
+        });
+
+        assert.equal(rejectedWriterCalls, 1, 'rejected nonterminal text must still reach the real writer once');
+        assert.strictEqual(rejectedResult, rejectedWriterResult, 'notify must return the real writer result unchanged');
+        assert.equal(rejectedResult, null);
+        assert.strictEqual(rejectedWriterClassification, rejectedClassification, 'rejected input must retain classification identity');
+        assert.deepEqual(rejectedClassification?.matches, [], 'negated and quoted text must not activate a workflow');
+        assert.deepEqual(Buffer.from(rejectedWriterText, 'utf8'), bytesBefore, 'writer must receive rejected input bytes unchanged');
+        assert.deepEqual(await readFile(sessionSkillStatePath), skillStateBefore, 'rejected input must preserve canonical state bytes');
+        assert.deepEqual(await readFile(autopilotStatePath), autopilotStateBefore, 'rejected input must preserve detail state bytes');
+        assert.equal(existsSync(rootSkillStatePath), false, 'rejected session input must not create root canonical state');
+      }
+    });
+  });
+
+  it('logs injected skill activation writer failures without failing the notify hook boundary', async () => {
+    await withTempWorkingDir(async (cwd) => {
+      const stateDir = join(cwd, '.omx', 'state');
+      const logsDir = join(cwd, '.omx', 'logs');
+      const sessionId = 'sess-notify-writer-failure';
+      const threadId = 'thread-notify-writer-failure';
+      const turnId = 'turn-notify-writer-failure';
+      let writerCalls = 0;
+
+      await mkdir(logsDir, { recursive: true });
+      const result = await recordNotifySkillActivationNonFatal({
+        stateDir,
+        sourceCwd: cwd,
+        text: '$ralplan plan this change',
+        sessionId,
+        threadId,
+        turnId,
+        payload: { type: 'agent-turn-complete' },
+      }, logsDir, {
+        recordSkillActivation: async () => {
+          writerCalls += 1;
+          throw new Error(`injected writer failure ${'x'.repeat(1_000)}`);
+        },
+      });
+
+      assert.equal(result, null);
+      assert.equal(writerCalls, 1);
+      const logPath = join(logsDir, `notify-hook-${new Date().toISOString().split('T')[0]}.jsonl`);
+      const events = (await readFile(logPath, 'utf8')).trim().split('\n')
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      const failure = events.find((event) => event.type === 'notify_skill_activation_failure');
+      assert.ok(failure);
+      assert.equal(failure.level, 'warn');
+      assert.equal(failure.session_id, sessionId);
+      assert.equal(failure.thread_id, threadId);
+      assert.equal(failure.turn_id, turnId);
+      assert.match(String(failure.error), /^injected writer failure /);
+      assert.ok(String(failure.error).length <= 512);
+      assert.equal(Number.isNaN(Date.parse(String(failure.timestamp))), false);
+    });
+  });
+
   it('writes skill-active-state.json when keyword activation is detected', async () => {
     await withTempWorkingDir(async (cwd) => {
       const omxDir = join(cwd, '.omx');
@@ -2354,7 +2606,7 @@ exit 0
       await chmod(join(fakeBinDir, 'tmux'), 0o755);
 
       const result = runNotifyHook(cwd, fakeBinDir, codexHome, {
-        'input-messages': ['please use $autopilot for this task'],
+        'input-messages': ['$autopilot handle this task'],
         'last-assistant-message': 'Here is the plan I will follow.',
       });
       assert.equal(result.status, 0, `hook failed: ${result.stderr || result.stdout}`);

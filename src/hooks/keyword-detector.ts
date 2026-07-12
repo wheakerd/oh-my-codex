@@ -18,7 +18,8 @@ import { classifyTaskSize, isHeavyMode, type TaskSizeResult, type TaskSizeThresh
 import { isApprovedExecutionFollowupShortcut, type FollowupMode } from '../team/followup-planner.js';
 import { isPlanningComplete, readPlanningArtifacts } from '../planning/artifacts.js';
 import { hasDurableRalplanConsensusEvidenceForCwd } from '../ralplan/consensus-gate.js';
-import { KEYWORD_TRIGGER_DEFINITIONS, compareKeywordMatches } from './keyword-registry.js';
+import { getExplicitSkillDefinition, KEYWORD_TRIGGER_DEFINITIONS, compareKeywordMatches } from './keyword-registry.js';
+
 import { readTeamModeConfig } from '../config/team-mode.js';
 import {
   SKILL_ACTIVE_STATE_FILE,
@@ -55,6 +56,41 @@ export interface KeywordMatch {
   skill: string;
   priority: number;
 }
+
+export type KeywordReservedInput = 'omx-question-answered' | 'prompts' | null;
+
+/** Stable diagnostic precedence for explicit candidates. */
+export const KEYWORD_INERT_DIAGNOSTIC_ORDER = Object.freeze([
+  'fenced-code',
+  'blockquote',
+  'inline-code',
+  'quote',
+  'escaped',
+  'not-leading-region',
+] as const);
+
+export type KeywordInertDiagnostic = (typeof KEYWORD_INERT_DIAGNOSTIC_ORDER)[number];
+
+
+export interface ExplicitSkillCandidate {
+  readonly rawKeyword: string;
+  readonly normalizedToken: string;
+  readonly skill: string | null;
+  readonly priority: number | null;
+  readonly reasons: readonly KeywordInertDiagnostic[];
+}
+
+export interface KeywordInputClassification {
+  readonly originalText: string;
+  readonly normalizedText: string;
+  readonly candidates: readonly ExplicitSkillCandidate[];
+  readonly explicitMatches: readonly KeywordMatch[];
+  readonly hasExplicitLikeInvocation: boolean;
+  readonly reservedInput: KeywordReservedInput;
+  readonly implicitMatches: readonly KeywordMatch[];
+  readonly matches: readonly KeywordMatch[];
+}
+
 
 const ACTIVE_SKILL_CONTINUATION_PATTERNS: RegExp[] = [
   /^[\\/]?\s*keep going(?:\s+now)?[.!]?\s*$/i,
@@ -111,6 +147,9 @@ export interface RecordSkillActivationInput {
   threadId?: string;
   turnId?: string;
   nowIso?: string;
+  classification?: KeywordInputClassification;
+  allowSecondaryTeam?: boolean;
+  allowSecondaryAutopilot?: boolean;
 }
 
 export interface DeepInterviewModeStatePersistenceInput {
@@ -914,53 +953,315 @@ function normalizeWorkflowKeyboardTypos(text: string): string {
   return text.replace(/ㅕㅣㅈ/g, 'ulw');
 }
 
-interface ExplicitSkillParseResult {
-  matches: KeywordMatch[];
-  sawExplicitLikeInvocation: boolean;
+
+type StructuralInertDiagnostic = Exclude<KeywordInertDiagnostic, 'escaped' | 'not-leading-region'>;
+
+const STRUCTURAL_INERT_DIAGNOSTICS: readonly StructuralInertDiagnostic[] = [
+  'fenced-code',
+  'blockquote',
+  'inline-code',
+  'quote',
+];
+
+const QUOTE_CLOSERS: Readonly<Record<string, string>> = Object.freeze({
+  '“': '”',
+  '‘': '’',
+  '«': '»',
+  '‹': '›',
+  '「': '」',
+  '『': '』',
+});
+const LETTER_OR_NUMBER = /[\p{L}\p{N}]/u;
+
+interface ExplicitCandidateScan {
+  rawKeyword: string;
+  normalizedToken: string;
+  skill: string | null;
+  priority: number | null;
+  start: number;
+  end: number;
+  reasons: Set<KeywordInertDiagnostic>;
 }
 
-function normalizeExplicitSkillToken(token: string): string {
-  if (token === 'ulw') return 'ultrawork';
-  if (token === 'frontend-ui-ux') return 'design';
-  return token;
+interface InertRange {
+  start: number;
+  end: number;
+  reason: StructuralInertDiagnostic;
 }
 
-function parseExplicitSkillInvocations(text: string): ExplicitSkillParseResult {
-  const results: KeywordMatch[] = [];
-  const regex = /(?:^|[^\w])\$(?:(?:oh-my-codex:)?([a-z][a-z0-9-]*))\b/gi;
-  let match: RegExpExecArray | null;
-  let captureStarted = false;
-  let lastMatchEnd = -1;
+interface InertRangeIndex {
+  starts: number[];
+  maximumEnds: number[];
+}
 
-  while ((match = regex.exec(text)) !== null) {
-    const token = (match[1] ?? '').toLowerCase();
-    if (!token) continue;
-    const rawKeyword = match[0].slice(match[0].lastIndexOf('$')).toLowerCase();
-    const normalizedSkill = normalizeExplicitSkillToken(token);
-    const registryEntry = KEYWORD_TRIGGER_DEFINITIONS.find((entry) => entry.skill.toLowerCase() === normalizedSkill);
-    const matchStart = match.index + match[0].lastIndexOf('$');
-    if (captureStarted) {
-      const between = text.slice(lastMatchEnd, matchStart);
-      if (!/^\s*$/.test(between)) break;
+interface MarkdownFence {
+  marker: '`' | '~';
+  length: number;
+}
+
+function lineEnd(text: string, start: number): number {
+  for (let cursor = start; cursor < text.length; cursor += 1) {
+    const character = text[cursor];
+    if (character === '\r' || character === '\n' || character === '\u2028' || character === '\u2029') return cursor;
+  }
+  return text.length;
+}
+
+function nextLineStart(text: string, end: number): number {
+  return text[end] === '\r' && text[end + 1] === '\n' ? end + 2 : end + 1;
+}
+
+function advanceSpaces(text: string, start: number, maximum: number): number {
+  let cursor = start;
+  while (cursor - start < maximum && text[cursor] === ' ') cursor += 1;
+  return cursor;
+}
+
+function markdownFenceAtStart(line: string): MarkdownFence | null {
+  let cursor = advanceSpaces(line, 0, 3);
+  if (line[cursor] === '>') {
+    cursor += 1;
+    if (line[cursor] === ' ') cursor += 1;
+  }
+  cursor = advanceSpaces(line, cursor, 3);
+
+  const marker = line[cursor];
+  if (marker !== '`' && marker !== '~') return null;
+  const start = cursor;
+  while (line[cursor] === marker) cursor += 1;
+  const length = cursor - start;
+  return length >= 3 ? { marker, length } : null;
+}
+
+function isBlockquoteLine(line: string): boolean {
+  return line[advanceSpaces(line, 0, 3)] === '>';
+}
+
+function collectFencedCodeRanges(text: string): InertRange[] {
+  const ranges: InertRange[] = [];
+  let lineStart = 0;
+  let fence: MarkdownFence | null = null;
+
+  while (lineStart <= text.length) {
+    const end = lineEnd(text, lineStart);
+    const line = text.slice(lineStart, end);
+    if (fence) {
+      ranges.push({ start: lineStart, end, reason: 'fenced-code' });
+      const closer = markdownFenceAtStart(line);
+      if (closer?.marker === fence.marker && closer.length >= fence.length) fence = null;
+    } else {
+      const opener = markdownFenceAtStart(line);
+      if (opener) {
+        fence = opener;
+        ranges.push({ start: lineStart, end, reason: 'fenced-code' });
+      }
     }
-
-    captureStarted = true;
-    lastMatchEnd = matchStart + rawKeyword.length;
-    if (!registryEntry) continue;
-
-    if (results.some((item) => item.skill === normalizedSkill)) continue;
-
-    results.push({
-      keyword: rawKeyword,
-      skill: normalizedSkill,
-      priority: registryEntry.priority,
-    });
+    if (end === text.length) break;
+    lineStart = nextLineStart(text, end);
   }
 
+  return ranges;
+}
+
+function collectInlineCodeRanges(text: string): InertRange[] {
+  const ranges: InertRange[] = [];
+  let lineStart = 0;
+  while (lineStart <= text.length) {
+    const end = lineEnd(text, lineStart);
+    let cursor = lineStart;
+    let opener: { start: number; length: number } | null = null;
+    while (cursor < end) {
+      if (text[cursor] !== '`') {
+        cursor += 1;
+        continue;
+      }
+      let runEnd = cursor + 1;
+      while (runEnd < end && text[runEnd] === '`') runEnd += 1;
+      const length = runEnd - cursor;
+      if (!opener) opener = { start: cursor, length };
+      else if (opener.length === length) {
+        ranges.push({ start: opener.start, end: runEnd, reason: 'inline-code' });
+        opener = null;
+      }
+      cursor = runEnd;
+    }
+    if (opener) ranges.push({ start: opener.start, end, reason: 'inline-code' });
+    if (end === text.length) break;
+    lineStart = nextLineStart(text, end);
+  }
+  return ranges;
+}
+
+function collectQuoteRanges(text: string): InertRange[] {
+  const ranges: InertRange[] = [];
+  let lineStart = 0;
+  while (lineStart <= text.length) {
+    const end = lineEnd(text, lineStart);
+    let opener: { start: number; closing: string } | null = null;
+    for (let cursor = lineStart; cursor < end; cursor += 1) {
+      const character = text[cursor];
+      const previous = text[cursor - 1] ?? '';
+      const next = text[cursor + 1] ?? '';
+      if ((character === "'" || character === '’') && LETTER_OR_NUMBER.test(previous) && LETTER_OR_NUMBER.test(next)) continue;
+
+      if (opener && character === opener.closing) {
+        ranges.push({ start: opener.start, end: cursor + 1, reason: 'quote' });
+        opener = null;
+        continue;
+      }
+      if (!opener && (character === '"' || character === "'" || character === '＂')) {
+        opener = { start: cursor, closing: character };
+        continue;
+      }
+      if (!opener && QUOTE_CLOSERS[character]) opener = { start: cursor, closing: QUOTE_CLOSERS[character] };
+    }
+    if (opener) ranges.push({ start: opener.start, end, reason: 'quote' });
+    if (end === text.length) break;
+    lineStart = nextLineStart(text, end);
+  }
+  return ranges;
+}
+
+function collectBlockquoteRanges(text: string): InertRange[] {
+  const ranges: InertRange[] = [];
+  let lineStart = 0;
+  while (lineStart <= text.length) {
+    const end = lineEnd(text, lineStart);
+    if (isBlockquoteLine(text.slice(lineStart, end))) {
+      ranges.push({ start: lineStart, end, reason: 'blockquote' });
+    }
+    if (end === text.length) break;
+    lineStart = nextLineStart(text, end);
+  }
+  return ranges;
+}
+
+function createInertRangeIndex(ranges: InertRange[]): InertRangeIndex {
+  ranges.sort((a, b) => a.start - b.start || a.end - b.end);
+  const starts = new Array<number>(ranges.length);
+  const maximumEnds = new Array<number>(ranges.length);
+  let maximumEnd = -1;
+  for (const [index, range] of ranges.entries()) {
+    starts[index] = range.start;
+    maximumEnd = Math.max(maximumEnd, range.end);
+    maximumEnds[index] = maximumEnd;
+  }
+  return { starts, maximumEnds };
+}
+
+function collectInertRangeIndexes(text: string): Readonly<Record<StructuralInertDiagnostic, InertRangeIndex>> {
   return {
-    matches: results,
-    sawExplicitLikeInvocation: captureStarted,
+    'fenced-code': createInertRangeIndex(collectFencedCodeRanges(text)),
+    blockquote: createInertRangeIndex(collectBlockquoteRanges(text)),
+    'inline-code': createInertRangeIndex(collectInlineCodeRanges(text)),
+    quote: createInertRangeIndex(collectQuoteRanges(text)),
   };
+}
+
+function isInInertRange(index: InertRangeIndex, position: number): boolean {
+  let lower = 0;
+  let upper = index.starts.length;
+  while (lower < upper) {
+    const middle = lower + Math.floor((upper - lower) / 2);
+    if (index.starts[middle] <= position) lower = middle + 1;
+    else upper = middle;
+  }
+  return lower > 0 && index.maximumEnds[lower - 1] > position;
+}
+
+function hasOddImmediateBackslashes(text: string, index: number): boolean {
+  let count = 0;
+  for (let cursor = index - 1; cursor >= 0 && text[cursor] === '\\'; cursor -= 1) count += 1;
+  return count % 2 === 1;
+}
+
+function scanExplicitCandidates(text: string): ExplicitCandidateScan[] {
+  const inertRangeIndexes = collectInertRangeIndexes(text);
+  const candidates: ExplicitCandidateScan[] = [];
+  const tokenPattern = /\$(?:oh-my-codex:)?([A-Za-z][A-Za-z0-9_-]*)/gi;
+  let match: RegExpExecArray | null;
+  while ((match = tokenPattern.exec(text)) !== null) {
+    const rawKeyword = match[0];
+    const start = match.index;
+    const end = start + rawKeyword.length;
+    const reasons = new Set<KeywordInertDiagnostic>();
+    for (const reason of STRUCTURAL_INERT_DIAGNOSTICS) {
+      if (isInInertRange(inertRangeIndexes[reason], start)) reasons.add(reason);
+    }
+    if (hasOddImmediateBackslashes(text, start)) reasons.add('escaped');
+    const normalizedToken = (match[1] ?? '').toLowerCase();
+    const definition = getExplicitSkillDefinition(normalizedToken);
+    candidates.push({
+      rawKeyword,
+      normalizedToken,
+      skill: definition?.skill ?? null,
+      priority: definition?.priority ?? null,
+      start,
+      end,
+      reasons,
+    });
+  }
+  return candidates;
+}
+
+function directLeadingCandidateIndexes(text: string, candidates: ExplicitCandidateScan[]): Set<number> {
+  const candidateIndexByStart = new Map<number, number>();
+  for (const [index, candidate] of candidates.entries()) candidateIndexByStart.set(candidate.start, index);
+
+  let cursor = /^\s*/.exec(text)?.[0].length ?? 0;
+  const listMarker = /^(?:(?:[-*+][^\S\r\n\u2028\u2029]+)|(?:\d{1,3}[.)][^\S\r\n\u2028\u2029]+))/.exec(text.slice(cursor));
+  if (listMarker) cursor += listMarker[0].length;
+
+  const indexes = new Set<number>();
+  let candidateIndex = candidateIndexByStart.get(cursor);
+  if (candidateIndex === undefined || candidates[candidateIndex].reasons.size > 0) return indexes;
+
+  indexes.add(candidateIndex);
+  cursor = candidates[candidateIndex].end;
+  while (true) {
+    const whitespace = /^[^\S\r\n\u2028\u2029]+/.exec(text.slice(cursor));
+    if (!whitespace) break;
+    cursor += whitespace[0].length;
+    candidateIndex = candidateIndexByStart.get(cursor);
+    if (candidateIndex === undefined || candidates[candidateIndex].reasons.size > 0) break;
+    indexes.add(candidateIndex);
+    cursor = candidates[candidateIndex].end;
+  }
+  return indexes;
+}
+
+function freezeMatches(matches: KeywordMatch[]): readonly KeywordMatch[] {
+  return Object.freeze(matches.map((match) => Object.freeze({ ...match })));
+}
+
+function freezeCandidates(candidates: ExplicitCandidateScan[]): readonly ExplicitSkillCandidate[] {
+  return Object.freeze(candidates.map((candidate) => Object.freeze({
+    rawKeyword: candidate.rawKeyword,
+    normalizedToken: candidate.normalizedToken,
+    skill: candidate.skill,
+    priority: candidate.priority,
+    reasons: Object.freeze(KEYWORD_INERT_DIAGNOSTIC_ORDER.filter((reason) => candidate.reasons.has(reason))),
+  })));
+}
+
+function detectImplicitKeywords(normalizedText: string): KeywordMatch[] {
+  const implicit: KeywordMatch[] = [];
+  for (const { pattern, skill, priority } of KEYWORD_MAP) {
+    const match = normalizedText.match(pattern);
+    if (!match || !hasIntentContextForKeyword(normalizedText, match[0].toLowerCase())) continue;
+    implicit.push({ keyword: match[0], skill, priority });
+  }
+
+  const seenSkills = new Set<string>();
+  return implicit.sort(compareKeywordMatches).filter((match) => {
+    if (seenSkills.has(match.skill)) return false;
+    seenSkills.add(match.skill);
+    return true;
+  });
+}
+
+function hasOmxQuestionAnsweredPrefix(text: string): boolean {
+  return /^\s*\[omx question answered\]/i.test(text);
 }
 
 function hasIntentContextForKeyword(text: string, keyword: string): boolean {
@@ -978,63 +1279,78 @@ function hasIntentContextForKeyword(text: string, keyword: string): boolean {
 }
 
 /**
- * Detect keywords in user input text
- * Returns explicit `$skill` matches first (left-to-right),
- * then appends implicit keyword matches sorted by priority.
+ * Classify one prompt with the direct-only explicit grammar and immutable
+ * diagnostics. Consumers must share this result rather than re-detecting.
  */
-export function detectKeywords(text: string): KeywordMatch[] {
+export function classifyKeywordInput(text: string): KeywordInputClassification {
   const normalizedText = normalizeWorkflowKeyboardTypos(text);
-  const explicitParse = parseExplicitSkillInvocations(normalizedText);
-  const explicit = explicitParse.matches;
-  if (hasExplicitPromptsInvocation(normalizedText) && explicit.length === 0) {
-    return [];
-  }
-  if (explicit.length === 0 && explicitParse.sawExplicitLikeInvocation) {
-    return [];
-  }
-  if (explicit.length > 0) {
-    return explicit;
+  const candidates = scanExplicitCandidates(normalizedText);
+  const directIndexes = directLeadingCandidateIndexes(normalizedText, candidates);
+  for (const [index, candidate] of candidates.entries()) {
+    if (!directIndexes.has(index)) candidate.reasons.add('not-leading-region');
   }
 
-  const implicit: KeywordMatch[] = [];
-
-  for (const { pattern, skill, priority } of KEYWORD_MAP) {
-    const match = normalizedText.match(pattern);
-    if (match) {
-      if (!hasIntentContextForKeyword(normalizedText, match[0].toLowerCase())) continue;
-      implicit.push({
-        keyword: match[0],
-        skill,
-        priority,
-      });
-    }
+  const explicitMatches: KeywordMatch[] = [];
+  const explicitSkills = new Set<string>();
+  for (const index of directIndexes) {
+    const candidate = candidates[index];
+    if (!candidate.skill || candidate.priority === null || explicitSkills.has(candidate.skill)) continue;
+    explicitSkills.add(candidate.skill);
+    explicitMatches.push({
+      keyword: candidate.rawKeyword,
+      skill: candidate.skill,
+      priority: candidate.priority,
+    });
   }
 
-  const merged: KeywordMatch[] = [...explicit];
-  const sortedImplicit = implicit.sort(compareKeywordMatches);
-  for (const item of sortedImplicit) {
-    if (merged.some((existing) => existing.skill === item.skill)) continue;
-    merged.push(item);
-  }
+  const markedQuestionAnswer = hasOmxQuestionAnsweredPrefix(normalizedText);
+  const reservedInput: KeywordReservedInput = markedQuestionAnswer
+    ? 'omx-question-answered'
+    : directIndexes.size > 0
+      ? null
+      : hasExplicitPromptsInvocation(normalizedText)
+        ? 'prompts'
+        : null;
+  const hasExplicitLikeInvocation = candidates.length > 0;
+  const finalMatches = reservedInput
+    ? []
+    : explicitMatches.length > 0
+      ? explicitMatches
+      : hasExplicitLikeInvocation
+        ? []
+        : detectImplicitKeywords(normalizedText);
+  const implicitMatches = reservedInput || hasExplicitLikeInvocation
+    ? []
+    : finalMatches;
 
-  return merged;
+  return Object.freeze({
+    originalText: text,
+    normalizedText,
+    candidates: freezeCandidates(candidates),
+    explicitMatches: freezeMatches(explicitMatches),
+    hasExplicitLikeInvocation,
+    reservedInput,
+    implicitMatches: freezeMatches(implicitMatches),
+    matches: freezeMatches(finalMatches),
+  });
 }
 
-/**
- * Get the highest-priority keyword match
- */
+/** Detect workflow matches using a fresh immutable input classification. */
+export function detectKeywords(text: string): KeywordMatch[] {
+  return [...classifyKeywordInput(text).matches];
+}
+
+/** Get the first match in classification order. */
 export function detectPrimaryKeyword(text: string): KeywordMatch | null {
-  const matches = detectKeywords(text);
-  return matches.length > 0 ? matches[0] : null;
+  return classifyKeywordInput(text).matches[0] ?? null;
 }
 
-function filterMatchesForTeamMode(matches: KeywordMatch[], teamEnabled: boolean): KeywordMatch[] {
-  return teamEnabled ? matches : matches.filter((entry) => entry.skill !== 'team');
+function filterMatchesForTeamMode(matches: readonly KeywordMatch[], teamEnabled: boolean): KeywordMatch[] {
+  return teamEnabled ? [...matches] : matches.filter((entry) => entry.skill !== 'team');
 }
 
-function detectPrimaryKeywordForTeamMode(text: string, teamEnabled: boolean): KeywordMatch | null {
-  const matches = filterMatchesForTeamMode(detectKeywords(text), teamEnabled);
-  return matches[0] ?? null;
+function detectPrimaryKeywordForTeamMode(classification: KeywordInputClassification, teamEnabled: boolean): KeywordMatch | null {
+  return filterMatchesForTeamMode(classification.matches, teamEnabled)[0] ?? null;
 }
 
 function isActiveSkillContinuationPrompt(text: string): boolean {
@@ -1052,13 +1368,10 @@ function isNamedActiveSkillContinuationPrompt(text: string, skill: string): bool
   ).test(text.trim());
 }
 
-function isOmxQuestionAnsweredPrompt(text: string): boolean {
-  return /^\s*\[omx question answered\]/i.test(text.trim());
-}
-
 function shouldReusePreviousSkillForContinuation(
   text: string,
   previous: SkillActiveState | null,
+  classification: KeywordInputClassification,
 ): boolean {
   const previousSkill = safeString(previous?.skill).trim();
   if (!previousSkill || previous?.active !== true || !isTrackedWorkflowMode(previousSkill)) {
@@ -1067,8 +1380,12 @@ function shouldReusePreviousSkillForContinuation(
 
   return isActiveSkillContinuationPrompt(text)
     || isNamedActiveSkillContinuationPrompt(text, previousSkill)
-    || ((previousSkill === 'autopilot' || previousSkill === 'deep-interview') && isOmxQuestionAnsweredPrompt(text));
+    || (
+      classification.reservedInput === 'omx-question-answered'
+      && (previousSkill === 'autopilot' || previousSkill === 'deep-interview')
+    );
 }
+
 
 function isAutopilotSupervisedChildSkill(skill: string): boolean {
   return skill === 'code-review'
@@ -1294,25 +1611,31 @@ function resolveContinuationKeywordMatch(
   text: string,
   previous: SkillActiveState | null,
   fallbackMatch: KeywordMatch | null,
+  classification: KeywordInputClassification,
 ): KeywordMatch | null {
   const previousSkill = safeString(previous?.skill).trim();
   if (!previousSkill || previous?.active !== true || !isTrackedWorkflowMode(previousSkill)) {
     return fallbackMatch;
   }
 
-  const markedQuestionAnswerContinuation = (previousSkill === 'autopilot' || previousSkill === 'deep-interview')
-    && isOmxQuestionAnsweredPrompt(text);
-
-  if (!markedQuestionAnswerContinuation && parseExplicitSkillInvocations(normalizeWorkflowKeyboardTypos(text)).sawExplicitLikeInvocation) {
-    return fallbackMatch;
+  const markedQuestionAnswerContinuation = classification.reservedInput === 'omx-question-answered'
+    && (previousSkill === 'autopilot' || previousSkill === 'deep-interview');
+  if (classification.reservedInput || (!markedQuestionAnswerContinuation && classification.hasExplicitLikeInvocation)) {
+    return markedQuestionAnswerContinuation
+      ? {
+          keyword: safeString(previous.keyword).trim() || `$${previousSkill}`,
+          skill: previousSkill,
+          priority: 0,
+        }
+      : fallbackMatch;
   }
 
-  if (!markedQuestionAnswerContinuation && !shouldReusePreviousSkillForContinuation(text, previous) && !safeString(fallbackMatch?.keyword).trim().startsWith('$')) {
+  if (!shouldReusePreviousSkillForContinuation(text, previous, classification) && !safeString(fallbackMatch?.keyword).trim().startsWith('$')) {
     return fallbackMatch;
   }
 
   return {
-    keyword: safeString(previous?.keyword).trim() || `$${previousSkill}`,
+    keyword: safeString(previous.keyword).trim() || `$${previousSkill}`,
     skill: previousSkill,
     priority: fallbackMatch?.priority ?? 0,
   };
@@ -1355,6 +1678,11 @@ function selectRootSkillStateCopy(
 }
 
 export async function recordSkillActivation(input: RecordSkillActivationInput): Promise<SkillActiveState | null> {
+  const classification = input.classification ?? classifyKeywordInput(input.text);
+  if (classification.originalText !== input.text) {
+    throw new Error('Keyword input classification text does not match activation text');
+  }
+
   const sourceCwd = input.sourceCwd ?? dirname(dirname(input.stateDir));
   const rootStatePath = join(input.stateDir, SKILL_ACTIVE_STATE_FILE);
   const sessionStatePath = input.sessionId
@@ -1367,13 +1695,16 @@ export async function recordSkillActivation(input: RecordSkillActivationInput): 
   const match = resolveContinuationKeywordMatch(
     input.text,
     previous,
-    detectPrimaryKeywordForTeamMode(input.text, teamMode.enabled),
+    detectPrimaryKeywordForTeamMode(classification, teamMode.enabled),
+    classification,
   );
   if (!match) return null;
 
+
   const nowIso = input.nowIso ?? new Date().toISOString();
   const hadDeepInterviewLock = previous?.skill === 'deep-interview' && previous?.input_lock?.active === true;
-  const matches = filterMatchesForTeamMode(detectKeywords(input.text), teamMode.enabled);
+  const matches = filterMatchesForTeamMode(classification.matches, teamMode.enabled);
+
   const hasCancelIntent = matches.some((entry) => entry.skill === 'cancel');
 
   if (hasCancelIntent && hadDeepInterviewLock) {
@@ -1410,7 +1741,8 @@ export async function recordSkillActivation(input: RecordSkillActivationInput): 
 
   const sameSkill = previous?.active === true && previous.skill === match.skill;
   const sameKeyword = previous?.keyword?.toLowerCase() === match.keyword.toLowerCase();
-  const sameSkillContinuation = sameSkill && shouldReusePreviousSkillForContinuation(input.text, previous);
+  const sameSkillContinuation = sameSkill && shouldReusePreviousSkillForContinuation(input.text, previous, classification);
+
   const matchedSeedConfig = STATEFUL_SKILL_SEED_CONFIG[match.skill as StatefulSkillMode];
   const matchedModeState = matchedSeedConfig
     ? await readJsonStateIfExists(resolveSeedStateFilePath(
@@ -1438,14 +1770,13 @@ export async function recordSkillActivation(input: RecordSkillActivationInput): 
   const trackedMatchSkill = isTrackedWorkflowMatch ? match.skill : null;
   const markedQuestionAnswerContinuation = sameSkill
     && (match.skill === 'autopilot' || match.skill === 'deep-interview')
-    && isOmxQuestionAnsweredPrompt(input.text);
-  const normalizedInputText = isTrackedWorkflowMatch
-    ? normalizeWorkflowKeyboardTypos(input.text)
-    : input.text;
+    && classification.reservedInput === 'omx-question-answered';
   const workflowMatches: TrackedWorkflowMode[] = isTrackedWorkflowMatch && !markedQuestionAnswerContinuation
-    ? parseExplicitSkillInvocations(normalizedInputText).matches
+    ? classification.explicitMatches
       .map((entry) => entry.skill)
       .filter((skill) => teamMode.enabled || skill !== 'team')
+      .filter((skill) => input.allowSecondaryTeam !== false || skill !== 'team' || skill === trackedMatchSkill)
+      .filter((skill) => input.allowSecondaryAutopilot !== false || skill !== 'autopilot' || skill === trackedMatchSkill)
       .filter(isTrackedWorkflowMode)
     : [];
   const resolvedWorkflowRequest = isTrackedWorkflowMatch

@@ -7,6 +7,8 @@ import { join } from 'node:path';
 import {
   detectKeywords,
   detectPrimaryKeyword,
+  classifyKeywordInput,
+  KEYWORD_INERT_DIAGNOSTIC_ORDER,
   recordSkillActivation,
   DEEP_INTERVIEW_STATE_FILE,
   DEEP_INTERVIEW_BLOCKED_APPROVAL_INPUTS,
@@ -15,7 +17,11 @@ import {
 } from '../keyword-detector.js';
 import { SKILL_ACTIVE_STATE_FILE } from '../../state/skill-active.js';
 import { isUnderspecifiedForExecution, applyRalplanGate } from '../keyword-detector.js';
-import { KEYWORD_TRIGGER_DEFINITIONS } from '../keyword-registry.js';
+import {
+  EXPLICIT_SKILL_ALIASES,
+  getExplicitSkillDefinition,
+  KEYWORD_TRIGGER_DEFINITIONS,
+} from '../keyword-registry.js';
 
 async function withIsolatedHome<T>(prefix: string, run: (homeDir: string) => Promise<T>): Promise<T> {
   const homeDir = await mkdtemp(join(tmpdir(), `omx-keyword-home-${prefix}-`));
@@ -131,7 +137,8 @@ describe('keyword detector team compatibility', () => {
   });
 
   it('does not merge implicit keyword matches when an explicit $skill is present', () => {
-    const matches = detectKeywords('please run $team and then analyze the result');
+    const matches = detectKeywords('$team and then analyze the result');
+
     assert.deepEqual(matches.map((m) => m.skill), ['team']);
   });
 
@@ -217,7 +224,8 @@ describe('keyword detector team compatibility', () => {
   });
 
   it('maps explicit $analyze invocation to analyze skill', () => {
-    const match = detectPrimaryKeyword('please run $analyze on this workflow');
+    const match = detectPrimaryKeyword('$analyze on this workflow');
+
     assert.ok(match);
     assert.equal(match.skill, 'analyze');
     assert.equal(match.keyword.toLowerCase(), '$analyze');
@@ -272,7 +280,8 @@ describe('keyword detector team compatibility', () => {
   });
 
   it('maps code-review keyword variants to code-review skill', () => {
-    const hyphen = detectPrimaryKeyword('run $code-review before merge');
+    const hyphen = detectPrimaryKeyword('$code-review before merge');
+
     assert.ok(hyphen);
     assert.equal(hyphen.skill, 'code-review');
     assert.equal(hyphen.keyword.toLowerCase(), '$code-review');
@@ -322,7 +331,7 @@ describe('keyword detector team compatibility', () => {
   });
 
   it('still triggers team for explicit $team invocation', () => {
-    const match = detectPrimaryKeyword('please run $team now');
+    const match = detectPrimaryKeyword('$team now');
     assert.ok(match);
     assert.equal(match.skill, 'team');
   });
@@ -493,9 +502,375 @@ describe('keyword detector team compatibility', () => {
   });
 });
 
+describe('keyword input classification direct grammar', () => {
+  it('classifies prompt-leading direct forms, aliases, priority, and block order', () => {
+    const cases = [
+      { text: '$ralplan implement this', skills: ['ralplan'], keywords: ['$ralplan'], priorities: [11] },
+      { text: '\u00a0$RALPLAN implement this', skills: ['ralplan'], keywords: ['$RALPLAN'], priorities: [11] },
+      { text: '- $team $ralph ship this', skills: ['team', 'ralph'], keywords: ['$team', '$ralph'], priorities: [8, 9] },
+      { text: '12) $oh-my-codex:ralplan build this', skills: ['ralplan'], keywords: ['$oh-my-codex:ralplan'], priorities: [11] },
+      { text: '$ulw $frontend-ui-ux build this', skills: ['ultrawork', 'design'], keywords: ['$ulw', '$frontend-ui-ux'], priorities: [10, 6] },
+      { text: '$ralplan $unknown $ralplan $ralph ship this', skills: ['ralplan', 'ralph'], keywords: ['$ralplan', '$ralph'], priorities: [11, 9] },
+      { text: '$ㅕㅣㅈ 병렬 작업', skills: ['ultrawork'], keywords: ['$ulw'], priorities: [10] },
+    ] as const;
+
+    for (const testCase of cases) {
+      const classification = classifyKeywordInput(testCase.text);
+      assert.equal(classification.reservedInput, null, testCase.text);
+      assert.deepEqual(classification.matches.map((match) => match.skill), testCase.skills, testCase.text);
+      assert.deepEqual(classification.matches.map((match) => match.keyword), testCase.keywords, testCase.text);
+      assert.deepEqual(classification.matches.map((match) => match.priority), testCase.priorities, testCase.text);
+    }
+  });
+
+  it('accepts only direct punctuation and list boundaries', () => {
+    const cases = [
+      { text: '* $ralph', skills: ['ralph'] },
+      { text: '+ $team', skills: ['team'] },
+      { text: '1. $ralplan', skills: ['ralplan'] },
+      { text: '999) $ultrawork', skills: ['ultrawork'] },
+      { text: '($ralplan)', skills: [] },
+      { text: '[$ralplan]', skills: [] },
+      { text: '1,$ralplan', skills: [] },
+    ] as const;
+
+    for (const testCase of cases) {
+      const classification = classifyKeywordInput(testCase.text);
+      assert.deepEqual(classification.matches.map((match) => match.skill), testCase.skills, testCase.text);
+      if (testCase.skills.length === 0) {
+        assert.deepEqual(classification.candidates[0]?.reasons, ['not-leading-region'], testCase.text);
+      }
+    }
+  });
+
+  it('lexes malformed maximal tokens without activating canonical prefixes', () => {
+    for (const text of ['$ralplan- plan this', '$oh-my-codex:ralplan- plan this', '$ralplan_invalid plan this']) {
+      const classification = classifyKeywordInput(text);
+      assert.deepEqual(classification.matches, [], text);
+      assert.equal(classification.reservedInput, null, text);
+      assert.equal(classification.hasExplicitLikeInvocation, true, text);
+      assert.equal(classification.candidates.length, 1, text);
+      assert.equal(classification.candidates[0]?.rawKeyword, text.split(' ')[0], text);
+      assert.equal(classification.candidates[0]?.skill, null, text);
+      assert.deepEqual(classification.candidates[0]?.reasons, [], text);
+    }
+  });
+
+  it('fails closed for balanced and unbalanced quote pairs', () => {
+    const quotePairs = [
+      { name: 'ASCII double', opening: '"', closing: '"' },
+      { name: 'ASCII single', opening: "'", closing: "'" },
+      { name: 'curly double', opening: '“', closing: '”' },
+      { name: 'curly single', opening: '‘', closing: '’' },
+      { name: 'guillemets', opening: '«', closing: '»' },
+      { name: 'Japanese corner', opening: '「', closing: '」' },
+      { name: 'Japanese nested', opening: '『', closing: '』' },
+      { name: 'fullwidth', opening: '＂', closing: '＂' },
+      { name: 'single guillemets', opening: '‹', closing: '›' },
+    ] as const;
+
+    for (const quotePair of quotePairs) {
+      for (const closing of [quotePair.closing, ''] as const) {
+        const text = `${quotePair.opening}$ralplan${closing}`;
+        const classification = classifyKeywordInput(text);
+        assert.deepEqual(classification.matches, [], `${quotePair.name}: ${JSON.stringify(text)}`);
+        assert.deepEqual(
+          classification.candidates[0]?.reasons,
+          ['quote', 'not-leading-region'],
+          `${quotePair.name}: ${JSON.stringify(text)}`,
+        );
+      }
+    }
+  });
+
+  it('keeps fences and escape parity inert without semantic phrase matching', () => {
+    const structuralCases = [
+      { text: '```\n$ralplan\n```', reason: 'fenced-code' },
+      { text: '~~~\n$ralplan\n~~~', reason: 'fenced-code' },
+      { text: '```\n$ralplan', reason: 'fenced-code' },
+      { text: '~~~\n$ralplan', reason: 'fenced-code' },
+    ] as const;
+    for (const testCase of structuralCases) {
+      const classification = classifyKeywordInput(testCase.text);
+      assert.deepEqual(classification.matches, [], testCase.text);
+      assert.deepEqual(classification.candidates[0]?.reasons, [testCase.reason, 'not-leading-region'], testCase.text);
+    }
+
+    const escapeCases = [
+      { text: '\\$ralplan', reasons: ['escaped', 'not-leading-region'] },
+      { text: '\\\\$ralplan', reasons: ['not-leading-region'] },
+      { text: '\\\\\\$ralplan', reasons: ['escaped', 'not-leading-region'] },
+    ] as const;
+    for (const testCase of escapeCases) {
+      const classification = classifyKeywordInput(testCase.text);
+      assert.deepEqual(classification.matches, [], testCase.text);
+      assert.deepEqual(classification.candidates[0]?.reasons, testCase.reasons, testCase.text);
+    }
+  });
+
+  it('terminates fenced, inline, quote, and blockquote regions on every logical line ending', () => {
+    const lineTerminators = ['\r', '\r\n', '\u2028', '\u2029'] as const;
+    for (const lineTerminator of lineTerminators) {
+      const label = JSON.stringify(lineTerminator);
+      const fenced = classifyKeywordInput(`~~~${lineTerminator}$ralplan${lineTerminator}~~~`);
+      assert.deepEqual(fenced.candidates[0]?.reasons, ['fenced-code', 'not-leading-region'], label);
+
+      const blockquoted = classifyKeywordInput(`> $ralplan${lineTerminator}$team`);
+      assert.deepEqual(blockquoted.candidates[0]?.reasons, ['blockquote', 'not-leading-region'], label);
+      assert.deepEqual(blockquoted.candidates[1]?.reasons, ['not-leading-region'], label);
+
+      const inline = classifyKeywordInput(`\`$ralplan${lineTerminator}$team`);
+      assert.deepEqual(inline.candidates[0]?.reasons, ['inline-code', 'not-leading-region'], label);
+      assert.deepEqual(inline.candidates[1]?.reasons, ['not-leading-region'], label);
+
+      const quoted = classifyKeywordInput(`"$ralplan${lineTerminator}$team`);
+      assert.deepEqual(quoted.candidates[0]?.reasons, ['quote', 'not-leading-region'], label);
+      assert.deepEqual(quoted.candidates[1]?.reasons, ['not-leading-region'], label);
+    }
+  });
+
+  it('keeps candidate diagnostics bounded across thousands of inert ranges', () => {
+    const count = 4_096;
+    const classification = classifyKeywordInput('`$ralplan` '.repeat(count).trimEnd());
+    assert.equal(classification.candidates.length, count);
+    assert.deepEqual(classification.candidates[0]?.reasons, ['inline-code', 'not-leading-region']);
+    assert.deepEqual(classification.candidates.at(-1)?.reasons, ['inline-code', 'not-leading-region']);
+    assert.deepEqual(classification.matches, []);
+  });
+
+  it('suppresses prose, multilingual, documentation, quoted, escaped, and code candidates without a phrase classifier', () => {
+    const cases = [
+      'Do not run $autopilot',
+      "don't use $autopilot",
+      'without $ralplan',
+      'Не запускай $autopilot',
+      'Не используй $autopilot',
+      '実行しないで $autopilot',
+      '使わないで $autopilot',
+
+      'Documentation example: $ralplan',
+      '($ralplan) is an example',
+      '"$autopilot" is an example',
+      '`$ralph` is a literal',
+      '```\n$team\n```',
+      '> $ultrawork is quoted',
+      '\\$autopilot',
+      'Prose\n$ralplan implement this',
+      'Prose\n$ralplan\n$team',
+    ] as const;
+
+    for (const text of cases) {
+      const classification = classifyKeywordInput(text);
+      assert.deepEqual(classification.matches, [], text);
+      assert.equal(classification.hasExplicitLikeInvocation, true, text);
+      assert.ok(classification.candidates.every((candidate) => candidate.reasons.includes('not-leading-region')), text);
+    }
+  });
+
+  it('applies marked-answer, accepted-direct, prompts, and explicit-like precedence in order', () => {
+    const cases = [
+      { text: '[omx question answered] $ralplan', reservedInput: 'omx-question-answered', skills: [] },
+      { text: '$ralplan plan this; /prompts:architect review', reservedInput: null, skills: ['ralplan'] },
+      { text: '$unknown /prompts:architect review', reservedInput: null, skills: [] },
+      { text: '/prompts:architect, keep going', reservedInput: 'prompts', skills: [] },
+      { text: '/prompts:unknown $ralplan plan this', reservedInput: 'prompts', skills: [] },
+      { text: 'Prose\n/prompts:architect\n$ralplan plan this', reservedInput: 'prompts', skills: [] },
+      { text: 'Do not run $autopilot', reservedInput: null, skills: [] },
+    ] as const;
+
+    for (const testCase of cases) {
+      const classification = classifyKeywordInput(testCase.text);
+      assert.equal(classification.reservedInput, testCase.reservedInput, testCase.text);
+      assert.deepEqual(classification.matches.map((match) => match.skill), testCase.skills, testCase.text);
+    }
+  });
+
+  it('deduplicates implicit aliases by skill without changing the stable winner', () => {
+    const text = 'autopilot mode; build me a dashboard';
+    const classification = classifyKeywordInput(text);
+    assert.deepEqual(classification.implicitMatches, [
+      { keyword: 'autopilot', skill: 'autopilot', priority: 10 },
+    ]);
+    assert.deepEqual(classification.matches, classification.implicitMatches);
+    assert.deepEqual(detectKeywords(text), classification.implicitMatches);
+  });
+
+  it('freezes classifications and retains ordered inert diagnostics', () => {
+    assert.equal(Object.isFrozen(KEYWORD_INERT_DIAGNOSTIC_ORDER), true);
+    assert.deepEqual(KEYWORD_INERT_DIAGNOSTIC_ORDER, [
+      'fenced-code',
+      'blockquote',
+      'inline-code',
+      'quote',
+      'escaped',
+      'not-leading-region',
+    ]);
+    const classification = classifyKeywordInput('"\\$ralph and $team"');
+    assert.equal(Object.isFrozen(classification), true);
+    assert.equal(Object.isFrozen(classification.candidates), true);
+    assert.equal(Object.isFrozen(classification.candidates[0]), true);
+    assert.equal(Object.isFrozen(classification.candidates[0]?.reasons), true);
+    assert.deepEqual(classification.candidates[0]?.reasons, ['quote', 'escaped', 'not-leading-region']);
+    assert.deepEqual(classification.candidates[1]?.reasons, ['quote', 'not-leading-region']);
+
+    const quotedFence = classifyKeywordInput('> ```\n> $ralph\n> ```');
+    assert.deepEqual(quotedFence.candidates[0]?.reasons, ['fenced-code', 'blockquote', 'not-leading-region']);
+
+    const blockquotedInline = classifyKeywordInput('> `$ralplan`\n$team');
+    assert.deepEqual(blockquotedInline.candidates[0]?.reasons, ['blockquote', 'inline-code', 'not-leading-region']);
+    assert.deepEqual(blockquotedInline.candidates[1]?.reasons, ['not-leading-region']);
+  });
+
+  it('passes a supplied classification through recording, rejects mismatched text, and leaves rejected state bytes untouched', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-keyword-classification-state-'));
+    const stateDir = join(cwd, '.omx', 'state');
+    const sessionId = 'session-classification-state';
+    const sessionDir = join(stateDir, 'sessions', sessionId);
+    const statePath = join(sessionDir, SKILL_ACTIVE_STATE_FILE);
+    const detailPath = join(sessionDir, 'autopilot-state.json');
+    const rawState = '{"version":1,"active":true,"skill":"autopilot","keyword":"$autopilot","phase":"deep-interview","activated_at":"2026-01-01T00:00:00.000Z","updated_at":"2026-01-01T00:00:00.000Z"}';
+    const rawDetail = '{"active":true,"mode":"autopilot","current_phase":"deep-interview"}';
+    try {
+      await mkdir(sessionDir, { recursive: true });
+      await writeFile(statePath, rawState);
+      await writeFile(detailPath, rawDetail);
+      const text = 'Do not run $autopilot';
+      const classification = classifyKeywordInput(text);
+      const result = await recordSkillActivation({ stateDir, sourceCwd: cwd, sessionId, text, classification });
+      assert.equal(result, null);
+      assert.equal(await readFile(statePath, 'utf-8'), rawState);
+      assert.equal(await readFile(detailPath, 'utf-8'), rawDetail);
+      assert.equal(existsSync(join(stateDir, SKILL_ACTIVE_STATE_FILE)), false);
+
+      await assert.rejects(
+        recordSkillActivation({
+          stateDir,
+          sourceCwd: cwd,
+          text: '$ralph',
+          classification,
+        }),
+        /classification text does not match activation text/,
+      );
+      assert.equal(await readFile(statePath, 'utf-8'), rawState);
+      assert.equal(await readFile(detailPath, 'utf-8'), rawDetail);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('does not create or mutate tracked workflow state for ineligible explicit candidates', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-keyword-ineligible-explicit-'));
+    const stateDir = join(cwd, '.omx', 'state');
+    const cases = [
+      { name: 'no canonical state', text: '“$ralplan”', existingSkill: null },
+      { name: 'active Ralplan same skill', text: 'without $ralplan', existingSkill: 'ralplan' },
+      { name: 'active Autopilot same skill', text: "don't use $autopilot", existingSkill: 'autopilot' },
+      { name: 'active Autopilot cross skill', text: 'without $ralplan', existingSkill: 'autopilot' },
+    ] as const;
+    try {
+      for (const [index, testCase] of cases.entries()) {
+        const sessionId = `ineligible-${index}`;
+        const sessionDir = join(stateDir, 'sessions', sessionId);
+        const statePath = join(sessionDir, SKILL_ACTIVE_STATE_FILE);
+        const detailPath = join(sessionDir, 'autopilot-state.json');
+        const rawState = testCase.existingSkill
+          ? JSON.stringify({
+              version: 1,
+              active: true,
+              skill: testCase.existingSkill,
+              keyword: `$${testCase.existingSkill}`,
+              phase: 'planning',
+              session_id: sessionId,
+              active_skills: [{ skill: testCase.existingSkill, phase: 'planning', active: true, session_id: sessionId }],
+            })
+          : null;
+        const rawDetail = testCase.existingSkill === 'autopilot'
+          ? '{"active":true,"mode":"autopilot","current_phase":"ralplan"}'
+          : null;
+        if (rawState) {
+          await mkdir(sessionDir, { recursive: true });
+          await writeFile(statePath, rawState);
+        }
+        if (rawDetail) await writeFile(detailPath, rawDetail);
+
+        const classification = classifyKeywordInput(testCase.text);
+        assert.equal(classification.hasExplicitLikeInvocation, true, testCase.name);
+        const result = await recordSkillActivation({
+          stateDir,
+          sourceCwd: cwd,
+          sessionId,
+          text: testCase.text,
+          classification,
+        });
+        assert.equal(result, null, testCase.name);
+        assert.equal(existsSync(join(stateDir, SKILL_ACTIVE_STATE_FILE)), false, testCase.name);
+        if (rawState) assert.equal(await readFile(statePath, 'utf-8'), rawState, testCase.name);
+        else assert.equal(existsSync(statePath), false, testCase.name);
+        if (rawDetail) assert.equal(await readFile(detailPath, 'utf-8'), rawDetail, testCase.name);
+        else assert.equal(existsSync(detailPath), false, testCase.name);
+      }
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('persists marked answers only for eligible active workflows', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-keyword-marked-answer-'));
+    const stateDir = join(cwd, '.omx', 'state');
+    const cases = [
+      { skill: 'autopilot', persists: true },
+      { skill: 'ralplan', persists: false },
+    ] as const;
+    try {
+      for (const [index, testCase] of cases.entries()) {
+        const sessionId = `marked-answer-${index}`;
+        const sessionDir = join(stateDir, 'sessions', sessionId);
+        const statePath = join(sessionDir, SKILL_ACTIVE_STATE_FILE);
+        const rawState = JSON.stringify({
+          version: 1,
+          active: true,
+          skill: testCase.skill,
+          keyword: `$${testCase.skill}`,
+          phase: 'planning',
+          activated_at: '2026-01-01T00:00:00.000Z',
+          updated_at: '2026-01-01T00:00:00.000Z',
+          session_id: sessionId,
+          active_skills: [{ skill: testCase.skill, phase: 'planning', active: true, session_id: sessionId }],
+        });
+        await mkdir(sessionDir, { recursive: true });
+        await writeFile(statePath, rawState);
+
+        const text = '[omx question answered] yes';
+        const classification = classifyKeywordInput(text);
+        assert.equal(classification.reservedInput, 'omx-question-answered');
+        const result = await recordSkillActivation({
+          stateDir,
+          sourceCwd: cwd,
+          sessionId,
+          text,
+          classification,
+          nowIso: '2026-02-01T00:00:00.000Z',
+        });
+        if (testCase.persists) {
+          assert.equal(result?.skill, 'autopilot');
+          assert.notEqual(await readFile(statePath, 'utf-8'), rawState);
+          assert.equal(existsSync(join(sessionDir, 'autopilot-state.json')), true);
+        } else {
+          assert.equal(result, null);
+          assert.equal(await readFile(statePath, 'utf-8'), rawState);
+          assert.equal(existsSync(join(sessionDir, 'ralplan-state.json')), false);
+        }
+      }
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('autoresearch keyword detection', () => {
   it('detects explicit $autoresearch invocation', () => {
-    const match = detectPrimaryKeyword('please run $autoresearch now');
+    const match = detectPrimaryKeyword('$autoresearch now');
+
     assert.ok(match);
     assert.equal(match.skill, 'autoresearch');
     assert.equal(match.keyword.toLowerCase(), '$autoresearch');
@@ -529,7 +904,7 @@ describe('explicit skill-name invocation requirement', () => {
     assert.equal(detectPrimaryKeyword('please do ralplan first'), null);
   });
   it('detects explicit prometheus-strict invocation only', () => {
-    const match = detectPrimaryKeyword('please run $prometheus-strict before implementation');
+    const match = detectPrimaryKeyword('$prometheus-strict before implementation');
     assert.ok(match);
     assert.equal(match.skill, 'prometheus-strict');
     assert.equal(match.keyword.toLowerCase(), '$prometheus-strict');
@@ -558,6 +933,25 @@ describe('keyword registry coverage', () => {
     assert.ok(registryKeywords.has('$prometheus-strict'));
     assert.ok(registryKeywords.has('ultragoal'));
     assert.ok(registryKeywords.has('autopilot'));
+  });
+
+  it('resolves immutable aliases without duplicate sources or skill collisions', () => {
+    assert.equal(Object.isFrozen(EXPLICIT_SKILL_ALIASES), true);
+    assert.equal(
+      new Set(EXPLICIT_SKILL_ALIASES.map((alias) => alias.source.toLowerCase())).size,
+      EXPLICIT_SKILL_ALIASES.length,
+    );
+    for (const alias of EXPLICIT_SKILL_ALIASES) {
+      const target = getExplicitSkillDefinition(alias.target);
+      const source = getExplicitSkillDefinition(alias.source.toUpperCase());
+      assert.ok(target, alias.target);
+      assert.deepEqual(source, target, alias.source);
+
+      const canonicalSource = KEYWORD_TRIGGER_DEFINITIONS.find(
+        (definition) => definition.keyword.toLowerCase() === `$${alias.source.toLowerCase()}`,
+      );
+      if (canonicalSource) assert.equal(canonicalSource.skill, target.skill, alias.source);
+    }
   });
 });
 
@@ -678,7 +1072,8 @@ describe('keyword detector skill-active-state lifecycle', () => {
       await mkdir(stateDir, { recursive: true });
       const result = await recordSkillActivation({
         stateDir,
-        text: 'please run $autopilot and keep going',
+        text: '$autopilot and keep going',
+
         sessionId: 'sess-1',
         threadId: 'thread-1',
         turnId: 'turn-1',
@@ -744,9 +1139,9 @@ describe('keyword detector skill-active-state lifecycle', () => {
         rationale: 'Autopilot starts at the deep-interview gate by default; clear bounded tasks may skip only with an explicit persisted skip reason.',
       });
       assert.deepEqual(modeState.state.handoff_artifacts, {
-        context_snapshot_path: '.omx/context/please-run-and-keep-going-20260225T000000Z.md',
+        context_snapshot_path: '.omx/context/and-keep-going-20260225T000000Z.md',
         context_snapshot: {
-          path: '.omx/context/please-run-and-keep-going-20260225T000000Z.md',
+          path: '.omx/context/and-keep-going-20260225T000000Z.md',
           kind: 'canonical',
           original_task_status: 'activation-prompt',
         },
@@ -775,8 +1170,8 @@ describe('keyword detector skill-active-state lifecycle', () => {
         reason: 'main_not_cheap_or_mini',
         explicitPlannerOverride: false,
       });
-      const snapshot = await readFile(join(cwd, '.omx', 'context', 'please-run-and-keep-going-20260225T000000Z.md'), 'utf-8');
-      assert.match(snapshot, /activation prompt \/ task seed: please run \$autopilot and keep going/);
+      const snapshot = await readFile(join(cwd, '.omx', 'context', 'and-keep-going-20260225T000000Z.md'), 'utf-8');
+      assert.match(snapshot, /activation prompt \/ task seed: \$autopilot and keep going/);
       assert.match(snapshot, /scope note: this seed captures the Autopilot activation prompt/);
     } finally {
       if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
@@ -796,7 +1191,8 @@ describe('keyword detector skill-active-state lifecycle', () => {
       // with deep_interview_gate.status="required" (gate not satisfied).
       const activated = await recordSkillActivation({
         stateDir,
-        text: 'please run $autopilot',
+        text: '$autopilot',
+
         sessionId: 'sess-gate',
         threadId: 'thread-gate',
         turnId: 'turn-1',
@@ -813,7 +1209,8 @@ describe('keyword detector skill-active-state lifecycle', () => {
       // path now defers to the same gate as the state_write backend.
       const denied = await recordSkillActivation({
         stateDir,
-        text: 'continue with $ralplan',
+        text: '$ralplan',
+
         sessionId: 'sess-gate',
         threadId: 'thread-gate',
         turnId: 'turn-2',
@@ -849,7 +1246,8 @@ describe('keyword detector skill-active-state lifecycle', () => {
       await mkdir(stateDir, { recursive: true });
       await recordSkillActivation({
         stateDir,
-        text: 'please run $autopilot',
+        text: '$autopilot',
+
         sessionId: 'sess-skip',
         threadId: 'thread-skip',
         turnId: 'turn-1',
@@ -860,7 +1258,8 @@ describe('keyword detector skill-active-state lifecycle', () => {
       // keyword handoff must hold the current phase rather than jump ahead.
       const result = await recordSkillActivation({
         stateDir,
-        text: 'jump straight to $ultragoal',
+        text: '$ultragoal',
+
         sessionId: 'sess-skip',
         threadId: 'thread-skip',
         turnId: 'turn-2',
@@ -916,7 +1315,8 @@ describe('keyword detector skill-active-state lifecycle', () => {
 
       const denied = await recordSkillActivation({
         stateDir,
-        text: 'advance to $ultragoal',
+        text: '$ultragoal',
+
         sessionId,
         threadId: 'thread-ralplan-gate',
         turnId: 'turn-ralplan-gate',
@@ -971,7 +1371,8 @@ describe('keyword detector skill-active-state lifecycle', () => {
 
       const denied = await recordSkillActivation({
         stateDir,
-        text: 'run $ultraqa now',
+        text: '$ultraqa now',
+
         sessionId,
         threadId: 'thread-ultraqa-skip',
         turnId: 'turn-ultraqa-skip',
@@ -2955,7 +3356,8 @@ deepMaxRounds = 21
       await mkdir(stateDir, { recursive: true });
       await recordSkillActivation({
         stateDir,
-        text: 'please run $deep-interview',
+        text: '$deep-interview',
+
         nowIso: '2026-02-25T00:00:00.000Z',
       });
 
@@ -3412,7 +3814,8 @@ deepMaxRounds = 21
 
       const result = await recordSkillActivation({
         stateDir: join(blockingFile, 'nested', 'state-dir'),
-        text: 'please run $autopilot',
+        text: '$autopilot',
+
         nowIso: '2026-02-25T00:00:00.000Z',
       });
 
@@ -4085,7 +4488,7 @@ deepMaxRounds = 21
 
       const result = await recordSkillActivation({
         stateDir,
-        text: 'please run $ralph now',
+        text: '$ralph now',
         nowIso: '2026-02-26T00:00:00.000Z',
       });
 

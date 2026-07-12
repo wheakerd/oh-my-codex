@@ -6432,6 +6432,231 @@ export async function onHookEvent(event) {
     }
   });
 
+  it("rejects inert and reserved direct-looking submits across native and CLI surfaces without Stop blockers", async () => {
+    const cases = [
+      { source: "codex-app", sessionId: "sess-inert-native", prompt: "Do not run $autopilot" },
+      { source: "cli", sessionId: "sess-reserved-cli", prompt: "/prompts:architect $autopilot" },
+      { source: "codex-app", sessionId: "sess-marked-native", prompt: "[omx question answered] $autopilot" },
+    ] as const;
+
+    for (const testCase of cases) {
+      const cwd = await mkdtemp(join(tmpdir(), `omx-native-hook-${testCase.sessionId}-`));
+      try {
+        await mkdir(join(cwd, ".omx", "state"), { recursive: true });
+        const submit = await dispatchCodexNativeHook(
+          {
+            hook_event_name: "UserPromptSubmit",
+            cwd,
+            source: testCase.source,
+            session_id: testCase.sessionId,
+            thread_id: `thread-${testCase.sessionId}`,
+            prompt: testCase.prompt,
+          },
+          { cwd },
+        );
+
+        assert.equal(submit.skillState, null);
+        assert.equal(
+          existsSync(join(cwd, ".omx", "state", "sessions", testCase.sessionId, "skill-active-state.json")),
+          false,
+        );
+        assert.equal(existsSync(join(cwd, ".omx", "state", "skill-active-state.json")), false);
+        assert.equal(
+          existsSync(join(cwd, ".omx", "state", "sessions", testCase.sessionId, "autopilot-state.json")),
+          false,
+        );
+        assert.doesNotMatch(
+          String((submit.outputJson as { hookSpecificOutput?: { additionalContext?: string } } | null)?.hookSpecificOutput?.additionalContext ?? ""),
+          /detected workflow keyword|Autopilot protocol|denied workflow keyword/i,
+        );
+
+        const stop = await dispatchCodexNativeHook(
+          { hook_event_name: "Stop", cwd, source: testCase.source, session_id: testCase.sessionId },
+          { cwd },
+        );
+        assert.equal(stop.outputJson, null);
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it("keeps issue #3133 negated, multilingual, and quoted ralplan mentions inert on the native entrypoint", async () => {
+    const rejectedInputs = [
+      { source: "codex-app", sessionId: "sess-3133-negated", prompt: "Do not run $ralplan and do not repeat the review." },
+      { source: "cli", sessionId: "sess-3133-russian", prompt: "Не запускай $ralplan" },
+      { source: "codex-app", sessionId: "sess-3133-quoted", prompt: "Logged review text: \"$ralplan plan this change\"." },
+    ] as const;
+
+    for (const testCase of rejectedInputs) {
+      const cwd = await mkdtemp(join(tmpdir(), `omx-native-hook-${testCase.sessionId}-`));
+      try {
+        const stateDir = join(cwd, ".omx", "state");
+        const sessionDir = join(stateDir, "sessions", testCase.sessionId);
+        await mkdir(stateDir, { recursive: true });
+
+        const submit = await dispatchCodexNativeHook(
+          {
+            hook_event_name: "UserPromptSubmit",
+            cwd,
+            source: testCase.source,
+            session_id: testCase.sessionId,
+            thread_id: `thread-${testCase.sessionId}`,
+            turn_id: `turn-${testCase.sessionId}`,
+            prompt: testCase.prompt,
+          },
+          { cwd },
+        );
+
+        assert.equal(submit.skillState, null);
+        assert.equal(existsSync(join(sessionDir, "skill-active-state.json")), false);
+        assert.equal(existsSync(join(sessionDir, "ralplan-state.json")), false);
+        assert.equal(existsSync(join(stateDir, "skill-active-state.json")), false);
+        assert.doesNotMatch(
+          String((submit.outputJson as { hookSpecificOutput?: { additionalContext?: string } } | null)?.hookSpecificOutput?.additionalContext ?? ""),
+          /ralplan/i,
+        );
+
+        const stop = await dispatchCodexNativeHook(
+          {
+            hook_event_name: "Stop",
+            cwd,
+            source: testCase.source,
+            session_id: testCase.sessionId,
+            thread_id: `thread-${testCase.sessionId}`,
+            turn_id: `stop-${testCase.sessionId}`,
+          },
+          { cwd },
+        );
+        assert.equal(stop.outputJson, null);
+        assert.doesNotMatch(JSON.stringify(stop.outputJson ?? {}), /ralplan/i);
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    }
+
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-3133-positive-"));
+    const sessionId = "sess-3133-positive";
+    try {
+      const stateDir = join(cwd, ".omx", "state");
+      const sessionDir = join(stateDir, "sessions", sessionId);
+      await mkdir(stateDir, { recursive: true });
+      const submit = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "UserPromptSubmit",
+          cwd,
+          source: "codex-app",
+          session_id: sessionId,
+          thread_id: "thread-3133-positive",
+          turn_id: "turn-3133-positive",
+          prompt: "$ralplan plan this change",
+        },
+        { cwd },
+      );
+
+      assert.equal(submit.skillState?.skill, "ralplan");
+      assert.equal(submit.skillState?.active, true);
+      assert.equal(existsSync(join(sessionDir, "skill-active-state.json")), true);
+      assert.equal(existsSync(join(sessionDir, "ralplan-state.json")), true);
+
+      const stop = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "Stop",
+          cwd,
+          source: "codex-app",
+          session_id: sessionId,
+          thread_id: "thread-3133-positive",
+          turn_id: "stop-3133-positive",
+        },
+        { cwd },
+      );
+      assert.equal(stop.outputJson?.decision, "block");
+      assert.match(String(stop.outputJson?.reason ?? ""), /ralplan is still active/i);
+      assert.match(String(stop.outputJson?.reason ?? ""), /continue from the current ralplan artifact/i);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("activates leading direct workflow invocations on native and CLI prompt submits", async () => {
+    for (const source of ["codex-app", "cli"] as const) {
+      const cwd = await mkdtemp(join(tmpdir(), `omx-native-hook-direct-${source}-`));
+      const sessionId = `sess-direct-${source}`;
+      try {
+        await mkdir(join(cwd, ".omx", "state"), { recursive: true });
+        const result = await dispatchCodexNativeHook(
+          {
+            hook_event_name: "UserPromptSubmit",
+            cwd,
+            source,
+            session_id: sessionId,
+            thread_id: `thread-${source}`,
+            prompt: "$autopilot resume this task",
+          },
+          { cwd },
+        );
+
+        assert.equal(result.skillState?.skill, "autopilot");
+        assert.equal(result.skillState?.active, true);
+        assert.equal(
+          existsSync(join(cwd, ".omx", "state", "sessions", sessionId, "autopilot-state.json")),
+          true,
+        );
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it("uses the first effective Team match for native outside-tmux blocking", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-team-first-effective-"));
+    try {
+      await mkdir(join(cwd, ".omx", "state"), { recursive: true });
+      const ralphFirst = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "UserPromptSubmit",
+          cwd,
+          source: "codex-app",
+          session_id: "sess-ralph-first-team",
+          thread_id: "thread-ralph-first-team",
+          prompt: "$ralph $team ship this fix",
+        },
+        { cwd },
+      );
+      assert.equal(ralphFirst.skillState?.skill, "ralph");
+      assert.equal(ralphFirst.skillState?.active, true);
+      assert.doesNotMatch(JSON.stringify(ralphFirst.outputJson), /cannot activate the tmux-only `team` workflow directly/);
+      assert.equal(
+        existsSync(join(cwd, ".omx", "state", "sessions", "sess-ralph-first-team", "ralph-state.json")),
+        true,
+      );
+      assert.equal(ralphFirst.skillState?.active_skills?.some((entry) => entry.skill === "team"), false);
+      assert.equal(existsSync(join(cwd, ".omx", "state", "team-state.json")), false);
+      assert.doesNotMatch(JSON.stringify(ralphFirst.outputJson), /Use the durable OMX team runtime via `omx team \.\.\.`/);
+
+      const teamFirst = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "UserPromptSubmit",
+          cwd,
+          source: "codex-app",
+          session_id: "sess-team-first-ralph",
+          thread_id: "thread-team-first-ralph",
+          prompt: "$team $ralph ship this fix",
+        },
+        { cwd },
+      );
+      assert.equal(teamFirst.skillState?.skill, "team");
+      assert.equal(teamFirst.skillState?.active, false);
+      assert.match(JSON.stringify(teamFirst.outputJson), /cannot activate the tmux-only `team` workflow directly/);
+      assert.equal(
+        existsSync(join(cwd, ".omx", "state", "sessions", "sess-team-first-ralph", "ralph-state.json")),
+        false,
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("denies direct $team prompt activation from Codex App/native outside tmux", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-team-native-block-"));
     try {
@@ -24815,6 +25040,52 @@ describe("codex native hook triage integration", () => {
       assert.equal(existsSync(stateFile), false);
     } finally {
       await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps marked workflow-like answers inert without treating them as a new triage request", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-triage-marked-answer-inert-"));
+    const codexHome = await mkdtemp(join(tmpdir(), "omx-triage-marked-answer-home-"));
+    const previousCodexHome = process.env.CODEX_HOME;
+    try {
+      await writeJson(join(codexHome, ".omx-config.json"), {
+        promptRouting: { triage: { enabled: true } },
+      });
+      process.env.CODEX_HOME = codexHome;
+      resetTriageConfigCache();
+      await mkdir(join(cwd, ".omx", "state"), { recursive: true });
+
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "UserPromptSubmit",
+          cwd,
+          source: "codex-app",
+          session_id: "triage-marked-answer-inert",
+          thread_id: "thread-triage-marked-answer-inert",
+          prompt: "[omx question answered] $autopilot add dark mode toggle to the settings page",
+        },
+        { cwd },
+      );
+
+      const additionalContext = String(
+        (result.outputJson as { hookSpecificOutput?: { additionalContext?: string } })?.hookSpecificOutput?.additionalContext ?? "",
+      );
+      assert.equal(result.skillState, null);
+      assert.equal(additionalContext, "");
+      assert.equal(
+        existsSync(join(cwd, ".omx", "state", "sessions", "triage-marked-answer-inert", "autopilot-state.json")),
+        false,
+      );
+      assert.equal(
+        existsSync(join(cwd, ".omx", "state", "sessions", "triage-marked-answer-inert", "prompt-routing-state.json")),
+        false,
+      );
+    } finally {
+      if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = previousCodexHome;
+      resetTriageConfigCache();
+      await rm(cwd, { recursive: true, force: true });
+      await rm(codexHome, { recursive: true, force: true });
     }
   });
 
