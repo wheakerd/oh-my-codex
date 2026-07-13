@@ -1601,6 +1601,20 @@ PY`,
       { name: "explicit-after-unclosed-quote", prompt: "\"quoted context\n$ralplan plan it", expectedSkill: null },
       { name: "explicit-after-blockquote-prose", prompt: "> quoted context\nThe docs mention $ralplan only", expectedSkill: null },
       { name: "explicit-after-quote-negative", prompt: "\"quoted context\"\nDo not run $ralplan", expectedSkill: null },
+      { name: "explicit-stale-predecessor-prose", prompt: "> quoted context\nProse\n$ralplan implement this", expectedSkill: null },
+      { name: "explicit-stale-predecessor-directive-clause", prompt: "> quoted context\nProse\nUse $ralplan plan this", expectedSkill: null },
+      { name: "explicit-stale-predecessor-prompts", prompt: "> quoted context\n/prompts:architect\n$ralplan plan this", expectedSkill: null },
+      { name: "explicit-stale-predecessor-second-block", prompt: "> quoted context\n$ralplan plan it\nLater discussion.\n$autopilot build it", expectedSkill: "ralplan", expectedDeferredSkills: [] },
+      { name: "explicit-negative-before-unclosed-quote", prompt: "Do not run $ralplan.\n\"unclosed context\n$autopilot build it", expectedSkill: null },
+      { name: "explicit-reference-before-unclosed-quote", prompt: "[$ralplan]: ./docs\n\"unclosed context\n$autopilot build it", expectedSkill: null },
+      { name: "explicit-prompts-inside-unclosed-quote", prompt: "\"Use /prompts:architect\n$ralplan plan it", expectedSkill: null },
+      { name: "explicit-malformed-prompts-suffix", prompt: "/prompts:architect한글\n$ralplan plan it", expectedSkill: null },
+      { name: "explicit-nested-list-prompts-positive", prompt: "- Use /prompts:architect.\n$ralplan plan it", expectedSkill: "ralplan" },
+      { name: "explicit-nested-list-fence-positive", prompt: "- - ```\n    quoted context\n    ```\n$ralplan plan it", expectedSkill: "ralplan" },
+      { name: "implicit-reference-destination", prompt: "[docs]:\nautopilot", expectedSkill: null },
+      { name: "explicit-middle-dot-suffix", prompt: "$ralplan·suffix plan it", expectedSkill: null },
+      { name: "explicit-percent-suffix", prompt: "$ralplan%docs", expectedSkill: null },
+      { name: "explicit-fullwidth-percent-suffix", prompt: "$ralplan％docs", expectedSkill: null },
       { name: "explicit-postposed-also-negative", prompt: "$ralplan is also prohibited.", expectedSkill: null },
       { name: "implicit-postposed-still-negative", prompt: "Autopilot mode is still prohibited.", expectedSkill: null },
       { name: "implicit-commonmark-case-fold", prompt: "See [ẞ autopilot mode] for details.\n\n[SS autopilot mode]: ./docs", expectedSkill: null },
@@ -1712,9 +1726,12 @@ PY`,
         if (testCase.expectedSkill === null) {
           assert.equal(existsSync(skillStatePath), false, testCase.name);
         } else {
-          const skillState = JSON.parse(await readFile(skillStatePath, "utf-8")) as { active?: boolean; skill?: string };
+          const skillState = JSON.parse(await readFile(skillStatePath, "utf-8")) as { active?: boolean; skill?: string; deferred_skills?: string[] };
           assert.equal(skillState.active, true, testCase.name);
           assert.equal(skillState.skill, testCase.expectedSkill, testCase.name);
+          if ("expectedDeferredSkills" in testCase) {
+            assert.deepEqual(skillState.deferred_skills ?? [], testCase.expectedDeferredSkills, testCase.name);
+          }
         }
 
         const stop = await dispatchCodexNativeHook({
@@ -1839,6 +1856,20 @@ PY`,
       { name: "explicit-after-unclosed-quote", prompt: "\"quoted context\n$ralplan plan it", expectedSkill: null },
       { name: "explicit-after-blockquote-prose", prompt: "> quoted context\nThe docs mention $ralplan only", expectedSkill: null },
       { name: "explicit-after-quote-negative", prompt: "\"quoted context\"\nDo not run $ralplan", expectedSkill: null },
+      { name: "explicit-stale-predecessor-prose", prompt: "> quoted context\nProse\n$ralplan implement this", expectedSkill: null },
+      { name: "explicit-stale-predecessor-directive-clause", prompt: "> quoted context\nProse\nUse $ralplan plan this", expectedSkill: null },
+      { name: "explicit-stale-predecessor-prompts", prompt: "> quoted context\n/prompts:architect\n$ralplan plan this", expectedSkill: null },
+      { name: "explicit-stale-predecessor-second-block", prompt: "> quoted context\n$ralplan plan it\nLater discussion.\n$autopilot build it", expectedSkill: "ralplan", expectedDeferredSkills: [] },
+      { name: "explicit-negative-before-unclosed-quote", prompt: "Do not run $ralplan.\n\"unclosed context\n$autopilot build it", expectedSkill: null },
+      { name: "explicit-reference-before-unclosed-quote", prompt: "[$ralplan]: ./docs\n\"unclosed context\n$autopilot build it", expectedSkill: null },
+      { name: "explicit-prompts-inside-unclosed-quote", prompt: "\"Use /prompts:architect\n$ralplan plan it", expectedSkill: null },
+      { name: "explicit-malformed-prompts-suffix", prompt: "/prompts:architect한글\n$ralplan plan it", expectedSkill: null },
+      { name: "explicit-nested-list-prompts-positive", prompt: "- Use /prompts:architect.\n$ralplan plan it", expectedSkill: "ralplan" },
+      { name: "explicit-nested-list-fence-positive", prompt: "- - ```\n    quoted context\n    ```\n$ralplan plan it", expectedSkill: "ralplan" },
+      { name: "implicit-reference-destination", prompt: "[docs]:\nautopilot", expectedSkill: null },
+      { name: "explicit-middle-dot-suffix", prompt: "$ralplan·suffix plan it", expectedSkill: null },
+      { name: "explicit-percent-suffix", prompt: "$ralplan%docs", expectedSkill: null },
+      { name: "explicit-fullwidth-percent-suffix", prompt: "$ralplan％docs", expectedSkill: null },
       { name: "explicit-postposed-also-negative", prompt: "$ralplan is also prohibited.", expectedSkill: null },
       { name: "implicit-postposed-still-negative", prompt: "Autopilot mode is still prohibited.", expectedSkill: null },
       { name: "implicit-commonmark-case-fold", prompt: "See [ẞ autopilot mode] for details.\n\n[SS autopilot mode]: ./docs", expectedSkill: null },
@@ -2006,7 +2037,7 @@ PY`,
           assert.equal(skillState.active, true, testCase.name);
           assert.equal(skillState.skill, testCase.expectedSkill, testCase.name);
           if ("expectedDeferredSkills" in testCase) {
-            assert.deepEqual(skillState.deferred_skills, testCase.expectedDeferredSkills, testCase.name);
+            assert.deepEqual(skillState.deferred_skills ?? [], testCase.expectedDeferredSkills, testCase.name);
           }
         }
 

@@ -1,4 +1,5 @@
 import {
+  existsSync,
   mkdtempSync,
   realpathSync,
   rmSync,
@@ -33,6 +34,11 @@ export const PACKED_INSTALL_NATIVE_HOOK_SMOKE_EVENTS = [
   'PreCompact',
   'PostCompact',
   'Stop',
+] as const;
+
+export const PACKED_INSTALL_NATIVE_HOOK_REGRESSION_PROMPTS = [
+  { name: 'unclosed-prompts-quote', prompt: '"Use /prompts:architect\n$ralplan plan it' },
+  { name: 'malformed-prompts-suffix', prompt: '/prompts:architect한글\n$ralplan plan it' },
 ] as const;
 
 function usage(): string {
@@ -210,6 +216,44 @@ function smokeInstalledNativeHookDist(prefixDir: string): void {
         input: JSON.stringify(payload),
       });
       validateHookStdout(eventName, result.stdout as string);
+    }
+
+    for (const testCase of PACKED_INSTALL_NATIVE_HOOK_REGRESSION_PROMPTS) {
+      const caseCwd = join(smokeCwd, testCase.name);
+      const sessionId = `packed-install-regression-${testCase.name}`;
+      mkdirSync(caseCwd, { recursive: true });
+      const environment = {
+        ...process.env,
+        OMX_ROOT: '',
+        OMX_STATE_ROOT: '',
+        OMX_SESSION_ID: '',
+        CODEX_SESSION_ID: '',
+      };
+      const promptPayload = {
+        hook_event_name: 'UserPromptSubmit',
+        cwd: caseCwd,
+        source: 'codex-app',
+        session_id: sessionId,
+        thread_id: `thread-${testCase.name}`,
+        turn_id: `turn-${testCase.name}`,
+        prompt: testCase.prompt,
+      };
+      const promptResult = run(process.execPath, [realpathSync(hookScript)], {
+        cwd: caseCwd,
+        env: environment,
+        input: JSON.stringify(promptPayload),
+      });
+      validateHookStdout('UserPromptSubmit', promptResult.stdout as string);
+      const skillStatePath = join(caseCwd, '.omx', 'state', 'sessions', sessionId, 'skill-active-state.json');
+      if (existsSync(skillStatePath)) throw new Error(`packed regression ${testCase.name} created workflow state`);
+
+      const stopResult = run(process.execPath, [realpathSync(hookScript)], {
+        cwd: caseCwd,
+        env: environment,
+        input: JSON.stringify({ ...promptPayload, hook_event_name: 'Stop', turn_id: `stop-${testCase.name}` }),
+      });
+      const stopOutput = JSON.parse(String(stopResult.stdout || '{}')) as { decision?: string };
+      if (stopOutput.decision === 'block') throw new Error(`packed regression ${testCase.name} blocked Stop`);
     }
   } finally {
     rmSync(smokeCwd, { recursive: true, force: true });

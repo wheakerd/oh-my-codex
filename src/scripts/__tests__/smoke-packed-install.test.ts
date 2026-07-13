@@ -9,6 +9,7 @@ import {
   hasUsableNodeModules,
   buildNativeHookSmokePayload,
   PACKED_INSTALL_NATIVE_HOOK_SMOKE_EVENTS,
+  PACKED_INSTALL_NATIVE_HOOK_REGRESSION_PROMPTS,
   PACKED_INSTALL_SMOKE_CORE_COMMANDS,
   parseNpmPackJsonOutput,
   resolveGitCommonDir,
@@ -50,6 +51,13 @@ test('packed install smoke covers every installed native hook event with minimal
     assert.equal(typeof payload.session_id, 'string');
     assert.equal(payload.cwd, '/tmp/omx-packed-hook-smoke');
   }
+});
+
+test('packed install smoke rejects terminal workflow activation regressions', () => {
+  assert.deepEqual(PACKED_INSTALL_NATIVE_HOOK_REGRESSION_PROMPTS, [
+    { name: 'unclosed-prompts-quote', prompt: '"Use /prompts:architect\n$ralplan plan it' },
+    { name: 'malformed-prompts-suffix', prompt: '/prompts:architect한글\n$ralplan plan it' },
+  ]);
 });
 
 test('packed install native hook stdout validation allows empty or JSON output only', () => {

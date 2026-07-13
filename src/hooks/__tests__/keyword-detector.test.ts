@@ -580,6 +580,9 @@ describe('keyword input classification direct grammar', () => {
       { text: '$ralplan\u202Emd', rawKeyword: '$ralplan\u202Emd' },
       { text: '$ralplan\uFEFF.md', rawKeyword: '$ralplan\uFEFF.md' },
       { text: '$ralplan．md', rawKeyword: '$ralplan．md' },
+      { text: '$ralplan·suffix plan it', rawKeyword: '$ralplan·suffix' },
+      { text: '$ralplan%docs', rawKeyword: '$ralplan%docs' },
+      { text: '$ralplan％docs', rawKeyword: '$ralplan％docs' },
     ] as const;
 
     for (const testCase of cases) {
@@ -614,6 +617,9 @@ describe('keyword input classification direct grammar', () => {
       { text: '    quoted context\n$ralplan plan it', skills: ['ralplan'] },
       { text: '"quoted context"\n$ralplan plan it', skills: ['ralplan'] },
       { text: 'Use /prompts:architect.\n$ralplan plan it', skills: ['ralplan'] },
+      { text: '- Use /prompts:architect.\n$ralplan plan it', skills: ['ralplan'] },
+      { text: '- - ```\n    quoted context\n    ```\n$ralplan plan it', skills: ['ralplan'] },
+      { text: '> quoted context\n$ralplan plan it\nLater discussion.\n$autopilot build it', skills: ['ralplan'] },
     ] as const;
 
     for (const testCase of cases) {
@@ -634,6 +640,14 @@ describe('keyword input classification direct grammar', () => {
       '"quoted context\n$ralplan plan it',
       '> quoted context\nThe docs mention $ralplan only',
       '"quoted context"\nDo not run $ralplan',
+      '> quoted context\nProse\n$ralplan implement this',
+      '> quoted context\nProse\nUse $ralplan plan this',
+      '> quoted context\n/prompts:architect\n$ralplan plan this',
+      'Do not run $ralplan.\n"unclosed context\n$autopilot build it',
+      '[$ralplan]: ./docs\n"unclosed context\n$autopilot build it',
+      '"Use /prompts:architect\n$ralplan plan it',
+      '/prompts:architect한글\n$ralplan plan it',
+      '[docs]:\nautopilot',
     ]) {
       assert.deepEqual(classifyKeywordInput(text).matches, [], text);
     }

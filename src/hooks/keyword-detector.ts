@@ -955,7 +955,7 @@ const EXCLUSION_PREFIX = '(?:ignore|discard|skip|omit|forget|disregard|exclude(?
 const NEGATIVE_PREFIX_PATTERN = new RegExp(`(?:\\b(?:do\\s+not|don't|without|never|not|no|neither|nor|avoid(?:ing)?|cannot|can't|${EXCLUSION_PREFIX})\\b|не\\s+(?:запускай|используй)|実行しないで|使わないで)`, 'iu');
 const LIST_DOCUMENTATION_SUFFIX = /^(?:\s*(?::|[—–])\s*\S|\s+(?:is|are|means|refer(?:s)?\s+to|denote(?:s)?)\b.*\b(?:commands?|workflows?|skills?|modes?|files?|documentation)\b)/i;
 const IMPLICIT_WORKFLOW_NOUN = '(?:modes?|workflows?|skills?|loops?)';
-const POSTPOSED_NEGATIVE_PREDICATE = /\s+(?:(?:is|are|was|were|should|must|can|could|may|will|would)\s+(?:(?:also|still)\s+)?(?:not|never)\b|(?:isn't|aren't|wasn't|weren't|cannot|can't|shouldn't|mustn't|won't|wouldn't|couldn't)\b|(?:is|are|was|were)\s+(?:(?:also|still)\s+)?(?:prohibited|forbidden|disabled|disallowed|unsupported)\b|(?:should|must|can|could|may|will|would)\s+(?:(?:also|still)\s+)?(?:not\s+)?be\s+(?:avoided|prohibited|forbidden|disabled|disallowed|unsupported)\b|(?:is|are|was|were)\s+(?:(?:also|still)\s+)?to\s+be\s+(?:avoided|prohibited|forbidden|disabled|disallowed|unsupported)\b)/iu;
+const POSTPOSED_NEGATIVE_PREDICATE = /\s+(?:(?:is|are|was|were|should|must|can|could|may|will|would)\s+(?:(?:also|still)\s+)?(?:not|never)\b|(?:isn't|aren't|wasn't|weren't|cannot|can't|shouldn't|mustn't|won't|wouldn't|couldn't)\b|(?:is|are|was|were)\s+(?:(?:also|still)\s+)?(?:inert|prohibited|forbidden|disabled|disallowed|unsupported)\b|(?:should|must|can|could|may|will|would)\s+(?:(?:also|still)\s+)?(?:not\s+)?be\s+(?:inert|avoided|prohibited|forbidden|disabled|disallowed|unsupported)\b|(?:is|are|was|were)\s+(?:(?:also|still)\s+)?to\s+be\s+(?:inert|avoided|prohibited|forbidden|disabled|disallowed|unsupported)\b)/iu;
 const PROMPTS_TOKEN_PATTERN = /\/prompts:[\w.-]+/giu;
 const COORDINATED_WORKFLOW_SUBJECT = '(?:(?:the|a|an)\\s+)?(?:autopilot|deep(?:[- ]+)interview|ralph|ralplan|ultrawork|ulw|ultragoal|ultraqa|autoresearch|coordinated\\s+team|team|consensus\\s+plan|code\\s+review|wiki|prometheus(?:-strict)?)';
 const COORDINATED_SUBJECT_JOINER = '(?:and|or|nor|as\\s+well\\s+as|along\\s+with|together\\s+with|&)';
@@ -1023,9 +1023,9 @@ function isExplicitTokenBoundary(text: string, index: number): boolean {
   if (UNSAFE_TOKEN_DELIMITER.test(character) && !SAFE_TOKEN_WHITESPACE.test(character)) return false;
   if (SAFE_TOKEN_WHITESPACE.test(character)) return true;
   const compatibility = character.normalize('NFKC');
-  if ([...compatibility].some((value) => value === '/' || value === '\\' || value === '$' || value === '@' || value === '#' || value === '=')) return false;
+  if ([...compatibility].some((value) => value === '/' || value === '\\' || value === '$' || value === '@' || value === '#' || value === '=' || value === '%' || value === '·')) return false;
   if ([...compatibility].some((value) => TOKEN_CONTINUATION.test(value))) return false;
-  if (character === '$' || character === '/' || character === '\\' || character === '@' || character === '#' || character === '=') return false;
+  if (character === '$' || character === '/' || character === '\\' || character === '@' || character === '#' || character === '=' || character === '%' || character === '·') return false;
   if (TOKEN_CONTINUATION.test(character)) return false;
   if (compatibility === '.') {
     const next = codePointAt(text, index + character.length);
@@ -1103,6 +1103,7 @@ interface MarkdownFence {
   length: number;
   blockquoteDepth: number;
   listItem: boolean;
+  indent: number;
   closingEligible: boolean;
 }
 
@@ -1130,8 +1131,8 @@ interface MarkdownContainerPrefix {
   listDepth: number;
 }
 
-function markdownContainerPrefix(line: string): MarkdownContainerPrefix {
-  let cursor = advanceSpaces(line, 0, 3);
+function markdownContainerPrefix(line: string, maximumLeadingSpaces = 3): MarkdownContainerPrefix {
+  let cursor = advanceSpaces(line, 0, maximumLeadingSpaces);
   let blockquoteDepth = 0;
   let listDepth = 0;
   while (cursor < line.length) {
@@ -1151,8 +1152,8 @@ function markdownContainerPrefix(line: string): MarkdownContainerPrefix {
   return { cursor, blockquoteDepth, listDepth };
 }
 
-function markdownFenceAtStart(line: string): MarkdownFence | null {
-  const container = markdownContainerPrefix(line);
+function markdownFenceAtStart(line: string, maximumLeadingSpaces = 3): MarkdownFence | null {
+  const container = markdownContainerPrefix(line, maximumLeadingSpaces);
   let cursor = container.cursor;
 
   const marker = line[cursor];
@@ -1161,7 +1162,7 @@ function markdownFenceAtStart(line: string): MarkdownFence | null {
   while (line[cursor] === marker) cursor += 1;
   const length = cursor - start;
   return length >= 3
-    ? { marker, length, blockquoteDepth: container.blockquoteDepth, listItem: container.listDepth > 0, closingEligible: /^[\t ]*$/.test(line.slice(cursor)) }
+    ? { marker, length, blockquoteDepth: container.blockquoteDepth, listItem: container.listDepth > 0, indent: start, closingEligible: /^[\t ]*$/.test(line.slice(cursor)) }
     : null;
 }
 
@@ -1226,7 +1227,7 @@ function collectFencedCodeRanges(text: string): InertRange[] {
     const end = lineEnd(text, lineStart);
     const line = text.slice(lineStart, end);
     if (fence) {
-      const closer = markdownFenceAtStart(line);
+      const closer = markdownFenceAtStart(line, fence.definition.listItem ? fence.definition.indent : 3);
       if (
         closer?.marker === fence.definition.marker
         && closer.length >= fence.definition.length
@@ -1324,7 +1325,7 @@ function collectBlockquoteRanges(text: string): InertRange[] {
   return ranges;
 }
 
-function createInertRangeIndex(ranges: InertRange[]): InertRangeIndex {
+function createInertRangeIndex(ranges: Array<{ start: number; end: number }>): InertRangeIndex {
   ranges.sort((a, b) => a.start - b.start || a.end - b.end);
   const starts = new Array<number>(ranges.length);
   const maximumEnds = new Array<number>(ranges.length);
@@ -1418,7 +1419,12 @@ function clauseDirectiveStart(text: string, predecessorEnd: number, candidateSta
     }
   }
   const directiveStart = clauseStart < 0 ? 0 : clauseStart;
-  return DIRECTIVE_CLAUSE_PREFIX.test(between.slice(directiveStart).trim());
+  return hasAdjacentPredecessorSeparator(text, predecessorEnd, predecessorEnd + directiveStart)
+    && DIRECTIVE_CLAUSE_PREFIX.test(between.slice(directiveStart).trim());
+}
+
+function hasAdjacentPredecessorSeparator(text: string, predecessorEnd: number, candidateStart: number): boolean {
+  return predecessorEnd <= candidateStart && /^[\s,;:.!?—–-]*$/u.test(text.slice(predecessorEnd, candidateStart));
 }
 
 function postposedExplicitNegationEnd(text: string, candidate: ExplicitCandidateScan): number | null {
@@ -1516,6 +1522,7 @@ function isMarkdownTableDelimiter(line: string): boolean {
 
 interface MarkdownReferenceIndex {
   labels: ReadonlySet<string>;
+  destinationRanges: InertRangeIndex;
 }
 
 function normalizeMarkdownReferenceLabel(label: string): string {
@@ -1537,6 +1544,7 @@ function markdownLabelClosingIndex(text: string, start: number, limit: number): 
 
 function collectMarkdownReferenceIndex(text: string): MarkdownReferenceIndex {
   const labels = new Set<string>();
+  const destinationRanges: InertPromptRange[] = [];
   const codeIndex = createInertRangeIndex([...collectFencedCodeRanges(text), ...collectIndentedCodeRanges(text)]);
   let start = 0;
   while (start <= text.length) {
@@ -1555,6 +1563,7 @@ function collectMarkdownReferenceIndex(text: string): MarkdownReferenceIndex {
           const indentation = /^[ \t]{0,3}/u.exec(text.slice(destinationLineStart, destinationLineEnd))?.[0].length ?? 0;
           const destinationStart = destinationLineStart + indentation;
           hasDestination = !isInInertRange(codeIndex, destinationStart) && /\S/u.test(text.slice(destinationStart, destinationLineEnd));
+          if (hasDestination) destinationRanges.push({ start: destinationStart, end: destinationLineEnd });
         }
         if (hasDestination) labels.add(normalizeMarkdownReferenceLabel(text.slice(labelStart + 1, closing)));
       }
@@ -1562,7 +1571,7 @@ function collectMarkdownReferenceIndex(text: string): MarkdownReferenceIndex {
     if (end === text.length) break;
     start = nextLineStart(text, end);
   }
-  return { labels };
+  return { labels, destinationRanges: createInertRangeIndex(destinationRanges) };
 }
 
 function hasMarkdownReferenceDefinition(index: MarkdownReferenceIndex, label: string): boolean {
@@ -1672,6 +1681,7 @@ function isInactivePromptsMention(
   return !hasActivePromptsTokenBoundary(text, start, end)
     || isMarkdownDocumentationMention(text, start, end, referenceIndex)
     || isStructurallyInert(inertRangeIndexes, start)
+    || isInInertRange(referenceIndex.destinationRanges, start)
     || isListItemDocumentation(text, start, end);
 }
 
@@ -1706,6 +1716,7 @@ function boundedPredecessorRanges(text: string, referenceIndex: MarkdownReferenc
     ...collectInlineCodeRanges(text),
     ...collectQuoteRanges(text),
   ];
+  const unboundedStructuralRanges = structuralRanges.filter((range) => !range.bounded);
   const ranges: InertPromptRange[] = structuralRanges
     .filter((range) => range.bounded)
     .map(({ start, end }) => ({ start, end }));
@@ -1713,14 +1724,18 @@ function boundedPredecessorRanges(text: string, referenceIndex: MarkdownReferenc
   const activeCommandPrefix = new RegExp(`^\\s*(?:please\\s+)?${DIRECTIVE_VERB}\\s+(?:the\\s+)?$`, 'iu');
   let match: RegExpExecArray | null;
   while ((match = pattern.exec(text)) !== null) {
-    const end = match.index + match[0].length;
-    const inactive = isInactivePromptsMention(text, match.index, end, inertRangeIndexes, referenceIndex);
-    const lineStart = lineStartForPosition(text, match.index);
-    if (!inactive && !activeCommandPrefix.test(text.slice(lineStart, match.index))) continue;
-    const markdownRange = inactive ? markdownDocumentationRange(text, match.index, end, referenceIndex) : null;
+    const start = match.index;
+    const end = start + match[0].length;
+    if (!isExplicitTokenBoundary(text, end)) continue;
+    if (unboundedStructuralRanges.some((range) => start >= range.start && start < range.end)) continue;
+    const inactive = isInactivePromptsMention(text, start, end, inertRangeIndexes, referenceIndex);
+    const lineStart = lineStartForPosition(text, start);
+    const leading = leadingDirectiveCursor(text, lineStart, false);
+    if (!inactive && !activeCommandPrefix.test(text.slice(leading.cursor, start))) continue;
+    const markdownRange = inactive ? markdownDocumentationRange(text, start, end, referenceIndex) : null;
     ranges.push({
-      start: markdownRange?.start ?? match.index,
-      end: inactive && isListItemDocumentation(text, match.index, end) ? lineEnd(text, end) : (markdownRange?.end ?? end),
+      start: markdownRange?.start ?? start,
+      end: inactive && isListItemDocumentation(text, start, end) ? lineEnd(text, end) : (markdownRange?.end ?? end),
     });
   }
   return ranges.sort((left, right) => left.start - right.start || left.end - right.end);
@@ -1802,8 +1817,10 @@ function directCandidateIndexes(text: string, candidates: ExplicitCandidateScan[
       inertPromptCursor += 1;
     }
     if (isInertOrNegativeMention(text, candidate)) {
-      let predecessorEnd = structuralInertRangeEnd(inertRangeIndexes, candidate.start) ?? candidate.end;
-      predecessorEnd = Math.max(predecessorEnd, postposedExplicitNegationEnd(text, candidate) ?? -1);
+      const structuralEnd = structuralInertRangeEnd(inertRangeIndexes, candidate.start);
+      let predecessorEnd = structuralEnd ?? candidate.end;
+      const predicateCandidate = structuralEnd !== null ? { ...candidate, end: structuralEnd } : candidate;
+      predecessorEnd = Math.max(predecessorEnd, postposedExplicitNegationEnd(text, predicateCandidate) ?? -1);
       const candidateLineStart = lineStartForPosition(text, candidate.start);
       const candidateLineEnd = lineEnd(text, candidate.end);
       if (text.lastIndexOf('[', candidate.start) >= candidateLineStart && text.indexOf(']', candidate.end) < candidateLineEnd) {
@@ -1817,9 +1834,16 @@ function directCandidateIndexes(text: string, candidates: ExplicitCandidateScan[
       latestInertEnd = Math.max(latestInertEnd, documentationRange?.end ?? candidate.end);
       continue;
     }
-    if (!indexes.has(candidateIndex) && latestInertEnd >= 0 && !isNegativeExplicitMention(text, candidate)) {
+    if (indexes.has(candidateIndex)) {
+      latestInertEnd = -1;
+      continue;
+    }
+    if (latestInertEnd >= 0 && !isNegativeExplicitMention(text, candidate)) {
       const lineLeading = leadingDirectiveCursor(text, lineStartForPosition(text, candidate.start), false).cursor === candidate.start;
-      if (lineLeading || clauseDirectiveStart(text, latestInertEnd, candidate.start)) addBlock(candidate.start);
+      if ((lineLeading && hasAdjacentPredecessorSeparator(text, latestInertEnd, candidate.start)) || clauseDirectiveStart(text, latestInertEnd, candidate.start)) {
+        addBlock(candidate.start);
+      }
+      latestInertEnd = -1;
     }
   }
   return indexes;
@@ -1952,6 +1976,8 @@ function isEmbeddedPathOrUrlMention(text: string, start: number): boolean {
 }
 
 function explicitCandidateDocumentationRange(text: string, candidate: ExplicitCandidateScan, referenceIndex: MarkdownReferenceIndex): InertPromptRange | null {
+  const destinationEnd = inertRangeEndAt(referenceIndex.destinationRanges, candidate.start);
+  if (destinationEnd !== null) return { start: candidate.start, end: destinationEnd };
   if (isCandidateInListItemDocumentation(text, candidate)) return { start: candidate.start, end: lineEnd(text, candidate.end) };
   const markdownRange = markdownDocumentationRange(text, candidate.start, candidate.end, referenceIndex);
   if (markdownRange) return markdownRange;
@@ -2001,7 +2027,7 @@ function isActiveImplicitMatch(
   inertRangeIndexes: Readonly<Record<StructuralInertDiagnostic, InertRangeIndex>>,
   referenceIndex: MarkdownReferenceIndex,
 ): ImplicitClauseRange | null {
-  if (isStructurallyInert(inertRangeIndexes, matchStart) || isImplicitListDocumentation(text, matchStart)) return null;
+  if (isStructurallyInert(inertRangeIndexes, matchStart) || isInInertRange(referenceIndex.destinationRanges, matchStart) || isImplicitListDocumentation(text, matchStart)) return null;
   if (hasOddImmediateBackslashes(text, matchStart)) return null;
   const clause = implicitClauseRange(text, matchStart, matchEnd);
   const lineStart = lineStartForPosition(text, matchStart);
