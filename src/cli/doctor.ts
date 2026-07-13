@@ -2,20 +2,11 @@
  * omx doctor - Validate oh-my-codex installation
  */
 
-import {
-	createNativeHookClaimJournalDurability,
-	recoverNativeHookClaimJournal,
-	type NativeHookClaimJournalDurability,
-} from "./native-hook-claim-journal.js";
-import {
-	emitDegradedDurabilityWarning,
-	recordRegularFileSyncOutcome,
-	type RegularFileDurabilityTracker,
-} from "../utils/file-durability.js";
-import { constants, existsSync, readFileSync, type Stats } from "fs";
-import { access, chown, lstat, mkdtemp, readdir, readFile, rmdir, rm } from "fs/promises";
+import { constants, existsSync, readFileSync } from "fs";
+import { access, chown, lstat, mkdtemp, readdir, readFile, rm } from "fs/promises";
 import { spawnSync } from "child_process";
-import { basename, dirname, join, relative } from "path";
+import { basename, join, relative, resolve as resolvePath } from "path";
+
 import { tmpdir } from "os";
 import {
 	codexHome,
@@ -47,15 +38,11 @@ import {
 import {
 	MANAGED_HOOK_EVENTS,
 	buildManagedCodexNativeHookCommand,
-	buildManagedCodexNativeHookWindowsShimContent,
-	classifyManagedCodexNativeHookWindowsShimOwnership,
 	discoverCodexHookConfigPaths,
-	isManagedCodexHookCommand,
-	parseManagedCodexNativeHookWindowsShimCommand,
-	planManagedCodexHooksRemoval,
 	resolveWindowsPowerShellPath,
-	type ManagedCodexHooksPlan,
-	validateCodexHooksConfigStrict,
+	getManagedCodexHookCommandsForEvent,
+	getMissingManagedCodexHookEvents,
+	hasCodexHooksJsonTopLevelState,
 } from "../config/codex-hooks.js";
 import { OMX_FIRST_PARTY_MCP_SERVER_NAMES } from "../config/omx-first-party-mcp.js";
 import { getDefaultBridge, isBridgeEnabled } from "../runtime/bridge.js";
@@ -100,19 +87,13 @@ import {
 import { AGENT_DEFINITIONS } from "../agents/definitions.js";
 import { getInstallableNativeAgentNames } from "../agents/policy.js";
 import { readCatalogManifest } from "../catalog/reader.js";
+import {
+	AUTHORITY_DIAGNOSTIC_CODES,
+	StateAuthorityError,
+	resolveStateAuthority,
+} from "../state/authority.js";
+import { resolveAuthenticatedTransportAuthority } from "../hooks/session.js";
 
-let doctorClaimJournalDurabilityOverride: NativeHookClaimJournalDurability | undefined;
-
-/** @internal Test seam for deterministic claim-journal durability coverage. */
-export function setDoctorClaimJournalDurabilityForTest(
-	durability: NativeHookClaimJournalDurability | undefined,
-): () => void {
-	const previous = doctorClaimJournalDurabilityOverride;
-	doctorClaimJournalDurabilityOverride = durability;
-	return () => {
-		doctorClaimJournalDurabilityOverride = previous;
-	};
-}
 
 interface DoctorOptions {
 	verbose?: boolean;
@@ -288,13 +269,6 @@ export async function doctor(options: DoctorOptions = {}): Promise<void> {
 	const cwd = process.cwd();
 	const scopeResolution = await resolveDoctorScope(cwd);
 	const paths = resolveDoctorPaths(cwd, scopeResolution.scope);
-	const recoveryTracker: RegularFileDurabilityTracker = { degraded: false };
-	const recovery = await recoverNativeHookClaimJournal(
-		paths.codexHomeDir,
-		doctorClaimJournalDurabilityOverride ?? createNativeHookClaimJournalDurability(),
-	);
-	recordRegularFileSyncOutcome(recoveryTracker, recovery.outcome);
-	emitDegradedDurabilityWarning("native-hook claim-journal recovery", recoveryTracker);
 	const scopeSourceMessage =
 		scopeResolution.source === "persisted"
 			? " (from .omx/setup-scope.json)"
@@ -377,18 +351,18 @@ export async function doctor(options: DoctorOptions = {}): Promise<void> {
 	}
 
 	// Check 4.25: Native hooks coverage
-	const nativeHooksCheck = await checkNativeHooks(paths.hooksPath, paths.configPath, {
-		codexHomeDir: paths.codexHomeDir,
-		installMode: scopeResolution.installMode,
-	});
-	checks.push(nativeHooksCheck);
+	checks.push(
+		await checkNativeHooks(paths.hooksPath, paths.configPath, {
+			codexHomeDir: paths.codexHomeDir,
+			installMode: scopeResolution.installMode,
+		}),
+	);
 	checks.push(await checkNativeHookDistSmoke());
 	if (options.verbose) {
 		const postCompactRuntimeCheck = await checkNativePostCompactHookRuntime(
 			paths.hooksPath,
 			cwd,
 			paths.codexHomeDir,
-			{ nativeHooksCheck },
 		);
 		if (postCompactRuntimeCheck) checks.push(postCompactRuntimeCheck);
 	}
@@ -442,6 +416,8 @@ export async function doctor(options: DoctorOptions = {}): Promise<void> {
 
 	// Check 8: State directory
 	checks.push(checkDirectory("State dir", paths.stateDir));
+	const authorityCheck = await checkStateAuthority(cwd);
+	if (authorityCheck) checks.push(authorityCheck);
 	checks.push(await checkRepoArtifactOwnership(cwd));
 
 	// Check 9: MCP servers configured
@@ -479,11 +455,10 @@ export async function doctor(options: DoctorOptions = {}): Promise<void> {
 	);
 
 	if (failCount > 0) {
-		console.log('\nReview failed checks above. Follow the check-specific recovery guidance; inspect invalid or ambiguous hook documents manually because doctor will not modify them.');
-
+		console.log('\nRun "omx setup" to fix installation issues.');
 	} else if (warnCount > 0) {
 		console.log(
-			'\nReview warnings above. Follow the check-specific recovery guidance; for AGENTS.md preservation prefer "omx setup --merge-agents".',
+			'\nReview warnings above. Use "omx setup --force" only when a warning recommends full replacement; for AGENTS.md preservation prefer "omx setup --merge-agents".',
 		);
 	} else {
 		console.log("\nAll checks passed! oh-my-codex is ready.");
@@ -491,15 +466,202 @@ export async function doctor(options: DoctorOptions = {}): Promise<void> {
 }
 
 interface TeamDoctorIssue {
-	code:
-		| "delayed_status_lag"
-		| "slow_shutdown"
-		| "orphan_tmux_session"
-		| "resume_blocker"
-		| "prompt_resume_unavailable"
-		| "stale_leader";
+	code: string;
 	message: string;
 	severity: "warn" | "fail";
+}
+
+interface AuthorityDoctorResolution {
+	stateDir: string | null;
+	issues: TeamDoctorIssue[];
+	validated: boolean;
+}
+
+function authorityLocatorPresent(env: NodeJS.ProcessEnv): boolean {
+	return [
+		env.OMX_STATE_AUTHORITY_PATH,
+		env.OMX_STATE_AUTHORITY_ID,
+		env.OMX_STATE_AUTHORITY_GENERATION_ID,
+		env.OMX_STATE_AUTHORITY_WORKSPACE_DIGEST,
+	].some((value) => typeof value === "string" && value.trim() !== "");
+}
+
+function authoritySessionId(env: NodeJS.ProcessEnv): string | undefined {
+	const sessionId = env.OMX_SESSION_ID?.trim();
+	return sessionId || undefined;
+}
+
+function authorityRootConflict(
+	cwd: string,
+	env: NodeJS.ProcessEnv,
+	canonicalStateRoot: string,
+): string | null {
+	const candidates: Array<{ name: string; path?: string }> = [
+		{ name: "OMX_TEAM_STATE_ROOT", path: env.OMX_TEAM_STATE_ROOT?.trim() },
+		{
+			name: "OMX_ROOT",
+			path: env.OMX_ROOT?.trim()
+				? join(env.OMX_ROOT.trim(), ".omx", "state")
+				: undefined,
+		},
+		{
+			name: "OMX_STATE_ROOT",
+			path: env.OMX_STATE_ROOT?.trim()
+				? join(env.OMX_STATE_ROOT.trim(), ".omx", "state")
+				: undefined,
+		},
+	];
+	for (const candidate of candidates) {
+		if (candidate.path && resolvePath(cwd, candidate.path) !== resolvePath(canonicalStateRoot)) {
+			return candidate.name;
+		}
+	}
+	return null;
+}
+
+async function resolveAuthorityForDoctor(
+	cwd: string,
+	env: NodeJS.ProcessEnv = process.env,
+): Promise<AuthorityDoctorResolution> {
+	const hasLocator = authorityLocatorPresent(env);
+	if (hasLocator) {
+		try {
+			const context = await resolveAuthenticatedTransportAuthority(cwd, env);
+			if (!context) {
+				throw new StateAuthorityError(
+					AUTHORITY_DIAGNOSTIC_CODES.authorityMissing,
+					"inherited state-authority transport is absent",
+				);
+			}
+			const issues: TeamDoctorIssue[] = [];
+			const conflictingRoot = authorityRootConflict(cwd, env, context.canonical_state_root);
+			if (conflictingRoot) {
+				issues.push({
+					code: AUTHORITY_DIAGNOSTIC_CODES.workspaceMismatch,
+					message: `${conflictingRoot} conflicts with the persisted authority state root; remove the override and relaunch`,
+					severity: "fail",
+				});
+			}
+			return {
+				stateDir: issues.length === 0 ? context.canonical_state_root : null,
+				issues,
+				validated: issues.length === 0,
+			};
+		} catch (error) {
+			return {
+				stateDir: null,
+				validated: false,
+				issues: [{
+					code: error instanceof StateAuthorityError
+						? error.code
+						: AUTHORITY_DIAGNOSTIC_CODES.rootMissing,
+					message: `cannot resolve inherited authority: ${error instanceof Error ? error.message : String(error)}`,
+					severity: "fail",
+				}],
+			};
+		}
+	}
+	try {
+		const resolution = await resolveStateAuthority({
+			startup_cwd: cwd,
+			observed_cwd: cwd,
+			session_id: authoritySessionId(env),
+		});
+		if (!resolution.context || !resolution.can_mutate) {
+			const anchorMissingOnly = resolution.diagnostics.length === 1
+				&& resolution.diagnostics[0]?.code === AUTHORITY_DIAGNOSTIC_CODES.anchorMissing;
+			if (!hasLocator && anchorMissingOnly) {
+				return { stateDir: omxStateDir(cwd), issues: [], validated: false };
+			}
+			return {
+				stateDir: null,
+				validated: false,
+				issues: resolution.diagnostics.map((diagnostic) => ({
+					code: diagnostic.code,
+					message: `${diagnostic.message}. Relaunch from the committed authority workspace; do not set an alternate OMX root.`,
+					severity: "fail" as const,
+				})),
+			};
+		}
+
+		const context = resolution.context;
+		const issues: TeamDoctorIssue[] = [...resolution.diagnostics].map((diagnostic) => ({
+			code: diagnostic.code,
+			message: `${diagnostic.message}. Relaunch from the committed authority workspace; do not set an alternate OMX root.`,
+			severity: "fail",
+		}));
+		const locator = env.OMX_STATE_AUTHORITY_PATH?.trim();
+		if (locator && resolvePath(cwd, locator) !== resolvePath(context.authority_path)) {
+			issues.push({
+				code: AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot,
+				message: "inherited authority locator does not match the persisted active generation",
+				severity: "fail",
+			});
+		}
+		if (env.OMX_STATE_AUTHORITY_ID?.trim() && env.OMX_STATE_AUTHORITY_ID.trim() !== context.generation.authority_id) {
+			issues.push({
+				code: AUTHORITY_DIAGNOSTIC_CODES.workspaceMismatch,
+				message: "inherited authority ID conflicts with the persisted active generation",
+				severity: "fail",
+			});
+		}
+		if (env.OMX_STATE_AUTHORITY_GENERATION_ID?.trim() && env.OMX_STATE_AUTHORITY_GENERATION_ID.trim() !== context.generation.generation_id) {
+			issues.push({
+				code: AUTHORITY_DIAGNOSTIC_CODES.authorityMissing,
+				message: "inherited authority generation ID conflicts with the persisted active generation",
+				severity: "fail",
+			});
+		}
+		if (env.OMX_STATE_AUTHORITY_WORKSPACE_DIGEST?.trim() && env.OMX_STATE_AUTHORITY_WORKSPACE_DIGEST.trim() !== context.workspace_identity.digest) {
+			issues.push({
+				code: AUTHORITY_DIAGNOSTIC_CODES.workspaceMismatch,
+				message: "inherited authority workspace digest conflicts with the persisted workspace",
+				severity: "fail",
+			});
+		}
+		const conflictingRoot = authorityRootConflict(cwd, env, context.canonical_state_root);
+		if (conflictingRoot) {
+			issues.push({
+				code: AUTHORITY_DIAGNOSTIC_CODES.workspaceMismatch,
+				message: `${conflictingRoot} conflicts with the persisted authority state root; remove the override and relaunch`,
+				severity: "fail",
+			});
+		}
+		return {
+			stateDir: issues.length === 0 ? context.canonical_state_root : null,
+			issues,
+			validated: issues.length === 0,
+		};
+	} catch (error) {
+		return {
+			stateDir: hasLocator ? null : omxStateDir(cwd),
+			validated: false,
+			issues: hasLocator
+				? [{
+					code: AUTHORITY_DIAGNOSTIC_CODES.rootMissing,
+					message: `cannot resolve inherited authority: ${error instanceof Error ? error.message : String(error)}`,
+					severity: "fail",
+				}]
+				: [],
+		};
+	}
+}
+
+async function checkStateAuthority(cwd: string): Promise<Check | null> {
+	const authority = await resolveAuthorityForDoctor(cwd);
+	if (!authority.validated && authority.issues.length === 0) return null;
+	if (authority.issues.length > 0) {
+		return {
+			name: "State authority",
+			status: "fail",
+			message: authority.issues.map((issue) => `${issue.code}: ${issue.message}`).join("; "),
+		};
+	}
+	return {
+		name: "State authority",
+		status: "pass",
+		message: `validated workspace state root ${authority.stateDir}`,
+	};
 }
 
 async function doctorTeam(): Promise<void> {
@@ -531,8 +693,10 @@ async function doctorTeam(): Promise<void> {
 async function collectTeamDoctorIssues(
 	cwd: string,
 ): Promise<TeamDoctorIssue[]> {
-	const issues: TeamDoctorIssue[] = [];
-	const stateDir = omxStateDir(cwd);
+	const authority = await resolveAuthorityForDoctor(cwd);
+	const issues: TeamDoctorIssue[] = [...authority.issues];
+	if (!authority.stateDir) return dedupeIssues(issues);
+	const stateDir = authority.stateDir;
 	const teamsRoot = join(stateDir, "team");
 	const nowMs = Date.now();
 	const lagThresholdMs = 60_000;
@@ -1611,12 +1775,10 @@ export async function checkExternalCodexProcessGuards(
 	};
 }
 
-export interface NativeHookCheckContext {
+interface NativeHookCheckContext {
 	codexHomeDir: string;
 	installMode?: SetupInstallMode;
-	platform?: NodeJS.Platform;
 }
-
 
 function isEnabledTomlValue(value: unknown): boolean {
 	return value === true || (typeof value === "string" && ["1", "true", "yes", "on"].includes(value.trim().toLowerCase()));
@@ -1636,225 +1798,6 @@ function configEnablesPluginScopedHooks(configContent: string): boolean {
 	} catch {
 		return /^\s*plugin_hooks\s*=\s*(?:true|1|"true"|"1"|"yes"|"on")\s*$/m.test(configContent);
 	}
-}
-
-function trimNativeHookDetailTerminalPeriod(detail: string): string {
-	return detail.endsWith(".") ? detail.slice(0, -1) : detail;
-}
-
-function formatNativeHookDiagnostics(
-	diagnostics: readonly {
-		eventName: string;
-		groupIndex: number;
-		handlerIndex?: number;
-		message: string;
-	}[],
-): string {
-	return diagnostics
-		.map((diagnostic) => {
-			const coordinate = `${diagnostic.eventName}[${diagnostic.groupIndex}]${
-				diagnostic.handlerIndex === undefined
-					? ""
-					: `.${diagnostic.handlerIndex}`
-			}`;
-			return `${coordinate}: ${trimNativeHookDetailTerminalPeriod(diagnostic.message)}`;
-		})
-		.join("; ");
-}
-
-function isJsonRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-const WINDOWS_SHIM_SCAN_EVENTS = [
-	"PreToolUse",
-	"PermissionRequest",
-	"PostToolUse",
-	"PreCompact",
-	"PostCompact",
-	"SessionStart",
-	"UserPromptSubmit",
-	"SubagentStart",
-	"SubagentStop",
-	"Stop",
-] as const;
-
-function effectiveWindowsHookCommand(handler: Record<string, unknown>): string | null {
-	const commandWindows = handler.commandWindows;
-	if (typeof commandWindows === "string") return commandWindows;
-	const commandWindowsSnakeCase = handler.command_windows;
-	if (typeof commandWindowsSnakeCase === "string") return commandWindowsSnakeCase;
-	return typeof handler.command === "string" ? handler.command : null;
-}
-
-function referencedWindowsNativeHookShimPaths(
-	root: Record<string, unknown>,
-	diagnostics: readonly {
-		code: string;
-		eventName: string;
-		groupIndex: number;
-		handlerIndex?: number;
-	}[],
-	codexHomeDir: string,
-): string[] {
-	if (!isJsonRecord(root.hooks)) return [];
-
-	const skippedGroups = new Set(
-		diagnostics
-			.filter((diagnostic) => diagnostic.code === "invalid_matcher")
-			.map((diagnostic) => `${diagnostic.eventName}:${diagnostic.groupIndex}`),
-	);
-	const skippedHandlers = new Set(
-		diagnostics
-			.filter((diagnostic) => diagnostic.code === "async_command" || diagnostic.code === "empty_command")
-			.map((diagnostic) => `${diagnostic.eventName}:${diagnostic.groupIndex}:${diagnostic.handlerIndex}`),
-	);
-	const shimPaths = new Set<string>();
-	for (const eventName of WINDOWS_SHIM_SCAN_EVENTS) {
-		const eventGroups = root.hooks[eventName];
-		if (!Array.isArray(eventGroups)) continue;
-		for (const [groupIndex, group] of eventGroups.entries()) {
-			if (skippedGroups.has(`${eventName}:${groupIndex}`) || !isJsonRecord(group) || !Array.isArray(group.hooks)) continue;
-			for (const [handlerIndex, handler] of group.hooks.entries()) {
-				if (
-					skippedHandlers.has(`${eventName}:${groupIndex}:${handlerIndex}`) ||
-					!isJsonRecord(handler) ||
-					handler.type !== "command"
-				) continue;
-				const command = effectiveWindowsHookCommand(handler);
-				if (!command) continue;
-				const shimPath = parseManagedCodexNativeHookWindowsShimCommand(command, {
-					platform: "win32",
-					codexHomeDir,
-				});
-				if (shimPath) shimPaths.add(shimPath);
-			}
-		}
-	}
-	return [...shimPaths];
-}
-
-async function checkWindowsNativeHookShimParentTopology(
-	shimPath: string,
-	codexHomeDir: string,
-): Promise<Check | null> {
-	let ancestorPath = dirname(shimPath);
-	for (;;) {
-		try {
-			const ancestorStat = await lstat(ancestorPath);
-			if (ancestorStat.isSymbolicLink() || !ancestorStat.isDirectory()) {
-				return {
-					name: "Native hooks",
-					status: "fail",
-					message: `referenced Windows native hook shim at ${shimPath} has an unsafe parent topology at ${ancestorPath}; doctor will not follow or modify it`,
-				};
-			}
-		} catch {
-			return {
-				name: "Native hooks",
-				status: "fail",
-				message: `referenced Windows native hook shim at ${shimPath} has a parent topology that cannot be safely validated; doctor will not follow or modify it`,
-			};
-		}
-		if (ancestorPath === codexHomeDir) return null;
-		const parentPath = dirname(ancestorPath);
-		if (parentPath === ancestorPath) {
-			return {
-				name: "Native hooks",
-				status: "fail",
-				message: `referenced Windows native hook shim at ${shimPath} is outside the controlled Codex home topology; doctor will not follow or modify it`,
-			};
-		}
-		ancestorPath = parentPath;
-	}
-}
-
-async function checkWindowsNativeHookShims(
-	root: Record<string, unknown>,
-	diagnostics: Parameters<typeof referencedWindowsNativeHookShimPaths>[1],
-	codexHomeDir: string,
-	requireCurrent = false,
-): Promise<Check | null> {
-	const expected = Buffer.from(
-		buildManagedCodexNativeHookWindowsShimContent(getPackageRoot()),
-		"utf-8",
-	);
-	for (const shimPath of referencedWindowsNativeHookShimPaths(root, diagnostics, codexHomeDir)) {
-		let shimContent: Buffer;
-		try {
-			const shimStat = await lstat(shimPath);
-			if (shimStat.isSymbolicLink() || !shimStat.isFile()) {
-				return {
-					name: "Native hooks",
-					status: "fail",
-					message: `referenced Windows native hook shim at ${shimPath} is not a regular file; doctor will not follow or modify it`,
-				};
-			}
-			if (shimStat.nlink !== 1) {
-				return {
-					name: "Native hooks",
-					status: "fail",
-					message: `referenced Windows native hook shim at ${shimPath} is hard-linked; doctor will not execute or modify it`,
-				};
-			}
-			shimContent = await readFile(shimPath);
-			const topologyCheck = await checkWindowsNativeHookShimParentTopology(
-				shimPath,
-				codexHomeDir,
-			);
-			if (topologyCheck) return topologyCheck;
-		} catch (error) {
-			const code = typeof error === "object" && error !== null && "code" in error
-				? String(error.code)
-				: undefined;
-			return {
-				name: "Native hooks",
-				status: "fail",
-				message: code === "ENOENT"
-					? `referenced Windows native hook shim is missing at ${shimPath}; manually reinstall the matching oh-my-codex version because doctor will not create or modify shims`
-					: `cannot read referenced Windows native hook shim at ${shimPath}; inspect it and manually reinstall the matching oh-my-codex version because doctor will not modify shims`,
-			};
-		}
-		const ownership = classifyManagedCodexNativeHookWindowsShimOwnership(shimContent, expected);
-		if (ownership === "modified") {
-			return {
-				name: "Native hooks",
-				status: "fail",
-				message: `referenced Windows native hook shim at ${shimPath} is not an exact current or complete historical generated shim; it may be modified, truncated, have extra content, or use ambiguous encoding. Manually reinstall the matching oh-my-codex version because doctor will not overwrite it`,
-			};
-		}
-		if (requireCurrent && ownership !== "current") {
-			return {
-				name: "Native hooks",
-				status: "warn",
-				message: `referenced Windows native hook shim at ${shimPath} is a complete historical generated shim, but verbose execution requires exact current shim bytes; run "omx setup" to migrate it before retrying`,
-			};
-		}
-	}
-	return null;
-}
-
-const MANAGED_HOOK_TRUST_KEY_LABELS: Record<
-	(typeof MANAGED_HOOK_EVENTS)[number],
-	string
-> = {
-	SessionStart: "session_start",
-	PreToolUse: "pre_tool_use",
-	PostToolUse: "post_tool_use",
-	UserPromptSubmit: "user_prompt_submit",
-	PreCompact: "pre_compact",
-	PostCompact: "post_compact",
-	Stop: "stop",
-};
-
-function getMissingManagedHookEventsFromPlan(
-	plan: Pick<ManagedCodexHooksPlan, "priorTrustState">,
-): (typeof MANAGED_HOOK_EVENTS)[number][] {
-	return MANAGED_HOOK_EVENTS.filter((eventName) => {
-		const label = MANAGED_HOOK_TRUST_KEY_LABELS[eventName];
-		const keyPattern = new RegExp(`:${label}:\\d+:\\d+$`);
-		return !Object.keys(plan.priorTrustState).some((key) => keyPattern.test(key));
-	});
 }
 
 function pluginHooksJsonHasNativeCoverage(content: string): boolean | null {
@@ -1887,7 +1830,7 @@ async function checkPluginScopedNativeHooks(
 	setupHooksPath: string,
 ): Promise<Check> {
 	const setupHooksPathDescription = existsSync(setupHooksPath)
-		? `existing hooks.json at ${setupHooksPath} is retained read-only and validated separately because plugin-scoped hooks are enabled`
+		? `existing hooks.json at ${setupHooksPath} is treated as user-owned because plugin-scoped hooks are enabled`
 		: `setup-owned hooks.json is intentionally absent at ${setupHooksPath}`;
 	const packagedMarketplace = await resolvePackagedOmxMarketplace(getPackageRoot());
 	if (!packagedMarketplace) {
@@ -1913,7 +1856,7 @@ async function checkPluginScopedNativeHooks(
 			name: "Native hooks",
 			status: "warn",
 			message:
-				`plugin-scoped hooks are enabled, but the expected Codex plugin cache manifest is missing at ${join(expectedCacheDir, ".codex-plugin", "plugin.json")}; ${setupHooksPathDescription}; run "omx setup --plugin" to refresh the plugin cache`,
+				`plugin-scoped hooks are enabled, but the expected Codex plugin cache manifest is missing at ${join(expectedCacheDir, ".codex-plugin", "plugin.json")}; ${setupHooksPathDescription}; run "omx setup --plugin --force" to refresh the plugin cache`,
 		};
 	}
 
@@ -1922,7 +1865,7 @@ async function checkPluginScopedNativeHooks(
 			name: "Native hooks",
 			status: "warn",
 			message:
-				`plugin-scoped hooks are enabled, but the Codex plugin cache manifest points hooks to ${String(state.hooksPointer)} instead of ./hooks/hooks.json at ${expectedHooksPath}; run "omx setup --plugin" to refresh the plugin cache`,
+				`plugin-scoped hooks are enabled, but the Codex plugin cache manifest points hooks to ${String(state.hooksPointer)} instead of ./hooks/hooks.json at ${expectedHooksPath}; run "omx setup --plugin --force" to refresh the plugin cache`,
 		};
 	}
 
@@ -1932,7 +1875,7 @@ async function checkPluginScopedNativeHooks(
 				name: "Native hooks",
 				status: "warn",
 				message:
-					`plugin-scoped hooks are enabled, but expected plugin hook file is missing at ${expectedPath}; ${setupHooksPathDescription}; run "omx setup --plugin" to refresh the plugin cache`,
+					`plugin-scoped hooks are enabled, but expected plugin hook file is missing at ${expectedPath}; ${setupHooksPathDescription}; run "omx setup --plugin --force" to refresh the plugin cache`,
 			};
 		}
 	}
@@ -1942,7 +1885,7 @@ async function checkPluginScopedNativeHooks(
 			name: "Native hooks",
 			status: "warn",
 			message:
-				`plugin-scoped hooks are enabled, but cached plugin hook files or pinned hook launcher in ${expectedCacheDir} do not match the packaged plugin; ${setupHooksPathDescription}; run "omx setup --plugin" to refresh the plugin cache`,
+				`plugin-scoped hooks are enabled, but cached plugin hook files or pinned hook launcher in ${expectedCacheDir} do not match the packaged plugin; ${setupHooksPathDescription}; run "omx setup --plugin --force" to refresh the plugin cache`,
 		};
 	}
 
@@ -1970,7 +1913,7 @@ async function checkPluginScopedNativeHooks(
 			name: "Native hooks",
 			status: "warn",
 			message:
-				`plugin-scoped hooks.json at ${expectedHooksPath} is missing OMX native coverage for one or more events; run "omx setup --plugin" to refresh the plugin cache`,
+				`plugin-scoped hooks.json at ${expectedHooksPath} is missing OMX native coverage for one or more events; run "omx setup --plugin --force" to refresh the plugin cache`,
 		};
 	}
 
@@ -2026,153 +1969,7 @@ async function checkPluginScopedNativeHooks(
 	};
 }
 
-function decodeStrictUtf8(bytes: Buffer): string | null {
-	try {
-		const content = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
-		return Buffer.from(content, "utf-8").equals(bytes) ? content : null;
-	} catch {
-		return null;
-	}
-}
-
-function combinePluginAndGlobalNativeHookChecks(plugin: Check, global: Check | null): Check {
-	if (!global) return plugin;
-	const status = plugin.status === "fail" || global.status === "fail"
-		? "fail"
-		: plugin.status === "warn" || global.status === "warn"
-			? "warn"
-			: "pass";
-	return {
-		name: "Native hooks",
-		status,
-		message: `${plugin.message}; existing global hooks.json: ${global.message}`,
-	};
-}
-
-function combineNativeHookIntegrityAndRemovalChecks(
-	integrityCheck: Check | null,
-	removalCheck: Check,
-): Check {
-	if (!integrityCheck) return removalCheck;
-	return {
-		name: "Native hooks",
-		status: integrityCheck.status === "fail" || removalCheck.status === "fail"
-			? "fail"
-			: "warn",
-		message: `${integrityCheck.message}; ${removalCheck.message}`,
-	};
-}
-
-async function checkExistingNativeHooks(
-	hooksPath: string,
-	context: NativeHookCheckContext,
-): Promise<Check> {
-	const platform = context.platform ?? process.platform;
-	try {
-		const hooksStat = await lstat(hooksPath);
-		if (hooksStat.isSymbolicLink() || !hooksStat.isFile()) {
-			return {
-				name: "Native hooks",
-				status: "fail",
-				message: `hooks.json at ${hooksPath} is not a regular file; doctor will not follow or modify it`,
-			};
-		}
-		const content = decodeStrictUtf8(await readFile(hooksPath));
-		if (content === null) {
-			return {
-				name: "Native hooks",
-				status: "fail",
-				message: `hooks.json at ${hooksPath} is not valid UTF-8; inspect the file manually because doctor will not modify it`,
-			};
-		}
-		const validation = validateCodexHooksConfigStrict(content, {
-			platform,
-			codexHomeDir: context.codexHomeDir,
-		});
-		if (!validation.ok) {
-			return {
-				name: "Native hooks",
-				status: "fail",
-				message: `hooks.json failed strict load validation (${validation.error.code}): ${trimNativeHookDetailTerminalPeriod(validation.error.message)}; inspect the file manually because doctor will not modify it`,
-			};
-		}
-
-		const removalPlan = planManagedCodexHooksRemoval(content, hooksPath, {
-			platform,
-			codexHomeDir: context.codexHomeDir,
-		});
-		const windowsShimCheck = platform === "win32"
-			? await checkWindowsNativeHookShims(
-				validation.root,
-				validation.diagnostics,
-				context.codexHomeDir,
-			)
-			: null;
-		if (!removalPlan.ok) {
-			const removalIsCoordinateOnly = removalPlan.error.code === "unsafe_managed_removal";
-			const removalCheck: Check = {
-				name: "Native hooks",
-				status: removalIsCoordinateOnly ? "warn" : "fail",
-				message: removalIsCoordinateOnly
-					? `hooks.json has OMX entries that cannot be safely removed (${removalPlan.error.code}): ${trimNativeHookDetailTerminalPeriod(removalPlan.error.message)}; manual cleanup is required because doctor will not overwrite or remove it`
-					: `hooks.json has ambiguous or untrusted OMX ownership (${removalPlan.error.code}): ${trimNativeHookDetailTerminalPeriod(removalPlan.error.message)}; inspect the file manually because doctor will not overwrite or remove it`,
-			};
-			return combineNativeHookIntegrityAndRemovalChecks(windowsShimCheck, removalCheck);
-		}
-		if (windowsShimCheck) return windowsShimCheck;
-		const legacyTrustStateEntries = Object.keys(removalPlan.legacyTrustState).length;
-		if (legacyTrustStateEntries > 0) {
-			return {
-				name: "Native hooks",
-				status: "warn",
-				message: `hooks.json contains ${legacyTrustStateEntries} exact historical OMX hook trust-state ${legacyTrustStateEntries === 1 ? "entry that requires" : "entries that require"} migration; run "omx setup" to migrate ${legacyTrustStateEntries === 1 ? "it" : "them"} after reviewing the configuration`,
-			};
-		}
-
-		if (validation.diagnostics.length > 0) {
-			return {
-				name: "Native hooks",
-				status: "warn",
-				message: `hooks.json discovery warnings: ${formatNativeHookDiagnostics(validation.diagnostics)}; Codex may ignore the listed entries, and doctor will not modify them`,
-			};
-		}
-
-		const missingEvents = getMissingManagedHookEventsFromPlan(removalPlan);
-		if (
-			removalPlan.hasForeignHooks &&
-			removalPlan.removedCount === 0 &&
-			missingEvents.length === MANAGED_HOOK_EVENTS.length
-		) {
-			return {
-				name: "Native hooks",
-				status: "pass",
-				message:
-					"hooks.json contains valid foreign hook entries and no OMX-managed wrappers; doctor will preserve the user-owned configuration",
-			};
-		}
-		if (missingEvents.length > 0) {
-			return {
-				name: "Native hooks",
-				status: "warn",
-				message: `hooks.json is missing OMX-managed coverage for ${missingEvents.join(", ")}; run "omx setup" to restore native hooks${removalPlan.hasForeignHooks ? "; valid foreign hooks will be preserved" : ""}`,
-			};
-		}
-
-		return {
-			name: "Native hooks",
-			status: "pass",
-			message: `hooks.json includes OMX-managed coverage for all native hook events${removalPlan.hasForeignHooks ? "; valid foreign hooks will be preserved" : ""}`,
-		};
-	} catch {
-		return {
-			name: "Native hooks",
-			status: "fail",
-			message: "cannot read hooks.json",
-		};
-	}
-}
-
-export async function checkNativeHooks(
+async function checkNativeHooks(
 	hooksPath: string,
 	configPath: string,
 	context: NativeHookCheckContext,
@@ -2181,13 +1978,7 @@ export async function checkNativeHooks(
 		try {
 			const configContent = await readFile(configPath, "utf-8");
 			if (configEnablesPluginScopedHooks(configContent)) {
-				const globalCheck = existsSync(hooksPath)
-					? await checkExistingNativeHooks(hooksPath, context)
-					: null;
-				return combinePluginAndGlobalNativeHookChecks(
-					await checkPluginScopedNativeHooks(context.codexHomeDir, hooksPath),
-					globalCheck,
-				);
+				return checkPluginScopedNativeHooks(context.codexHomeDir, hooksPath);
 			}
 		} catch {
 			// Fall through to the hooks.json checks; the dedicated config check will
@@ -2199,13 +1990,15 @@ export async function checkNativeHooks(
 		if (existsSync(configPath)) {
 			try {
 				const configContent = await readFile(configPath, "utf-8");
-				if (context.installMode === "plugin" && configHasOmxEntries(configContent)) {
-					return {
-						name: "Native hooks",
-						status: "warn",
-						message:
-							`plugin mode is using legacy native hook fallback, but expected setup-owned hooks.json is missing at ${hooksPath}; run "omx setup --plugin" to restore the fallback hook file, or upgrade Codex to plugin_hooks support so setup can use plugin-scoped hooks`,
-					};
+				if (context.installMode === "plugin") {
+					if (configHasOmxEntries(configContent)) {
+						return {
+							name: "Native hooks",
+							status: "warn",
+							message:
+								`plugin mode is using legacy native hook fallback, but expected setup-owned hooks.json is missing at ${hooksPath}; run "omx setup --plugin --force" to restore the fallback hook file, or upgrade Codex to plugin_hooks support so setup can use plugin-scoped hooks`,
+						};
+					}
 				}
 
 				if (configHasOmxEntries(configContent)) {
@@ -2213,11 +2006,11 @@ export async function checkNativeHooks(
 						name: "Native hooks",
 						status: "warn",
 						message:
-							`expected setup-owned hooks.json is missing at ${hooksPath} even though config.toml has OMX entries; run "omx setup" to restore native hook coverage`,
+							`expected setup-owned hooks.json is missing at ${hooksPath} even though config.toml has OMX entries; run "omx setup --force" to restore native hook coverage`,
 					};
 				}
 			} catch {
-				// Fall through to the neutral first-setup path when config cannot be read here;
+				// fall through to the neutral first-setup path when config cannot be read here;
 				// the dedicated config check will report read failures separately.
 			}
 		}
@@ -2229,7 +2022,48 @@ export async function checkNativeHooks(
 		};
 	}
 
-	return checkExistingNativeHooks(hooksPath, context);
+	try {
+		const content = await readFile(hooksPath, "utf-8");
+		const missingEvents = getMissingManagedCodexHookEvents(content);
+		if (missingEvents === null) {
+			return {
+				name: "Native hooks",
+				status: "fail",
+				message:
+					'invalid hooks.json; Codex may skip OMX hook coverage until "omx setup --force" repairs it',
+			};
+		}
+		const hasTopLevelState = hasCodexHooksJsonTopLevelState(content);
+		if (hasTopLevelState === true) {
+			return {
+				name: "Native hooks",
+				status: "fail",
+				message:
+					'top-level state in hooks.json is incompatible with Codex 0.140 (unknown field state, expected hooks); run "omx setup --force" to migrate trust state to config.toml and repair hooks.json',
+			};
+		}
+
+		if (missingEvents.length > 0) {
+			return {
+				name: "Native hooks",
+				status: "warn",
+				message: `hooks.json is missing OMX-managed coverage for ${missingEvents.join(", ")}; run "omx setup --force" to restore native hooks`,
+			};
+		}
+
+		return {
+			name: "Native hooks",
+			status: "pass",
+			message:
+				"hooks.json includes OMX-managed coverage for all native hook events",
+		};
+	} catch {
+		return {
+			name: "Native hooks",
+			status: "fail",
+			message: "cannot read hooks.json",
+		};
+	}
 }
 
 export async function checkNativeHookDistSmoke(
@@ -2239,12 +2073,22 @@ export async function checkNativeHookDistSmoke(
 	const nodePath = options.nodePath ?? process.execPath;
 	const runner = options.runner ?? spawnSync;
 	const scriptPath = join(packageRoot, "dist", "scripts", "codex-native-hook.js");
+	const packageJsonPath = join(packageRoot, "package.json");
+	let packageVersion = "current";
+	try {
+		const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf-8")) as { version?: unknown };
+		if (typeof packageJson.version === "string" && packageJson.version.trim()) {
+			packageVersion = packageJson.version.trim();
+		}
+	} catch {
+		// Keep the generic recovery copy when package metadata is not readable.
+	}
 
 	if (!existsSync(scriptPath)) {
 		return {
 			name: "Native hook dist smoke",
 			status: "fail",
-			message: `installed native hook script is missing at ${scriptPath}; reinstall oh-my-codex and run "omx setup"`,
+			message: `installed native hook script is missing at ${scriptPath}; reinstall oh-my-codex and run "omx setup --force"`,
 		};
 	}
 
@@ -2276,7 +2120,7 @@ export async function checkNativeHookDistSmoke(
 			return {
 				name: "Native hook dist smoke",
 				status: "fail",
-				message: `installed native hook dist smoke failed to run (${result.error.message}); reinstall oh-my-codex and run "omx setup"`,
+				message: `installed native hook dist smoke failed to run (${result.error.message}); reinstall oh-my-codex and run "omx setup --force"`,
 			};
 		}
 		if (result.status !== 0) {
@@ -2286,7 +2130,7 @@ export async function checkNativeHookDistSmoke(
 			return {
 				name: "Native hook dist smoke",
 				status: "fail",
-				message: `installed native hook dist failed a minimal UserPromptSubmit smoke (${detail}); reinstall the matching oh-my-codex version and then run "omx setup"`,
+				message: `installed native hook dist failed a minimal UserPromptSubmit smoke (${detail}); reinstall with "npm install -g oh-my-codex@${packageVersion} --force --min-release-age=0 --before=" and then run "omx setup --force"`,
 			};
 		}
 
@@ -2311,16 +2155,17 @@ export function classifyPostCompactHookStdout(stdout: string): Check | null {
 			name: "Native PostCompact hook",
 			status: "fail",
 			message:
-				"PostCompact hook emitted JSON stdout, but OMX PostCompact must emit no stdout until Codex defines a supported PostCompact output contract; rerun \"omx setup\" after upgrading",
+				"PostCompact hook emitted JSON stdout, but OMX PostCompact must emit no stdout until Codex defines a supported PostCompact output contract; run \"omx setup --force\" after upgrading",
 		};
 	} catch (error) {
 		return {
 			name: "Native PostCompact hook",
 			status: "fail",
-			message: `PostCompact hook emitted invalid JSON stdout (${error instanceof Error ? error.message : String(error)}); rerun "omx setup" after upgrading`,
+			message: `PostCompact hook emitted invalid JSON stdout (${error instanceof Error ? error.message : String(error)}); run "omx setup --force" after upgrading`,
 		};
 	}
 }
+
 
 interface PostCompactSmokeSpawnInvocation {
 	command: string;
@@ -2357,303 +2202,61 @@ export function buildPostCompactSmokeSpawnInvocation(
 	};
 }
 
-function buildInMemoryWindowsShimSmokeInvocation(
-	expectedShimContent: Buffer,
-	options: { env?: NodeJS.ProcessEnv } = {},
-): PostCompactSmokeSpawnInvocation | null {
-	const shimSource = decodeStrictUtf8(expectedShimContent);
-	if (shimSource === null) return null;
-
-	const encodedShimBytes = expectedShimContent.toString("base64");
-	const command = [
-		"$ErrorActionPreference = 'Stop'",
-		`$omxShimSource = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('${encodedShimBytes}'))`,
-		"if ($omxShimSource.Length -gt 0 -and [int][char]$omxShimSource[0] -eq 0xFEFF) { $omxShimSource = $omxShimSource.Substring(1) }",
-		"& ([ScriptBlock]::Create($omxShimSource))",
-		"exit $LASTEXITCODE",
-	].join("; ");
-	return {
-		command: resolveWindowsPowerShellPath(options.env),
-		args: [
-			"-NoProfile",
-			"-ExecutionPolicy",
-			"Bypass",
-			"-EncodedCommand",
-			Buffer.from(command, "utf16le").toString("base64"),
-		],
-		shell: false,
-	};
-}
-
-interface SmokeDirectoryIdentity {
-	dev: number;
-	ino: number;
-}
-
-function smokeDirectoryIdentity(stat: Stats): SmokeDirectoryIdentity | null {
-	if (
-		!stat.isDirectory() ||
-		stat.isSymbolicLink() ||
-		(process.platform !== "win32" && (stat.mode & 0o077) !== 0)
-	) return null;
-	return { dev: stat.dev, ino: stat.ino };
-}
-
-async function readSmokeDirectoryIdentity(
-	smokeCwd: string,
-): Promise<SmokeDirectoryIdentity | null> {
-	try {
-		return smokeDirectoryIdentity(await lstat(smokeCwd));
-	} catch {
-		return null;
-	}
-}
-
-function sameSmokeDirectoryIdentity(
-	expected: SmokeDirectoryIdentity,
-	actual: SmokeDirectoryIdentity | null,
-): boolean {
-	return actual !== null && actual.dev === expected.dev && actual.ino === expected.ino;
-}
-
-function smokeDirectorySafetyCheck(message: string): Check {
-	return {
-		name: "Native PostCompact hook",
-		status: "warn",
-		message,
-	};
-}
-
-async function cleanupSmokeDirectoryIfUnchanged(
-	smokeCwd: string,
-	identity: SmokeDirectoryIdentity,
-): Promise<Check | null> {
-	if (!sameSmokeDirectoryIdentity(identity, await readSmokeDirectoryIdentity(smokeCwd))) {
-		return smokeDirectorySafetyCheck(
-			"temporary PostCompact smoke directory changed during validation; doctor preserved it for manual recovery and skipped cleanup for safety",
-		);
-	}
-	try {
-		// Only remove the empty, identity-checked directory. Never recursively remove
-		// a directory that another process could have replaced or populated.
-		await rmdir(smokeCwd);
-		return null;
-	} catch {
-		return smokeDirectorySafetyCheck(
-			"temporary PostCompact smoke directory could not be removed without recursive deletion; doctor preserved it for manual recovery",
-		);
-	}
-}
-
-function inMemoryWindowsShimSmokeCheck(): Check {
-	return {
-		name: "Native PostCompact hook",
-		status: "warn",
-		message: "doctor could not build an in-memory Windows native hook smoke command from exact validated shim bytes; doctor skipped execution for safety",
-	};
-}
-
-interface NativePostCompactHookRuntimeOptions {
-	nativeHooksCheck?: Check;
-	platform?: NodeJS.Platform;
-	expectedCommand?: string;
-	runner?: typeof spawnSync;
-	beforeWindowsShimSmoke?: (paths: {
-		canonicalShimPath: string;
-		smokeCwd: string;
-	}) => void | Promise<void>;
-}
-
-function getManagedPostCompactHookCommands(
-	content: string,
-	platform: NodeJS.Platform,
-	codexHomeDir: string,
-): string[] | null {
-	const validation = validateCodexHooksConfigStrict(content, {
-		platform,
-		codexHomeDir,
-	});
-	if (!validation.ok) return null;
-	return validation.discoveredCommands
-		.filter((command) => command.eventName === "PostCompact")
-		.map((command) => command.command)
-		.filter((command) =>
-			isManagedCodexHookCommand(command) ||
-			(platform === "win32" && parseManagedCodexNativeHookWindowsShimCommand(command, {
-				platform,
-				codexHomeDir,
-			}) !== null),
-		);
-}
-
-function currentPostCompactCommandCheck(): Check {
-	return {
-		name: "Native PostCompact hook",
-		status: "warn",
-		message:
-			"effective PostCompact OMX command does not match this installation's managed hook command; doctor skipped execution for safety, and rerunning \"omx setup\" should refresh stale hooks.json entries",
-	};
-}
-
-function skippedPostCompactIntegrityCheck(integrityCheck: Check): Check {
-	return {
-		name: "Native PostCompact hook",
-		status: integrityCheck.status === "fail" ? "fail" : "warn",
-		message: `${integrityCheck.message}; doctor skipped execution because native hook integrity validation did not pass`,
-	};
-}
-
-export async function checkNativePostCompactHookRuntime(
+async function checkNativePostCompactHookRuntime(
 	hooksPath: string,
 	cwd: string,
 	codexHomeDir: string,
-	options: NativePostCompactHookRuntimeOptions = {},
 ): Promise<Check | null> {
 	if (!existsSync(hooksPath)) return null;
-	if (options.nativeHooksCheck && options.nativeHooksCheck.status !== "pass") return null;
 
-	const platform = options.platform ?? process.platform;
-	const expectedCommand = options.expectedCommand ?? buildManagedCodexNativeHookCommand(getPackageRoot(), {
-		codexHomeDir,
-		platform,
-	});
-	let content: string | null;
+	let content: string;
 	try {
-		content = decodeStrictUtf8(await readFile(hooksPath));
+		content = await readFile(hooksPath, "utf-8");
 	} catch {
 		return null;
 	}
-	if (content === null) return null;
 
-	const postCompactCommands = getManagedPostCompactHookCommands(content, platform, codexHomeDir);
-	if (postCompactCommands === null || postCompactCommands.length === 0) return null;
+	const postCompactCommands = getManagedCodexHookCommandsForEvent(
+		content,
+		"PostCompact",
+	);
+	if (postCompactCommands === null || postCompactCommands.length === 0) {
+		return null;
+	}
+
+	const expectedCommand = buildManagedCodexNativeHookCommand(getPackageRoot(), {
+		codexHomeDir,
+	});
 	const uniqueCommands = [...new Set(postCompactCommands)];
 	if (uniqueCommands.length !== 1 || uniqueCommands[0] !== expectedCommand) {
-		return currentPostCompactCommandCheck();
+		return {
+			name: "Native PostCompact hook",
+			status: "warn",
+			message:
+				"effective PostCompact OMX command does not match this installation's managed hook command; doctor skipped execution for safety, and \"omx setup --force\" should refresh stale hooks.json entries",
+		};
 	}
 
 	const smokeCwd = await mkdtemp(join(tmpdir(), "omx-doctor-postcompact-"));
-	const smokeDirectory = await readSmokeDirectoryIdentity(smokeCwd);
-	if (!smokeDirectory) {
-		return smokeDirectorySafetyCheck(
-			"temporary PostCompact smoke directory could not be validated; doctor preserved it for manual recovery and skipped execution for safety",
-		);
-	}
-	let primaryResult: Check | null = null;
-	let primaryError: Error | null = null;
 	try {
-		primaryResult = await (async (): Promise<Check> => {
-		const revalidatedIntegrity = await checkExistingNativeHooks(hooksPath, {
-			codexHomeDir,
-			platform,
-		});
-		if (revalidatedIntegrity.status !== "pass") {
-			return skippedPostCompactIntegrityCheck(revalidatedIntegrity);
-		}
-
-		let revalidatedContent: string | null;
-		try {
-			revalidatedContent = decodeStrictUtf8(await readFile(hooksPath));
-		} catch {
-			return {
-				name: "Native PostCompact hook",
-				status: "warn",
-				message: "hooks.json changed during verbose validation; doctor skipped execution for safety",
-			};
-		}
-		if (revalidatedContent === null) {
-			return {
-				name: "Native PostCompact hook",
-				status: "warn",
-				message: "hooks.json changed during verbose validation; doctor skipped execution for safety",
-			};
-		}
-		const revalidatedCommands = getManagedPostCompactHookCommands(
-			revalidatedContent,
-			platform,
-			codexHomeDir,
-		);
-		if (
-			revalidatedCommands === null ||
-			revalidatedCommands.length === 0 ||
-			new Set(revalidatedCommands).size !== 1 ||
-			revalidatedCommands[0] !== expectedCommand
-		) {
-			return currentPostCompactCommandCheck();
-		}
-
-		if (platform === "win32") {
-			const validation = validateCodexHooksConfigStrict(revalidatedContent, {
-				platform,
-				codexHomeDir,
-			});
-			if (!validation.ok) {
-				return {
-					name: "Native PostCompact hook",
-					status: "warn",
-					message: "hooks.json changed during verbose validation; doctor skipped execution for safety",
-				};
-			}
-			const currentShimCheck = await checkWindowsNativeHookShims(
-				validation.root,
-				validation.diagnostics,
-				codexHomeDir,
-				true,
-			);
-			if (currentShimCheck) return skippedPostCompactIntegrityCheck(currentShimCheck);
-		}
-
-		let smokeInvocation: PostCompactSmokeSpawnInvocation;
-		if (platform === "win32") {
-			const canonicalShimPath = parseManagedCodexNativeHookWindowsShimCommand(expectedCommand, {
-				platform,
-				codexHomeDir,
-			});
-			if (!canonicalShimPath) return currentPostCompactCommandCheck();
-
-			const expectedShimContent = Buffer.from(
-				buildManagedCodexNativeHookWindowsShimContent(getPackageRoot()),
-				"utf-8",
-			);
-			const inMemoryInvocation = buildInMemoryWindowsShimSmokeInvocation(expectedShimContent);
-			if (!inMemoryInvocation) return inMemoryWindowsShimSmokeCheck();
-			smokeInvocation = inMemoryInvocation;
-			try {
-				await options.beforeWindowsShimSmoke?.({ canonicalShimPath, smokeCwd });
-			} catch {
-				return smokeDirectorySafetyCheck(
-					"Windows native hook changed during validation; doctor skipped execution for safety",
-				);
-			}
-		} else {
-			smokeInvocation = buildPostCompactSmokeSpawnInvocation(expectedCommand, { platform });
-		}
-		if (!sameSmokeDirectoryIdentity(smokeDirectory, await readSmokeDirectoryIdentity(smokeCwd))) {
-			return smokeDirectorySafetyCheck(
-				"temporary PostCompact smoke directory changed during validation; doctor preserved it for manual recovery and skipped execution for safety",
-			);
-		}
-
 		const payload = JSON.stringify({
 			hook_event_name: "PostCompact",
 			cwd: smokeCwd,
 			session_id: "omx-doctor-postcompact-smoke",
 		});
-		const result = (options.runner ?? spawnSync)(smokeInvocation.command, smokeInvocation.args, {
+		const smokeInvocation = buildPostCompactSmokeSpawnInvocation(expectedCommand);
+		const result = spawnSync(smokeInvocation.command, smokeInvocation.args, {
 			cwd,
 			encoding: "utf-8",
 			env: {
 				...process.env,
 				OMX_NATIVE_HOOK_DOCTOR_SMOKE: "1",
-				OMX_ROOT: smokeCwd,
-				OMX_SESSION_ID: "omx-doctor-postcompact-smoke",
-				OMX_SOURCE_CWD: smokeCwd,
-				OMX_STARTUP_CWD: smokeCwd,
 			},
 			input: payload,
 			shell: smokeInvocation.shell,
 			timeout: 5_000,
 		});
+
 		if (result.error) {
 			return {
 				name: "Native PostCompact hook",
@@ -2679,22 +2282,9 @@ export async function checkNativePostCompactHookRuntime(
 			message:
 				"verbose smoke validation confirmed the effective PostCompact hook exits successfully with no stdout",
 		};
-		})();
-	} catch (error) {
-		primaryError = error instanceof Error ? error : new Error(String(error));
-		throw primaryError;
 	} finally {
-		const cleanupCheck = await cleanupSmokeDirectoryIfUnchanged(smokeCwd, smokeDirectory);
-		if (cleanupCheck) {
-			if (primaryResult) {
-				if (primaryResult.status === "pass") primaryResult.status = cleanupCheck.status;
-				primaryResult.message = `${primaryResult.message}; ${cleanupCheck.message}`;
-			} else if (primaryError) {
-				primaryError.message = `${primaryError.message}; ${cleanupCheck.message}`;
-			}
-		}
+		await rm(smokeCwd, { recursive: true, force: true });
 	}
-	return primaryResult;
 }
 
 async function checkNativeHookRuntimeMirrors(

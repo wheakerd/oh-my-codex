@@ -1,14 +1,20 @@
+import { createHash } from 'node:crypto';
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
 import { chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
-import { execFileSync, spawn, spawnSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { basename, dirname, join } from 'node:path';
+import { basename, delimiter, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { HUD_TMUX_HEIGHT_LINES } from '../../hud/constants.js';
+import { buildStateAuthorityTransportEnv } from '../../state/transport-env.js';
+import {
+  canonicalizeExistingAuthorityPath,
+  initializeStateAuthority,
+  mintStateAuthorityTransportCapability,
+} from '../../state/authority.js';
 import { DETACHED_TMUX_HISTORY_LIMIT } from '../index.js';
-import { writeSessionEnd, writeSessionStart } from '../../hooks/session.js';
 
 const CLI_SPAWN_TIMEOUT_MS = 60_000;
 
@@ -26,9 +32,20 @@ function buildRunOmxEnv(envOverrides: Record<string, string>): NodeJS.ProcessEnv
       delete env[key];
     }
   }
+  const pathOverride = envOverrides.PATH;
+  const overrides = { ...envOverrides };
+  delete overrides.PATH;
+  if (pathOverride !== undefined) {
+    for (const key of Object.keys(env)) {
+      if (key.toLowerCase() === 'path') delete env[key];
+    }
+  }
   return {
     ...env,
-    ...envOverrides,
+    ...overrides,
+    ...(pathOverride === undefined
+      ? {}
+      : { [process.platform === 'win32' ? 'Path' : 'PATH']: pathOverride }),
   };
 }
 
@@ -55,18 +72,46 @@ function runOmx(
   };
 }
 
-
 function normalizeDarwinTmpPath(value: string): string {
   return process.platform === 'darwin' ? value.replaceAll('/private/var/', '/var/') : value;
+}
+
+function canonicalTestPath(path: string): string {
+  return canonicalizeExistingAuthorityPath(path);
+}
+
+
+function platformTestPath(fakeBin: string): string {
+  const inheritedPath = process.platform === 'win32'
+    ? process.env.Path ?? process.env.PATH
+    : process.env.PATH ?? process.env.Path;
+  return [fakeBin, inheritedPath]
+    .filter((entry): entry is string => typeof entry === 'string' && entry.length > 0)
+    .join(delimiter);
 }
 
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-function shouldSkipForSpawnPermissions(err: string): boolean {
-  return typeof err === 'string' && /(EPERM|EACCES)/i.test(err);
+
+async function authenticatedLaunchTransport(
+  cwd: string,
+  launchId: string,
+): Promise<{ env: Record<string, string>; capability: string }> {
+  const authority = await initializeStateAuthority({
+    startup_cwd: cwd,
+    observed_cwd: cwd,
+    launch_id: launchId,
+    session_binding: { canonical_session_id: `${launchId}-session` },
+  });
+  await mintStateAuthorityTransportCapability(authority);
+  const env = buildStateAuthorityTransportEnv(authority, {});
+  const capability = env.OMX_STATE_AUTHORITY_CAPABILITY;
+  if (!capability) throw new Error('expected authenticated state-authority capability');
+  return { env: env as Record<string, string>, capability };
 }
+
 
 
 async function createGitRepo(wd: string): Promise<string> {
@@ -84,6 +129,24 @@ async function createGitRepo(wd: string): Promise<string> {
 async function writeExecutable(path: string, content: string): Promise<void> {
   await writeFile(path, content);
   await chmod(path, 0o755);
+  if (process.platform === 'win32' && !basename(path).includes('.')) {
+    await writeFile(`${path}.cmd`, `@echo off\r\nsh "%~dp0${basename(path)}" %*\r\n`);
+    if (basename(path) === 'codex') {
+      const nodeHostedPath = join(dirname(path), 'node_modules', '@openai', 'codex', 'bin', 'codex.js');
+      await mkdir(dirname(nodeHostedPath), { recursive: true });
+      await writeFile(
+        nodeHostedPath,
+        [
+          "const { spawnSync } = require('node:child_process');",
+          `const script = ${JSON.stringify(path)};`,
+          "const result = spawnSync('sh', [script, ...process.argv.slice(2)], { env: process.env, stdio: 'inherit' });",
+          'if (result.error) throw result.error;',
+          'process.exit(result.status ?? 1);',
+          '',
+        ].join('\n'),
+      );
+    }
+  }
 }
 
 async function createLaunchFixture(
@@ -107,84 +170,12 @@ async function createLaunchFixture(
     tmuxLogPath,
     env: {
       HOME: home,
-      PATH: `${fakeBin}:/usr/bin:/bin`,
+      PATH: platformTestPath(fakeBin),
       OMX_AUTO_UPDATE: '0',
       OMX_NOTIFY_FALLBACK: '0',
       OMX_HOOK_DERIVED_SIGNALS: '0',
       OMX_ROOT: '',
       OMX_STATE_ROOT: '',
-      OMXBOX_ACTIVE: '',
-      OMX_SOURCE_CWD: '',
-      OMX_MADMAX_DETACHED_CONTEXT: '',
-    },
-  };
-}
-
-function startHeldOmx(
-  cwd: string,
-  envOverrides: Record<string, string>,
-): ReturnType<typeof spawn> {
-  const testDir = dirname(fileURLToPath(import.meta.url));
-  const repoRoot = join(testDir, '..', '..', '..');
-  return spawn(process.execPath, [join(repoRoot, 'dist', 'cli', 'omx.js'), '--direct', '--version'], {
-    cwd,
-    env: buildRunOmxEnv(envOverrides),
-    stdio: 'inherit',
-  });
-}
-
-async function waitForPath(path: string, expectedLines: number = 1): Promise<void> {
-  for (let attempt = 0; attempt < 300; attempt += 1) {
-    if (existsSync(path)) {
-      const contents = await readFile(path, 'utf-8').catch(() => '');
-      if (contents.trim().split('\n').filter(Boolean).length >= expectedLines) return;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 20));
-  }
-  throw new Error(`timed out waiting for ${path}`);
-}
-
-async function stopHeldOmx(child: ReturnType<typeof spawn>, releasePath: string): Promise<void> {
-  await rm(releasePath, { force: true });
-  await new Promise<void>((resolve, reject) => {
-    child.once('error', reject);
-    child.once('exit', () => resolve());
-  });
-}
-
-async function createHeldCodexFixture(wd: string): Promise<{
-  env: Record<string, string>;
-  releasePath: string;
-  rootsPath: string;
-}> {
-  const home = join(wd, 'home');
-  const fakeBin = join(wd, 'bin');
-  const releasePath = join(wd, 'hold');
-  const rootsPath = join(wd, 'roots.log');
-  await mkdir(home, { recursive: true });
-  await mkdir(fakeBin, { recursive: true });
-  await writeFile(releasePath, 'hold\n');
-  await writeExecutable(
-    join(fakeBin, 'codex'),
-    `#!/bin/sh
-printf '%s\\n' "$OMX_ROOT" >> "${rootsPath}"
-while [ -f "${releasePath}" ]; do sleep 1; done
-`,
-  );
-  await writeExecutable(join(fakeBin, 'ps'), '#!/bin/sh\nexit 0\n');
-  return {
-    releasePath,
-    rootsPath,
-    env: {
-      HOME: home,
-      PATH: `${fakeBin}:/usr/bin:/bin`,
-      OMX_AUTO_UPDATE: '0',
-      OMX_NOTIFY_FALLBACK: '0',
-      OMX_HOOK_DERIVED_SIGNALS: '0',
-      OMX_ROOT: '',
-      OMX_STATE_ROOT: '',
-      TMUX: '',
-      TMUX_PANE: '',
     },
   };
 }
@@ -209,7 +200,7 @@ exit 42
 
       const result = runOmx(wd, ['--direct', '--version'], {
         HOME: home,
-        PATH: `${fakeBin}:/usr/bin:/bin`,
+        PATH: platformTestPath(fakeBin),
         OMX_AUTO_UPDATE: '0',
         OMX_NOTIFY_FALLBACK: '0',
         OMX_HOOK_DERIVED_SIGNALS: '0',
@@ -217,7 +208,6 @@ exit 42
         TMUX_PANE: '',
       });
 
-      if (shouldSkipForSpawnPermissions(result.error)) return;
 
       assert.equal(result.status, 42, result.error || result.stderr || result.stdout);
       assert.match(result.stderr, /codex-startup-boom/);
@@ -239,7 +229,7 @@ exit 42
 
       const result = runOmx(wd, ['--direct', '--version'], {
         HOME: home,
-        PATH: `${fakeBin}:/usr/bin:/bin`,
+        PATH: fakeBin,
         OMX_AUTO_UPDATE: '0',
         OMX_NOTIFY_FALLBACK: '0',
         OMX_HOOK_DERIVED_SIGNALS: '0',
@@ -247,7 +237,6 @@ exit 42
         TMUX_PANE: '',
       });
 
-      if (shouldSkipForSpawnPermissions(result.error)) return;
 
       assert.notEqual(result.status, 0);
       assert.match(result.stderr, /failed to launch codex: executable not found in PATH/);
@@ -274,20 +263,23 @@ exit 42
       await chmod(fakeCodexPath, 0o755);
       await writeFile(fakePsPath, '#!/bin/sh\nexit 0\n');
       await chmod(fakePsPath, 0o755);
+      if (process.platform === 'win32') {
+        await writeExecutable(fakeCodexPath, await readFile(fakeCodexPath, 'utf-8'));
+        await writeExecutable(fakePsPath, await readFile(fakePsPath, 'utf-8'));
+      }
 
       const result = runOmx(
         wd,
         ['--xhigh', '--madmax'],
         {
           HOME: home,
-          PATH: `${fakeBin}:/usr/bin:/bin`,
+          PATH: platformTestPath(fakeBin),
           OMX_AUTO_UPDATE: '0',
           OMX_NOTIFY_FALLBACK: '0',
           OMX_HOOK_DERIVED_SIGNALS: '0',
         },
       );
 
-      if (shouldSkipForSpawnPermissions(result.error)) return;
 
       assert.equal(result.status, 0, result.error || result.stderr || result.stdout);
       assert.match(result.stdout, /fake-codex:.*--dangerously-bypass-approvals-and-sandbox/);
@@ -299,107 +291,8 @@ exit 42
   });
 });
 
-describe('ordinary launch root collision guidance', () => {
-  it('keeps the cwd default for the first launch and fails the second and third launches closed with explicit-root guidance', async () => {
-    const wd = await mkdtemp(join(tmpdir(), 'omx-launch-root-conflict-'));
-    try {
-      execFileSync('git', ['init'], { cwd: wd, stdio: 'ignore' });
-      const fixture = await createHeldCodexFixture(wd);
-      await writeSessionStart(wd, 'first-standard-launch', { pid: process.pid });
-
-      const second = runOmx(wd, ['--direct', '--version'], fixture.env);
-      const third = runOmx(wd, ['--direct', '--version'], fixture.env);
-      if (shouldSkipForSpawnPermissions(second.error) || shouldSkipForSpawnPermissions(third.error)) return;
-      for (const result of [second, third]) {
-        assert.notEqual(result.status, 0, result.stderr || result.stdout);
-        assert.match(result.stderr, /session_pointer_owner_conflict/);
-        assert.match(result.stderr, /concurrent conversations in this checkout require distinct user-specified OMX_ROOT values/);
-        assert.match(result.stderr, /POSIX: OMX_ROOT="\$HOME\/\.omx\/instances\/second-conversation" omx/);
-        assert.match(result.stderr, /PowerShell: \$env:OMX_ROOT = "\$HOME\/\.omx\/instances\/second-conversation"; omx/);
-        assert.match(result.stderr, /cmd\.exe: set "OMX_ROOT=%USERPROFILE%\\\.omx\\instances\\second-conversation" && omx/);
-        assert.match(result.stderr, /OMX does not reroute or allocate one automatically/);
-      }
-      const resume = runOmx(wd, ['--direct', 'resume'], fixture.env);
-      if (!shouldSkipForSpawnPermissions(resume.error)) {
-        assert.notEqual(resume.status, 0, resume.stderr || resume.stdout);
-        assert.match(resume.stderr, /session_pointer_owner_conflict/);
-        assert.doesNotMatch(resume.stderr, /concurrent conversations in this checkout require distinct user-specified OMX_ROOT values/);
-      }
-      await writeSessionEnd(wd, 'first-standard-launch');
-    } finally {
-      await rm(wd, { recursive: true, force: true });
-    }
-  });
-
-  it('keeps explicit roots literal: distinct roots launch independently while a shared root remains fatal without reroute guidance', async () => {
-    const wd = await mkdtemp(join(tmpdir(), 'omx-launch-explicit-roots-'));
-    execFileSync('git', ['init'], { cwd: wd, stdio: 'ignore' });
-    let first: ReturnType<typeof spawn> | undefined;
-    let second: ReturnType<typeof spawn> | undefined;
-    try {
-      const fixture = await createHeldCodexFixture(wd);
-      const firstRoot = join(wd, 'first-root');
-      const secondRoot = join(wd, 'second-root');
-      first = startHeldOmx(wd, { ...fixture.env, OMX_ROOT: firstRoot });
-      second = startHeldOmx(wd, { ...fixture.env, OMX_ROOT: secondRoot });
-      await waitForPath(fixture.rootsPath, 2);
-      assert.deepEqual(
-        new Set((await readFile(fixture.rootsPath, 'utf-8')).trim().split('\n')),
-        new Set([firstRoot, secondRoot]),
-      );
-
-      const collision = runOmx(wd, ['--direct', '--version'], { ...fixture.env, OMX_ROOT: firstRoot });
-      if (shouldSkipForSpawnPermissions(collision.error)) return;
-      assert.notEqual(collision.status, 0, collision.stderr || collision.stdout);
-      assert.match(collision.stderr, /session_pointer_owner_conflict/);
-      assert.doesNotMatch(collision.stderr, /concurrent conversations in this checkout require distinct user-specified OMX_ROOT values/);
-      assert.doesNotMatch(collision.stderr, /reroute or allocate one automatically/);
-
-      await stopHeldOmx(first, fixture.releasePath);
-      first = undefined;
-      if (second.exitCode === null) {
-        await new Promise<void>((resolve) => second!.once('exit', () => resolve()));
-      }
-      second = undefined;
-    } finally {
-      if (first) first.kill('SIGKILL');
-      if (second) second.kill('SIGKILL');
-      await rm(wd, { recursive: true, force: true });
-    }
-  });
-
-  it('keeps different checkout defaults independent and relaunches through stale default-pointer evidence', async () => {
-    const wd = await mkdtemp(join(tmpdir(), 'omx-launch-root-stale-'));
-    try {
-      const firstCheckout = join(wd, 'first-checkout');
-      const secondCheckout = join(wd, 'second-checkout');
-      await mkdir(firstCheckout, { recursive: true });
-      await mkdir(secondCheckout, { recursive: true });
-      execFileSync('git', ['init'], { cwd: firstCheckout, stdio: 'ignore' });
-      execFileSync('git', ['init'], { cwd: secondCheckout, stdio: 'ignore' });
-
-      await writeSessionStart(firstCheckout, 'first-checkout-owner', { pid: process.pid });
-      await writeSessionStart(secondCheckout, 'second-checkout-owner', { pid: process.pid });
-      assert.match(await readFile(join(firstCheckout, '.omx', 'state', 'session.json'), 'utf-8'), /first-checkout-owner/);
-      assert.match(await readFile(join(secondCheckout, '.omx', 'state', 'session.json'), 'utf-8'), /second-checkout-owner/);
-      await writeSessionEnd(firstCheckout, 'first-checkout-owner');
-      await writeSessionEnd(secondCheckout, 'second-checkout-owner');
-
-      await writeSessionStart(firstCheckout, 'stale-owner', { pid: 2_147_483_647 });
-      const fixture = await createHeldCodexFixture(wd);
-      await rm(fixture.releasePath, { force: true });
-      const relaunch = runOmx(firstCheckout, ['--direct', '--version'], fixture.env);
-      if (shouldSkipForSpawnPermissions(relaunch.error)) return;
-      assert.equal(relaunch.status, 0, relaunch.error || relaunch.stderr || relaunch.stdout);
-      assert.doesNotMatch(relaunch.stderr, /concurrent conversations in this checkout require distinct user-specified OMX_ROOT values/);
-    } finally {
-      await rm(wd, { recursive: true, force: true });
-    }
-  });
-});
-
 describe('omx --worktree disposable state root', () => {
-  it('keeps launch worktree state under the source repo root by default', async () => {
+  it('establishes a worktree-local committed authority before launching Codex', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-launch-worktree-state-'));
     try {
       const repo = await createGitRepo(wd);
@@ -411,6 +304,8 @@ describe('omx --worktree disposable state root', () => {
         join(fakeBin, 'codex'),
         `#!/bin/sh
 printf 'fake-codex-omx-root:%s\n' "$OMX_ROOT"
+printf 'fake-codex-authority-path:%s\n' "$OMX_STATE_AUTHORITY_PATH"
+printf 'fake-codex-workspace:%s\n' "$OMX_STATE_AUTHORITY_WORKSPACE_DIGEST"
 printf 'fake-codex:%s\n' "$*"
 `,
       );
@@ -418,7 +313,7 @@ printf 'fake-codex:%s\n' "$*"
 
       const result = runOmx(repo, ['--direct', '--worktree', '--version'], {
         HOME: home,
-        PATH: `${fakeBin}:/usr/bin:/bin`,
+        PATH: platformTestPath(fakeBin),
         OMX_AUTO_UPDATE: '0',
         OMX_NOTIFY_FALLBACK: '0',
         OMX_HOOK_DERIVED_SIGNALS: '0',
@@ -428,22 +323,36 @@ printf 'fake-codex:%s\n' "$*"
         TMUX_PANE: '',
       });
 
-      if (shouldSkipForSpawnPermissions(result.error)) return;
 
       const worktreePath = join(dirname(repo), `${basename(repo)}.omx-worktrees`, 'launch-detached');
       assert.equal(result.status, 0, result.error || result.stderr || result.stdout);
+      const normalizedStdout = result.stdout;
       assert.match(
-        normalizeDarwinTmpPath(result.stdout),
-        new RegExp(`fake-codex-omx-root:${escapeRegExp(normalizeDarwinTmpPath(repo))}`),
+        normalizedStdout,
+        new RegExp(`fake-codex-omx-root:${escapeRegExp(canonicalTestPath(worktreePath))}`),
       );
-      assert.equal(existsSync(join(repo, '.omx', 'state')), true);
-      assert.equal(existsSync(join(worktreePath, '.omx')), false);
+      const authorityPath = normalizedStdout.match(/fake-codex-authority-path:(.*)/)?.[1] ?? '';
+      const workspaceDigest = normalizedStdout.match(/fake-codex-workspace:(.*)/)?.[1] ?? '';
+      const childAuthority = JSON.parse(await readFile(authorityPath, 'utf-8')) as {
+        canonical_state_root: string;
+        workspace_identity: { canonical_path: string; digest: string };
+      };
+      assert.equal(
+        canonicalTestPath(childAuthority.canonical_state_root),
+        join(canonicalTestPath(worktreePath), '.omx', 'state'),
+      );
+      assert.equal(
+        canonicalTestPath(childAuthority.workspace_identity.canonical_path),
+        canonicalTestPath(worktreePath),
+      );
+      assert.equal(childAuthority.workspace_identity.digest, workspaceDigest);
+      assert.equal(existsSync(join(worktreePath, '.omx', 'state')), true);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
   });
 
-  it('preserves explicit OMX_ROOT for launch worktree state', async () => {
+  it('fails closed when ambient OMX_ROOT conflicts with committed launch authority', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-launch-worktree-explicit-root-'));
     try {
       const repo = await createGitRepo(wd);
@@ -463,7 +372,7 @@ printf 'fake-codex:%s\n' "$*"
 
       const result = runOmx(repo, ['--direct', '--worktree', '--version'], {
         HOME: home,
-        PATH: `${fakeBin}:/usr/bin:/bin`,
+        PATH: platformTestPath(fakeBin),
         OMX_AUTO_UPDATE: '0',
         OMX_NOTIFY_FALLBACK: '0',
         OMX_HOOK_DERIVED_SIGNALS: '0',
@@ -473,12 +382,14 @@ printf 'fake-codex:%s\n' "$*"
         TMUX_PANE: '',
       });
 
-      if (shouldSkipForSpawnPermissions(result.error)) return;
 
-      assert.equal(result.status, 0, result.error || result.stderr || result.stdout);
-      assert.match(result.stdout, new RegExp(`fake-codex-omx-root:${escapeRegExp(explicitRoot)}`));
-      assert.equal(existsSync(join(explicitRoot, '.omx', 'state')), true);
-      assert.equal(existsSync(join(repo, '.omx')), false);
+      assert.equal(result.status, 1, result.error || result.stderr || result.stdout);
+      assert.match(result.stderr, /OMX_ROOT conflicts with the authenticated state authority/i);
+      assert.doesNotMatch(result.stdout, /fake-codex/);
+      const worktreePath = join(dirname(repo), `${basename(repo)}.omx-worktrees`, 'launch-detached');
+      assert.equal(existsSync(join(repo, '.omx', 'state')), false);
+      assert.equal(existsSync(join(worktreePath, '.omx', 'state')), true);
+      assert.equal(existsSync(explicitRoot), false);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
@@ -501,14 +412,18 @@ printf 'fake-codex-omx-root:%s\n' "$OMX_ROOT"
 printf 'fake-codex-box:%s\n' "$OMXBOX_ACTIVE"
 printf 'fake-codex-source:%s\n' "$OMX_SOURCE_CWD"
 printf 'fake-codex-context:%s\n' "$OMX_MADMAX_DETACHED_CONTEXT"
+printf 'fake-codex-authority-path:%s\n' "$OMX_STATE_AUTHORITY_PATH"
+printf 'fake-codex-authority-id:%s\n' "$OMX_STATE_AUTHORITY_ID"
+printf 'fake-codex-authority-generation:%s\n' "$OMX_STATE_AUTHORITY_GENERATION_ID"
 printf 'fake-codex:%s\n' "$*"
 `,
+
       );
       await writeExecutable(join(fakeBin, 'ps'), '#!/bin/sh\nexit 0\n');
 
       const result = runOmx(repo, ['--direct', '--madmax', '--worktree', '--version'], {
         HOME: home,
-        PATH: `${fakeBin}:/usr/bin:/bin`,
+        PATH: platformTestPath(fakeBin),
         OMX_AUTO_UPDATE: '0',
         OMX_NOTIFY_FALLBACK: '0',
         OMX_HOOK_DERIVED_SIGNALS: '0',
@@ -519,27 +434,64 @@ printf 'fake-codex:%s\n' "$*"
         TMUX_PANE: '',
       });
 
-      if (shouldSkipForSpawnPermissions(result.error)) return;
 
       const worktreePath = join(dirname(repo), `${basename(repo)}.omx-worktrees`, 'launch-detached');
-      const normalizedStdout = normalizeDarwinTmpPath(result.stdout);
+      const normalizedStdout = result.stdout;
       assert.equal(result.status, 0, result.error || result.stderr || result.stdout);
       assert.match(
         normalizedStdout,
-        new RegExp(`fake-codex-pwd:${escapeRegExp(normalizeDarwinTmpPath(worktreePath))}`),
+        new RegExp(`fake-codex-pwd:${escapeRegExp(canonicalTestPath(worktreePath))}`),
       );
       const rootMatch = normalizedStdout.match(/fake-codex-omx-root:(.*)/);
       assert.ok(rootMatch, normalizedStdout);
       const boxedRoot = rootMatch[1];
-      assert.match(boxedRoot, new RegExp(`^${escapeRegExp(normalizeDarwinTmpPath(runs))}/run-`));
-      assert.notEqual(boxedRoot, normalizeDarwinTmpPath(repo));
-      assert.notEqual(boxedRoot, normalizeDarwinTmpPath(worktreePath));
+      assert.match(boxedRoot, new RegExp(`^${escapeRegExp(canonicalTestPath(runs))}/run-`));
+      assert.notEqual(boxedRoot, canonicalTestPath(repo));
+      assert.notEqual(boxedRoot, canonicalTestPath(worktreePath));
       assert.match(normalizedStdout, /fake-codex-box:1/);
       assert.match(
         normalizedStdout,
-        new RegExp(`fake-codex-source:${escapeRegExp(normalizeDarwinTmpPath(repo))}`),
+        new RegExp(`fake-codex-source:${escapeRegExp(canonicalTestPath(repo))}`),
       );
       assert.match(normalizedStdout, /fake-codex-context:[0-9a-f]{32}/);
+      const authorityPath = normalizedStdout.match(/fake-codex-authority-path:(.*)/)?.[1] ?? '';
+      const authorityId = normalizedStdout.match(/fake-codex-authority-id:(.*)/)?.[1] ?? '';
+      const authorityGenerationId = normalizedStdout.match(/fake-codex-authority-generation:(.*)/)?.[1] ?? '';
+      assert.match(authorityPath, new RegExp(`^${escapeRegExp(boxedRoot)}/\\.omx/state/authority/generations/`));
+      const childAuthority = JSON.parse(await readFile(authorityPath, 'utf-8')) as {
+        authority_id: string;
+        generation_id: string;
+        canonical_state_root: string;
+        workspace_identity: { canonical_path: string };
+      };
+      assert.equal(childAuthority.authority_id, authorityId);
+      assert.equal(childAuthority.generation_id, authorityGenerationId);
+      assert.equal(canonicalTestPath(childAuthority.canonical_state_root), join(boxedRoot, '.omx', 'state'));
+      assert.equal(
+        canonicalTestPath(childAuthority.workspace_identity.canonical_path),
+        canonicalTestPath(worktreePath),
+      );
+
+      const metadata = JSON.parse(await readFile(join(boxedRoot, '.omxbox-run.json'), 'utf-8')) as {
+        authority_id?: string;
+        authority_generation_id?: string;
+        authority_state_root?: string;
+      };
+      assert.equal(metadata.authority_id, childAuthority.authority_id);
+      assert.equal(metadata.authority_generation_id, childAuthority.generation_id);
+      assert.equal(canonicalTestPath(metadata.authority_state_root ?? ''), canonicalTestPath(childAuthority.canonical_state_root));
+      const registry = await readFile(join(runs, 'registry.jsonl'), 'utf-8');
+      assert.match(registry, new RegExp(`"authority_generation_id":"${escapeRegExp(childAuthority.generation_id)}"`));
+      assert.doesNotMatch(registry, /OMX_STATE_AUTHORITY_CAPABILITY/);
+      const launchJournals = await Promise.all(
+        (await readdir(join(dirname(authorityPath), 'journals')))
+          .filter((entry) => entry.endsWith('.json'))
+          .map(async (entry) => JSON.parse(await readFile(join(dirname(authorityPath), 'journals', entry), 'utf-8')) as {
+            kind?: string;
+            status?: string;
+          }),
+      );
+      assert.ok(launchJournals.some((journal) => journal.kind === 'launch_transport_publish' && journal.status === 'committed'));
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
@@ -601,7 +553,6 @@ exit 0
         TMUX_PANE: '',
       });
 
-      if (shouldSkipForSpawnPermissions(result.error)) return;
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
       assert.equal(result.status, 0, result.error || result.stderr || result.stdout);
@@ -616,7 +567,7 @@ exit 0
 });
 
 describe('omx launcher when tmux is available', () => {
-  it('reuses the same boxed madmax detached launch context instead of spawning duplicate tmux sessions', async () => {
+  it('rejects a detached madmax record unless it matches the current committed authority', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-launch-madmax-reuse-'));
     try {
       const runs = join(wd, 'runs');
@@ -692,28 +643,30 @@ exit 0
         TMUX_PANE: '',
       };
       const first = runOmx(wd, ['--madmax', '--tmux'], baseEnv);
-      if (shouldSkipForSpawnPermissions(first.error)) return;
       assert.equal(first.status, 0, first.error || first.stderr || first.stdout);
 
       const second = runOmx(wd, ['--madmax', '--tmux'], baseEnv);
-      if (shouldSkipForSpawnPermissions(second.error)) return;
       assert.equal(second.status, 0, second.error || second.stderr || second.stdout);
-      assert.match(
-        second.stderr,
-        /madmax detached launch already active for this context; attaching .* instead of starting a duplicate/,
-      );
-
+      assert.doesNotMatch(second.stderr, /madmax detached launch already active for this context/);
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
-      assert.equal((tmuxLog.match(/tmux:new-session/g) || []).length, 1);
-      assert.equal((tmuxLog.match(/tmux:has-session/g) || []).length, 1);
+      assert.equal((tmuxLog.match(/tmux:new-session/g) || []).length, 2);
+      assert.equal((tmuxLog.match(/tmux:has-session/g) || []).length, 0);
       assert.equal((tmuxLog.match(/tmux:attach-session/g) || []).length, 2);
-      const activeRecords = await readFile(
-        join(runs, 'active-detached', 'boxed-context-under-test.json'),
-        'utf-8',
-      );
-      assert.match(activeRecords, /"tmux_session_name"/);
-      assert.match(activeRecords, /"session_id"/);
-      assert.match(activeRecords, /"tmux_pane_id": "%12"/);
+      const forgedRecordPath = join(runs, 'active-detached', 'boxed-context-under-test.json');
+      assert.equal(existsSync(forgedRecordPath), false);
+      const activeRecordDirectory = join(runs, 'active-detached');
+      const activeRecordNames = (await readdir(activeRecordDirectory))
+        .filter((entry) => entry.endsWith('.json'));
+      assert.equal(activeRecordNames.length, 2);
+      for (const activeRecordName of activeRecordNames) {
+        const activeRecord = await readFile(join(activeRecordDirectory, activeRecordName), 'utf-8');
+        assert.match(activeRecord, /"authority_protocol_version": 1/);
+        assert.match(activeRecord, /"authority_generation_id"/);
+        assert.match(activeRecord, /"authority_binding_id"/);
+        assert.match(activeRecord, /"authority_fencing_token"/);
+        assert.match(activeRecord, /"authority_root_identity"/);
+        assert.match(activeRecord, /"tmux_pane_id": "%12"/);
+      }
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
@@ -739,6 +692,14 @@ case "$1" in
     ;;
   new-session)
     printf '%%77\n'
+    exit 0
+    ;;
+  source-file)
+    while IFS= read -r line; do
+      case "$line" in
+        *OMX_TMUX_IMPORT_*_MANIFEST*) printf 'tmux:manifest:%s\n' "$line" >> "${logPath}" ;;
+      esac
+    done
     exit 0
     ;;
   split-window)
@@ -785,24 +746,40 @@ exit 0
         TMUX: '',
         TMUX_PANE: '',
       });
-      if (shouldSkipForSpawnPermissions(result.error)) return;
       assert.equal(result.status, 0, result.error || result.stderr || result.stdout);
 
       const activeFiles = await readdir(join(runs, 'active-detached'));
       assert.equal(activeFiles.length, 1);
       const activeRecord = JSON.parse(await readFile(join(runs, 'active-detached', activeFiles[0]), 'utf-8'));
       const worktreePath = join(dirname(repo), `${basename(repo)}.omx-worktrees`, 'launch-detached');
-      assert.match(activeRecord.run_dir, new RegExp(`^${escapeRegExp(normalizeDarwinTmpPath(runs))}/run-`));
-      assert.equal(normalizeDarwinTmpPath(activeRecord.source_cwd), normalizeDarwinTmpPath(repo));
-      assert.equal(normalizeDarwinTmpPath(activeRecord.worktree_cwd), normalizeDarwinTmpPath(worktreePath));
+      assert.match(activeRecord.run_dir, new RegExp(`^${escapeRegExp(canonicalTestPath(runs))}/run-`));
+      assert.equal(canonicalTestPath(activeRecord.source_cwd), canonicalTestPath(repo));
+      assert.equal(canonicalTestPath(activeRecord.worktree_cwd), canonicalTestPath(worktreePath));
       assert.equal(activeRecord.session_id.startsWith('omx-'), true);
       assert.equal(activeRecord.tmux_pane_id, '%77');
+      assert.equal(activeRecord.authority_protocol_version, 1);
+      assert.equal(typeof activeRecord.authority_generation_id, 'string');
+      assert.equal(typeof activeRecord.authority_binding_id, 'string');
+      assert.equal(typeof activeRecord.authority_fencing_token, 'number');
+      assert.equal(typeof activeRecord.authority_root_identity?.canonical_path, 'string');
 
       const tmuxLog = normalizeDarwinTmpPath(await readFile(tmuxLogPath, 'utf-8'));
-      assert.match(tmuxLog, new RegExp(`-e OMX_ROOT=${escapeRegExp(normalizeDarwinTmpPath(activeRecord.run_dir))}`));
-      assert.match(tmuxLog, /-e OMXBOX_ACTIVE=1/);
-      assert.match(tmuxLog, new RegExp(`-e OMX_SOURCE_CWD=${escapeRegExp(normalizeDarwinTmpPath(repo))}`));
-      assert.match(tmuxLog, new RegExp(`-e OMX_MADMAX_DETACHED_CONTEXT=${escapeRegExp(activeRecord.context_key)}`));
+      const newSessionCommand = tmuxLog
+        .split('\n')
+        .find((line) => line.startsWith('tmux:new-session '));
+      const manifestCommand = tmuxLog
+        .split('\n')
+        .find((line) => line.startsWith('tmux:manifest:'));
+      assert.ok(newSessionCommand);
+      assert.ok(manifestCommand);
+      assert.match(manifestCommand, /OMX_ROOT/);
+      assert.match(manifestCommand, /OMXBOX_ACTIVE/);
+      assert.match(manifestCommand, /OMX_SOURCE_CWD/);
+      assert.match(manifestCommand, /OMX_MADMAX_DETACHED_CONTEXT/);
+      assert.match(manifestCommand, /OMX_STATE_AUTHORITY_CAPABILITY/);
+      assert.match(tmuxLog, /tmux:source-file -/);
+      assert.doesNotMatch(newSessionCommand, /OMX_ROOT|OMXBOX_ACTIVE|OMX_SOURCE_CWD|OMX_MADMAX_DETACHED_CONTEXT|OMX_STATE_AUTHORITY_CAPABILITY/);
+      assert.doesNotMatch(tmuxLog, /(?:^|\s)OMX_STATE_AUTHORITY_CAPABILITY=[A-Za-z0-9]/m);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
@@ -884,12 +861,38 @@ exit 0
         TMUX_PANE: '',
       });
 
-      if (shouldSkipForSpawnPermissions(result.error)) return;
       assert.equal(result.status, 0, result.error || result.stderr || result.stdout);
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
       assert.doesNotMatch(tmuxLog, /tmux:set-option .* -t user-owned-session .*history-limit/);
       assert.doesNotMatch(tmuxLog, /tmux:clear-history .*user-owned-session|tmux:clear-history .*%99/);
       assert.match(tmuxLog, /tmux:new-session /);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('does not let cancel mutate a bare madmax registry candidate', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-launch-madmax-cancel-denial-'));
+    try {
+      const runs = join(wd, 'runs');
+      const runDir = join(runs, 'run-forged');
+      const statePath = join(runDir, '.omx', 'state', 'ralph-state.json');
+      await mkdir(dirname(statePath), { recursive: true });
+      await writeFile(statePath, JSON.stringify({ active: true, current_phase: 'running' }));
+      await writeFile(
+        join(runs, 'registry.jsonl'),
+        `${JSON.stringify({ source_cwd: wd, run_dir: runDir })}\n`,
+      );
+
+      const result = runOmx(wd, ['cancel'], {
+        OMX_RUNS_DIR: runs,
+        OMX_HOOK_DERIVED_SIGNALS: '0',
+      });
+
+      assert.equal(result.status, 1, result.error || result.stderr || result.stdout);
+      assert.match(result.stderr, /cancel requires a committed authenticated state authority/i);
+      const stored = JSON.parse(await readFile(statePath, 'utf-8')) as { active?: unknown };
+      assert.equal(stored.active, true);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
@@ -925,7 +928,6 @@ exit 0
 
       const first = runOmx(wd, ['--madmax', '--high', '--tmux'], baseEnv);
       const second = runOmx(wd, ['--madmax', '--high', '--tmux'], baseEnv);
-      if (shouldSkipForSpawnPermissions(first.error) || shouldSkipForSpawnPermissions(second.error)) return;
       assert.equal(first.status, 0, first.error || first.stderr || first.stdout);
       assert.equal(second.status, 0, second.error || second.stderr || second.stdout);
       assert.doesNotMatch(first.stderr + second.stderr, /timed out waiting for madmax detached launch context lock/);
@@ -986,7 +988,6 @@ exit 0
       };
       const first = runOmx(wd, ['--madmax', '--tmux'], baseEnv);
       const second = runOmx(wd, ['--madmax', '--xhigh', '--tmux'], baseEnv);
-      if (shouldSkipForSpawnPermissions(first.error) || shouldSkipForSpawnPermissions(second.error)) return;
       assert.equal(first.status, 0, first.error || first.stderr || first.stdout);
       assert.equal(second.status, 0, second.error || second.stderr || second.stdout);
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
@@ -1052,13 +1053,18 @@ exit 0
 `,
       );
       await chmod(fakeTmuxPath, 0o755);
+      if (process.platform === 'win32') {
+        await writeExecutable(fakeCodexPath, await readFile(fakeCodexPath, 'utf-8'));
+        await writeExecutable(fakePsPath, await readFile(fakePsPath, 'utf-8'));
+        await writeExecutable(fakeTmuxPath, await readFile(fakeTmuxPath, 'utf-8'));
+      }
 
       const result = runOmx(
         wd,
         ['--madmax', '--tmux'],
         {
           HOME: home,
-          PATH: `${fakeBin}:/usr/bin:/bin`,
+          PATH: platformTestPath(fakeBin),
           OMX_AUTO_UPDATE: '0',
           OMX_NOTIFY_FALLBACK: '0',
           OMX_HOOK_DERIVED_SIGNALS: '0',
@@ -1068,7 +1074,6 @@ exit 0
         },
       );
 
-      if (shouldSkipForSpawnPermissions(result.error)) return;
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
       assert.doesNotMatch(tmuxLog, /tmux:show-options -gv history-limit/);
@@ -1087,139 +1092,239 @@ exit 0
     }
   });
 
-  it('preserves parent provider env without replaying terminal state over an OMX-created tmux pane', async () => {
+  it('keeps detached tmux new-session bounded while importing provider and authority env without serializing raw values', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-launch-tmux-parent-env-'));
     try {
       const home = join(wd, 'home');
       const fakeBin = join(wd, 'bin');
       const envLogPath = join(wd, 'codex-env.log');
       const tmuxLogPath = join(wd, 'tmux.log');
+      const restoreMarkerPath = join(wd, 'tmux-environment-restored');
+      const tmuxFixtureStatePath = join(wd, 'tmux-fixture-state.json');
+      const tmuxFixtureProgramPath = join(fakeBin, 'tmux-fixture.cjs');
+      const codexFixtureProgramPath = join(fakeBin, 'codex-fixture.cjs');
+      const injectionCanaryPath = join(wd, 'provider-injection-canary');
+      const providerSecret =
+        `provider secret "quoted" \\ $HOME $(touch ${injectionCanaryPath}); literal-end`;
+      const inheritedCiEnvironment = Object.fromEntries(
+        Array.from({ length: 512 }, (_, index) => [
+          `CI_OMX_BOUND_${index}`,
+          `ci-value-${index}`,
+        ]),
+      );
 
       await mkdir(home, { recursive: true });
       await mkdir(fakeBin, { recursive: true });
+      await writeFile(
+        codexFixtureProgramPath,
+        `const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
+const capability = process.env.OMX_STATE_AUTHORITY_CAPABILITY || '';
+const provider = process.env.CUSTOM_LLM_API_KEY || '';
+const expectedProvider = process.env.OMX_TEST_EXPECTED_PROVIDER_SECRET || '';
+if (!capability || provider !== expectedProvider || process.env.IS_GAJAE_SLOP_GENERATOR !== '1') process.exit(91);
+const persisted = [];
+const visit = (directory) => {
+  for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+    const candidate = path.join(directory, entry.name);
+    if (entry.isDirectory()) visit(candidate);
+    else if (entry.isFile()) persisted.push(fs.readFileSync(candidate));
+  }
+};
+visit(${JSON.stringify(wd)});
+if (persisted.some((value) => value.includes(capability) || value.includes(provider))) process.exit(92);
+const digest = (value) => crypto.createHash('sha256').update(value).digest('hex');
+fs.writeFileSync(${JSON.stringify(envLogPath)}, [
+  'provider_digest=' + digest(provider),
+  'authority_digest=' + digest(capability),
+  'marker=1',
+  'persisted_corpus_clean=1',
+].join('\\n') + '\\n');
+process.exit(130);`,
+      );
       await writeExecutable(
         join(fakeBin, 'codex'),
         `#!/bin/sh
-{
-  printf 'custom=%s\n' "$CUSTOM_LLM_API_KEY"
-  printf 'marker=%s\n' "$IS_GAJAE_SLOP_GENERATOR"
-  printf 'term=%s\n' "$TERM"
-  printf 'term_program=%s\n' "$TERM_PROGRAM"
-  printf 'term_program_version=%s\n' "$TERM_PROGRAM_VERSION"
-  printf 'colorterm=%s\n' "$COLORTERM"
-  printf 'tmux=%s\n' "$TMUX"
-  printf 'tmux_pane=%s\n' "$TMUX_PANE"
-  printf 'columns=%s\n' "\${COLUMNS-unset}"
-  printf 'lines=%s\n' "\${LINES-unset}"
-  printf 'terminfo=%s\n' "\${TERMINFO-unset}"
-  printf 'terminfo_dirs=%s\n' "\${TERMINFO_DIRS-unset}"
-  printf 'termcap=%s\n' "\${TERMCAP-unset}"
-} > "${envLogPath}"
-exit 130
+exec "${process.execPath}" "${codexFixtureProgramPath}" "$@"
 `,
       );
       await writeExecutable(join(fakeBin, 'ps'), '#!/bin/sh\nexit 0\n');
+      await writeFile(
+        tmuxFixtureProgramPath,
+        `const fs = require('fs');
+const { spawnSync } = require('child_process');
+const args = process.argv.slice(2);
+const command = args[0] || '';
+const statePath = ${JSON.stringify(tmuxFixtureStatePath)};
+const logPath = ${JSON.stringify(tmuxLogPath)};
+const restoreMarkerPath = ${JSON.stringify(restoreMarkerPath)};
+const readState = () => { try { return JSON.parse(fs.readFileSync(statePath, 'utf8')); } catch { return {}; } };
+const writeState = (state) => fs.writeFileSync(statePath, JSON.stringify(state));
+const parseLine = (line) => {
+  const tokens = [];
+  let index = 0;
+  while (index < line.length) {
+    while (line[index] === ' ') index += 1;
+    if (index >= line.length) break;
+    if (line[index] === '"') {
+      index += 1;
+      let value = '';
+      while (index < line.length && line[index] !== '"') {
+        if (line[index] === '\\\\' && index + 1 < line.length) {
+          value += line[index + 1];
+          index += 2;
+        } else {
+          value += line[index];
+          index += 1;
+        }
+      }
+      if (line[index] !== '"') process.exit(99);
+      index += 1;
+      tokens.push(value);
+    } else {
+      const start = index;
+      while (index < line.length && line[index] !== ' ') index += 1;
+      tokens.push(line.slice(start, index));
+    }
+  }
+  return tokens;
+};
+fs.appendFileSync(logPath, 'tmux:' + args.join(' ') + '\\n');
+if (command === '-V') { console.log('tmux 3.2a'); process.exit(0); }
+if (command === 'list-sessions') { console.log('existing-server-session'); process.exit(0); }
+if (command === 'new-session') {
+  if (args.includes('-e')) process.exit(97);
+  const state = readState();
+  state.startupCommand = args.at(-1) || '';
+  writeState(state);
+  console.log('%12');
+  process.exit(0);
+}
+if (command === 'source-file') {
+  const input = fs.readFileSync(0, 'utf8');
+  const state = readState();
+  const sourceValues = {};
+  let restored = false;
+  for (const line of input.split(/\\r?\\n/).filter(Boolean)) {
+    const tokens = parseLine(line);
+    if (tokens[0] !== 'set-environment') continue;
+    const separator = tokens.indexOf('--');
+    const name = separator >= 0 ? tokens[separator + 1] : '';
+    const value = separator >= 0 ? tokens[separator + 2] : undefined;
+    if (!name.startsWith('OMX_TMUX_IMPORT_')) continue;
+    if (tokens.includes('-u') || tokens.includes('-r')) restored = true;
+    else if (value !== undefined) sourceValues[name] = value;
+  }
+  if (Object.keys(sourceValues).length > 0 && !state.startupRan) {
+    const childEnv = { ...process.env };
+    const manifestEntry = Object.entries(sourceValues).find(([sourceName]) => sourceName.endsWith('_MANIFEST'));
+    const manifestMatch = manifestEntry?.[1].match(/^v1:([0-9]+):(.*)$/);
+    const targetNames = manifestMatch?.[2].split(',') ?? [];
+    const sourcePrefix = manifestEntry?.[0].slice(0, -'_MANIFEST'.length) ?? '';
+    if (!manifestMatch || Number(manifestMatch[1]) !== targetNames.length) process.exit(96);
+    for (const [sourceName, value] of Object.entries(sourceValues)) {
+      childEnv['OMX_TEST_TMUX_SOURCE_' + sourceName] = value;
+      if (sourceName.endsWith('_MANIFEST')) continue;
+      const sourceIndex = Number(sourceName.slice(sourcePrefix.length + 1));
+      const targetName = targetNames[sourceIndex];
+      if (!Number.isSafeInteger(sourceIndex) || !targetName) process.exit(96);
+      if (targetName === 'CUSTOM_LLM_API_KEY' && value !== process.env.OMX_TEST_EXPECTED_PROVIDER_SECRET) process.exit(95);
+    }
+    const execution = spawnSync('sh', ['-c', state.startupCommand || ''], {
+      cwd: ${JSON.stringify(wd)},
+      env: childEnv,
+      encoding: 'utf8',
+    });
+    if (execution.error || (execution.status !== 0 && execution.status !== 130)) process.exit(98);
+    state.startupRan = true;
+    writeState(state);
+  }
+  if (restored) fs.writeFileSync(restoreMarkerPath, 'restored');
+  process.exit(0);
+}
+if (command === 'show-environment') {
+  const requestedName = args.at(-1) || '';
+  const value = process.env['OMX_TEST_TMUX_SOURCE_' + requestedName];
+  if (value !== undefined) console.log(requestedName + '=' + value);
+  else {
+    console.log('CUSTOM_LLM_API_KEY=previous-provider-baseline');
+    console.log('-OMX_STATE_AUTHORITY_CAPABILITY');
+  }
+  process.exit(0);
+}
+if (command === 'display-message') {
+  console.log(args[1] === '-p' && args[2] === '#{socket_path}' ? '/tmp/tmux-test.sock' : '0');
+  process.exit(0);
+}
+if (command === 'show-options') { console.log('off'); process.exit(0); }
+if (command === 'split-window') { console.log('hud-pane'); process.exit(0); }
+process.exit(0);
+`,
+      );
       await writeExecutable(
         join(fakeBin, 'tmux'),
         `#!/bin/sh
-printf 'tmux:%s\n' "$*" >> "${tmuxLogPath}"
-case "$1" in
-  -V)
-    printf 'tmux 3.4\\n'
-    exit 0
-    ;;
-  new-session)
-    last=''
-    for arg in "$@"; do last="$arg"; done
-    env -u COLORTERM \
-      TERM=tmux-256color \
-      TERM_PROGRAM=tmux \
-      TERM_PROGRAM_VERSION=3.4 \
-      TMUX=/tmp/tmux-test.sock,123,0 \
-      TMUX_PANE=%12 \
-      COLUMNS=211 \
-      LINES=77 \
-      TERMINFO=/tmp/server-terminfo \
-      TERMINFO_DIRS=/tmp/server-terminfo-dirs \
-      TERMCAP=server-termcap \
-      sh -c "$last" >/dev/null 2>&1 || true
-    printf 'leader-pane\\n'
-    exit 0
-    ;;
-  split-window)
-    printf 'hud-pane\\n'
-    exit 0
-    ;;
-  display-message)
-    if [ "$2" = '-p' ] && [ "$3" = '#{socket_path}' ]; then
-      printf '/tmp/tmux-test.sock\\n'
-    else
-      printf '0\\n'
-    fi
-    exit 0
-    ;;
-  show-options)
-    printf 'off\\n'
-    exit 0
-    ;;
-  set-option|set-hook|attach-session|kill-session|run-shell|resize-pane)
-    exit 0
-    ;;
-esac
-exit 0
+exec "${process.execPath}" "${tmuxFixtureProgramPath}" "$@"
 `,
       );
 
-      const result = runOmx(
-        wd,
-        ['--tmux', '--madmax'],
-        {
-          HOME: home,
-          PATH: `${fakeBin}:/usr/bin:/bin`,
-          OMX_AUTO_UPDATE: '0',
-          OMX_NOTIFY_FALLBACK: '0',
-          OMX_HOOK_DERIVED_SIGNALS: '0',
-          TERM: 'xterm-256color',
-          TERM_PROGRAM: 'WarpTerminal',
-          TERM_PROGRAM_VERSION: 'outer-terminal-version',
-          TERMINFO: '/tmp/outer-terminfo',
-          TERMINFO_DIRS: '/tmp/outer-terminfo-dirs',
-          TERMCAP: 'outer-termcap',
-          COLORTERM: 'truecolor',
-          COLUMNS: '200',
-          LINES: '60',
-          TMUX: '',
-          TMUX_PANE: '',
-          CUSTOM_LLM_API_KEY: 'fake-provider-key',
-          IS_GAJAE_SLOP_GENERATOR: '1',
-        },
-      );
+      const result = runOmx(wd, ['--tmux', '--madmax'], {
+        HOME: home,
+        PATH: platformTestPath(fakeBin),
+        OMX_AUTO_UPDATE: '0',
+        OMX_NOTIFY_FALLBACK: '0',
+        OMX_HOOK_DERIVED_SIGNALS: '0',
+        TMUX: '',
+        TMUX_PANE: '',
+        CUSTOM_LLM_API_KEY: providerSecret,
+        OMX_TEST_EXPECTED_PROVIDER_SECRET: providerSecret,
+        IS_GAJAE_SLOP_GENERATOR: '1',
+        ...inheritedCiEnvironment,
+      });
 
-      if (shouldSkipForSpawnPermissions(result.error)) return;
-
-      assert.equal(result.status, 0, result.error || result.stderr || result.stdout);
+      const failureLog = await readFile(tmuxLogPath, 'utf-8').catch(() => '');
       assert.equal(
-        await readFile(envLogPath, 'utf-8'),
-        [
-          'custom=fake-provider-key',
-          'marker=1',
-          'term=tmux-256color',
-          'term_program=tmux',
-          'term_program_version=3.4',
-          'colorterm=truecolor',
-          'tmux=/tmp/tmux-test.sock,123,0',
-          'tmux_pane=%12',
-          'columns=211',
-          'lines=77',
-          'terminfo=/tmp/outer-terminfo',
-          'terminfo_dirs=/tmp/outer-terminfo-dirs',
-          'termcap=outer-termcap',
-          '',
-        ].join('\n'),
+        result.status,
+        0,
+        [result.error, result.stderr, result.stdout, failureLog].filter(Boolean).join('\n'),
       );
+      const childEvidence = await readFile(envLogPath, 'utf-8');
+      assert.match(
+        childEvidence,
+        new RegExp(`^provider_digest=${createHash('sha256').update(providerSecret).digest('hex')}$`, 'm'),
+      );
+      assert.match(childEvidence, /^authority_digest=[0-9a-f]{64}$/m);
+      assert.match(childEvidence, /^marker=1$/m);
+      assert.match(childEvidence, /^persisted_corpus_clean=1$/m);
+
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
-      assert.doesNotMatch(tmuxLog, /fake-provider-key/);
-      assert.doesNotMatch(tmuxLog, /CUSTOM_LLM_API_KEY=/);
+      const tmuxScript = await readFile(join(fakeBin, 'tmux'), 'utf-8');
+      const tmuxState = await readFile(tmuxFixtureStatePath, 'utf-8');
+      assert.match(tmuxLog, /tmux:new-session /);
+      const newSessionCommand = tmuxLog
+        .split('\n')
+        .find((line) => line.startsWith('tmux:new-session '));
+      assert.ok(newSessionCommand);
+      assert.ok(
+        newSessionCommand.length < 15_000,
+        `new-session command unexpectedly grew to ${newSessionCommand.length} bytes for ${Object.keys(inheritedCiEnvironment).length} inherited variables`,
+      );
+      assert.doesNotMatch(newSessionCommand, new RegExp(escapeRegExp(providerSecret)));
+      assert.equal((tmuxLog.match(/tmux:source-file -/g) || []).length, 2);
+      assert.ok(
+        tmuxLog.indexOf('tmux:split-window ') < tmuxLog.lastIndexOf('tmux:source-file -'),
+        'session environment must remain available until the HUD split has inherited it',
+      );
+      assert.match(tmuxLog, /tmux:wait-for -S /);
+      assert.match(tmuxLog, /tmux:wait-for omx-detached-launch-[0-9a-f]+-environment-imported/);
+      assert.doesNotMatch(tmuxLog, /^tmux:new-session .* -e [A-Z_][A-Z0-9_]*(?: |$)/m);
+      assert.doesNotMatch(tmuxLog, /tmux:wait-for -[LU] /);
+      assert.doesNotMatch(tmuxLog, new RegExp(escapeRegExp(providerSecret)));
+      assert.doesNotMatch(tmuxScript, new RegExp(escapeRegExp(providerSecret)));
+      assert.doesNotMatch(tmuxState, new RegExp(escapeRegExp(providerSecret)));
+      assert.equal(existsSync(injectionCanaryPath), false);
+      assert.equal(await readFile(restoreMarkerPath, 'utf-8'), 'restored');
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
@@ -1251,7 +1356,6 @@ exit 0
         },
       );
 
-      if (shouldSkipForSpawnPermissions(result.error)) return;
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8').catch(() => '');
       assert.equal(result.status, 0, result.error || result.stderr || result.stdout);
@@ -1284,7 +1388,6 @@ exit 0
         },
       );
 
-      if (shouldSkipForSpawnPermissions(result.error)) return;
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8').catch(() => '');
       assert.equal(result.status, 0, result.error || result.stderr || result.stdout);
@@ -1316,7 +1419,6 @@ exit 0
         },
       );
 
-      if (shouldSkipForSpawnPermissions(result.error)) return;
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8').catch(() => '');
       assert.equal(result.status, 0, result.error || result.stderr || result.stdout);
@@ -1372,7 +1474,6 @@ exit 0
         },
       );
 
-      if (shouldSkipForSpawnPermissions(result.error)) return;
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
       assert.equal(result.status, 0, result.error || result.stderr || result.stdout);
@@ -1418,7 +1519,7 @@ case "$1" in
     exit 1
     ;;
   new-session)
-    printf 'leader-pane\n'
+    printf '%%12\n'
     exit 0
     ;;
   split-window)
@@ -1445,13 +1546,18 @@ exit 0
 `,
       );
       await chmod(fakeTmuxPath, 0o755);
+      if (process.platform === 'win32') {
+        await writeExecutable(fakeCodexPath, await readFile(fakeCodexPath, 'utf-8'));
+        await writeExecutable(fakePsPath, await readFile(fakePsPath, 'utf-8'));
+        await writeExecutable(fakeTmuxPath, await readFile(fakeTmuxPath, 'utf-8'));
+      }
 
       const result = runOmx(
         wd,
         ['--madmax', '--tmux'],
         {
           HOME: home,
-          PATH: `${fakeBin}:/usr/bin:/bin`,
+          PATH: platformTestPath(fakeBin),
           OMX_AUTO_UPDATE: '0',
           OMX_NOTIFY_FALLBACK: '0',
           OMX_HOOK_DERIVED_SIGNALS: '0',
@@ -1460,7 +1566,6 @@ exit 0
         },
       );
 
-      if (shouldSkipForSpawnPermissions(result.error)) return;
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
       assert.equal(result.status, 0, result.error || result.stderr || result.stdout);
@@ -1510,13 +1615,18 @@ exit 1
 `,
       );
       await chmod(fakeTmuxPath, 0o755);
+      if (process.platform === 'win32') {
+        await writeExecutable(fakeCodexPath, await readFile(fakeCodexPath, 'utf-8'));
+        await writeExecutable(fakePsPath, await readFile(fakePsPath, 'utf-8'));
+        await writeExecutable(fakeTmuxPath, await readFile(fakeTmuxPath, 'utf-8'));
+      }
 
       const result = runOmx(
         wd,
         ['--madmax', '--tmux'],
         {
           HOME: home,
-          PATH: `${fakeBin}:/usr/bin:/bin`,
+          PATH: platformTestPath(fakeBin),
           OMX_AUTO_UPDATE: '0',
           OMX_NOTIFY_FALLBACK: '0',
           OMX_HOOK_DERIVED_SIGNALS: '0',
@@ -1525,7 +1635,6 @@ exit 1
         },
       );
 
-      if (shouldSkipForSpawnPermissions(result.error)) return;
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
       assert.equal(result.status, 0, result.error || result.stderr || result.stdout);
@@ -1565,7 +1674,7 @@ case "$1" in
     exit 0
     ;;
   new-session)
-    printf 'leader-pane\n'
+    printf '%%12\n'
     exit 0
     ;;
   split-window)
@@ -1596,13 +1705,18 @@ exit 0
 `,
       );
       await chmod(fakeTmuxPath, 0o755);
+      if (process.platform === 'win32') {
+        await writeExecutable(fakeCodexPath, await readFile(fakeCodexPath, 'utf-8'));
+        await writeExecutable(fakePsPath, await readFile(fakePsPath, 'utf-8'));
+        await writeExecutable(fakeTmuxPath, await readFile(fakeTmuxPath, 'utf-8'));
+      }
 
       const result = runOmx(
         wd,
         ['--madmax', '--tmux'],
         {
           HOME: home,
-          PATH: `${fakeBin}:/usr/bin:/bin`,
+          PATH: platformTestPath(fakeBin),
           OMX_AUTO_UPDATE: '0',
           OMX_NOTIFY_FALLBACK: '0',
           OMX_HOOK_DERIVED_SIGNALS: '0',
@@ -1611,7 +1725,6 @@ exit 0
         },
       );
 
-      if (shouldSkipForSpawnPermissions(result.error)) return;
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
       assert.equal(result.status, 0, result.error || result.stderr || result.stdout);
@@ -1635,7 +1748,7 @@ case "$1" in
     exit 0
     ;;
   new-session)
-    printf 'leader-pane\n'
+    printf '%%12\n'
     exit 0
     ;;
   split-window)
@@ -1675,7 +1788,6 @@ exit 0
         },
       );
 
-      if (shouldSkipForSpawnPermissions(result.error)) return;
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
       assert.equal(result.status, 0, result.error || result.stderr || result.stdout);
@@ -1700,6 +1812,8 @@ exit 0
       const fakeTmuxPath = join(fakeBin, 'tmux');
       const tmuxLogPath = join(wd, 'tmux.log');
       const codexLogPath = join(wd, 'codex.log');
+      const tmuxEnvironmentPath = join(wd, 'tmux-environment');
+      const tmuxWaitPath = join(wd, 'tmux-wait');
 
       await mkdir(home, { recursive: true });
       await mkdir(fakeBin, { recursive: true });
@@ -1731,28 +1845,74 @@ case "$cmd" in
   new-session)
     for last; do :; done
     if [ -n "\${last:-}" ]; then
-      /bin/sh -c "$last"
+      /bin/sh -c "$last" </dev/null >/dev/null 2>&1 &
     fi
-    printf 'leader-pane\\n'
+    printf '%%12\n'
+    exit 0
+    ;;
+  source-file)
+    while IFS= read -r line; do
+      set -- $line
+      if [ "$1" = 'set-environment' ] && [ "$2" = '-t' ]; then
+        name=\${5#\\"}
+        name=\${name%\\"}
+        case "$name" in
+          OMX_TMUX_IMPORT_*_MANIFEST)
+            value=\${6#\\"}
+            value=\${value%\\"}
+            ;;
+          *) value="$PATH" ;;
+        esac
+        printf '%s=%s\n' "$name" "$value" >> "${tmuxEnvironmentPath}"
+      fi
+    done
+    exit 0
+    ;;
+  wait-for)
+    if [ "$1" = '-S' ]; then
+      : > "${tmuxWaitPath}-\${2}"
+      exit 0
+    fi
+    case "$1" in
+      *environment-import-ready) exit 0 ;;
+    esac
+    while [ ! -f "${tmuxWaitPath}-\${1}" ]; do sleep 0.01; done
     exit 0
     ;;
   split-window)
-    printf 'hud-pane\\n'
+    printf 'hud-pane\n'
     exit 0
     ;;
   display-message)
     if [ "$1" = '-p' ] && [ "$2" = '#{socket_path}' ]; then
-      printf '/tmp/tmux-test.sock\\n'
+      printf '/tmp/tmux-test.sock\n'
     else
-      printf '0\\n'
+      printf '0\n'
+    fi
+    exit 0
+    ;;
+  show-environment)
+    for last; do :; done
+    requested=\${last#\\"}
+    requested=\${requested%\\"}
+    if [ -f "${tmuxEnvironmentPath}" ]; then
+      while IFS= read -r assignment; do
+        case "$assignment" in
+          "$requested="*) printf '%s\n' "$assignment"; exit 0 ;;
+        esac
+      done < "${tmuxEnvironmentPath}"
     fi
     exit 0
     ;;
   show-options)
-    printf 'off\\n'
+    printf 'off\n'
     exit 0
     ;;
-  set-option|set-hook|attach-session|kill-session|run-shell|resize-pane|select-pane)
+  attach-session)
+    while [ ! -f "${codexLogPath}" ]; do sleep 0.01; done
+    exit 0
+    ;;
+  set-option|set-hook|kill-session|run-shell|resize-pane|select-pane)
     exit 0
     ;;
 esac
@@ -1767,7 +1927,7 @@ exit 0
         {
           HOME: home,
           SHELL: '/definitely/missing-shell',
-          PATH: `${fakeBin}:/usr/bin:/bin`,
+          PATH: platformTestPath(fakeBin),
           OMX_AUTO_UPDATE: '0',
           OMX_NOTIFY_FALLBACK: '0',
           OMX_HOOK_DERIVED_SIGNALS: '0',
@@ -1776,8 +1936,10 @@ exit 0
         },
       );
 
-      if (shouldSkipForSpawnPermissions(result.error)) return;
 
+      const tmuxEnvironment = await readFile(tmuxEnvironmentPath, 'utf-8');
+      assert.match(tmuxEnvironment, /OMX_TMUX_IMPORT_[a-f0-9]{32}_MANIFEST=v1:/);
+      assert.doesNotMatch(tmuxEnvironment, /OMX_STATE_AUTHORITY_CAPABILITY=[A-Za-z0-9]/);
       const codexLog = normalizeDarwinTmpPath(await readFile(codexLogPath, 'utf-8'));
       assert.match(codexLog, /codex:.*--dangerously-bypass-approvals-and-sandbox/);
       assert.match(codexLog, new RegExp(`codex-pwd:${escapeRegExp(normalizeDarwinTmpPath(wd))}`));
@@ -1797,6 +1959,8 @@ exit 0
       const fakeTmuxPath = join(fakeBin, 'tmux');
       const tmuxLogPath = join(wd, 'tmux.log');
       const codexLogPath = join(wd, 'codex.log');
+      const tmuxEnvironmentPath = join(wd, 'tmux-environment');
+      const tmuxWaitPath = join(wd, 'tmux-wait');
 
       await mkdir(home, { recursive: true });
       await mkdir(fakeBin, { recursive: true });
@@ -1826,28 +1990,74 @@ case "$cmd" in
   new-session)
     for last; do :; done
     if [ -n "\${last:-}" ]; then
-      /bin/sh -c "$last"
+      /bin/sh -c "$last" </dev/null >/dev/null 2>&1 &
     fi
-    printf 'leader-pane\\n'
+    printf '%%12\n'
+    exit 0
+    ;;
+  source-file)
+    while IFS= read -r line; do
+      set -- $line
+      if [ "$1" = 'set-environment' ] && [ "$2" = '-t' ]; then
+        name=\${5#\\"}
+        name=\${name%\\"}
+        case "$name" in
+          OMX_TMUX_IMPORT_*_MANIFEST)
+            value=\${6#\\"}
+            value=\${value%\\"}
+            ;;
+          *) value="$PATH" ;;
+        esac
+        printf '%s=%s\n' "$name" "$value" >> "${tmuxEnvironmentPath}"
+      fi
+    done
+    exit 0
+    ;;
+  wait-for)
+    if [ "$1" = '-S' ]; then
+      : > "${tmuxWaitPath}-\${2}"
+      exit 0
+    fi
+    case "$1" in
+      *environment-import-ready) exit 0 ;;
+    esac
+    while [ ! -f "${tmuxWaitPath}-\${1}" ]; do sleep 0.01; done
     exit 0
     ;;
   split-window)
-    printf 'hud-pane\\n'
+    printf 'hud-pane\n'
     exit 0
     ;;
   display-message)
     if [ "$1" = '-p' ] && [ "$2" = '#{socket_path}' ]; then
-      printf '/tmp/tmux-test.sock\\n'
+      printf '/tmp/tmux-test.sock\n'
     else
-      printf '0\\n'
+      printf '0\n'
+    fi
+    exit 0
+    ;;
+  show-environment)
+    for last; do :; done
+    requested=\${last#\\"}
+    requested=\${requested%\\"}
+    if [ -f "${tmuxEnvironmentPath}" ]; then
+      while IFS= read -r assignment; do
+        case "$assignment" in
+          "$requested="*) printf '%s\n' "$assignment"; exit 0 ;;
+        esac
+      done < "${tmuxEnvironmentPath}"
     fi
     exit 0
     ;;
   show-options)
-    printf 'off\\n'
+    printf 'off\n'
     exit 0
     ;;
-  set-option|set-hook|attach-session|kill-session|run-shell|resize-pane|select-pane)
+  attach-session)
+    while [ ! -f "${codexLogPath}" ]; do sleep 0.01; done
+    exit 0
+    ;;
+  set-option|set-hook|kill-session|run-shell|resize-pane|select-pane)
     exit 0
     ;;
 esac
@@ -1862,7 +2072,7 @@ exit 0
         {
           HOME: home,
           SHELL: '/bin/not-a-real-shell',
-          PATH: `${fakeBin}:/usr/bin:/bin`,
+          PATH: platformTestPath(fakeBin),
           OMX_AUTO_UPDATE: '0',
           OMX_NOTIFY_FALLBACK: '0',
           OMX_HOOK_DERIVED_SIGNALS: '0',
@@ -1871,9 +2081,11 @@ exit 0
         },
       );
 
-      if (shouldSkipForSpawnPermissions(result.error)) return;
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
+      const tmuxEnvironment = await readFile(tmuxEnvironmentPath, 'utf-8');
+      assert.match(tmuxEnvironment, /OMX_TMUX_IMPORT_[a-f0-9]{32}_MANIFEST=v1:/);
+      assert.doesNotMatch(tmuxEnvironment, /OMX_STATE_AUTHORITY_CAPABILITY=[A-Za-z0-9]/);
       const codexLog = normalizeDarwinTmpPath(await readFile(codexLogPath, 'utf-8'));
       assert.match(tmuxLog, /\/bin\/sh/);
       assert.doesNotMatch(tmuxLog, /not-a-real-shell/);
