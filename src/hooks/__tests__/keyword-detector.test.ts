@@ -544,7 +544,17 @@ describe('keyword input classification direct grammar', () => {
   });
 
   it('lexes malformed maximal tokens without activating canonical prefixes', () => {
-    for (const text of ['$ralplan- plan this', '$oh-my-codex:ralplan- plan this', '$ralplan_invalid plan this']) {
+    for (const text of [
+      '$ralplan- plan this',
+      '$oh-my-codex:ralplan- plan this',
+      '$ralplan_invalid plan this',
+      '$ralplan@docs plan this',
+      '$ralplan#docs plan this',
+      '$ralplan=docs plan this',
+      '$ralplan＠docs plan this',
+      '$ralplan＃docs plan this',
+      '$ralplan＝docs plan this',
+    ]) {
       const classification = classifyKeywordInput(text);
       assert.deepEqual(classification.matches, [], text);
       assert.equal(classification.reservedInput, null, text);
@@ -591,6 +601,9 @@ describe('keyword input classification direct grammar', () => {
       { text: 'Do not run $ralplan; instead $autopilot build issue #3140', skills: ['autopilot'] },
       { text: 'Do not run $ralplan, instead $autopilot build it', skills: ['autopilot'] },
       { text: 'Do not run $ralplan; use $autopilot build it', skills: ['autopilot'] },
+      { text: 'Do not run $ralplan but use $autopilot build it', skills: ['autopilot'] },
+      { text: 'Do not run $ralplan but instead use $autopilot build it', skills: ['autopilot'] },
+      { text: 'Do not run $ralplan — instead use $autopilot build it', skills: ['autopilot'] },
       { text: 'Quoted inline-code `$ralplan`; use $autopilot build it', skills: ['autopilot'] },
       { text: 'Without $ralplan.\n$autopilot build it', skills: ['autopilot'] },
       { text: 'Quoted example: "$ralplan plan it".\n$autopilot build it', skills: ['autopilot'] },
@@ -632,6 +645,8 @@ describe('keyword input classification direct grammar', () => {
       '- $ralplan, $autopilot are workflow commands',
       '- $ralplan and $autopilot are workflow commands',
       '- $ralplan, $autopilot, and $team are workflow commands',
+      '- $ralplan / $autopilot are workflow commands',
+      '- $ralplan/$autopilot are workflow commands',
     ]) {
       const classification = classifyKeywordInput(text);
       assert.equal(classification.reservedInput, null, text);
@@ -644,11 +659,196 @@ describe('keyword input classification direct grammar', () => {
       { text: '- $ralplan, $autopilot are workflow commands\n$team execute it', skills: ['team'] },
       { text: '- $ralplan and $autopilot are workflow commands\n$team execute it', skills: ['team'] },
       { text: '- $ralplan, $autopilot, and $team are workflow commands\n$ralph execute it', skills: ['ralph'] },
+      { text: '- $ralplan / $autopilot are workflow commands\n$team execute it', skills: ['team'] },
+      { text: '- $ralplan/$autopilot are workflow commands\n$team execute it', skills: ['team'] },
     ] as const) {
       assert.deepEqual(classifyKeywordInput(testCase.text).matches.map((match) => match.skill), testCase.skills, testCase.text);
     }
 
     assert.deepEqual(detectKeywords('- $ralplan plan this').map((match) => match.skill), ['ralplan']);
+  });
+
+  it('requires implicit workflow phrases to be active, unmasked, and non-negated', () => {
+    for (const text of [
+      'Do not use autopilot mode.',
+      'Do not use deep interview, autopilot mode.',
+      'Do not use deep interview, nor autopilot mode.',
+      'Avoid autopilot mode.',
+      'Neither deep interview nor autopilot mode.',
+      'Autopilot mode is not allowed.',
+      "Autopilot mode isn't allowed.",
+      'Autopilot mode cannot be used.',
+      'Autopilot mode is prohibited.',
+      'No autopilot mode.',
+      'The docs call this "autopilot mode".',
+      '```\nautopilot mode\n```',
+      '- ```\n  autopilot mode\n  ```',
+      '- ```\n  first example\n- ```\n  autopilot mode\n  ```',
+      'use /prompts:architect autopilot mode',
+      '- autopilot mode is a workflow command',
+      'The reference describes autopilot mode.',
+      'This documents autopilot mode.',
+      'The guide says do not use deep interview but instead use autopilot mode.',
+      '[autopilot mode](./docs.md)',
+      '## Autopilot mode',
+      '| autopilot mode | workflow command |',
+      'Autopilot mode — autonomous workflow command',
+      'Autopilot mode / deep interview are workflow commands.',
+      'autopilot mode is workflow documentation.',
+      '`autopilot mode`',
+      '> autopilot mode',
+      '„autopilot mode“',
+      '‚autopilot mode‘',
+      '문서autopilot mode한글',
+      'autopilot mode는 사용하지 마세요',
+      'Autopilot mode and deep interview are prohibited.',
+      'Autopilot mode should be avoided.',
+      'Example: do not use deep interview but instead use autopilot mode.',
+      '＇autopilot mode＇',
+      '\\$oh-my-codex:autopilot mode',
+      'Autopilot mode, deep interview, and team are prohibited.',
+      'For example, do not use deep interview but instead use autopilot mode.',
+      'According to the docs, do not use deep interview but instead use autopilot mode.',
+      'Don’t use autopilot mode.',
+      'Don＇t use autopilot mode.',
+      'Autopilot mode isn’t allowed.',
+      'Autopilot mode is to be avoided.',
+      'Autopilot mode was to be disabled.',
+      'Autopilot mode and the deep interview workflow are prohibited.',
+      'As an example, do not use deep interview but instead use autopilot mode.',
+      'For instance, do not use deep interview but instead use autopilot mode.',
+      '[autopilot mode][docs]',
+      'Autopilot mode and deep interview workflows are prohibited.',
+      'As an example, ignore the docs and use autopilot mode.',
+      'For instance, ignore the docs and use autopilot mode.',
+      '[autopilot mode]: ./docs',
+      '[autopilot mode]',
+      'Autopilot mode\n===',
+      '$ralplan | workflow\n--- | ---',
+      'Mode | Meaning\n--- | ---\nautopilot mode | autonomous workflow command',
+      'Autopilot mode as well as deep interview workflows are prohibited.',
+      'Autopilot mode along with deep interview workflows are prohibited.',
+      'Autopilot mode together with deep interview workflows are prohibited.',
+      'Autopilot mode & deep interview workflows are prohibited.',
+      'As an example: ignore the docs and use autopilot mode.',
+      'For instance — ignore the docs and use autopilot mode.',
+      'For example - ignore the docs and use autopilot mode.',
+      'For instance: use autopilot mode.',
+      'For instance — use autopilot mode.',
+      'Mode | Meaning\n--- | ---\nmanual | docs\nautopilot mode | autonomous workflow command',
+      'See [autopilot mode] for details.\n\n[autopilot mode]: ./docs',
+      'Autopilot mode, as well as deep interview workflows, are prohibited.',
+      'Autopilot mode, along with deep interview workflows, are prohibited.',
+      'Autopilot mode, together with deep interview workflows, are prohibited.',
+      'See [autopilot   mode] for details.\n\n[autopilot mode]: ./docs',
+      'Ignore autopilot mode.',
+      'Skip autopilot mode.',
+      'Exclude autopilot mode.',
+      '$ralplan is prohibited.',
+      '$ralplan should not be run.',
+      '$ralplan and $autopilot are prohibited.',
+      'See [ẞ autopilot mode] for details.\n\n[SS autopilot mode]: ./docs',
+      'See [foo\\] autopilot mode] for details.\n\n[foo\\] autopilot mode]: ./docs',
+      'For instance: in version 1.2, use autopilot mode.',
+      'For instance: e.g. use autopilot mode.',
+      '$ralplan and the $autopilot workflow are prohibited.',
+      '$ralplan and autopilot mode are prohibited.',
+      'See [autopilot mode] for details.\n\n> [autopilot mode]: ./docs',
+      'See [autopilot mode] for details.\n\n- [autopilot mode]: ./docs',
+      'See [autopilot mode] for details.\n\n>   [autopilot mode]: ./docs',
+      '-     $ralplan',
+      '1.     autopilot mode',
+      'See [autopilot mode] for details.\n\n>    [autopilot mode]: ./docs',
+      'See [autopilot mode] for details.\n\n[autopilot mode]:\n  ./docs',
+      '-   \t$ralplan',
+      '- -     autopilot mode',
+      '$ralplan is also prohibited.',
+      'Autopilot mode is still prohibited.',
+      '- > autopilot mode',
+      '- - - - - - - - -     autopilot mode',
+      '1234. > autopilot mode',
+    ]) {
+      const classification = classifyKeywordInput(text);
+      assert.deepEqual(classification.matches, [], text);
+      assert.deepEqual(classification.implicitMatches, [], text);
+    }
+
+    for (const testCase of [
+      { text: 'Use autopilot mode.', skills: ['autopilot'] },
+      { text: 'List files and use autopilot mode.', skills: ['autopilot'] },
+      { text: "No, don't stop.", skills: ['ralph'] },
+      { text: 'Do not use deep interview, but use autopilot mode.', skills: ['autopilot'] },
+      { text: 'Do not use deep interview but instead use autopilot mode.', skills: ['autopilot'] },
+      { text: 'Do not use deep interview — instead use autopilot mode.', skills: ['autopilot'] },
+      { text: 'Autopilot mode is workflow documentation.\nUse autopilot mode.', skills: ['autopilot'] },
+      { text: 'Use /prompts:architect.\nUse autopilot mode.', skills: ['autopilot'] },
+      { text: 'Ignore the quoted "/prompts:architect" and use autopilot mode.', skills: ['autopilot'] },
+      { text: 'Do not run $ralplan but instead use autopilot mode.', skills: ['autopilot'] },
+      { text: 'Ignore "$ralplan" and use autopilot mode.', skills: ['autopilot'] },
+      { text: 'Ignore \\/prompts:architect and use autopilot mode.', skills: ['autopilot'] },
+      { text: 'See https://example.com/prompts:architect and use autopilot mode.', skills: ['autopilot'] },
+      { text: 'Autopilot mode should be used.', skills: ['autopilot'] },
+      { text: 'Autopilot mode must be enabled.', skills: ['autopilot'] },
+      { text: 'Autopilot mode can be run.', skills: ['autopilot'] },
+      { text: 'User＇s request: use autopilot mode.', skills: ['autopilot'] },
+      { text: 'See [/prompts:architect](./docs.md) and use autopilot mode.', skills: ['autopilot'] },
+      { text: 'Use autopilot mode, while deep interview is prohibited.', skills: ['autopilot'] },
+      { text: 'Read the docs. Use autopilot mode.', skills: ['autopilot'] },
+      { text: 'The docs are stale; use autopilot mode.', skills: ['autopilot'] },
+      { text: 'Ignore the docs, use autopilot mode.', skills: ['autopilot'] },
+      { text: 'Ignore \\/prompts:architect\n$ralplan plan it', skills: ['ralplan'] },
+      { text: 'See https://example.com/prompts:architect\n$ralplan plan it', skills: ['ralplan'] },
+      { text: 'See [/prompts:architect](./docs.md)\n$ralplan plan it', skills: ['ralplan'] },
+      { text: 'See [$ralplan](./docs.md) and use autopilot mode.', skills: ['autopilot'] },
+      { text: 'See https://example.com/$ralplan and use autopilot mode.', skills: ['autopilot'] },
+      { text: 'Use autopilot mode, and deep interview is prohibited.', skills: ['autopilot'] },
+      { text: 'Ignore the docs and use autopilot mode.', skills: ['autopilot'] },
+      { text: 'Ignore \\/prompts:architect; use $ralplan plan it', skills: ['ralplan'] },
+      { text: 'See https://example.com/prompts:architect; use $ralplan plan it', skills: ['ralplan'] },
+      { text: 'See [/prompts:architect](./docs.md); use $ralplan plan it', skills: ['ralplan'] },
+      { text: 'See [/prompts:architect][docs]; use $ralplan plan it', skills: ['ralplan'] },
+      { text: '## /prompts:architect\n$ralplan plan it', skills: ['ralplan'] },
+      { text: '| /prompts:architect |\n$ralplan plan it', skills: ['ralplan'] },
+      { text: '## $ralplan\nUse autopilot mode.', skills: ['autopilot'] },
+      { text: '| $ralplan |\nUse autopilot mode.', skills: ['autopilot'] },
+      { text: 'See [$ralplan][docs] and use autopilot mode.', skills: ['autopilot'] },
+      { text: 'See C:\\docs\\$ralplan and use autopilot mode.', skills: ['autopilot'] },
+      { text: 'Users＇ request: use autopilot mode.', skills: ['autopilot'] },
+      { text: 'Use autopilot mode, and deep interview should be avoided.', skills: ['autopilot'] },
+      { text: 'Ignore the docs but use autopilot mode.', skills: ['autopilot'] },
+      { text: '[/prompts:architect]: ./docs\n$ralplan plan it', skills: ['ralplan'] },
+      { text: '[/prompts:architect]\n$ralplan plan it', skills: ['ralplan'] },
+      { text: '[$ralplan]: ./docs\nUse autopilot mode.', skills: ['autopilot'] },
+      { text: '[$ralplan]\nUse autopilot mode.', skills: ['autopilot'] },
+      { text: '$ralplan\n===\nUse autopilot mode.', skills: ['autopilot'] },
+      { text: '$ralplan | workflow\n--- | ---\nUse autopilot mode.', skills: ['autopilot'] },
+      { text: '## $ralplan\n$autopilot build it', skills: ['autopilot'] },
+      { text: 'See [$ralplan](./docs.md); use $autopilot build it', skills: ['autopilot'] },
+      { text: 'See C:\\docs\\$ralplan; use $autopilot build it', skills: ['autopilot'] },
+      { text: 'Mode | Meaning\n--- | ---\n$ralplan | planning\n$autopilot build it', skills: ['autopilot'] },
+      { text: 'See [$ralplan] for details.\n\n[$ralplan]: ./docs\nUse autopilot mode.', skills: ['autopilot'] },
+      { text: 'Ignore "$ralplan" and use $autopilot build it', skills: ['autopilot'] },
+      { text: 'Ignore `$ralplan` and use $autopilot build it', skills: ['autopilot'] },
+      { text: 'See [$ralplan   ] for details.\n\n[$ralplan]: ./docs\nUse autopilot mode.', skills: ['autopilot'] },
+      { text: 'For instance: manual mode is slower. Use autopilot mode.', skills: ['autopilot'] },
+      { text: 'See [`$ralplan`](./docs.md) and use $autopilot build it', skills: ['autopilot'] },
+      { text: 'Ignore deep interview and use autopilot mode.', skills: ['autopilot'] },
+      { text: 'See [docs](https://example.com/$ralplan) and use $autopilot build it', skills: ['autopilot'] },
+      { text: 'See [docs](./docs.md "$ralplan reference") and use $autopilot build it', skills: ['autopilot'] },
+      { text: 'See [docs](https://example.com/(v1)/$ralplan) and use $autopilot build it', skills: ['autopilot'] },
+      { text: 'See [$ralplan](https://example.com/(v1)) and use $autopilot build it', skills: ['autopilot'] },
+      { text: 'See [docs](./docs.md "$ralplan (reference") and use $autopilot build it', skills: ['autopilot'] },
+      { text: 'See [autopilot mode] for details.\n\n>     [autopilot mode]: ./docs', skills: ['autopilot'] },
+      { text: '-\t $ralplan', skills: ['ralplan'] },
+      { text: '$ralplan is prohibited but use $autopilot build it', skills: ['autopilot'] },
+      { text: '$ralplan is prohibited and use $autopilot build it', skills: ['autopilot'] },
+      { text: '- - $ralplan plan it', skills: ['ralplan'] },
+      { text: '1234. $ralplan plan it', skills: ['ralplan'] },
+      { text: '- ```\n  $ralplan\n  ```\n$autopilot build it', skills: ['autopilot'] },
+      { text: '- - $ralplan is the consensus-planning command\n$autopilot build it', skills: ['autopilot'] },
+    ] as const) {
+      assert.deepEqual(classifyKeywordInput(testCase.text).matches.map((match) => match.skill), testCase.skills, testCase.text);
+    }
   });
 
   it('defines punctuation-separated workflow directives as one ordered block', () => {
@@ -672,6 +872,7 @@ describe('keyword input classification direct grammar', () => {
       { name: 'Japanese corner', opening: '「', closing: '」' },
       { name: 'Japanese nested', opening: '『', closing: '』' },
       { name: 'fullwidth', opening: '＂', closing: '＂' },
+      { name: 'fullwidth single', opening: '＇', closing: '＇' },
       { name: 'single guillemets', opening: '‹', closing: '›' },
     ] as const;
 
@@ -798,6 +999,9 @@ describe('keyword input classification direct grammar', () => {
     assert.deepEqual(classification.candidates[0]?.reasons, ['inline-code', 'not-leading-region']);
     assert.deepEqual(classification.candidates.at(-1)?.reasons, ['inline-code', 'not-leading-region']);
     assert.deepEqual(classification.matches, []);
+    const shortcuts = classifyKeywordInput('See [$ralplan] for details.\n'.repeat(count) + '\n[$ralplan]: ./docs');
+    assert.equal(shortcuts.candidates.length, count + 1);
+    assert.deepEqual(shortcuts.matches, []);
   });
 
   it('suppresses prose, multilingual, documentation, quoted, escaped, and code candidates without a phrase classifier', () => {
