@@ -1317,7 +1317,7 @@ function isListItemDocumentation(text: string, candidateStart: number, blockEnd:
   const leading = leadingDirectiveCursor(text, lineStart, false);
   if (!leading.listItem || leading.cursor !== candidateStart) return false;
   const end = lineEnd(text, blockEnd);
-  const tokenSequence = /^(?:(?:\$(?:oh-my-codex:)?[A-Za-z][A-Za-z0-9_-]*)|(?:\/prompts:[\w.-]+))(?:(?:\s*,\s*|\s+(?:and|or)\s+)(?:(?:\$(?:oh-my-codex:)?[A-Za-z][A-Za-z0-9_-]*)|(?:\/prompts:[\w.-]+)))*/iu.exec(text.slice(candidateStart, end));
+  const tokenSequence = /^(?:(?:\$(?:oh-my-codex:)?[A-Za-z][A-Za-z0-9_-]*)|(?:\/prompts:[\w.-]+))(?:(?:\s*,\s*(?:(?:and|or)\s+)?|\s+(?:and|or)\s+)(?:(?:\$(?:oh-my-codex:)?[A-Za-z][A-Za-z0-9_-]*)|(?:\/prompts:[\w.-]+)))*/iu.exec(text.slice(candidateStart, end));
   if (!tokenSequence) return false;
   return LIST_DOCUMENTATION_SUFFIX.test(text.slice(candidateStart + tokenSequence[0].length, end));
 }

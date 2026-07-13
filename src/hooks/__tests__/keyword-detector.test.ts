@@ -631,6 +631,7 @@ describe('keyword input classification direct grammar', () => {
       '- $ralplan — consensus-planning command',
       '- $ralplan, $autopilot are workflow commands',
       '- $ralplan and $autopilot are workflow commands',
+      '- $ralplan, $autopilot, and $team are workflow commands',
     ]) {
       const classification = classifyKeywordInput(text);
       assert.equal(classification.reservedInput, null, text);
@@ -642,6 +643,7 @@ describe('keyword input classification direct grammar', () => {
       { text: '- /prompts:architect is the prompt command documentation\n$ralplan plan it', skills: ['ralplan'] },
       { text: '- $ralplan, $autopilot are workflow commands\n$team execute it', skills: ['team'] },
       { text: '- $ralplan and $autopilot are workflow commands\n$team execute it', skills: ['team'] },
+      { text: '- $ralplan, $autopilot, and $team are workflow commands\n$ralph execute it', skills: ['ralph'] },
     ] as const) {
       assert.deepEqual(classifyKeywordInput(testCase.text).matches.map((match) => match.skill), testCase.skills, testCase.text);
     }
