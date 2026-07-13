@@ -1,20 +1,28 @@
 import { after, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync } from "node:fs";
+import { existsSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import {
 	chmod,
 	cp,
+	lstat,
 	mkdir,
 	mkdtemp,
 	readFile,
 	readdir,
 	rm,
+	symlink,
 	writeFile,
+	stat,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { parse as parseToml } from "@iarna/toml";
-import { setup } from "../setup.js";
+import {
+	setNativeHookTransactionFailureInjectorForTest,
+	setNativeHookTransactionPlatformForTest,
+	setNativeHookTransactionTemporaryPathForTest,
+	setup,
+} from "../setup.js";
 import { resolveSetupRefreshArgs } from "../update.js";
 import { uninstall } from "../uninstall.js";
 import { OMX_FIRST_PARTY_MCP_SERVER_NAMES } from "../../config/omx-first-party-mcp.js";
@@ -26,6 +34,10 @@ import {
 	materializePackagedOmxPluginCache,
 	resolvePackagedOmxMarketplace,
 } from "../plugin-marketplace.js";
+import {
+	buildManagedCodexNativeHookWindowsShimContent,
+	buildManagedCodexNativeHookWindowsShimPath,
+} from "../../config/codex-hooks.js";
 
 const packageRoot = process.cwd();
 let previousPathForFakeCodex: string | undefined;
@@ -2385,27 +2397,205 @@ describe("omx setup install mode behavior", () => {
 			await rm(wd, { recursive: true, force: true });
 		}
 	});
+	it("removes Windows hooks before deleting the no-longer-referenced shim", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-setup-windows-hook-removal-"));
+		const removalOrder: string[] = [];
+		const resetPlatform = setNativeHookTransactionPlatformForTest("win32");
+		let resetFailureInjector: (() => void) | undefined;
+		try {
+			await withIsolatedUserHome(wd, async (codexHomeDir) => {
+				await withTempCwd(wd, async () => {
+					await setup({
+						scope: "user",
+						installMode: "legacy",
+						skipNativeAgentRefresh: true,
+					});
+					const hooksPath = join(codexHomeDir, "hooks.json");
+					const shimPath = buildManagedCodexNativeHookWindowsShimPath(codexHomeDir);
+					assert.equal(existsSync(hooksPath), true);
+					assert.equal(existsSync(shimPath), true);
+					resetFailureInjector = setNativeHookTransactionFailureInjectorForTest(
+						(stage, artifact) => {
+							if (
+								stage === "before_remove" &&
+								(artifact.kind === "hooks" || artifact.kind === "shim")
+							) {
+								removalOrder.push(artifact.kind);
+							}
+						},
+					);
+					await setup({
+						scope: "user",
+						installMode: "plugin",
+						skipNativeAgentRefresh: true,
+						pluginAgentsMdPrompt: async () => false,
+						codexFeaturesProbe: () =>
+							[
+								"hooks                                   stable             true",
+								"plugin_hooks                            experimental       true",
+								"",
+							].join("\n"),
+					});
+					assert.deepEqual(removalOrder, ["hooks", "shim"]);
+					assert.equal(existsSync(hooksPath), false);
+					assert.equal(existsSync(shimPath), false);
+				});
+			});
+		} finally {
+			resetFailureInjector?.();
+			resetPlatform();
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
+	it("restores the Windows shim before hooks when plugin-transition deletions roll back", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-setup-windows-hook-rollback-"));
+		const restorationOrder: string[] = [];
+		const resetPlatform = setNativeHookTransactionPlatformForTest("win32");
+		let resetFailureInjector: (() => void) | undefined;
+		try {
+			await withIsolatedUserHome(wd, async (codexHomeDir) => {
+				await withTempCwd(wd, async () => {
+					await setup({
+						scope: "user",
+						installMode: "legacy",
+						skipNativeAgentRefresh: true,
+					});
+					const hooksPath = join(codexHomeDir, "hooks.json");
+					const shimPath = buildManagedCodexNativeHookWindowsShimPath(codexHomeDir);
+					const hooksBefore = await readFile(hooksPath);
+					const shimBefore = await readFile(shimPath);
+					resetFailureInjector = setNativeHookTransactionFailureInjectorForTest(
+						(stage, artifact) => {
+							if (stage === "before_readback" && artifact.kind === "shim") {
+								throw new Error("injected Windows shim deletion failure");
+							}
+							if (
+								stage === "before_rollback_rename" &&
+								(artifact.kind === "hooks" || artifact.kind === "shim")
+							) {
+								restorationOrder.push(artifact.kind);
+							}
+						},
+					);
+					await assert.rejects(
+						setup({
+							scope: "user",
+							installMode: "plugin",
+							skipNativeAgentRefresh: true,
+							pluginAgentsMdPrompt: async () => false,
+							codexFeaturesProbe: () =>
+								[
+									"hooks                                   stable             true",
+									"plugin_hooks                            experimental       true",
+									"",
+								].join("\n"),
+						}),
+						/rolled back: injected Windows shim deletion failure/,
+					);
+					assert.deepEqual(restorationOrder, ["shim", "hooks"]);
+					assert.deepEqual(await readFile(shimPath), shimBefore);
+					assert.deepEqual(await readFile(hooksPath), hooksBefore);
+				});
+			});
+		} finally {
+			resetFailureInjector?.();
+			resetPlatform();
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
 
-	it("preserves existing user hooks while using plugin-scoped hooks", async () => {
+	it("preserves foreign native hook enablement when transitioning from plugin fallback", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-setup-install-mode-"));
+		try {
+			await withIsolatedUserHome(wd, async (codexHomeDir) => {
+				await withTempCwd(wd, async () => {
+					await setup({
+						scope: "user",
+						installMode: "plugin",
+						codexFeaturesProbe: () =>
+							"hooks                                   stable             true\n",
+					});
+					const hooksPath = join(codexHomeDir, "hooks.json");
+					const existingHooks = JSON.parse(await readFile(hooksPath, "utf-8")) as {
+						hooks?: Record<string, Array<Record<string, unknown>>>;
+					};
+					const foreignHookGroup = {
+						hooks: [
+							{
+								type: "command",
+								command: "/usr/bin/python3 /tmp/foreign-hook.py",
+								timeout: 5,
+							},
+						],
+					};
+					const existingRegistrations = existingHooks.hooks ?? {};
+					existingHooks.hooks = {
+						...existingRegistrations,
+						UserPromptSubmit: [
+							foreignHookGroup,
+							...(existingRegistrations.UserPromptSubmit ?? []),
+						],
+					};
+					await writeFile(
+						hooksPath,
+						JSON.stringify(existingHooks, null, 2) + "\n",
+					);
+
+					await setup({ scope: "user", installMode: "plugin" });
+
+					const finalHooksContent = await readFile(hooksPath, "utf-8");
+					const config = await readFile(join(codexHomeDir, "config.toml"), "utf-8");
+					assert.match(finalHooksContent, /foreign-hook\.py/);
+					assert.doesNotMatch(finalHooksContent, /codex-native-hook\.js/);
+					assert.match(config, /^plugin_hooks = true$/m);
+					assert.match(config, /^hooks = true$/m);
+				});
+			});
+		} finally {
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps native hooks enabled for pre-existing foreign hooks in plugin-scoped setup", async () => {
 		const wd = await mkdtemp(join(tmpdir(), "omx-setup-install-mode-"));
 		try {
 			await withIsolatedUserHome(wd, async (codexHomeDir) => {
 				await withTempCwd(wd, async () => {
 					const hooksPath = join(codexHomeDir, "hooks.json");
-					const existingHooks =
-						JSON.stringify({ hooks: { UserPromptSubmit: [] } }, null, 2) + "\n";
-					await writeFile(hooksPath, existingHooks);
+					const foreignHookGroup = {
+						hooks: [
+							{
+								type: "command",
+								command: "/usr/bin/python3 /tmp/foreign-hook.py",
+								timeout: 5,
+							},
+						],
+					};
+					await writeFile(
+						hooksPath,
+						JSON.stringify(
+							{ hooks: { UserPromptSubmit: [foreignHookGroup] } },
+							null,
+							2,
+						) + "\n",
+					);
 
 					await setup({ scope: "user", installMode: "plugin" });
 
-					const hooks = await readFile(hooksPath, "utf-8");
-					assert.match(hooks, /"UserPromptSubmit"/);
-					assert.doesNotMatch(hooks, /codex-native-hook\.js/);
+					const finalHooksContent = await readFile(hooksPath, "utf-8");
+					assert.match(finalHooksContent, /"UserPromptSubmit"/);
+					assert.match(finalHooksContent, /foreign-hook\.py/);
+					assert.doesNotMatch(finalHooksContent, /codex-native-hook\.js/);
 					const config = await readFile(
 						join(codexHomeDir, "config.toml"),
 						"utf-8",
 					);
 					assert.match(config, /^plugin_hooks = true$/m);
+					assert.match(
+						config,
+						/^hooks = true$/m,
+						"plugin-scoped setup must keep native hooks enabled for foreign hooks",
+					);
 				});
 			});
 		} finally {
@@ -3067,6 +3257,1158 @@ describe("omx setup install mode behavior", () => {
 				});
 			});
 		} finally {
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
+	it("fails plugin hook-removal preflight before creating unrelated setup artifacts", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-setup-preflight-"));
+		try {
+			await withIsolatedUserHome(wd, async (codexHomeDir) => {
+				await withTempCwd(wd, async () => {
+					const hooksPath = join(codexHomeDir, "hooks.json");
+					const configPath = join(codexHomeDir, "config.toml");
+					const hooksContent = JSON.stringify(
+						{
+							hooks: {
+								SessionStart: [
+									{
+										matcher: "startup|resume|clear",
+										hooks: [
+											{
+												type: "command",
+												command: 'node "/repo/dist/scripts/codex-native-hook.js"',
+											},
+										],
+									},
+									{ hooks: [{ type: "command", command: "echo foreign" }] },
+								],
+							},
+						},
+						null,
+						2,
+					) + "\n";
+					const configContent = 'model = "foreign-config"\n';
+					await writeFile(hooksPath, hooksContent);
+					await writeFile(configPath, configContent);
+
+					await assert.rejects(
+						() =>
+							setup({
+								scope: "user",
+								installMode: "plugin",
+								mergeAgents: true,
+								codexFeaturesProbe: () =>
+									"hooks                                   stable             true\nplugin_hooks                            experimental       true\n",
+							}),
+						(error: unknown) => {
+							assert.equal(
+								(error as { code?: unknown }).code,
+								"unsafe_managed_removal",
+							);
+							return true;
+						},
+					);
+					assert.equal(await readFile(hooksPath, "utf-8"), hooksContent);
+					assert.equal(await readFile(configPath, "utf-8"), configContent);
+					assert.equal(existsSync(join(wd, ".omx")), false);
+					assert.equal(existsSync(join(codexHomeDir, "prompts")), false);
+					assert.equal(existsSync(join(codexHomeDir, "agents")), false);
+				});
+			});
+		} finally {
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
+	it("rejects symlinked Codex transaction ancestors without writing foreign storage", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-setup-symlinked-codex-home-"));
+		try {
+			await withIsolatedUserHome(wd, async (codexHomeDir) => {
+				await withTempCwd(wd, async () => {
+					const foreignCodexHome = join(wd, "foreign-codex-home");
+					await mkdir(foreignCodexHome);
+					await writeFile(join(foreignCodexHome, "sentinel.txt"), "foreign\n");
+					await rm(codexHomeDir, { recursive: true, force: true });
+					await symlink(foreignCodexHome, codexHomeDir);
+
+					await assert.rejects(
+						setup({
+							scope: "user",
+							installMode: "legacy",
+							skipNativeAgentRefresh: true,
+						}),
+						/ancestor .*symbolic link/,
+					);
+					assert.deepEqual(await readdir(foreignCodexHome), ["sentinel.txt"]);
+					assert.equal(existsSync(join(wd, ".omx")), false);
+				});
+			});
+		} finally {
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
+	it("rejects a symlinked native artifact parent before touching its target", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-setup-symlinked-native-parent-"));
+		try {
+			await withIsolatedUserHome(wd, async (codexHomeDir) => {
+				await withTempCwd(wd, async () => {
+					const foreignMetadataDir = join(wd, "foreign-native-metadata");
+					await mkdir(foreignMetadataDir);
+					await writeFile(join(foreignMetadataDir, "sentinel.txt"), "foreign\n");
+					await symlink(foreignMetadataDir, join(codexHomeDir, ".omx"));
+
+					await assert.rejects(
+						setup({
+							scope: "user",
+							installMode: "legacy",
+							skipNativeAgentRefresh: true,
+						}),
+						/ancestor .*symbolic link/,
+					);
+					assert.deepEqual(await readdir(foreignMetadataDir), ["sentinel.txt"]);
+					assert.equal(existsSync(join(codexHomeDir, "config.toml")), false);
+					assert.equal(existsSync(join(codexHomeDir, "hooks.json")), false);
+					assert.equal(existsSync(join(wd, ".omx")), false);
+				});
+			});
+		} finally {
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
+	it("revalidates native artifact parent topology immediately before mutation", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-setup-stale-native-parent-"));
+		let resetFailureInjector: (() => void) | undefined;
+		try {
+			await withIsolatedUserHome(wd, async (codexHomeDir) => {
+				await withTempCwd(wd, async () => {
+					const metadataParent = join(codexHomeDir, ".omx");
+					let injected = false;
+					resetFailureInjector = setNativeHookTransactionFailureInjectorForTest(
+						(stage) => {
+							if (stage !== "before_precondition" || injected) return;
+							injected = true;
+							writeFileSync(metadataParent, "foreign\n");
+						},
+					);
+
+					await assert.rejects(
+						setup({
+							scope: "user",
+							installMode: "legacy",
+							skipNativeAgentRefresh: true,
+						}),
+						/ancestor .*not a directory/,
+					);
+					assert.equal(injected, true);
+					assert.equal(await readFile(metadataParent, "utf-8"), "foreign\n");
+					assert.equal(existsSync(join(codexHomeDir, "config.toml")), false);
+					assert.equal(existsSync(join(codexHomeDir, "hooks.json")), false);
+				});
+			});
+		} finally {
+			resetFailureInjector?.();
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects a modified Windows hook shim during setup preflight", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-setup-windows-shim-"));
+		const resetPlatform = setNativeHookTransactionPlatformForTest("win32");
+		try {
+			await withIsolatedUserHome(wd, async (codexHomeDir) => {
+				await withTempCwd(wd, async () => {
+					const shimPath = buildManagedCodexNativeHookWindowsShimPath(codexHomeDir);
+					const modifiedShim = "# modified by user\n";
+					await writeFile(shimPath, modifiedShim);
+
+					await assert.rejects(
+						() =>
+							setup({
+								scope: "user",
+								installMode: "legacy",
+								mergeAgents: true,
+							}),
+						/modified Windows native hook shim/,
+					);
+					assert.equal(await readFile(shimPath, "utf-8"), modifiedShim);
+					assert.equal(existsSync(join(codexHomeDir, "hooks.json")), false);
+					assert.equal(existsSync(join(codexHomeDir, "config.toml")), false);
+					assert.equal(existsSync(join(wd, ".omx")), false);
+				});
+			});
+		} finally {
+			resetPlatform();
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
+
+	it("writes hooks, notification metadata, then config/trust and rolls all writes back when config replacement fails", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-setup-hook-transaction-"));
+		const writeOrder: string[] = [];
+		const resetFailureInjector = setNativeHookTransactionFailureInjectorForTest(
+			(stage, artifact) => {
+				if (stage !== "before_temp_write") return;
+				writeOrder.push(artifact.kind);
+				if (artifact.kind === "config") {
+					throw new Error("injected config replacement failure");
+				}
+			},
+		);
+		try {
+			await withIsolatedUserHome(wd, async (codexHomeDir) => {
+				await withTempCwd(wd, async () => {
+					await writeFile(
+						join(codexHomeDir, "config.toml"),
+						'notify = ["node", "/tmp/user-notify.js"]\n',
+					);
+					await assert.rejects(
+						() =>
+							setup({
+								scope: "user",
+								installMode: "legacy",
+								mergeAgents: true,
+								skipNativeAgentRefresh: true,
+							}),
+						/rolled back: injected config replacement failure/,
+					);
+					assert.deepEqual(writeOrder, ["hooks", "metadata", "config"]);
+					assert.equal(existsSync(join(codexHomeDir, "hooks.json")), false);
+					assert.equal(
+						await readFile(join(codexHomeDir, "config.toml"), "utf-8"),
+						'notify = ["node", "/tmp/user-notify.js"]\n',
+					);
+					assert.equal(
+						existsSync(join(codexHomeDir, ".omx", "notify-dispatch.json")),
+						false,
+					);
+				});
+			});
+		} finally {
+			resetFailureInjector();
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
+	it("writes the Windows shim, hooks, notification metadata, then config/trust and rolls all writes back", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-setup-windows-hook-transaction-"));
+		const writeOrder: string[] = [];
+		const resetFailureInjector = setNativeHookTransactionFailureInjectorForTest(
+			(stage, artifact) => {
+				if (stage !== "before_temp_write") return;
+				writeOrder.push(artifact.kind);
+				if (artifact.kind === "config") {
+					throw new Error("injected Windows config replacement failure");
+				}
+			},
+		);
+		const resetPlatform = setNativeHookTransactionPlatformForTest("win32");
+		try {
+			await withIsolatedUserHome(wd, async (codexHomeDir) => {
+				await withTempCwd(wd, async () => {
+					await writeFile(
+						join(codexHomeDir, "config.toml"),
+						'notify = ["node", "/tmp/user-notify.js"]\n',
+					);
+					const shimPath = buildManagedCodexNativeHookWindowsShimPath(codexHomeDir);
+					await assert.rejects(
+						() =>
+							setup({
+								scope: "user",
+								installMode: "legacy",
+								mergeAgents: true,
+								skipNativeAgentRefresh: true,
+							}),
+						/rolled back: injected Windows config replacement failure/,
+					);
+					assert.deepEqual(writeOrder, ["shim", "hooks", "metadata", "config"]);
+					assert.equal(existsSync(shimPath), false);
+					assert.equal(existsSync(join(codexHomeDir, "hooks.json")), false);
+					assert.equal(
+						await readFile(join(codexHomeDir, "config.toml"), "utf-8"),
+						'notify = ["node", "/tmp/user-notify.js"]\n',
+					);
+					assert.equal(
+						existsSync(join(codexHomeDir, ".omx", "notify-dispatch.json")),
+						false,
+					);
+				});
+			});
+		} finally {
+			resetFailureInjector();
+			resetPlatform();
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
+	it("aborts stale native snapshots before setup can write unrelated artifacts", async () => {
+		const originalConfig = Buffer.from('model = "before"\n', "utf-8");
+		const originalHooks = Buffer.from('{"hooks": {}}\n', "utf-8");
+		const foreignHooks = Buffer.from('{"hooks": {"Stop": []}}\n', "utf-8");
+		const foreignConfig = Buffer.from('model = "foreign"\n', "utf-8");
+		const fixtures = [
+			{
+				name: "hooks creation",
+				seedHooks: null,
+				mutate: (hooksPath: string, _configPath: string) =>
+					writeFileSync(hooksPath, foreignHooks),
+				expectedHooks: foreignHooks,
+				expectedConfig: originalConfig,
+			},
+			{
+				name: "config modification",
+				seedHooks: originalHooks,
+				mutate: (_hooksPath: string, configPath: string) =>
+					writeFileSync(configPath, foreignConfig),
+				expectedHooks: originalHooks,
+				expectedConfig: foreignConfig,
+			},
+			{
+				name: "hooks deletion",
+				seedHooks: originalHooks,
+				mutate: (hooksPath: string, _configPath: string) => rmSync(hooksPath),
+				expectedHooks: null,
+				expectedConfig: originalConfig,
+			},
+			{
+				name: "config deletion",
+				seedHooks: originalHooks,
+				mutate: (_hooksPath: string, configPath: string) => rmSync(configPath),
+				expectedHooks: originalHooks,
+				expectedConfig: null,
+			},
+		] as const;
+		for (const fixture of fixtures) {
+			const wd = await mkdtemp(join(tmpdir(), "omx-setup-stale-native-"));
+			let resetFailureInjector: (() => void) | undefined;
+			try {
+				await withIsolatedUserHome(wd, async (codexHomeDir) => {
+					await withTempCwd(wd, async () => {
+						const hooksPath = join(codexHomeDir, "hooks.json");
+						const configPath = join(codexHomeDir, "config.toml");
+						await writeFile(configPath, originalConfig);
+						if (fixture.seedHooks) await writeFile(hooksPath, fixture.seedHooks);
+
+						let injected = false;
+						resetFailureInjector = setNativeHookTransactionFailureInjectorForTest(
+							(stage) => {
+								if (stage !== "before_precondition" || injected) return;
+								injected = true;
+								fixture.mutate(hooksPath, configPath);
+							},
+						);
+						await assert.rejects(
+							setup({
+								scope: "user",
+								installMode: "legacy",
+								skipNativeAgentRefresh: true,
+								codexFeaturesProbe: () => null,
+								codexVersionProbe: () => null,
+							}),
+							/precondition changed/,
+						);
+						assert.equal(injected, true, fixture.name);
+						if (fixture.expectedConfig === null) {
+							assert.equal(existsSync(configPath), false);
+						} else {
+							assert.deepEqual(await readFile(configPath), fixture.expectedConfig);
+						}
+						if (fixture.expectedHooks === null) {
+							assert.equal(existsSync(hooksPath), false);
+						} else {
+							assert.deepEqual(await readFile(hooksPath), fixture.expectedHooks);
+						}
+						assert.equal(existsSync(join(wd, ".omx")), false);
+						assert.equal(existsSync(join(codexHomeDir, "agents")), false);
+					});
+				});
+			} finally {
+				resetFailureInjector?.();
+				await rm(wd, { recursive: true, force: true });
+			}
+		}
+	});
+	it("aborts when notification metadata changes after planning", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-setup-stale-notify-metadata-"));
+		let resetFailureInjector: (() => void) | undefined;
+		try {
+			await withIsolatedUserHome(wd, async (codexHomeDir) => {
+				await withTempCwd(wd, async () => {
+					const configPath = join(codexHomeDir, "config.toml");
+					const hooksPath = join(codexHomeDir, "hooks.json");
+					const metadataPath = join(
+						codexHomeDir,
+						".omx",
+						"notify-dispatch.json",
+					);
+					const configBefore = 'notify = ["node", "/tmp/user-notify.js"]\n';
+					const foreignMetadata = Buffer.from('{"managedBy":"foreign"}\n', "utf-8");
+					await writeFile(configPath, configBefore);
+					await mkdir(dirname(metadataPath), { recursive: true });
+					let injected = false;
+					resetFailureInjector = setNativeHookTransactionFailureInjectorForTest(
+						(stage, target) => {
+							if (
+								stage !== "before_precondition" ||
+								target.kind !== "metadata" ||
+								injected
+							) {
+								return;
+							}
+							injected = true;
+							writeFileSync(metadataPath, foreignMetadata);
+						},
+					);
+					await assert.rejects(
+						setup({
+							scope: "user",
+							installMode: "legacy",
+							skipNativeAgentRefresh: true,
+							codexFeaturesProbe: () => null,
+							codexVersionProbe: () => null,
+						}),
+						/precondition changed/,
+					);
+					assert.equal(injected, true);
+					assert.deepEqual(await readFile(metadataPath), foreignMetadata);
+					assert.equal(await readFile(configPath, "utf-8"), configBefore);
+					assert.equal(existsSync(hooksPath), false);
+				});
+			});
+		} finally {
+			resetFailureInjector?.();
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
+
+	it("aborts when the Windows shim changes after planning", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-setup-stale-windows-shim-"));
+		const resetPlatform = setNativeHookTransactionPlatformForTest("win32");
+		let resetFailureInjector: (() => void) | undefined;
+		try {
+			await withIsolatedUserHome(wd, async (codexHomeDir) => {
+				await withTempCwd(wd, async () => {
+					await setup({
+						scope: "user",
+						installMode: "legacy",
+						skipNativeAgentRefresh: true,
+						codexFeaturesProbe: () => null,
+						codexVersionProbe: () => null,
+					});
+					const shimPath = buildManagedCodexNativeHookWindowsShimPath(codexHomeDir);
+					const hooksPath = join(codexHomeDir, "hooks.json");
+					const configPath = join(codexHomeDir, "config.toml");
+					const configBefore = await readFile(configPath);
+					await writeFile(hooksPath, '{"hooks": {}}\n');
+					const hooksBefore = await readFile(hooksPath);
+					const foreignShim = Buffer.from("# foreign shim\n", "utf-8");
+					let injected = false;
+					resetFailureInjector = setNativeHookTransactionFailureInjectorForTest(
+						(stage, target) => {
+							if (
+								stage === "before_precondition" &&
+								target.kind === "shim" &&
+								!injected
+							) {
+								injected = true;
+								writeFileSync(shimPath, foreignShim);
+							}
+						},
+					);
+					await assert.rejects(
+						setup({
+							scope: "user",
+							installMode: "legacy",
+							skipNativeAgentRefresh: true,
+							codexFeaturesProbe: () => null,
+							codexVersionProbe: () => null,
+						}),
+						/precondition changed/,
+					);
+					assert.equal(injected, true);
+					assert.deepEqual(await readFile(shimPath), foreignShim);
+					assert.deepEqual(await readFile(hooksPath), hooksBefore);
+					assert.deepEqual(await readFile(configPath), configBefore);
+				});
+			});
+		} finally {
+			resetFailureInjector?.();
+			resetPlatform();
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
+	it("never deletes plugin hooks from a stale snapshot", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-setup-plugin-stale-hooks-"));
+		let resetFailureInjector: (() => void) | undefined;
+		try {
+			await withIsolatedUserHome(wd, async (codexHomeDir) => {
+				await withTempCwd(wd, async () => {
+					await setup({ scope: "user", installMode: "legacy", skipNativeAgentRefresh: true });
+					const hooksPath = join(codexHomeDir, "hooks.json");
+					const configPath = join(codexHomeDir, "config.toml");
+					const configBefore = await readFile(configPath);
+					const foreignHooks = Buffer.from('{"hooks": {"Stop": []}}\n', "utf-8");
+					let injected = false;
+					resetFailureInjector = setNativeHookTransactionFailureInjectorForTest(
+						(stage) => {
+							if (stage !== "before_precondition" || injected) return;
+							injected = true;
+							writeFileSync(hooksPath, foreignHooks);
+						},
+					);
+					await assert.rejects(
+						setup({
+							scope: "user",
+							installMode: "plugin",
+							pluginAgentsMdPrompt: async () => false,
+							skipNativeAgentRefresh: true,
+						}),
+						/precondition changed/,
+					);
+					assert.equal(injected, true);
+					assert.deepEqual(await readFile(hooksPath), foreignHooks);
+					assert.deepEqual(await readFile(configPath), configBefore);
+				});
+			});
+		} finally {
+			resetFailureInjector?.();
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
+
+	it("never rolls back a concurrent foreign hook replacement", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-setup-stale-rollback-"));
+		let resetFailureInjector: (() => void) | undefined;
+		try {
+			await withIsolatedUserHome(wd, async (codexHomeDir) => {
+				await withTempCwd(wd, async () => {
+					const hooksPath = join(codexHomeDir, "hooks.json");
+					const configPath = join(codexHomeDir, "config.toml");
+					const hooksBefore = Buffer.from('{"hooks": {}}\n', "utf-8");
+					const configBefore = Buffer.from('model = "before"\n', "utf-8");
+					const foreignHooks = Buffer.from('{"hooks": {"Stop": []}}\n', "utf-8");
+					await writeFile(hooksPath, hooksBefore);
+					await writeFile(configPath, configBefore);
+					resetFailureInjector = setNativeHookTransactionFailureInjectorForTest(
+						(stage, target) => {
+							if (stage !== "before_temp_write" || target.kind !== "config") return;
+							writeFileSync(hooksPath, foreignHooks);
+							throw new Error("injected config replacement failure after foreign hook write");
+						},
+					);
+					await assert.rejects(
+						setup({
+							scope: "user",
+							installMode: "legacy",
+							skipNativeAgentRefresh: true,
+							codexFeaturesProbe: () => null,
+							codexVersionProbe: () => null,
+						}),
+						/rollback failed/,
+					);
+					assert.deepEqual(await readFile(hooksPath), foreignHooks);
+					assert.deepEqual(await readFile(configPath), configBefore);
+				});
+			});
+		} finally {
+			resetFailureInjector?.();
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
+	it("preserves pre-existing native bytes and modes across injected transaction failures", async () => {
+		const failures = [
+			{ stage: "before_backup", kind: "shim" },
+			{ stage: "before_temp_write", kind: "shim" },
+			{ stage: "before_rename", kind: "hooks" },
+			{ stage: "before_temp_write", kind: "metadata" },
+			{ stage: "before_readback", kind: "config" },
+		] as const;
+		for (const failure of failures) {
+			const wd = await mkdtemp(join(tmpdir(), "omx-setup-transaction-rollback-"));
+			const resetPlatform = setNativeHookTransactionPlatformForTest("win32");
+			let resetFailureInjector: (() => void) | undefined;
+			try {
+				await withIsolatedUserHome(wd, async (codexHomeDir) => {
+					await withTempCwd(wd, async () => {
+						const shimPath = buildManagedCodexNativeHookWindowsShimPath(codexHomeDir);
+						const hooksPath = join(codexHomeDir, "hooks.json");
+						const configPath = join(codexHomeDir, "config.toml");
+						const shimBefore = Buffer.from(
+							buildManagedCodexNativeHookWindowsShimContent(join(wd, "previous")),
+							"utf-8",
+						);
+						const hooksBefore = Buffer.from('{"hooks": {}}\n', "utf-8");
+						const configBefore = Buffer.from(
+							'model = "before"\nnotify = ["node", "/tmp/user-notify.js"]\n',
+							"utf-8",
+						);
+						await mkdir(dirname(shimPath), { recursive: true });
+						await writeFile(shimPath, shimBefore);
+						await writeFile(hooksPath, hooksBefore);
+						await writeFile(configPath, configBefore);
+						await Promise.all([
+							chmod(shimPath, 0o640),
+							chmod(hooksPath, 0o640),
+							chmod(configPath, 0o640),
+						]);
+
+						resetFailureInjector = setNativeHookTransactionFailureInjectorForTest(
+							(stage, target) => {
+								if (stage === failure.stage && target.kind === failure.kind) {
+									throw new Error(`injected ${failure.stage} ${failure.kind} failure`);
+								}
+							},
+						);
+						await assert.rejects(
+							setup({
+								scope: "user",
+								installMode: "legacy",
+								skipNativeAgentRefresh: true,
+								codexFeaturesProbe: () => null,
+								codexVersionProbe: () => null,
+							}),
+							/injected .* failure/,
+						);
+						assert.deepEqual(await readFile(shimPath), shimBefore, failure.stage);
+						assert.deepEqual(await readFile(hooksPath), hooksBefore, failure.stage);
+						assert.deepEqual(await readFile(configPath), configBefore, failure.stage);
+						assert.equal(
+							existsSync(join(codexHomeDir, ".omx", "notify-dispatch.json")),
+							false,
+							failure.stage,
+						);
+						for (const path of [shimPath, hooksPath, configPath]) {
+							assert.equal((await stat(path)).mode & 0o777, 0o640, path);
+						}
+					});
+				});
+			} finally {
+				resetFailureInjector?.();
+				resetPlatform();
+				await rm(wd, { recursive: true, force: true });
+			}
+		}
+	});
+	it("fails closed when a managed dispatcher metadata snapshot is not valid UTF-8", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-setup-invalid-notify-metadata-"));
+		try {
+			await withIsolatedUserHome(wd, async (codexHomeDir) => {
+				await withTempCwd(wd, async () => {
+					const configPath = join(codexHomeDir, "config.toml");
+					const metadataPath = join(
+						codexHomeDir,
+						".omx",
+						"notify-dispatch.json",
+					);
+					const dispatcherPath = join(
+						packageRoot,
+						"dist",
+						"scripts",
+						"notify-dispatcher.js",
+					);
+					const configBefore = `notify = ${JSON.stringify([
+						"node",
+						dispatcherPath,
+						"--metadata",
+						metadataPath,
+					])}\n`;
+					await mkdir(dirname(metadataPath), { recursive: true });
+					await writeFile(configPath, configBefore);
+					await writeFile(metadataPath, Buffer.from([0xff]));
+
+					await assert.rejects(
+						setup({ scope: "user", installMode: "legacy", skipNativeAgentRefresh: true }),
+						/notification metadata .*invalid UTF-8/,
+					);
+					assert.equal(await readFile(configPath, "utf-8"), configBefore);
+					assert.deepEqual(await readFile(metadataPath), Buffer.from([0xff]));
+					assert.equal(existsSync(join(codexHomeDir, "hooks.json")), false);
+				});
+			});
+		} finally {
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps consulted unchanged notification metadata in the native transaction preconditions", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-setup-notify-precondition-"));
+		let resetFailureInjector: (() => void) | undefined;
+		try {
+			await withIsolatedUserHome(wd, async (codexHomeDir) => {
+				await withTempCwd(wd, async () => {
+					const configPath = join(codexHomeDir, "config.toml");
+					const hooksPath = join(codexHomeDir, "hooks.json");
+					const metadataPath = join(
+						codexHomeDir,
+						".omx",
+						"notify-dispatch.json",
+					);
+					await writeFile(
+						configPath,
+						'notify = ["node", "/tmp/user-notify.js"]\n',
+					);
+					await setup({
+						scope: "user",
+						installMode: "legacy",
+						skipNativeAgentRefresh: true,
+					});
+					const configBefore = await readFile(configPath);
+					const hooksBefore = await readFile(hooksPath);
+					const foreignMetadata = Buffer.from('{"managedBy":"foreign"}\n', "utf-8");
+					let injected = false;
+					resetFailureInjector = setNativeHookTransactionFailureInjectorForTest(
+						(stage, target) => {
+							if (
+								stage === "before_precondition" &&
+								target.kind === "metadata" &&
+								!injected
+							) {
+								injected = true;
+								writeFileSync(metadataPath, foreignMetadata);
+							}
+						},
+					);
+					await assert.rejects(
+						setup({
+							scope: "user",
+							installMode: "legacy",
+							skipNativeAgentRefresh: true,
+						}),
+						/precondition changed/,
+					);
+					assert.equal(injected, true);
+					assert.deepEqual(await readFile(metadataPath), foreignMetadata);
+					assert.deepEqual(await readFile(configPath), configBefore);
+					assert.deepEqual(await readFile(hooksPath), hooksBefore);
+				});
+			});
+		} finally {
+			resetFailureInjector?.();
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects config decisions whose MCP-removal callback changed the planned config snapshot", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-setup-stale-config-decision-"));
+		try {
+			await withIsolatedUserHome(wd, async (codexHomeDir) => {
+				await withTempCwd(wd, async () => {
+					const configPath = join(codexHomeDir, "config.toml");
+					const configBefore = '[mcp_servers.omx_state]\ncommand = "node"\n';
+					const foreignConfig = 'model = "foreign"\n';
+					await writeFile(configPath, configBefore);
+
+					await assert.rejects(
+						setup({
+							scope: "user",
+							installMode: "legacy",
+							skipNativeAgentRefresh: true,
+							firstPartyMcpRemovalPrompt: async () => {
+								await writeFile(configPath, foreignConfig);
+								return false;
+							},
+						}),
+						/precondition changed/,
+					);
+					assert.equal(await readFile(configPath, "utf-8"), foreignConfig);
+					assert.equal(existsSync(join(codexHomeDir, "hooks.json")), false);
+					assert.equal(existsSync(join(codexHomeDir, ".omx")), false);
+				});
+			});
+		} finally {
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
+
+	it("fails closed for pre-existing native transaction write temporaries", async () => {
+		const fixtures = ["regular file", "symlink"] as const;
+		for (const fixture of fixtures) {
+			const wd = await mkdtemp(join(tmpdir(), "omx-setup-temp-collision-"));
+			let resetTemporaryPath: (() => void) | undefined;
+			try {
+				await withIsolatedUserHome(wd, async (codexHomeDir) => {
+					await withTempCwd(wd, async () => {
+						const configPath = join(codexHomeDir, "config.toml");
+						const hooksPath = join(codexHomeDir, "hooks.json");
+						const collisionPath = join(codexHomeDir, ".hooks-write-collision");
+						const configBefore = 'model = "before"\n';
+						await writeFile(configPath, configBefore);
+						if (fixture === "regular file") {
+							await writeFile(collisionPath, "collision\n");
+						} else {
+							const targetPath = join(wd, "collision-target");
+							await writeFile(targetPath, "collision\n");
+							await symlink(targetPath, collisionPath);
+						}
+						resetTemporaryPath = setNativeHookTransactionTemporaryPathForTest(
+							(path, purpose) =>
+								path === hooksPath && purpose === "write"
+									? collisionPath
+									: join(dirname(path), `.${purpose}-unused`),
+						);
+
+						await assert.rejects(
+							setup({
+								scope: "user",
+								installMode: "legacy",
+								skipNativeAgentRefresh: true,
+							}),
+							/EEXIST/,
+						);
+						assert.equal(await readFile(collisionPath, "utf-8"), "collision\n");
+						assert.equal(await readFile(configPath, "utf-8"), configBefore);
+						assert.equal(existsSync(hooksPath), false);
+					});
+				});
+			} finally {
+				resetTemporaryPath?.();
+				await rm(wd, { recursive: true, force: true });
+			}
+		}
+	});
+
+	it("fails closed when a non-throwing injector replaces an owned write temporary", async () => {
+		const fixtures = ["regular file", "symlink"] as const;
+		for (const fixture of fixtures) {
+			const wd = await mkdtemp(join(tmpdir(), "omx-setup-write-temp-replacement-"));
+			let resetFailureInjector: (() => void) | undefined;
+			let resetTemporaryPath: (() => void) | undefined;
+			try {
+				await withIsolatedUserHome(wd, async (codexHomeDir) => {
+					await withTempCwd(wd, async () => {
+						const configPath = join(codexHomeDir, "config.toml");
+						const hooksPath = join(codexHomeDir, "hooks.json");
+						const temporaryPath = join(codexHomeDir, ".hooks-write-owned");
+						const foreignTargetPath = join(wd, "foreign-write-temporary-target");
+						const configBefore = Buffer.from('model = "before"\n', "utf-8");
+						const foreignContents = `foreign ${fixture} write temporary\n`;
+						await writeFile(configPath, configBefore);
+						if (fixture === "symlink") {
+							await writeFile(foreignTargetPath, foreignContents);
+						}
+						resetTemporaryPath = setNativeHookTransactionTemporaryPathForTest(
+							(path, purpose) =>
+								path === hooksPath && purpose === "write"
+									? temporaryPath
+									: join(dirname(path), `.${basename(path)}.${purpose}-fallback`),
+						);
+						let injected = false;
+						resetFailureInjector = setNativeHookTransactionFailureInjectorForTest(
+							(stage, target) => {
+								if (stage !== "before_rename" || target.kind !== "hooks") return;
+								injected = true;
+								rmSync(temporaryPath);
+								if (fixture === "regular file") {
+									writeFileSync(temporaryPath, foreignContents);
+								} else {
+									symlinkSync(foreignTargetPath, temporaryPath);
+								}
+							},
+						);
+
+						await assert.rejects(
+							setup({
+								scope: "user",
+								installMode: "legacy",
+								skipNativeAgentRefresh: true,
+							}),
+							/temporary.*manual recovery/,
+						);
+						assert.equal(injected, true);
+						const replacementStatus = await lstat(temporaryPath);
+						if (fixture === "regular file") {
+							assert.equal(replacementStatus.isFile(), true);
+							assert.equal(await readFile(temporaryPath, "utf-8"), foreignContents);
+						} else {
+							assert.equal(replacementStatus.isSymbolicLink(), true);
+							assert.equal(await readFile(foreignTargetPath, "utf-8"), foreignContents);
+						}
+						assert.equal(existsSync(hooksPath), false);
+						assert.deepEqual(await readFile(configPath), configBefore);
+					});
+				});
+			} finally {
+				resetFailureInjector?.();
+				resetTemporaryPath?.();
+				await rm(wd, { recursive: true, force: true });
+			}
+		}
+	});
+
+	it("fails closed when a non-throwing injector replaces an owned staged deletion", async () => {
+		const fixtures = ["regular file", "symlink"] as const;
+		for (const fixture of fixtures) {
+			const wd = await mkdtemp(join(tmpdir(), "omx-setup-staged-delete-replacement-"));
+			const resetPlatform = setNativeHookTransactionPlatformForTest("win32");
+			let resetFailureInjector: (() => void) | undefined;
+			let resetTemporaryPath: (() => void) | undefined;
+			try {
+				await withIsolatedUserHome(wd, async (codexHomeDir) => {
+					await withTempCwd(wd, async () => {
+						await setup({
+							scope: "user",
+							installMode: "legacy",
+							skipNativeAgentRefresh: true,
+						});
+						const shimPath = buildManagedCodexNativeHookWindowsShimPath(codexHomeDir);
+						const hooksPath = join(codexHomeDir, "hooks.json");
+						const configPath = join(codexHomeDir, "config.toml");
+						const stagedDeletionPath = join(codexHomeDir, ".hooks-delete-owned");
+						const foreignTargetPath = join(wd, "foreign-staged-deletion-target");
+						const shimBefore = await readFile(shimPath);
+						const hooksBefore = await readFile(hooksPath);
+						const configBefore = await readFile(configPath);
+						const foreignContents = `foreign ${fixture} staged deletion\n`;
+						if (fixture === "symlink") {
+							await writeFile(foreignTargetPath, foreignContents);
+						}
+						resetTemporaryPath = setNativeHookTransactionTemporaryPathForTest(
+							(path, purpose) =>
+								path === hooksPath && purpose === "delete"
+									? stagedDeletionPath
+									: join(dirname(path), `.${basename(path)}.${purpose}-fallback`),
+						);
+						let injected = false;
+						resetFailureInjector = setNativeHookTransactionFailureInjectorForTest(
+							(stage, target) => {
+								if (stage !== "before_remove" || target.kind !== "hooks") return;
+								injected = true;
+								rmSync(stagedDeletionPath);
+								if (fixture === "regular file") {
+									writeFileSync(stagedDeletionPath, foreignContents);
+								} else {
+									symlinkSync(foreignTargetPath, stagedDeletionPath);
+								}
+							},
+						);
+
+						await assert.rejects(
+							setup({
+								scope: "user",
+								installMode: "plugin",
+								pluginAgentsMdPrompt: async () => false,
+								skipNativeAgentRefresh: true,
+							}),
+							/staged deletion.*manual recovery/,
+						);
+						assert.equal(injected, true);
+						const replacementStatus = await lstat(stagedDeletionPath);
+						if (fixture === "regular file") {
+							assert.equal(replacementStatus.isFile(), true);
+							assert.equal(await readFile(stagedDeletionPath, "utf-8"), foreignContents);
+						} else {
+							assert.equal(replacementStatus.isSymbolicLink(), true);
+							assert.equal(await readFile(foreignTargetPath, "utf-8"), foreignContents);
+						}
+						assert.deepEqual(await readFile(shimPath), shimBefore);
+						assert.deepEqual(await readFile(hooksPath), hooksBefore);
+						assert.deepEqual(await readFile(configPath), configBefore);
+					});
+				});
+			} finally {
+				resetFailureInjector?.();
+				resetTemporaryPath?.();
+				resetPlatform();
+				await rm(wd, { recursive: true, force: true });
+			}
+		}
+	});
+
+	it("rolls back a renamed native hook when post-rename verification fails", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-setup-post-rename-rollback-"));
+		const resetPlatform = setNativeHookTransactionPlatformForTest("linux");
+		let resetFailureInjector: (() => void) | undefined;
+		try {
+			await withIsolatedUserHome(wd, async (codexHomeDir) => {
+				await withTempCwd(wd, async () => {
+					const hooksPath = join(codexHomeDir, "hooks.json");
+					const configPath = join(codexHomeDir, "config.toml");
+					const hooksBefore = Buffer.from('{"hooks": {}}\n', "utf-8");
+					const configBefore = Buffer.from('model = "before"\n', "utf-8");
+					await writeFile(hooksPath, hooksBefore);
+					await writeFile(configPath, configBefore);
+					await Promise.all([chmod(hooksPath, 0o640), chmod(configPath, 0o640)]);
+					resetFailureInjector = setNativeHookTransactionFailureInjectorForTest(
+						(stage, target) => {
+							if (stage === "after_rename" && target.kind === "hooks") {
+								throw new Error("injected post-rename verification failure");
+							}
+						},
+					);
+
+					await assert.rejects(
+						setup({
+							scope: "user",
+							installMode: "legacy",
+							skipNativeAgentRefresh: true,
+							codexFeaturesProbe: () => null,
+							codexVersionProbe: () => null,
+						}),
+						/rolled back: injected post-rename verification failure/,
+					);
+					assert.deepEqual(await readFile(hooksPath), hooksBefore);
+					assert.deepEqual(await readFile(configPath), configBefore);
+					assert.equal((await stat(hooksPath)).mode & 0o777, 0o640);
+					assert.equal((await stat(configPath)).mode & 0o777, 0o640);
+				});
+			});
+		} finally {
+			resetFailureInjector?.();
+			resetPlatform();
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
+	it("preserves a concurrent replacement after staged source removal for manual recovery", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-setup-post-remove-manual-recovery-"));
+		const resetPlatform = setNativeHookTransactionPlatformForTest("linux");
+		let resetFailureInjector: (() => void) | undefined;
+		let resetTemporaryPath: (() => void) | undefined;
+		try {
+			await withIsolatedUserHome(wd, async (codexHomeDir) => {
+				await withTempCwd(wd, async () => {
+					await setup({
+						scope: "user",
+						installMode: "legacy",
+						skipNativeAgentRefresh: true,
+					});
+					const hooksPath = join(codexHomeDir, "hooks.json");
+					const configPath = join(codexHomeDir, "config.toml");
+					const stagedDeletionPath = join(codexHomeDir, ".hooks-delete-post-remove");
+					const hooksBefore = await readFile(hooksPath);
+					const configBefore = await readFile(configPath);
+					const foreignHooks = Buffer.from('{"hooks":{"Stop":[]}}\n', "utf-8");
+					resetTemporaryPath = setNativeHookTransactionTemporaryPathForTest(
+						(path, purpose) =>
+							path === hooksPath && purpose === "delete"
+								? stagedDeletionPath
+								: join(dirname(path), `.${basename(path)}.${purpose}-fallback`),
+					);
+					resetFailureInjector = setNativeHookTransactionFailureInjectorForTest(
+						(stage, target) => {
+							if (stage === "after_remove" && target.kind === "hooks") {
+								writeFileSync(hooksPath, foreignHooks);
+								throw new Error("injected post-remove verification failure");
+							}
+						},
+					);
+
+					await assert.rejects(
+						setup({
+							scope: "user",
+							installMode: "plugin",
+							skipNativeAgentRefresh: true,
+							pluginAgentsMdPrompt: async () => false,
+							codexFeaturesProbe: () =>
+								[
+									"hooks                                   stable             true",
+									"plugin_hooks                            experimental       true",
+									"",
+								].join("\n"),
+						}),
+						(error: unknown) => {
+							const message = error instanceof Error ? error.message : String(error);
+							assert.match(message, /manual recovery/);
+							assert.ok(message.includes(hooksPath));
+							return true;
+						},
+					);
+					assert.deepEqual(await readFile(hooksPath), foreignHooks);
+					assert.deepEqual(await readFile(configPath), configBefore);
+					assert.deepEqual(await readFile(stagedDeletionPath), hooksBefore);
+				});
+			});
+		} finally {
+			resetFailureInjector?.();
+			resetTemporaryPath?.();
+			resetPlatform();
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
+	it("never removes a concurrent replacement while rolling back a newly created artifact", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-setup-rollback-remove-"));
+		let resetFailureInjector: (() => void) | undefined;
+		try {
+			await withIsolatedUserHome(wd, async (codexHomeDir) => {
+				await withTempCwd(wd, async () => {
+					const hooksPath = join(codexHomeDir, "hooks.json");
+					const configPath = join(codexHomeDir, "config.toml");
+					const configBefore = Buffer.from(
+						'notify = ["node", "/tmp/user-notify.js"]\n',
+						"utf-8",
+					);
+					const foreignHooks = Buffer.from('{"hooks":{"Stop":[]}}\n', "utf-8");
+					await writeFile(configPath, configBefore);
+					resetFailureInjector = setNativeHookTransactionFailureInjectorForTest(
+						(stage, target) => {
+							if (stage === "before_temp_write" && target.kind === "config") {
+								throw new Error("injected config failure");
+							}
+							if (stage === "before_rollback_remove" && target.kind === "hooks") {
+								writeFileSync(hooksPath, foreignHooks);
+							}
+						},
+					);
+					await assert.rejects(
+						setup({
+							scope: "user",
+							installMode: "legacy",
+							skipNativeAgentRefresh: true,
+						}),
+						/rollback failed/,
+					);
+					assert.deepEqual(await readFile(hooksPath), foreignHooks);
+					assert.deepEqual(await readFile(configPath), configBefore);
+				});
+			});
+		} finally {
+			resetFailureInjector?.();
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
+
+	it("does not enter rollback after a second staged-deletion cleanup failure", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-setup-staged-deletion-cleanup-"));
+		const resetPlatform = setNativeHookTransactionPlatformForTest("win32");
+		let resetFailureInjector: (() => void) | undefined;
+		try {
+			await withIsolatedUserHome(wd, async (codexHomeDir) => {
+				await withTempCwd(wd, async () => {
+					await setup({
+						scope: "user",
+						installMode: "legacy",
+						skipNativeAgentRefresh: true,
+					});
+					const shimPath = buildManagedCodexNativeHookWindowsShimPath(codexHomeDir);
+					const hooksPath = join(codexHomeDir, "hooks.json");
+					const configPath = join(codexHomeDir, "config.toml");
+					let cleanupCount = 0;
+					resetFailureInjector = setNativeHookTransactionFailureInjectorForTest(
+						(stage, target) => {
+							if (
+								stage === "before_staged_cleanup" &&
+								(target.kind === "shim" || target.kind === "hooks")
+							) {
+								cleanupCount += 1;
+								if (cleanupCount === 2) {
+									throw new Error("injected second staged-deletion cleanup failure");
+								}
+							}
+						},
+					);
+					await assert.rejects(
+						setup({
+							scope: "user",
+							installMode: "plugin",
+							skipNativeAgentRefresh: true,
+							pluginAgentsMdPrompt: async () => false,
+						}),
+						/committed but staged deletion cleanup failed/,
+					);
+					assert.equal(cleanupCount, 2);
+					assert.equal(existsSync(shimPath), false);
+					assert.equal(existsSync(hooksPath), false);
+					assert.match(await readFile(configPath, "utf-8"), /^plugin_hooks = true$/m);
+				});
+			});
+		} finally {
+			resetFailureInjector?.();
+			resetPlatform();
 			await rm(wd, { recursive: true, force: true });
 		}
 	});

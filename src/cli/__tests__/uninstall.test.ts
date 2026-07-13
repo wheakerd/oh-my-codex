@@ -1,12 +1,18 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { buildManagedCodexHooksConfig } from '../../config/codex-hooks.js';
+import {
+  buildManagedCodexHookTrustState,
+  buildManagedCodexHooksConfig,
+  buildManagedCodexNativeHookWindowsShimContent,
+  buildManagedCodexNativeHookWindowsShimPath,
+} from '../../config/codex-hooks.js';
+import { uninstall } from '../uninstall.js';
 import TOML from '@iarna/toml';
 
 function runOmx(
@@ -36,7 +42,21 @@ function runOmx(
 }
 
 function shouldSkipForSpawnPermissions(err: string): boolean {
-  return typeof err === 'string' && /(EPERM|EACCES)/i.test(err);
+  return /(EPERM|EACCES)/i.test(err);
+}
+
+async function withCwd<T>(cwd: string, run: () => Promise<T>): Promise<T> {
+  const previousCwd = process.cwd();
+  process.chdir(cwd);
+  try {
+    return await run();
+  } finally {
+    process.chdir(previousCwd);
+  }
+}
+
+function packageRoot(): string {
+  return join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 }
 
 /** Build a realistic OMX config.toml for testing */
@@ -395,6 +415,8 @@ describe('omx uninstall', () => {
           managedBy: 'oh-my-codex',
           version: 1,
           previousNotify: ['node', staleDispatcher, '--metadata', metadataPath],
+          omxNotify: ['node', join(stalePkgRoot, 'dist', 'scripts', 'notify-hook.js')],
+          dispatcherNotify: ['node', staleDispatcher, '--metadata', metadataPath],
         }),
       );
 
@@ -447,61 +469,966 @@ describe('omx uninstall', () => {
     }
   });
 
-  it('preserves user hooks while removing OMX-managed wrappers', async () => {
-    const wd = await mkdtemp(join(tmpdir(), 'omx-uninstall-'));
+  it('fails closed for unsupported root metadata in hooks.json', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-uninstall-invalid-hooks-root-'));
     try {
       const home = join(wd, 'home');
       const codexDir = join(home, '.codex');
+      const configPath = join(codexDir, 'config.toml');
+      const hooksPath = join(codexDir, 'hooks.json');
+      const config = buildOmxConfig().replace(/^hooks = true$/m, 'codex_hooks = true');
+      const hooks = JSON.stringify({
+        version: 1,
+        hooks: {
+          SessionStart: [{
+            hooks: [{ type: 'command', command: 'node "/repo/dist/scripts/codex-native-hook.js"' }],
+          }],
+        },
+      }, null, 2) + '\n';
       await mkdir(codexDir, { recursive: true });
-      await writeFile(
-        join(codexDir, 'config.toml'),
-        buildOmxConfig().replace(/^hooks = true$/m, 'codex_hooks = true'),
-      );
-      await writeFile(
-        join(codexDir, 'hooks.json'),
-        JSON.stringify(
-          {
-            hooks: {
-              SessionStart: [
-                {
-                  hooks: [
-                    { type: 'command', command: 'node "/repo/dist/scripts/codex-native-hook.js"' },
-                    { type: 'command', command: 'echo keep-me' },
-                  ],
-                },
-              ],
-            },
-            version: 1,
-          },
-          null,
-          2,
-        ) + '\n',
-      );
+      await writeFile(configPath, config);
+      await writeFile(hooksPath, hooks);
+
+      const res = runOmx(wd, ['uninstall'], { HOME: home });
+      if (shouldSkipForSpawnPermissions(res.error)) return;
+      assert.equal(res.status, 1, res.stderr || res.stdout);
+      assert.match(res.stderr, /unknown root field version/);
+      assert.equal(await readFile(configPath, 'utf-8'), config);
+      assert.equal(await readFile(hooksPath, 'utf-8'), hooks);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('removes safely positioned managed wrappers while preserving foreign hooks and the native feature flag', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-uninstall-safe-foreign-hooks-'));
+    try {
+      const home = join(wd, 'home');
+      const codexDir = join(home, '.codex');
+      const configPath = join(codexDir, 'config.toml');
+      const hooksPath = join(codexDir, 'hooks.json');
+      await mkdir(codexDir, { recursive: true });
+      await writeFile(configPath, buildOmxConfig().replace(/^hooks = true$/m, 'codex_hooks = true'));
+      await writeFile(hooksPath, JSON.stringify({
+        hooks: {
+          SessionStart: [
+            { hooks: [{ type: 'command', command: 'echo keep-me' }] },
+            { matcher: 'startup|resume|clear', hooks: [{ type: 'command', command: 'node "/repo/dist/scripts/codex-native-hook.js"' }] },
+          ],
+        },
+      }, null, 2) + '\n');
 
       const res = runOmx(wd, ['uninstall'], { HOME: home });
       if (shouldSkipForSpawnPermissions(res.error)) return;
       assert.equal(res.status, 0, res.stderr || res.stdout);
-      assert.equal(existsSync(join(codexDir, 'hooks.json')), true);
 
-      const hooks = await readFile(join(codexDir, 'hooks.json'), 'utf-8');
+      const hooks = await readFile(hooksPath, 'utf-8');
       assert.match(hooks, /echo keep-me/);
-      assert.match(hooks, /"version": 1/);
       assert.doesNotMatch(hooks, /codex-native-hook\.js/);
+      const config = await readFile(configPath, 'utf-8');
+      assert.match(config, /^hooks = true$/m);
+      assert.doesNotMatch(config, /^codex_hooks\s*=/m);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+  it('fails closed without removing a shell-expanding foreign command that resembles an OMX hook', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-uninstall-shell-expanding-hook-'));
+    try {
+      const home = join(wd, 'home');
+      const codexDir = join(home, '.codex');
+      const configPath = join(codexDir, 'config.toml');
+      const hooksPath = join(codexDir, 'hooks.json');
+      const config = buildOmxConfig();
+      const hooks = JSON.stringify({
+        hooks: {
+          SessionStart: [{
+            matcher: 'startup|resume|clear',
+            hooks: [{ type: 'command', command: 'node "$HOME/repo/dist/scripts/codex-native-hook.js"' }],
+          }],
+        },
+      }, null, 2) + '\n';
+      await mkdir(codexDir, { recursive: true });
+      await writeFile(configPath, config);
+      await writeFile(hooksPath, hooks);
 
-      const config = await readFile(join(codexDir, 'config.toml'), 'utf-8');
-      assert.match(
-        config,
-        /^hooks = true$/m,
-        'preserved user hooks should keep the canonical Codex hooks feature enabled',
-      );
-      assert.doesNotMatch(
-        config,
-        /^codex_hooks\s*=/m,
-        'legacy Codex hook aliases should be normalized during uninstall preservation',
-      );
-      assert.match(config, /^multi_agent\s*=/m);
-      assert.doesNotMatch(config, /^child_agents_md\s*=/m);
-      assert.doesNotMatch(config, /^goals\s*=/m);
+      const res = runOmx(wd, ['uninstall'], { HOME: home });
+      if (shouldSkipForSpawnPermissions(res.error)) return;
+      assert.equal(res.status, 1, res.stderr || res.stdout);
+      assert.match(res.stderr, /ambiguous_managed_handler|does not match the managed command grammar/i);
+      assert.equal(await readFile(configPath, 'utf-8'), config);
+      assert.equal(await readFile(hooksPath, 'utf-8'), hooks);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('fails closed without cleaning config when managed removal would shift a foreign handler', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-uninstall-unsafe-foreign-hooks-'));
+    try {
+      const home = join(wd, 'home');
+      const codexDir = join(home, '.codex');
+      const configPath = join(codexDir, 'config.toml');
+      const hooksPath = join(codexDir, 'hooks.json');
+      const config = buildOmxConfig();
+      const hooks = JSON.stringify({
+        hooks: {
+          SessionStart: [{
+            matcher: 'startup|resume|clear',
+            hooks: [
+              { type: 'command', command: 'node "/repo/dist/scripts/codex-native-hook.js"' },
+              { type: 'command', command: 'echo keep-me' },
+            ],
+          }],
+        },
+      }, null, 2) + '\n';
+      await mkdir(codexDir, { recursive: true });
+      await writeFile(configPath, config);
+      await writeFile(hooksPath, hooks);
+
+      const res = runOmx(wd, ['uninstall'], { HOME: home });
+      if (shouldSkipForSpawnPermissions(res.error)) return;
+      assert.equal(res.status, 1, res.stderr || res.stdout);
+      assert.match(res.stderr, /unsafe_managed_removal|shift a foreign coordinate/i);
+      assert.equal(await readFile(configPath, 'utf-8'), config);
+      assert.equal(await readFile(hooksPath, 'utf-8'), hooks);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('rolls back hooks, historical proof-owned shim, and config when shim removal fails', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-uninstall-shim-rollback-'));
+    try {
+      await withCwd(wd, async () => {
+        const codexDir = join(wd, '.codex');
+        const configPath = join(codexDir, 'config.toml');
+        const hooksPath = join(codexDir, 'hooks.json');
+        const shimPath = buildManagedCodexNativeHookWindowsShimPath(codexDir);
+        const config = buildOmxConfig();
+        const hooks = `${JSON.stringify(
+          buildManagedCodexHooksConfig(packageRoot(), {
+            platform: 'win32',
+            codexHomeDir: codexDir,
+          }),
+          null,
+          2,
+        )}\n`;
+        const shim = buildManagedCodexNativeHookWindowsShimContent(
+          'C:\\Historical Install\\oh-my-codex',
+          { nodePath: 'D:\\Historical Node\\node.exe' },
+        );
+        await mkdir(codexDir, { recursive: true });
+        await mkdir(dirname(shimPath), { recursive: true });
+        await writeFile(configPath, config);
+        await writeFile(hooksPath, hooks);
+        await writeFile(shimPath, shim);
+
+        await assert.rejects(
+          uninstall({
+            scope: 'project',
+            transactionPlatform: 'win32',
+            transactionFailureInjector: async (stage) => {
+              if (stage !== 'before-shim-removal') return;
+              assert.equal(existsSync(hooksPath), false, 'hooks must mutate before shim removal');
+              assert.equal(await readFile(configPath, 'utf-8'), config);
+              throw new Error('simulated shim removal failure');
+            },
+          }),
+          /simulated shim removal failure/,
+        );
+
+        assert.equal(await readFile(hooksPath, 'utf-8'), hooks);
+        assert.equal(await readFile(shimPath, 'utf-8'), shim);
+        assert.equal(await readFile(configPath, 'utf-8'), config);
+      });
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a modified Windows shim before any uninstall artifact write', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-uninstall-modified-shim-'));
+    try {
+      await withCwd(wd, async () => {
+        const codexDir = join(wd, '.codex');
+        const configPath = join(codexDir, 'config.toml');
+        const hooksPath = join(codexDir, 'hooks.json');
+        const shimPath = buildManagedCodexNativeHookWindowsShimPath(codexDir);
+        const config = buildOmxConfig();
+        const hooks = `${JSON.stringify(
+          buildManagedCodexHooksConfig(packageRoot(), {
+            platform: 'win32',
+            codexHomeDir: codexDir,
+          }),
+          null,
+          2,
+        )}\n`;
+        const shim = `${buildManagedCodexNativeHookWindowsShimContent(packageRoot())}\n# user edit\n`;
+        await mkdir(codexDir, { recursive: true });
+        await mkdir(dirname(shimPath), { recursive: true });
+        await writeFile(configPath, config);
+        await writeFile(hooksPath, hooks);
+        await writeFile(shimPath, shim);
+
+        await assert.rejects(
+          uninstall({ scope: 'project', transactionPlatform: 'win32' }),
+          /modified native hook Windows shim/,
+        );
+
+        assert.equal(await readFile(hooksPath, 'utf-8'), hooks);
+        assert.equal(await readFile(shimPath, 'utf-8'), shim);
+        assert.equal(await readFile(configPath, 'utf-8'), config);
+      });
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('rolls back hooks, shim, and config when config commit fails after hook mutation', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-uninstall-config-rollback-'));
+    try {
+      await withCwd(wd, async () => {
+        const codexDir = join(wd, '.codex');
+        const configPath = join(codexDir, 'config.toml');
+        const hooksPath = join(codexDir, 'hooks.json');
+        const shimPath = buildManagedCodexNativeHookWindowsShimPath(codexDir);
+        const config = buildOmxConfig();
+        const hooks = `${JSON.stringify(
+          buildManagedCodexHooksConfig(packageRoot(), {
+            platform: 'win32',
+            codexHomeDir: codexDir,
+          }),
+          null,
+          2,
+        )}\n`;
+        const shim = buildManagedCodexNativeHookWindowsShimContent(packageRoot());
+        await mkdir(codexDir, { recursive: true });
+        await mkdir(dirname(shimPath), { recursive: true });
+        await writeFile(configPath, config);
+        await writeFile(hooksPath, hooks);
+        await writeFile(shimPath, shim);
+
+        await assert.rejects(
+          uninstall({
+            scope: 'project',
+            transactionPlatform: 'win32',
+            transactionFailureInjector: async (stage) => {
+              if (stage !== 'after-config-commit') return;
+              assert.equal(existsSync(hooksPath), false, 'hooks must mutate before config commit');
+              assert.equal(existsSync(shimPath), false, 'shim must mutate before config commit');
+              assert.notEqual(await readFile(configPath, 'utf-8'), config);
+              throw new Error('simulated config commit failure');
+            },
+          }),
+          /simulated config commit failure/,
+        );
+
+        assert.equal(await readFile(hooksPath, 'utf-8'), hooks);
+        assert.equal(await readFile(shimPath, 'utf-8'), shim);
+        assert.equal(await readFile(configPath, 'utf-8'), config);
+      });
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects invalid UTF-8 hooks.json and config.toml before changing either artifact', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-uninstall-invalid-utf8-'));
+    try {
+      await withCwd(wd, async () => {
+        const codexDir = join(wd, '.codex');
+        const configPath = join(codexDir, 'config.toml');
+        const hooksPath = join(codexDir, 'hooks.json');
+        const hooks = Buffer.from([0x7b, 0xff, 0x7d]);
+        const config = Buffer.from([0x6f, 0x6d, 0x78, 0x5f, 0xff]);
+        await mkdir(codexDir, { recursive: true });
+        await writeFile(configPath, buildOmxConfig());
+        await writeFile(hooksPath, hooks);
+
+        await assert.rejects(uninstall({ scope: 'project' }), /not valid UTF-8/);
+        assert.deepEqual(await readFile(hooksPath), hooks);
+
+        await writeFile(hooksPath, JSON.stringify(buildManagedCodexHooksConfig(packageRoot())));
+        await writeFile(configPath, config);
+        await assert.rejects(uninstall({ scope: 'project' }), /not valid UTF-8/);
+        assert.deepEqual(await readFile(configPath), config);
+
+        const bomHooks = Buffer.concat([
+          Buffer.from([0xef, 0xbb, 0xbf]),
+          Buffer.from('{"hooks":{}}\n', 'utf-8'),
+        ]);
+        await writeFile(configPath, buildOmxConfig());
+        await writeFile(hooksPath, bomHooks);
+        await assert.rejects(uninstall({ scope: 'project' }), /must contain a JSON object/);
+        assert.deepEqual(await readFile(hooksPath), bomHooks);
+        assert.equal(existsSync(hooksPath), true);
+      });
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects symlinked native hook artifacts without following their targets', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-uninstall-symlink-hooks-'));
+    try {
+      await withCwd(wd, async () => {
+        const codexDir = join(wd, '.codex');
+        const configPath = join(codexDir, 'config.toml');
+        const hooksPath = join(codexDir, 'hooks.json');
+        const targetPath = join(wd, 'user-hooks.json');
+        const config = buildOmxConfig();
+        const target = '{"user":"hooks"}\n';
+        await mkdir(codexDir, { recursive: true });
+        await writeFile(configPath, config);
+        await writeFile(targetPath, target);
+        await symlink(targetPath, hooksPath);
+
+        await assert.rejects(uninstall({ scope: 'project' }), /expected a regular file, not a symbolic link/);
+        assert.equal((await lstat(hooksPath)).isSymbolicLink(), true);
+        assert.equal(await readFile(targetPath, 'utf-8'), target);
+        assert.equal(await readFile(configPath, 'utf-8'), config);
+      });
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('aborts before the first removal when any planned artifact becomes stale', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-uninstall-stale-snapshot-'));
+    try {
+      await withCwd(wd, async () => {
+        const codexDir = join(wd, '.codex');
+        const configPath = join(codexDir, 'config.toml');
+        const hooksPath = join(codexDir, 'hooks.json');
+        const config = buildOmxConfig();
+        const hooks = `${JSON.stringify(buildManagedCodexHooksConfig(packageRoot()), null, 2)}\n`;
+        const staleConfig = `${config}# concurrent user edit\n`;
+        await mkdir(codexDir, { recursive: true });
+        await writeFile(configPath, config);
+        await writeFile(hooksPath, hooks);
+
+        await assert.rejects(
+          uninstall({
+            scope: 'project',
+            transactionFailureInjector: async (stage) => {
+              if (stage === 'before-hooks-commit') await writeFile(configPath, staleConfig);
+            },
+          }),
+          /planned artifact .* changed, was created, or was removed after planning/,
+        );
+        assert.equal(await readFile(hooksPath, 'utf-8'), hooks);
+        assert.equal(await readFile(configPath, 'utf-8'), staleConfig);
+      });
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('never replaces a concurrent symlink while rolling back a failed uninstall transaction', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-uninstall-stale-rollback-link-'));
+    try {
+      await withCwd(wd, async () => {
+        const codexDir = join(wd, '.codex');
+        const configPath = join(codexDir, 'config.toml');
+        const hooksPath = join(codexDir, 'hooks.json');
+        const shimPath = buildManagedCodexNativeHookWindowsShimPath(codexDir);
+        const replacementPath = join(wd, 'concurrent-user-hooks.json');
+        const config = buildOmxConfig();
+        const hooks = `${JSON.stringify(buildManagedCodexHooksConfig(packageRoot(), {
+          platform: 'win32',
+          codexHomeDir: codexDir,
+        }), null, 2)}\n`;
+        const replacement = '{"user":"replacement"}\n';
+        await mkdir(codexDir, { recursive: true });
+        await mkdir(dirname(shimPath), { recursive: true });
+        await writeFile(configPath, config);
+        await writeFile(hooksPath, hooks);
+        await writeFile(shimPath, buildManagedCodexNativeHookWindowsShimContent(packageRoot()));
+        await writeFile(replacementPath, replacement);
+
+        await assert.rejects(
+          uninstall({
+            scope: 'project',
+            transactionPlatform: 'win32',
+            transactionFailureInjector: async (stage) => {
+              if (stage !== 'before-shim-removal') return;
+              await symlink(replacementPath, hooksPath);
+              throw new Error('simulated concurrent hook replacement');
+            },
+          }),
+          /Uninstall artifact rollback failed.*(?:Refusing stale rollback|expected a regular file, not a symbolic link)/,
+        );
+        assert.equal((await lstat(hooksPath)).isSymbolicLink(), true);
+        assert.equal(await readFile(replacementPath, 'utf-8'), replacement);
+        assert.equal(await readFile(configPath, 'utf-8'), config);
+      });
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+  it('rejects a symlinked controlled ancestor before reading an escaped artifact', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-uninstall-ancestor-link-'));
+    try {
+      await withCwd(wd, async () => {
+        const codexDir = join(wd, '.codex');
+        const escapedDir = join(wd, 'escaped-codex');
+        const configPath = join(escapedDir, 'config.toml');
+        const config = buildOmxConfig();
+        await mkdir(escapedDir, { recursive: true });
+        await writeFile(configPath, config);
+        await symlink(
+          escapedDir,
+          codexDir,
+          process.platform === 'win32' ? 'junction' : 'dir',
+        );
+
+        await assert.rejects(
+          uninstall({ scope: 'project' }),
+          /controlled ancestor .* must be a non-symbolic-link directory/,
+        );
+        assert.equal(await readFile(configPath, 'utf-8'), config);
+      });
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('does not truncate or follow regular and symlink replacement temporary collisions', async () => {
+    for (const collisionKind of ['regular', 'symlink'] as const) {
+      const wd = await mkdtemp(join(tmpdir(), `omx-uninstall-temp-${collisionKind}-`));
+      try {
+        await withCwd(wd, async () => {
+          const codexDir = join(wd, '.codex');
+          const configPath = join(codexDir, 'config.toml');
+          const collisionPath = join(codexDir, '.config.toml.collision');
+          const collisionTarget = join(wd, 'collision-target');
+          const config = buildOmxConfig();
+          const collision = 'foreign temporary collision\n';
+          await mkdir(codexDir, { recursive: true });
+          await writeFile(configPath, config);
+          if (collisionKind === 'regular') {
+            await writeFile(collisionPath, collision);
+          } else {
+            await writeFile(collisionTarget, collision);
+            await symlink(collisionTarget, collisionPath);
+          }
+
+          await assert.rejects(
+            uninstall({
+              scope: 'project',
+              transactionTemporaryPath: () => collisionPath,
+            }),
+            /EEXIST/,
+          );
+          assert.equal(await readFile(configPath, 'utf-8'), config);
+          assert.equal(
+            await readFile(collisionKind === 'regular' ? collisionPath : collisionTarget, 'utf-8'),
+            collision,
+          );
+          if (collisionKind === 'symlink') {
+            assert.equal((await lstat(collisionPath)).isSymbolicLink(), true);
+          }
+        });
+      } finally {
+        await rm(wd, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it('rejects stale snapshots immediately before forward rename and remove mutations', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-uninstall-stale-forward-'));
+    try {
+      await withCwd(wd, async () => {
+        const codexDir = join(wd, '.codex');
+        const configPath = join(codexDir, 'config.toml');
+        const hooksPath = join(codexDir, 'hooks.json');
+        const config = buildOmxConfig();
+        const concurrentConfig = `${config}# concurrent replacement\n`;
+        await mkdir(codexDir, { recursive: true });
+        await writeFile(configPath, config);
+
+        await assert.rejects(
+          uninstall({
+            scope: 'project',
+            transactionFailureInjector: async (stage) => {
+              if (stage === 'before-rename') await writeFile(configPath, concurrentConfig);
+            },
+          }),
+          /planned artifact .* changed, was created, or was removed after planning/,
+        );
+        assert.equal(await readFile(configPath, 'utf-8'), concurrentConfig);
+
+        const hooks = `${JSON.stringify(buildManagedCodexHooksConfig(packageRoot()), null, 2)}\n`;
+        const concurrentHooks = '{"foreign":"replacement"}\n';
+        await writeFile(configPath, config);
+        await writeFile(hooksPath, hooks);
+        await assert.rejects(
+          uninstall({
+            scope: 'project',
+            transactionFailureInjector: async (stage) => {
+              if (stage === 'before-remove') await writeFile(hooksPath, concurrentHooks);
+            },
+          }),
+          /planned artifact .* changed, was created, or was removed after planning/,
+        );
+        assert.equal(await readFile(hooksPath, 'utf-8'), concurrentHooks);
+        assert.equal(await readFile(configPath, 'utf-8'), config);
+      });
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('fails closed for non-throwing regular and symlink write-temporary replacements', async () => {
+    for (const replacementKind of ['regular', 'symlink'] as const) {
+      const wd = await mkdtemp(join(tmpdir(), `omx-uninstall-write-temp-${replacementKind}-`));
+      try {
+        await withCwd(wd, async () => {
+          const codexDir = join(wd, '.codex');
+          const configPath = join(codexDir, 'config.toml');
+          const hooksPath = join(codexDir, 'hooks.json');
+          const temporaryPath = join(codexDir, '.config.toml.write-temporary');
+          const replacementTarget = join(wd, 'foreign-write-temporary');
+          const config = Buffer.from(buildOmxConfig());
+          const hooks = Buffer.from('{}\n');
+          const replacement = Buffer.from('foreign write temporary replacement\n');
+          await mkdir(codexDir, { recursive: true });
+          await writeFile(configPath, config);
+          await writeFile(hooksPath, hooks);
+
+          await assert.rejects(
+            uninstall({
+              scope: 'project',
+              transactionTemporaryPath: (_path, purpose) =>
+                purpose === 'write' ? temporaryPath : join(codexDir, '.hooks.json.staged'),
+              transactionFailureInjector: async (stage) => {
+                if (stage !== 'before-rename') return;
+                await rm(temporaryPath, { force: true });
+                if (replacementKind === 'regular') {
+                  await writeFile(temporaryPath, replacement);
+                } else {
+                  await writeFile(replacementTarget, replacement);
+                  await symlink(replacementTarget, temporaryPath);
+                }
+              },
+            }),
+            (error: unknown) => {
+              const message = error instanceof Error ? error.message : String(error);
+              assert.match(message, /planned artifact .* changed, was created, or was removed after planning|expected a regular file, not a symbolic link/);
+              assert.ok(message.includes(temporaryPath));
+              assert.match(message, /preserved temporary .*manual recovery after cleanup verification failed/);
+              return true;
+            },
+          );
+
+          assert.deepEqual(await readFile(configPath), config);
+          assert.deepEqual(await readFile(hooksPath), hooks);
+          if (replacementKind === 'regular') {
+            assert.deepEqual(await readFile(temporaryPath), replacement);
+          } else {
+            assert.equal((await lstat(temporaryPath)).isSymbolicLink(), true);
+            assert.deepEqual(await readFile(replacementTarget), replacement);
+          }
+        });
+      } finally {
+        await rm(wd, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it('fails closed for non-throwing regular and symlink staged-tombstone replacements', async () => {
+    for (const replacementKind of ['regular', 'symlink'] as const) {
+      const wd = await mkdtemp(join(tmpdir(), `omx-uninstall-staged-tombstone-${replacementKind}-`));
+      try {
+        await withCwd(wd, async () => {
+          const codexDir = join(wd, '.codex');
+          const configPath = join(codexDir, 'config.toml');
+          const hooksPath = join(codexDir, 'hooks.json');
+          const stagedPath = join(codexDir, '.hooks.json.staged-tombstone');
+          const replacementTarget = join(wd, 'foreign-staged-tombstone');
+          const config = Buffer.from(buildOmxConfig());
+          const hooks = Buffer.from(`${JSON.stringify(buildManagedCodexHooksConfig(packageRoot()), null, 2)}\n`);
+          const replacement = Buffer.from('foreign staged tombstone replacement\n');
+          await mkdir(codexDir, { recursive: true });
+          await writeFile(configPath, config);
+          await writeFile(hooksPath, hooks);
+
+          await assert.rejects(
+            uninstall({
+              scope: 'project',
+              transactionTemporaryPath: (_path, purpose) =>
+                purpose === 'delete' ? stagedPath : join(codexDir, '.write-temporary'),
+              transactionFailureInjector: async (stage) => {
+                if (stage !== 'before-remove') return;
+                await rm(stagedPath, { force: true });
+                if (replacementKind === 'regular') {
+                  await writeFile(stagedPath, replacement);
+                } else {
+                  await writeFile(replacementTarget, replacement);
+                  await symlink(replacementTarget, stagedPath);
+                }
+              },
+            }),
+            (error: unknown) => {
+              const message = error instanceof Error ? error.message : String(error);
+              assert.match(message, /planned artifact .* changed, was created, or was removed after planning|expected a regular file, not a symbolic link/);
+              assert.ok(message.includes(stagedPath));
+              assert.match(message, /preserved staged deletion .*manual recovery after cleanup verification failed/);
+              return true;
+            },
+          );
+
+          assert.deepEqual(await readFile(configPath), config);
+          assert.deepEqual(await readFile(hooksPath), hooks);
+          if (replacementKind === 'regular') {
+            assert.deepEqual(await readFile(stagedPath), replacement);
+          } else {
+            assert.equal((await lstat(stagedPath)).isSymbolicLink(), true);
+            assert.deepEqual(await readFile(replacementTarget), replacement);
+          }
+        });
+      } finally {
+        await rm(wd, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it('rejects stale snapshots immediately before rollback rename and staged-copy removal', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-uninstall-stale-rollback-primitives-'));
+    try {
+      await withCwd(wd, async () => {
+        const codexDir = join(wd, '.codex');
+        const configPath = join(codexDir, 'config.toml');
+        const hooksPath = join(codexDir, 'hooks.json');
+        const hooks = `${JSON.stringify(buildManagedCodexHooksConfig(packageRoot()), null, 2)}\n`;
+        const config = buildOmxConfig();
+        await mkdir(codexDir, { recursive: true });
+        await writeFile(configPath, config);
+        await writeFile(hooksPath, hooks);
+
+        const concurrentHooks = '{"foreign":"rollback rename"}\n';
+        await assert.rejects(
+          uninstall({
+            scope: 'project',
+            transactionFailureInjector: async (stage) => {
+              if (stage === 'before-config-commit') throw new Error('stop after hook deletion');
+              if (stage === 'before-rollback-rename') {
+                await writeFile(hooksPath, concurrentHooks);
+              }
+            },
+          }),
+          /Uninstall artifact rollback failed.*Refusing uninstall because planned artifact/,
+        );
+        assert.equal(await readFile(hooksPath, 'utf-8'), concurrentHooks);
+
+        await writeFile(hooksPath, hooks);
+        const stagedPath = join(codexDir, '.hooks.json.rollback-stage');
+        const staleStagedCopy = 'foreign staged copy\n';
+        await assert.rejects(
+          uninstall({
+            scope: 'project',
+            transactionTemporaryPath: (_path, purpose) =>
+              purpose === 'delete' ? stagedPath : join(codexDir, '.write-temporary'),
+            transactionFailureInjector: async (stage) => {
+              if (stage === 'before-config-commit') throw new Error('stop after hook deletion');
+              if (stage === 'before-rollback-remove') {
+                await writeFile(stagedPath, staleStagedCopy);
+              }
+            },
+          }),
+          /Uninstall artifact rollback failed.*staged deletion cleanup/,
+        );
+        assert.equal(await readFile(hooksPath, 'utf-8'), hooks);
+        assert.equal(await readFile(stagedPath, 'utf-8'), staleStagedCopy);
+      });
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('cleans staged deletions only after commit and leaves the staged copy recoverable on cleanup failure', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-uninstall-staged-deletion-'));
+    try {
+      await withCwd(wd, async () => {
+        const codexDir = join(wd, '.codex');
+        const configPath = join(codexDir, 'config.toml');
+        const hooksPath = join(codexDir, 'hooks.json');
+        const hooks = `${JSON.stringify(buildManagedCodexHooksConfig(packageRoot()), null, 2)}\n`;
+        const config = buildOmxConfig();
+        const stagedPath = join(codexDir, '.hooks.json.staged');
+        await mkdir(codexDir, { recursive: true });
+        await writeFile(configPath, config);
+        await writeFile(hooksPath, hooks);
+
+        await uninstall({
+          scope: 'project',
+          transactionTemporaryPath: (_path, purpose) =>
+            purpose === 'delete' ? stagedPath : join(codexDir, '.write-temporary'),
+        });
+        assert.equal(existsSync(hooksPath), false);
+        assert.equal(existsSync(stagedPath), false, 'successful commit leaves no staged tombstone');
+
+        await writeFile(configPath, config);
+        await writeFile(hooksPath, hooks);
+        await assert.rejects(
+          uninstall({
+            scope: 'project',
+            transactionTemporaryPath: (_path, purpose) =>
+              purpose === 'delete' ? stagedPath : join(codexDir, '.write-temporary'),
+            transactionFailureInjector: (stage) => {
+              if (stage === 'before-staged-cleanup') {
+                throw new Error('staged deletion cleanup interrupted');
+              }
+            },
+          }),
+          /committed but staged deletion cleanup failed/,
+        );
+        assert.equal(existsSync(hooksPath), false);
+        assert.equal(await readFile(stagedPath, 'utf-8'), hooks);
+      });
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('strictly validates dispatcher metadata and treats it as a stale read-only transaction precondition', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-uninstall-notify-metadata-'));
+    try {
+      await withCwd(wd, async () => {
+        const codexDir = join(wd, '.codex');
+        const configPath = join(codexDir, 'config.toml');
+        const metadataPath = join(codexDir, '.omx', 'notify-dispatch.json');
+        const dispatcherPath = join(packageRoot(), 'dist', 'scripts', 'notify-dispatcher.js');
+        const config = buildOmxConfig().replace(
+          /^notify = .*$/m,
+          `notify = ${JSON.stringify(['node', dispatcherPath, '--metadata', metadataPath])}`,
+        );
+        const metadata = {
+          managedBy: 'oh-my-codex',
+          version: 1,
+          previousNotify: ['node', '/tmp/user-notify.js'],
+          omxNotify: ['node', join(packageRoot(), 'dist', 'scripts', 'notify-hook.js')],
+          dispatcherNotify: ['node', dispatcherPath, '--metadata', metadataPath],
+        };
+        await mkdir(dirname(metadataPath), { recursive: true });
+        await writeFile(configPath, config);
+        await writeFile(
+          metadataPath,
+          JSON.stringify({ ...metadata, previousNotify: ['not-a-string', 7] }),
+        );
+
+        await assert.rejects(
+          uninstall({ scope: 'project' }),
+          /previousNotify must be null or an array of strings/,
+        );
+        assert.equal(await readFile(configPath, 'utf-8'), config);
+        await writeFile(metadataPath, Buffer.from([0x7b, 0xff, 0x7d]));
+        await assert.rejects(
+          uninstall({ scope: 'project' }),
+          /not valid UTF-8/,
+        );
+        assert.equal(await readFile(configPath, 'utf-8'), config);
+
+        await writeFile(metadataPath, JSON.stringify(metadata));
+        await assert.rejects(
+          uninstall({
+            scope: 'project',
+            transactionFailureInjector: async (stage) => {
+              if (stage === 'before-config-commit') {
+                await writeFile(
+                  metadataPath,
+                  JSON.stringify({ ...metadata, previousNotify: ['node', '/tmp/concurrent.js'] }),
+                );
+              }
+            },
+          }),
+          /planned artifact .* changed, was created, or was removed after planning/,
+        );
+        assert.equal(await readFile(configPath, 'utf-8'), config);
+      });
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('does not report stale rollback recovery when failure occurs before destructive removal', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-uninstall-pre-destructive-'));
+    try {
+      await withCwd(wd, async () => {
+        const codexDir = join(wd, '.codex');
+        const configPath = join(codexDir, 'config.toml');
+        const hooksPath = join(codexDir, 'hooks.json');
+        const stagedPath = join(codexDir, '.hooks.json.pre-destructive');
+        const config = buildOmxConfig();
+        const hooks = `${JSON.stringify(buildManagedCodexHooksConfig(packageRoot()), null, 2)}\n`;
+        await mkdir(codexDir, { recursive: true });
+        await writeFile(configPath, config);
+        await writeFile(hooksPath, hooks);
+
+        await assert.rejects(
+          uninstall({
+            scope: 'project',
+            transactionTemporaryPath: (_path, purpose) =>
+              purpose === 'delete' ? stagedPath : join(codexDir, '.write-temporary'),
+            transactionFailureInjector: (stage) => {
+              if (stage === 'before-remove') throw new Error('pre-destructive removal failure');
+            },
+          }),
+          (error: unknown) => {
+            const message = error instanceof Error ? error.message : String(error);
+            assert.match(message, /pre-destructive removal failure/);
+            assert.doesNotMatch(message, /manual recovery|stale rollback/i);
+            return true;
+          },
+        );
+        assert.equal(await readFile(hooksPath, 'utf-8'), hooks);
+        assert.equal(await readFile(configPath, 'utf-8'), config);
+        assert.equal(existsSync(stagedPath), false);
+      });
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('removes exact historical root trust state but preserves nonmatching nested state', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-uninstall-legacy-hook-state-'));
+    try {
+      const home = join(wd, 'home');
+      const codexDir = join(home, '.codex');
+      const configPath = join(codexDir, 'config.toml');
+      const hooksPath = join(codexDir, 'hooks.json');
+      await mkdir(codexDir, { recursive: true });
+      await writeFile(configPath, buildOmxConfig());
+      await writeFile(hooksPath, JSON.stringify({
+        state: {
+          [`${hooksPath}:stop:0:0`]: { trusted_hash: 'sha256:historical' },
+        },
+      }, null, 2) + '\n');
+
+      const rootStateCleanup = runOmx(wd, ['uninstall'], { HOME: home });
+      if (shouldSkipForSpawnPermissions(rootStateCleanup.error)) return;
+      assert.equal(rootStateCleanup.status, 0, rootStateCleanup.stderr || rootStateCleanup.stdout);
+      assert.deepEqual(JSON.parse(await readFile(hooksPath, 'utf-8')), {});
+
+      const nestedState = {
+        retained: { custom: true, trusted_hash: 'sha256:not-omx' },
+      };
+      await writeFile(hooksPath, JSON.stringify({
+        hooks: {
+          state: nestedState,
+          SessionStart: [{
+            hooks: [{ type: 'command', command: 'node "/repo/dist/scripts/codex-native-hook.js"' }],
+          }],
+        },
+      }, null, 2) + '\n');
+      const nestedStateCleanup = runOmx(wd, ['uninstall', '--keep-config'], { HOME: home });
+      assert.equal(nestedStateCleanup.status, 0, nestedStateCleanup.stderr || nestedStateCleanup.stdout);
+      const after = JSON.parse(await readFile(hooksPath, 'utf-8')) as {
+        hooks?: { state?: unknown; SessionStart?: unknown };
+      };
+      assert.deepEqual(after.hooks?.state, nestedState);
+      assert.equal(after.hooks?.SessionStart, undefined);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('removes only trust state at the managed hook coordinates planned from hooks.json', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-uninstall-hook-trust-coordinates-'));
+    try {
+      const home = join(wd, 'home');
+      const codexDir = join(home, '.codex');
+      const configPath = join(codexDir, 'config.toml');
+      const hooksPath = join(codexDir, 'hooks.json');
+      const hooks = JSON.stringify({
+        hooks: {
+          SessionStart: [{
+            hooks: [{ type: 'command', command: 'node "/repo/dist/scripts/codex-native-hook.js"' }],
+          }],
+        },
+      }, null, 2) + '\n';
+      const trustState = buildManagedCodexHookTrustState(hooksPath, wd, {
+        hooksContent: hooks,
+      });
+      const [actualKey, actualTrust] = Object.entries(trustState)[0] ?? [];
+      if (!actualKey || !actualTrust) {
+        assert.fail('expected SessionStart managed trust state');
+      }
+      const staleCoordinate = `${hooksPath}:session_start:9:0`;
+      const actualHeader = `[hooks.state.${JSON.stringify(actualKey)}]`;
+      const staleHeader = `[hooks.state.${JSON.stringify(staleCoordinate)}]`;
+      const config = [
+        buildOmxConfig().trimEnd(),
+        '',
+        actualHeader,
+        `trusted_hash = "${actualTrust.trusted_hash}"`,
+        '',
+        staleHeader,
+        `trusted_hash = "${actualTrust.trusted_hash}"`,
+        '',
+      ].join('\n');
+      await mkdir(codexDir, { recursive: true });
+      await writeFile(configPath, config);
+      await writeFile(hooksPath, hooks);
+
+      const res = runOmx(wd, ['uninstall'], { HOME: home });
+      if (shouldSkipForSpawnPermissions(res.error)) return;
+      assert.equal(res.status, 0, res.stderr || res.stdout);
+      const cleaned = await readFile(configPath, 'utf-8');
+      assert.equal(cleaned.includes(actualHeader), false);
+      assert.equal(cleaned.includes(staleHeader), true);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps empty hooks.json byte-identical during dry-run and no-op uninstall', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-uninstall-empty-hooks-'));
+    try {
+      const home = join(wd, 'home');
+      const codexDir = join(home, '.codex');
+      const configPath = join(codexDir, 'config.toml');
+      const hooksPath = join(codexDir, 'hooks.json');
+      const config = buildOmxConfig();
+      const hooks = '{}\n';
+      await mkdir(codexDir, { recursive: true });
+      await writeFile(configPath, config);
+      await writeFile(hooksPath, hooks);
+
+      const dryRun = runOmx(wd, ['uninstall', '--dry-run'], { HOME: home });
+      if (shouldSkipForSpawnPermissions(dryRun.error)) return;
+      assert.equal(dryRun.status, 0, dryRun.stderr || dryRun.stdout);
+      assert.equal(await readFile(configPath, 'utf-8'), config);
+      assert.equal(await readFile(hooksPath, 'utf-8'), hooks);
+
+      const uninstall = runOmx(wd, ['uninstall'], { HOME: home });
+      assert.equal(uninstall.status, 0, uninstall.stderr || uninstall.stdout);
+      assert.equal(await readFile(hooksPath, 'utf-8'), hooks);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('fails closed for partial hooks.json corruption before config cleanup', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-uninstall-corrupt-hooks-'));
+    try {
+      const home = join(wd, 'home');
+      const codexDir = join(home, '.codex');
+      const configPath = join(codexDir, 'config.toml');
+      const hooksPath = join(codexDir, 'hooks.json');
+      const config = buildOmxConfig();
+      const hooks = '{\n  "hooks": { "SessionStart": {} }\n}\n';
+      await mkdir(codexDir, { recursive: true });
+      await writeFile(configPath, config);
+      await writeFile(hooksPath, hooks);
+
+      const res = runOmx(wd, ['uninstall'], { HOME: home });
+      if (shouldSkipForSpawnPermissions(res.error)) return;
+      assert.equal(res.status, 1, res.stderr || res.stdout);
+      assert.match(res.stderr, /SessionStart must be an array/);
+      assert.equal(await readFile(configPath, 'utf-8'), config);
+      assert.equal(await readFile(hooksPath, 'utf-8'), hooks);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
@@ -522,10 +1449,11 @@ describe('omx uninstall', () => {
         JSON.stringify({
           hooks: {
             SessionStart: [
+              { hooks: [{ type: 'command', command: 'echo keep-me' }] },
               {
+                matcher: 'startup|resume|clear',
                 hooks: [
                   { type: 'command', command: 'node "/repo/dist/scripts/codex-native-hook.js"' },
-                  { type: 'command', command: 'echo keep-me' },
                 ],
               },
             ],

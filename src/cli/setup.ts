@@ -14,8 +14,11 @@ import {
 	stat,
 	lstat,
 	rm,
+	open,
+	chmod,
 } from "fs/promises";
-import { join, dirname, relative, basename } from "path";
+import { join, dirname, relative, basename, isAbsolute, sep } from "path";
+
 import { existsSync } from "fs";
 import { spawnSync } from "child_process";
 import { createInterface } from "readline/promises";
@@ -57,12 +60,13 @@ import {
 } from "../config/generator.js";
 import type { CodexHookFeatureFlag } from "../config/codex-feature-flags.js";
 import {
-	buildManagedCodexHookTrustState,
 	buildManagedCodexNativeHookWindowsShimContent,
 	buildManagedCodexNativeHookWindowsShimPath,
-	mergeManagedCodexHooksConfig,
-	extractCodexHooksJsonTrustState,
-	removeManagedCodexHooks,
+	planManagedCodexHooksMerge,
+	planManagedCodexHooksRemoval,
+	classifyManagedCodexNativeHookWindowsShimOwnership,
+	ManagedCodexHooksPlanError,
+	validateCodexHooksConfigStrict,
 } from "../config/codex-hooks.js";
 import {
 	getLegacyUnifiedMcpRegistryCandidate,
@@ -226,12 +230,6 @@ interface SetupRunSummary {
 interface SetupBackupContext {
 	backupRoot: string;
 	baseRoot: string;
-}
-
-interface ManagedConfigResult {
-	finalConfig: string;
-	omxManagesTui: boolean;
-	repairedLegacyTeamRunTable: boolean;
 }
 
 interface LegacySkillOverlapNotice {
@@ -430,85 +428,926 @@ function getBackupContext(
 	};
 }
 
-function escapeTomlBasicString(value: string): string {
-	return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-}
-
-function renderHooksJsonTrustStateToml(content: string | null | undefined): string {
-	const trustState = extractCodexHooksJsonTrustState(content);
-	return Object.entries(trustState)
-		.sort(([left], [right]) => left.localeCompare(right))
-		.flatMap(([key, state]) => [
-			`[hooks.state."${escapeTomlBasicString(key)}"]`,
-			`trusted_hash = "${escapeTomlBasicString(state.trusted_hash)}"`,
-			...(typeof state.enabled === "boolean" ? [`enabled = ${state.enabled}`] : []),
-			"",
-		])
-		.join("\n")
-		.trimEnd();
-}
-
-function existingHooksStateKeys(config: string): Set<string> {
-	try {
-		const parsed = TOML.parse(config) as {
-			hooks?: { state?: Record<string, unknown> };
-		};
-		return new Set(Object.keys(parsed.hooks?.state ?? {}));
-	} catch {
-		return new Set();
+function logManagedCodexHooksPlanDiagnostics(
+	diagnostics: readonly { message: string }[] | undefined,
+	options: Pick<SetupOptions, "verbose">,
+): void {
+	if (!options.verbose || !diagnostics) return;
+	for (const diagnostic of diagnostics) {
+		console.log(`  hook plan diagnostic: ${diagnostic.message}`);
 	}
 }
-function appendHooksJsonTrustStateToConfig(
-	config: string,
-	hooksContent: string | null | undefined,
-): string {
-	const existingKeys = existingHooksStateKeys(config);
-	const trustState = extractCodexHooksJsonTrustState(hooksContent);
-	const migratableContent = JSON.stringify({
-		state: Object.fromEntries(
-			Object.entries(trustState).filter(([key]) => !existingKeys.has(key)),
-		),
-	});
-	const trustToml = renderHooksJsonTrustStateToml(migratableContent);
-	if (!trustToml) return config;
-	const base = config.trimEnd();
-	return [
-		base,
-		base ? "" : null,
-		"# Migrated from legacy hooks.json state; kept in Codex config.toml because Codex 0.140 rejects top-level hooks.json state.",
-		trustToml,
-		"",
-	].filter((line): line is string => line !== null).join("\n");
+
+type NativeHookTransactionArtifactKind = "shim" | "hooks" | "config" | "metadata";
+	type NativeHookTransactionFailureStage =
+	| "before_precondition"
+	| "before_backup"
+	| "before_temp_write"
+	| "before_rename"
+	| "after_rename"
+	| "before_remove"
+	| "after_remove"
+	| "before_readback"
+	| "before_rollback"
+	| "before_rollback_rename"
+	| "before_rollback_remove"
+	| "before_staged_cleanup";
+
+type NativeHookTransactionTopology =
+	| { kind: "absent" }
+	| { kind: "regular_file"; mode: number };
+
+interface NativeHookTransactionArtifactSnapshot {
+	bytes: Buffer | null;
+	topology: NativeHookTransactionTopology;
+	device?: number;
+	inode?: number;
+	links?: number;
 }
 
-async function migrateLegacyHooksJsonTrustStateToConfig(
-	configPath: string,
-	hooksContent: string | null | undefined,
+interface NativeHookTransactionArtifact {
+	kind: NativeHookTransactionArtifactKind;
+	path: string;
+	label: string;
+	before: NativeHookTransactionArtifactSnapshot;
+	after: Buffer | null;
+	afterTopology: NativeHookTransactionTopology;
+	hookPlatform?: NodeJS.Platform;
+}
+
+interface NativeHookTransactionPrecondition {
+	kind: NativeHookTransactionArtifactKind;
+	path: string;
+	label: string;
+	before: NativeHookTransactionArtifactSnapshot;
+}
+
+
+type NativeHookTransactionAncestorTopology =
+	| { kind: "absent" }
+	| { kind: "directory"; device: number; inode: number };
+
+interface NativeHookTransactionAncestorSnapshot {
+	path: string;
+	topology: NativeHookTransactionAncestorTopology;
+}
+
+interface NativeHookTransactionAncestorPrecondition {
+	controlledRoot: string;
+	ancestorPaths: string[];
+	snapshots: NativeHookTransactionAncestorSnapshot[];
+}
+
+interface AppliedNativeHookTransactionArtifact {
+	artifact: NativeHookTransactionArtifact;
+	appliedSnapshot: NativeHookTransactionArtifactSnapshot;
+	stagedDeletionPath?: string;
+	stagedDeletionSnapshot?: NativeHookTransactionArtifactSnapshot;
+}
+
+let nativeHookTransactionFailureInjector:
+	| ((
+		stage: NativeHookTransactionFailureStage,
+		target: NativeHookTransactionArtifact | NativeHookTransactionPrecondition,
+	) => void)
+	| undefined;
+let nativeHookTransactionSequence = 0;
+let nativeHookTransactionPlatformOverride: NodeJS.Platform | undefined;
+let nativeHookTransactionTemporaryPathOverride:
+	| ((path: string, purpose: "write" | "delete") => string)
+	| undefined;
+
+/** @internal Test seam for deterministic atomic-write and rollback coverage. */
+export function setNativeHookTransactionFailureInjectorForTest(
+	injector:
+		| ((
+			stage: NativeHookTransactionFailureStage,
+			target: NativeHookTransactionArtifact | NativeHookTransactionPrecondition,
+		) => void)
+		| undefined,
+): () => void {
+	const previous = nativeHookTransactionFailureInjector;
+	nativeHookTransactionFailureInjector = injector;
+	return () => {
+		nativeHookTransactionFailureInjector = previous;
+	};
+}
+
+/** @internal Test seam for deterministic Windows transaction coverage. */
+export function setNativeHookTransactionPlatformForTest(
+	platform: NodeJS.Platform | undefined,
+): () => void {
+	const previous = nativeHookTransactionPlatformOverride;
+	nativeHookTransactionPlatformOverride = platform;
+	return () => {
+		nativeHookTransactionPlatformOverride = previous;
+	};
+}
+
+/** @internal Test seam for deterministic native transaction temporary-path coverage. */
+export function setNativeHookTransactionTemporaryPathForTest(
+	resolver:
+		| ((path: string, purpose: "write" | "delete") => string)
+		| undefined,
+): () => void {
+	const previous = nativeHookTransactionTemporaryPathOverride;
+	nativeHookTransactionTemporaryPathOverride = resolver;
+	return () => {
+		nativeHookTransactionTemporaryPathOverride = previous;
+	};
+}
+
+function nativeHookPlatform(): NodeJS.Platform {
+	return nativeHookTransactionPlatformOverride ?? process.platform;
+}
+
+function hookTransactionBytesEqual(
+	left: Buffer | null,
+	right: Buffer | null,
+): boolean {
+	return left === null || right === null ? left === right : left.equals(right);
+}
+
+function nativeHookTransactionTopologyEqual(
+	left: NativeHookTransactionTopology,
+	right: NativeHookTransactionTopology,
+): boolean {
+	return left.kind === "absent" || right.kind === "absent"
+		? left.kind === right.kind
+		: left.mode === right.mode;
+}
+
+function isMissingPathError(error: unknown): boolean {
+	return (
+		typeof error === "object" &&
+		error !== null &&
+		"code" in error &&
+		(error as { code?: unknown }).code === "ENOENT"
+	);
+}
+
+
+function nativeHookTransactionArtifactAncestorPaths(
+	controlledRoot: string,
+	artifactPaths: readonly string[],
+): string[] {
+	const paths = new Set([controlledRoot]);
+	for (const artifactPath of artifactPaths) {
+		const parentPath = dirname(artifactPath);
+		const fromControlledRoot = relative(controlledRoot, parentPath);
+		if (
+			fromControlledRoot === ".." ||
+			fromControlledRoot.startsWith(`..${sep}`) ||
+			isAbsolute(fromControlledRoot)
+		) {
+			continue;
+		}
+		let ancestorPath = controlledRoot;
+		if (fromControlledRoot !== "") {
+			for (const component of fromControlledRoot.split(sep)) {
+				ancestorPath = join(ancestorPath, component);
+				paths.add(ancestorPath);
+			}
+		}
+	}
+	return [...paths];
+}
+
+async function captureNativeHookTransactionAncestorSnapshots(
+	ancestorPaths: readonly string[],
+): Promise<NativeHookTransactionAncestorSnapshot[]> {
+	const snapshots: NativeHookTransactionAncestorSnapshot[] = [];
+	for (const path of ancestorPaths) {
+		let status;
+		try {
+			status = await lstat(path);
+		} catch (error) {
+			if (isMissingPathError(error)) {
+				snapshots.push({ path, topology: { kind: "absent" } });
+				continue;
+			}
+			throw error;
+		}
+		if (status.isSymbolicLink()) {
+			throw new Error(
+				`Refusing native hook transaction: ancestor ${path} is a symbolic link.`,
+			);
+		}
+		if (!status.isDirectory()) {
+			throw new Error(
+				`Refusing native hook transaction: ancestor ${path} is not a directory.`,
+			);
+		}
+		snapshots.push({
+			path,
+			topology: { kind: "directory", device: status.dev, inode: status.ino },
+		});
+	}
+	return snapshots;
+}
+
+function nativeHookTransactionAncestorTopologyEqual(
+	left: NativeHookTransactionAncestorTopology,
+	right: NativeHookTransactionAncestorTopology,
+): boolean {
+	return left.kind === "absent" || right.kind === "absent"
+		? left.kind === right.kind
+		: left.device === right.device && left.inode === right.inode;
+}
+
+async function captureNativeHookTransactionAncestorPrecondition(
+	controlledRoot: string,
+	artifactPaths: readonly string[],
+): Promise<NativeHookTransactionAncestorPrecondition> {
+	const ancestorPaths = nativeHookTransactionArtifactAncestorPaths(
+		controlledRoot,
+		artifactPaths,
+	);
+	return {
+		controlledRoot,
+		ancestorPaths,
+		snapshots: await captureNativeHookTransactionAncestorSnapshots(ancestorPaths),
+	};
+}
+
+async function assertNativeHookTransactionAncestorPrecondition(
+	precondition: NativeHookTransactionAncestorPrecondition,
+): Promise<void> {
+	const actual = await captureNativeHookTransactionAncestorSnapshots(
+		precondition.ancestorPaths,
+	);
+	for (let index = 0; index < precondition.snapshots.length; index += 1) {
+		const expected = precondition.snapshots[index]!;
+		const current = actual[index]!;
+		if (!nativeHookTransactionAncestorTopologyEqual(current.topology, expected.topology)) {
+			throw new Error(
+				`Native hook transaction precondition changed for ancestor ${expected.path}; refusing to mutate a stale topology.`,
+			);
+		}
+	}
+}
+
+async function refreshNativeHookTransactionAncestorPrecondition(
+	precondition: NativeHookTransactionAncestorPrecondition,
+	artifactPath: string,
+): Promise<void> {
+	const allowedCreatedPaths = new Set(
+		nativeHookTransactionArtifactAncestorPaths(precondition.controlledRoot, [artifactPath]),
+	);
+	const actual = await captureNativeHookTransactionAncestorSnapshots(
+		precondition.ancestorPaths,
+	);
+	for (let index = 0; index < precondition.snapshots.length; index += 1) {
+		const expected = precondition.snapshots[index]!;
+		const current = actual[index]!;
+		if (nativeHookTransactionAncestorTopologyEqual(current.topology, expected.topology)) {
+			continue;
+		}
+		if (
+			expected.topology.kind === "absent" &&
+			current.topology.kind === "directory" &&
+			allowedCreatedPaths.has(expected.path)
+		) {
+			continue;
+		}
+		throw new Error(
+			`Native hook transaction precondition changed for ancestor ${expected.path}; refusing to mutate a stale topology.`,
+		);
+	}
+	precondition.snapshots = actual;
+}
+
+function decodeNativeHookTransactionUtf8(bytes: Buffer, label: string): string {
+	try {
+		const content = new TextDecoder("utf-8", {
+			fatal: true,
+			ignoreBOM: true,
+		}).decode(bytes);
+		if (!Buffer.from(content, "utf-8").equals(bytes)) {
+			throw new Error("decoded text did not round-trip to the original bytes");
+		}
+		return content;
+	} catch (error) {
+		throw new ManagedCodexHooksPlanError(
+			"invalid_document",
+			`Refusing to read ${label}: invalid UTF-8 (${error instanceof Error ? error.message : String(error)}).`,
+			{ label },
+		);
+	}
+}
+
+async function captureNativeHookTransactionArtifact(
+	path: string,
+	label: string,
+): Promise<NativeHookTransactionArtifactSnapshot> {
+	let before;
+	try {
+		before = await lstat(path);
+	} catch (error) {
+		if (isMissingPathError(error)) {
+			return { bytes: null, topology: { kind: "absent" } };
+		}
+		throw error;
+	}
+	if (!before.isFile() || before.nlink !== 1) {
+		throw new Error(
+			`Refusing native hook transaction for ${label}: expected a single-link regular file or absence.`,
+		);
+	}
+	const bytes = await readFile(path);
+	const after = await lstat(path);
+	const beforeTopology = {
+		kind: "regular_file" as const,
+		mode: before.mode & 0o7777,
+	};
+	const afterTopology = {
+		kind: "regular_file" as const,
+		mode: after.mode & 0o7777,
+	};
+	if (
+		!after.isFile() ||
+		after.nlink !== 1 ||
+		!nativeHookTransactionTopologyEqual(beforeTopology, afterTopology) ||
+		before.dev !== after.dev ||
+		before.ino !== after.ino ||
+		before.nlink !== after.nlink
+	) {
+		throw new Error(
+			`Refusing native hook transaction for ${label}: path changed while its snapshot was read.`,
+		);
+	}
+	return {
+		bytes,
+		topology: beforeTopology,
+		device: before.dev,
+		inode: before.ino,
+		links: before.nlink,
+	};
+}
+
+function nativeHookTransactionSnapshotsEqual(
+	left: NativeHookTransactionArtifactSnapshot,
+	right: NativeHookTransactionArtifactSnapshot,
+): boolean {
+	return (
+		hookTransactionBytesEqual(left.bytes, right.bytes) &&
+		nativeHookTransactionTopologyEqual(left.topology, right.topology) &&
+		left.device === right.device &&
+		left.inode === right.inode &&
+		left.links === right.links
+	);
+}
+
+function nativeHookTransactionSnapshotMatchesExpected(
+	snapshot: NativeHookTransactionArtifactSnapshot,
+	expected: Pick<NativeHookTransactionArtifactSnapshot, "bytes" | "topology">,
+): boolean {
+	return (
+		hookTransactionBytesEqual(snapshot.bytes, expected.bytes) &&
+		nativeHookTransactionTopologyEqual(snapshot.topology, expected.topology)
+	);
+}
+
+function nativeHookTransactionOutputTopology(
+	before: NativeHookTransactionArtifactSnapshot,
+	after: Buffer | null,
+): NativeHookTransactionTopology {
+	if (after === null) return { kind: "absent" };
+	return {
+		kind: "regular_file",
+		mode: before.topology.kind === "regular_file" ? before.topology.mode : 0o600,
+	};
+}
+
+function nativeHookTransactionArtifact(
+	kind: NativeHookTransactionArtifactKind,
+	path: string,
+	label: string,
+	before: NativeHookTransactionArtifactSnapshot,
+	after: Buffer | null,
+	hookPlatform?: NodeJS.Platform,
+): NativeHookTransactionArtifact | null {
+	return hookTransactionBytesEqual(before.bytes, after)
+		? null
+		: {
+			kind,
+			path,
+			label,
+			before,
+			after,
+			afterTopology: nativeHookTransactionOutputTopology(before, after),
+			hookPlatform,
+		};
+}
+
+function nativeHookTransactionPrecondition(
+	kind: NativeHookTransactionArtifactKind,
+	path: string,
+	label: string,
+	before: NativeHookTransactionArtifactSnapshot,
+): NativeHookTransactionPrecondition {
+	return { kind, path, label, before };
+}
+
+function assertWindowsNativeHookShimOwnership(
+	shimPath: string,
+	before: Buffer | null,
+	expected: Buffer,
+): void {
+	if (before === null) return;
+	const ownership = classifyManagedCodexNativeHookWindowsShimOwnership(
+		before,
+		expected,
+	);
+	if (ownership === "current" || ownership === "historical") return;
+	throw new Error(
+		`Refusing to replace modified Windows native hook shim ${shimPath}. Restore the complete OMX-generated shim or remove it after verifying no foreign hook references it.`,
+	);
+}
+
+function injectNativeHookTransactionFailure(
+	stage: NativeHookTransactionFailureStage,
+	target: NativeHookTransactionArtifact | NativeHookTransactionPrecondition,
+): void {
+	nativeHookTransactionFailureInjector?.(stage, target);
+}
+
+function nativeHookTransactionTemporaryPath(
+	path: string,
+	purpose: "write" | "delete",
+): string {
+	if (nativeHookTransactionTemporaryPathOverride) {
+		return nativeHookTransactionTemporaryPathOverride(path, purpose);
+	}
+	nativeHookTransactionSequence += 1;
+	return join(
+		dirname(path),
+		`.${basename(path)}.omx-${purpose}-${process.pid}-${nativeHookTransactionSequence}.tmp`,
+	);
+}
+
+async function atomicWriteNativeHookTransactionArtifact(
+	artifact: NativeHookTransactionArtifact,
+	content: Buffer,
+	stage: "write" | "rollback",
+	expectedCurrent: NativeHookTransactionArtifactSnapshot,
+	ancestorPrecondition: NativeHookTransactionAncestorPrecondition,
+	onWriteApplied?: (snapshot: NativeHookTransactionArtifactSnapshot) => void,
+): Promise<void> {
+	const temporaryPath = nativeHookTransactionTemporaryPath(artifact.path, "write");
+	let temporaryCreated = false;
+	let temporarySnapshot: NativeHookTransactionArtifactSnapshot | undefined;
+	try {
+		await assertNativeHookTransactionAncestorPrecondition(ancestorPrecondition);
+		await mkdir(dirname(artifact.path), { recursive: true });
+		await refreshNativeHookTransactionAncestorPrecondition(
+			ancestorPrecondition,
+			artifact.path,
+		);
+
+		if (stage === "write") {
+			injectNativeHookTransactionFailure("before_temp_write", artifact);
+		} else {
+			injectNativeHookTransactionFailure("before_rollback", artifact);
+		}
+		await assertNativeHookTransactionArtifactSnapshot(
+			artifact.path,
+			artifact.label,
+			expectedCurrent,
+			stage === "write" ? "precondition" : "rollback",
+		);
+		await assertNativeHookTransactionAncestorPrecondition(ancestorPrecondition);
+
+		const handle = await open(
+			temporaryPath,
+			"wx",
+			artifact.afterTopology.kind === "regular_file"
+				? artifact.afterTopology.mode
+				: 0o600,
+		);
+		temporaryCreated = true;
+		try {
+			await handle.writeFile(content);
+			await handle.sync();
+		} finally {
+			await handle.close();
+		}
+		if (artifact.afterTopology.kind === "regular_file") {
+			await chmod(temporaryPath, artifact.afterTopology.mode);
+		}
+		temporarySnapshot = await assertNativeHookTransactionArtifactState(
+			temporaryPath,
+			`${artifact.label} temporary`,
+			{ bytes: content, topology: artifact.afterTopology },
+			"read-back",
+		);
+		if (stage === "write") {
+			injectNativeHookTransactionFailure("before_rename", artifact);
+		} else {
+			injectNativeHookTransactionFailure("before_rollback_rename", artifact);
+		}
+		await assertNativeHookTransactionArtifactSnapshot(
+			artifact.path,
+			artifact.label,
+			expectedCurrent,
+			stage === "write" ? "precondition" : "rollback",
+		);
+		await assertNativeHookTransactionAncestorPrecondition(ancestorPrecondition);
+		await assertNativeHookTransactionArtifactSnapshot(
+			temporaryPath,
+			`${artifact.label} temporary`,
+			temporarySnapshot,
+			"read-back",
+		);
+
+		if (!temporarySnapshot) {
+			throw new Error("temporary path was not fully captured after writing");
+		}
+		await rename(temporaryPath, artifact.path);
+		temporaryCreated = false;
+		if (stage === "write") {
+			onWriteApplied?.(temporarySnapshot);
+			injectNativeHookTransactionFailure("after_rename", artifact);
+		}
+	} catch (error) {
+		if (temporaryCreated) {
+			try {
+				if (!temporarySnapshot) {
+					throw new Error("temporary path was not fully captured after writing");
+				}
+				await assertNativeHookTransactionArtifactSnapshot(
+					temporaryPath,
+					`${artifact.label} temporary`,
+					temporarySnapshot,
+					"read-back",
+				);
+				await assertNativeHookTransactionAncestorPrecondition(ancestorPrecondition);
+				await rm(temporaryPath);
+			} catch (cleanupError) {
+				const message = error instanceof Error ? error.message : String(error);
+				throw new Error(
+					`Native hook transaction ${stage} failed (${message}) and preserved temporary ${temporaryPath} for manual recovery after cleanup verification failed: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`,
+				);
+			}
+		}
+		throw error;
+	}
+}
+
+async function assertNativeHookTransactionArtifactState(
+	path: string,
+	label: string,
+	expected: Pick<NativeHookTransactionArtifactSnapshot, "bytes" | "topology">,
+	context: "precondition" | "rollback" | "read-back",
+): Promise<NativeHookTransactionArtifactSnapshot> {
+	const actual = await captureNativeHookTransactionArtifact(path, label);
+	if (!nativeHookTransactionSnapshotMatchesExpected(actual, expected)) {
+		if (context === "rollback") {
+			throw new Error(
+				`Native hook transaction rollback preserved ${path} for manual recovery because ${label} no longer matches the transaction-owned version.`,
+			);
+		}
+		throw new Error(
+			`Native hook transaction ${context} changed for ${label}; refusing to overwrite concurrent content.`,
+		);
+	}
+	return actual;
+}
+async function assertNativeHookTransactionArtifactSnapshot(
+	path: string,
+	label: string,
+	expected: NativeHookTransactionArtifactSnapshot,
+	context: "precondition" | "rollback" | "read-back",
+): Promise<NativeHookTransactionArtifactSnapshot> {
+	const actual = await captureNativeHookTransactionArtifact(path, label);
+	if (!nativeHookTransactionSnapshotsEqual(actual, expected)) {
+		if (context === "rollback") {
+			throw new Error(
+				`Native hook transaction rollback preserved ${path} for manual recovery because ${label} no longer matches the transaction-owned version.`,
+			);
+		}
+		throw new Error(
+			`Native hook transaction ${context} changed for ${label}; refusing to overwrite concurrent content.`,
+		);
+	}
+	return actual;
+}
+
+async function assertNativeHookTransactionPrecondition(
+	precondition: NativeHookTransactionPrecondition,
+): Promise<void> {
+	await assertNativeHookTransactionArtifactSnapshot(
+		precondition.path,
+		precondition.label,
+		precondition.before,
+		"precondition",
+	);
+}
+
+async function applyNativeHookTransactionArtifact(
+	artifact: NativeHookTransactionArtifact,
+	ancestorPrecondition: NativeHookTransactionAncestorPrecondition,
+	applied: AppliedNativeHookTransactionArtifact[],
+): Promise<AppliedNativeHookTransactionArtifact> {
+	await assertNativeHookTransactionArtifactSnapshot(
+		artifact.path,
+		artifact.label,
+		artifact.before,
+		"precondition",
+	);
+	await assertNativeHookTransactionAncestorPrecondition(ancestorPrecondition);
+
+	if (artifact.after !== null) {
+		let entry: AppliedNativeHookTransactionArtifact | undefined;
+		await atomicWriteNativeHookTransactionArtifact(
+			artifact,
+			artifact.after,
+			"write",
+			artifact.before,
+			ancestorPrecondition,
+			(appliedSnapshot) => {
+				entry = { artifact, appliedSnapshot };
+				applied.push(entry);
+			},
+		);
+		if (!entry) {
+			throw new Error("native hook transaction write was not registered as applied");
+		}
+		return entry;
+	}
+
+	const stagedDeletionPath = nativeHookTransactionTemporaryPath(artifact.path, "delete");
+	let stagedDeletionCreated = false;
+	let originalRemoved = false;
+	let stagedDeletionSnapshot: NativeHookTransactionArtifactSnapshot | undefined;
+	try {
+		injectNativeHookTransactionFailure("before_temp_write", artifact);
+		await assertNativeHookTransactionArtifactSnapshot(
+			artifact.path,
+			artifact.label,
+			artifact.before,
+			"precondition",
+		);
+		await assertNativeHookTransactionAncestorPrecondition(ancestorPrecondition);
+
+		const handle = await open(
+			stagedDeletionPath,
+			"wx",
+			artifact.before.topology.kind === "regular_file"
+				? artifact.before.topology.mode
+				: 0o600,
+		);
+		stagedDeletionCreated = true;
+		try {
+			await handle.writeFile(artifact.before.bytes!);
+			await handle.sync();
+		} finally {
+			await handle.close();
+		}
+		if (artifact.before.topology.kind === "regular_file") {
+			await chmod(stagedDeletionPath, artifact.before.topology.mode);
+		}
+		stagedDeletionSnapshot = await assertNativeHookTransactionArtifactState(
+			stagedDeletionPath,
+			`${artifact.label} staged deletion`,
+			{ bytes: artifact.before.bytes, topology: artifact.before.topology },
+			"read-back",
+		);
+		injectNativeHookTransactionFailure("before_remove", artifact);
+		await assertNativeHookTransactionArtifactSnapshot(
+			artifact.path,
+			artifact.label,
+			artifact.before,
+			"precondition",
+		);
+		await assertNativeHookTransactionAncestorPrecondition(ancestorPrecondition);
+		await assertNativeHookTransactionArtifactSnapshot(
+			stagedDeletionPath,
+			`${artifact.label} staged deletion`,
+			stagedDeletionSnapshot,
+			"read-back",
+		);
+
+		await rm(artifact.path);
+		originalRemoved = true;
+		const entry: AppliedNativeHookTransactionArtifact = {
+			artifact,
+			appliedSnapshot: { bytes: null, topology: { kind: "absent" } },
+			stagedDeletionPath,
+			stagedDeletionSnapshot,
+		};
+		applied.push(entry);
+		injectNativeHookTransactionFailure("after_remove", artifact);
+		return entry;
+	} catch (error) {
+		if (stagedDeletionCreated && !originalRemoved) {
+			try {
+				if (!stagedDeletionSnapshot) {
+					throw new Error("staged deletion path was not fully captured after writing");
+				}
+				await assertNativeHookTransactionArtifactSnapshot(
+					stagedDeletionPath,
+					`${artifact.label} staged deletion`,
+					stagedDeletionSnapshot,
+					"read-back",
+				);
+				await assertNativeHookTransactionAncestorPrecondition(ancestorPrecondition);
+				await rm(stagedDeletionPath);
+			} catch (cleanupError) {
+				const message = error instanceof Error ? error.message : String(error);
+				throw new Error(
+					`Native hook transaction failed (${message}) and preserved staged deletion ${stagedDeletionPath} for manual recovery after cleanup verification failed: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`,
+				);
+			}
+		}
+		throw error;
+	}
+}
+
+async function verifyNativeHookTransactionArtifact(
+	applied: AppliedNativeHookTransactionArtifact,
+): Promise<void> {
+	const { artifact } = applied;
+	injectNativeHookTransactionFailure("before_readback", artifact);
+	const actual = await captureNativeHookTransactionArtifact(artifact.path, artifact.label);
+	if (!nativeHookTransactionSnapshotsEqual(actual, applied.appliedSnapshot)) {
+		throw new Error(
+			`Native hook transaction read-back changed for ${artifact.label}; refusing to overwrite concurrent content.`,
+		);
+	}
+	if (artifact.after === null) return;
+	const content = decodeNativeHookTransactionUtf8(actual.bytes!, artifact.label);
+	if (artifact.kind === "hooks") {
+		const validation = validateCodexHooksConfigStrict(content, {
+			platform: artifact.hookPlatform,
+		});
+		if (!validation.ok) {
+			throw new Error(
+				`Native hook transaction wrote invalid hooks.json: ${validation.error.message}`,
+			);
+		}
+	}
+	if (artifact.kind === "config") TOML.parse(content);
+}
+
+async function restoreNativeHookTransactionArtifact(
+	applied: AppliedNativeHookTransactionArtifact,
+	ancestorPrecondition: NativeHookTransactionAncestorPrecondition,
+): Promise<void> {
+	const { artifact } = applied;
+	const current = await captureNativeHookTransactionArtifact(artifact.path, artifact.label);
+	if (!nativeHookTransactionSnapshotsEqual(current, applied.appliedSnapshot)) {
+		throw new Error(
+			`Native hook transaction rollback preserved ${artifact.path} for manual recovery because ${artifact.label} no longer matches the transaction-owned version.`,
+		);
+	}
+	if (artifact.before.bytes === null) {
+		injectNativeHookTransactionFailure("before_rollback", artifact);
+		injectNativeHookTransactionFailure("before_rollback_remove", artifact);
+		await assertNativeHookTransactionArtifactSnapshot(
+			artifact.path,
+			artifact.label,
+			applied.appliedSnapshot,
+			"rollback",
+		);
+		await assertNativeHookTransactionAncestorPrecondition(ancestorPrecondition);
+
+		await rm(artifact.path);
+	} else {
+		const restoreArtifact: NativeHookTransactionArtifact = {
+			...artifact,
+			after: artifact.before.bytes,
+			afterTopology: artifact.before.topology,
+		};
+		await atomicWriteNativeHookTransactionArtifact(
+			restoreArtifact,
+			artifact.before.bytes,
+			"rollback",
+			applied.appliedSnapshot,
+			ancestorPrecondition,
+		);
+	}
+	const restored = await captureNativeHookTransactionArtifact(artifact.path, artifact.label);
+	if (
+		!nativeHookTransactionSnapshotMatchesExpected(restored, {
+			bytes: artifact.before.bytes,
+			topology: artifact.before.topology,
+		})
+	) {
+		throw new Error(
+			`Native hook transaction rollback preserved ${artifact.path} for manual recovery because ${artifact.label} no longer matches the expected restored version.`,
+		);
+	}
+}
+
+async function cleanupNativeHookTransactionStagedDeletions(
+	applied: readonly AppliedNativeHookTransactionArtifact[],
+	ancestorPrecondition: NativeHookTransactionAncestorPrecondition,
+): Promise<void> {
+	for (const entry of applied) {
+		if (!entry.stagedDeletionPath || !entry.stagedDeletionSnapshot) continue;
+		injectNativeHookTransactionFailure("before_staged_cleanup", entry.artifact);
+		await assertNativeHookTransactionArtifactSnapshot(
+			entry.stagedDeletionPath,
+			`${entry.artifact.label} staged deletion`,
+			entry.stagedDeletionSnapshot,
+			"read-back",
+		);
+		await assertNativeHookTransactionAncestorPrecondition(ancestorPrecondition);
+		await rm(entry.stagedDeletionPath);
+	}
+}
+
+async function commitNativeHookTransaction(
+	artifacts: readonly NativeHookTransactionArtifact[],
+	preconditions: readonly NativeHookTransactionPrecondition[],
+	ancestorPrecondition: NativeHookTransactionAncestorPrecondition,
 	backupContext: SetupBackupContext,
 	summary: SetupCategorySummary,
 	options: Pick<SetupOptions, "dryRun" | "verbose">,
 ): Promise<void> {
-	const existingConfig = existsSync(configPath)
-		? await readFile(configPath, "utf-8")
-		: "";
-	const nextConfig = appendHooksJsonTrustStateToConfig(existingConfig, hooksContent);
-	if (nextConfig === existingConfig) return;
-	if (
-		await ensureBackup(configPath, existsSync(configPath), backupContext, options)
-	) {
-		summary.backedUp += 1;
+	if (options.dryRun) return;
+
+	await assertNativeHookTransactionAncestorPrecondition(ancestorPrecondition);
+
+	for (const precondition of preconditions) {
+		injectNativeHookTransactionFailure("before_precondition", precondition);
+		await assertNativeHookTransactionPrecondition(precondition);
 	}
-	if (!options.dryRun) {
-		await mkdir(dirname(configPath), { recursive: true });
-		await writeFile(configPath, nextConfig);
+	if (artifacts.length === 0) return;
+	for (const artifact of artifacts) {
+		injectNativeHookTransactionFailure("before_backup", artifact);
+		if (
+			await ensureBackup(
+				artifact.path,
+				artifact.before.bytes !== null,
+				backupContext,
+				options,
+			)
+		) {
+			summary.backedUp += 1;
+		}
 	}
-	summary.updated += 1;
-	if (options.verbose) {
-		console.log(
-			`  ${options.dryRun ? "would migrate" : "migrated"} legacy hooks.json trust state to ${configPath}`,
+	for (const precondition of preconditions) {
+		await assertNativeHookTransactionPrecondition(precondition);
+	}
+	await assertNativeHookTransactionAncestorPrecondition(ancestorPrecondition);
+
+
+	const applied: AppliedNativeHookTransactionArtifact[] = [];
+	try {
+		for (const artifact of artifacts) {
+			const entry = await applyNativeHookTransactionArtifact(
+				artifact,
+				ancestorPrecondition,
+				applied,
+			);
+			await verifyNativeHookTransactionArtifact(entry);
+		}
+	} catch (error) {
+		const rollbackFailures: string[] = [];
+		const restored: AppliedNativeHookTransactionArtifact[] = [];
+		for (const entry of [...applied].reverse()) {
+			try {
+				await restoreNativeHookTransactionArtifact(entry, ancestorPrecondition);
+				restored.push(entry);
+			} catch (rollbackError) {
+				rollbackFailures.push(
+					`${entry.artifact.label}: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`,
+				);
+			}
+		}
+		try {
+			await cleanupNativeHookTransactionStagedDeletions(
+				restored,
+				ancestorPrecondition,
+			);
+		} catch (cleanupError) {
+			rollbackFailures.push(
+				`staged deletion cleanup: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`,
+			);
+		}
+		const message = error instanceof Error ? error.message : String(error);
+		if (rollbackFailures.length > 0) {
+			throw new Error(
+				`Native hook transaction failed (${message}) and rollback failed (${rollbackFailures.join("; ")}).`,
+			);
+		}
+		throw new Error(`Native hook transaction failed and was rolled back: ${message}`);
+	}
+
+	try {
+		await cleanupNativeHookTransactionStagedDeletions(
+			applied,
+			ancestorPrecondition,
+		);
+	} catch (error) {
+		throw new Error(
+			`Native hook transaction committed but staged deletion cleanup failed: ${error instanceof Error ? error.message : String(error)}`,
 		);
 	}
 }
+
 
 async function ensureBackup(
 	destinationPath: string,
@@ -1063,13 +1902,11 @@ function legacyPluginDeveloperInstructionsDecision(
 }
 
 async function resolvePluginDeveloperInstructionsDecision(
+	existingConfig: string,
 	configPath: string,
 	options: Pick<SetupOptions, "pluginDeveloperInstructionsPrompt">,
 ): Promise<PluginDeveloperInstructionsDecision> {
-	const existing = existsSync(configPath)
-		? await readFile(configPath, "utf-8")
-		: "";
-	const value = readRootDeveloperInstructions(existing);
+	const value = readRootDeveloperInstructions(existingConfig);
 	if (value === undefined) {
 		if (options.pluginDeveloperInstructionsPrompt) {
 			return legacyPluginDeveloperInstructionsDecision(
@@ -1752,267 +2589,123 @@ function insertRootTomlKey(config: string, line: string): string {
 	return [...before, line, "", ...after].join("\n") + "\n";
 }
 
-async function ensurePluginMarketplaceRegistration(
-	configPath: string,
-	pkgRoot: string,
-	mcpMode: SetupMcpMode,
-	removeFirstPartyMcp: boolean,
-	backupContext: SetupBackupContext,
-	summary: SetupCategorySummary,
-	options: Pick<SetupOptions, "dryRun" | "verbose">,
-): Promise<"updated" | "unchanged" | "unavailable"> {
-	const packagedMarketplace = await resolvePackagedOmxMarketplace(pkgRoot);
-	if (!packagedMarketplace) {
-		summary.skipped += 1;
-		return "unavailable";
-	}
 
-	const existingConfig = existsSync(configPath)
-		? await readFile(configPath, "utf-8")
-		: "";
-	const nextConfig = upsertLocalOmxMarketplaceRegistration(
-		upsertLocalOmxPluginMcpServerEnablement(
-			upsertLocalOmxPluginEnablement(existingConfig),
-			mcpMode === "compat",
-			{ removeWhenDisabled: removeFirstPartyMcp },
-		),
-		pkgRoot,
-	);
-	const destinationExists = existsSync(configPath);
-
-	if (nextConfig === existingConfig) {
-		summary.unchanged += 1;
-		return "unchanged";
-	}
-
-	if (
-		await ensureBackup(configPath, destinationExists, backupContext, options)
-	) {
-		summary.backedUp += 1;
-	}
-	if (!options.dryRun) {
-		await mkdir(dirname(configPath), { recursive: true });
-		await writeFile(configPath, nextConfig);
-	}
-	summary.updated += 1;
-	if (options.verbose) {
-		console.log(
-			`  ${options.dryRun ? "would register" : "registered"} local Codex plugin marketplace ${OMX_LOCAL_MARKETPLACE_NAME} from ${pkgRoot}`,
-		);
-	}
-	return "updated";
+interface PluginModeHooksConfigPlan {
+	finalConfig: string;
+	hooksFinalContent: string | null;
+	hooksRemovedCount: number;
+	cleanedLegacyConfig: boolean;
+	diagnostics: readonly { message: string }[];
 }
 
-async function cleanupPluginModeManagedHooksJson(
+function buildPluginModeHooksConfigPlan(
+	existingConfig: string,
 	existingHooksContent: string | null,
-	hooksPath: string,
-	backupContext: SetupBackupContext,
-	summary: SetupCategorySummary,
-	options: Pick<SetupOptions, "dryRun" | "verbose">,
-): Promise<void> {
-	if (existingHooksContent === null) {
-		summary.unchanged += 1;
-		return;
-	}
-
-	const removed = removeManagedCodexHooks(existingHooksContent);
-	if (removed.removedCount === 0) {
-		summary.unchanged += 1;
-		return;
-	}
-
-	if (await ensureBackup(hooksPath, true, backupContext, options)) {
-		summary.backedUp += 1;
-	}
-	if (!options.dryRun) {
-		if (removed.nextContent === null) {
-			await rm(hooksPath, { force: true });
-		} else {
-			await writeFile(hooksPath, removed.nextContent);
-		}
-	}
-	summary.removed += removed.removedCount;
-	if (options.verbose) {
-		console.log(
-			`  ${options.dryRun ? "would remove" : "removed"} ${removed.removedCount} legacy setup-managed hook wrapper(s) from ${hooksPath}`,
-		);
-	}
-}
-
-async function applyPluginModeHooksConfig(
-	configPath: string,
-	hooksPath: string,
 	pkgRoot: string,
+	hooksPath: string,
 	codexHomeDir: string,
-	backupContext: SetupBackupContext,
-	summary: SetupCategorySummary,
-	options: Pick<SetupOptions, "dryRun" | "verbose"> & {
+	options: {
 		codexHookFeatureFlag: CodexHookFeatureFlag;
 		pluginScopedHooks: boolean;
+		preserveFirstPartyMcp?: boolean;
+		developerInstructionsDecision: PluginDeveloperInstructionsDecision;
+		platform: NodeJS.Platform;
 	},
-): Promise<void> {
-	const existingConfig = existsSync(configPath)
-		? await readFile(configPath, "utf-8")
-		: "";
-	const managedTrustState = buildManagedCodexHookTrustState(
-		hooksPath,
-		pkgRoot,
-		{ platform: process.platform, codexHomeDir },
-	);
-	const nextConfigBase = upsertPluginModeRuntimeFeatureFlags(
-		stripManagedCodexHookTrustState(existingConfig, { managedTrustState }),
-		options.codexHookFeatureFlag,
-		{ pluginScopedHooks: options.pluginScopedHooks },
-	);
-	const nextConfig = options.pluginScopedHooks
-		? nextConfigBase
-		: upsertManagedCodexHookTrustState(
-			nextConfigBase,
+): PluginModeHooksConfigPlan {
+	const managedHookOptions = {
+		platform: options.platform,
+		codexHomeDir,
+	} as const;
+	const managedHooksPlan = options.pluginScopedHooks
+		? existingHooksContent === null
+			? null
+			: planManagedCodexHooksRemoval(
+				existingHooksContent,
+				hooksPath,
+				managedHookOptions,
+			)
+		: planManagedCodexHooksMerge(
+			existingHooksContent,
 			pkgRoot,
 			hooksPath,
-			{ platform: process.platform, codexHomeDir },
+			managedHookOptions,
 		);
-	if (nextConfig !== existingConfig) {
-		if (
-			await ensureBackup(
-				configPath,
-				existsSync(configPath),
-				backupContext,
-				options,
-			)
-		) {
-			summary.backedUp += 1;
-		}
-		if (!options.dryRun) {
-			await mkdir(dirname(configPath), { recursive: true });
-			await writeFile(configPath, nextConfig);
-		}
-		summary.updated += 1;
-	} else {
-		summary.unchanged += 1;
-	}
+	if (managedHooksPlan && !managedHooksPlan.ok) throw managedHooksPlan.error;
 
-	const existingHooksContent = existsSync(hooksPath)
-		? await readFile(hooksPath, "utf-8")
-		: null;
-	await migrateLegacyHooksJsonTrustStateToConfig(
-		configPath,
-		existingHooksContent,
-		backupContext,
-		summary,
+	const managedHookTrustState = managedHooksPlan?.finalTrustState ?? {};
+	const priorManagedHookTrustState = managedHooksPlan?.priorTrustState ?? {};
+	const legacyHookTrustState = managedHooksPlan?.legacyTrustState ?? {};
+	const configAfterLegacyCleanup = buildPluginModeLegacyConfig(
+		existingConfig,
 		options,
 	);
-	if (options.pluginScopedHooks) {
-		await cleanupPluginModeManagedHooksJson(
-			existingHooksContent,
-			hooksPath,
-			backupContext,
-			summary,
-			options,
-		);
-	} else {
-		const hooksConfig = mergeManagedCodexHooksConfig(
-			existingHooksContent,
+	const configWithRuntimeFeatures = upsertPluginModeRuntimeFeatureFlags(
+		configAfterLegacyCleanup,
+		options.codexHookFeatureFlag,
+		{
+			pluginScopedHooks: options.pluginScopedHooks,
+			preserveNativeHooks:
+				options.pluginScopedHooks && managedHooksPlan?.hasForeignHooks === true,
+		},
+	);
+	return {
+		finalConfig: upsertManagedCodexHookTrustState(
+			configWithRuntimeFeatures,
 			pkgRoot,
 			hooksPath,
-			{ platform: process.platform, codexHomeDir },
-		);
-		await syncManagedContent(
-			hooksConfig,
-			hooksPath,
-			summary,
-			backupContext,
-			options,
-			`native hooks ${hooksPath}`,
-		);
-		await syncManagedWindowsNativeHookShim(
-			codexHomeDir,
-			pkgRoot,
-			summary,
-			backupContext,
-			options,
-		);
-	}
-
-	if (options.verbose) {
-		const surface = options.pluginScopedHooks
-			? "official plugin-scoped hooks"
-			: `legacy native hooks at ${hooksPath}`;
-		console.log(
-			`  ${options.dryRun ? "would configure" : "configured"} plugin-mode ${surface} and runtime feature flags`,
-		);
-	}
+			{
+				...managedHookOptions,
+				managedTrustState: managedHookTrustState,
+				priorManagedHookTrustState,
+				legacyHookTrustState,
+			},
+		),
+		hooksFinalContent: managedHooksPlan ? managedHooksPlan.finalContent : existingHooksContent,
+	hooksRemovedCount: managedHooksPlan?.removedCount ?? 0,
+		cleanedLegacyConfig: configAfterLegacyCleanup !== existingConfig,
+		diagnostics: managedHooksPlan?.diagnostics ?? [],
+	};
 }
 
-async function applyPluginDeveloperInstructionsDefault(
-	configPath: string,
-	backupContext: SetupBackupContext,
-	summary: SetupCategorySummary,
-	options: Pick<SetupOptions, "dryRun" | "verbose"> & {
-		decision: PluginDeveloperInstructionsDecision;
-	},
-): Promise<"updated" | "exists" | "skipped"> {
-	const existing = existsSync(configPath)
-		? await readFile(configPath, "utf-8")
-		: "";
-	if (options.decision.action === "preserve") {
-		summary.skipped += 1;
-		if (options.verbose) {
-			console.log(
-				`  preserved plugin developer_instructions default: ${options.decision.reason}`,
-			);
-		}
-		return options.decision.state === "missing" ? "skipped" : "exists";
+interface PluginDeveloperInstructionsConfigPlan {
+	finalConfig: string;
+	result: "updated" | "exists" | "skipped";
+}
+
+function buildPluginDeveloperInstructionsConfigPlan(
+	existingConfig: string,
+	decision: PluginDeveloperInstructionsDecision,
+): PluginDeveloperInstructionsConfigPlan {
+	if (decision.action === "preserve") {
+		return {
+			finalConfig: existingConfig,
+			result: decision.state === "missing" ? "skipped" : "exists",
+		};
 	}
 
 	const line = `developer_instructions = ${JSON.stringify(OMX_PLUGIN_DEVELOPER_INSTRUCTIONS)}`;
 	const hasExistingDeveloperInstructions = rootHasTomlKey(
-		existing,
+		existingConfig,
 		"developer_instructions",
 	);
-	if (hasExistingDeveloperInstructions && options.decision.action === "add") {
-		summary.skipped += 1;
-		if (options.verbose) {
-			console.log(
-				"  skipped plugin developer_instructions default: root developer_instructions already exists",
-			);
-		}
-		return "exists";
+	if (hasExistingDeveloperInstructions && decision.action === "add") {
+		return { finalConfig: existingConfig, result: "exists" };
 	}
-
-	const nextConfig = hasExistingDeveloperInstructions
-		? replaceRootTomlKey(existing, "developer_instructions", line)
-		: insertRootTomlKey(existing, line);
-	const destinationExists = existsSync(configPath);
-	if (
-		await ensureBackup(configPath, destinationExists, backupContext, options)
-	) {
-		summary.backedUp += 1;
-	}
-	if (!options.dryRun) {
-		await mkdir(dirname(configPath), { recursive: true });
-		await writeFile(configPath, nextConfig);
-	}
-	summary.updated += 1;
-	if (options.verbose) {
-		console.log(
-			`  ${options.dryRun ? "would add" : "added"} plugin developer_instructions default to ${configPath}`,
-		);
-	}
-	return "updated";
+	return {
+		finalConfig: hasExistingDeveloperInstructions
+			? replaceRootTomlKey(existingConfig, "developer_instructions", line)
+			: insertRootTomlKey(existingConfig, line),
+		result: "updated",
+	};
 }
 
-async function cleanupPluginModeLegacyConfig(
-	configPath: string,
-	backupContext: SetupBackupContext,
-	options: Pick<SetupOptions, "dryRun" | "verbose"> & {
+function buildPluginModeLegacyConfig(
+	original: string,
+	options: {
 		preserveFirstPartyMcp?: boolean;
 		developerInstructionsDecision: PluginDeveloperInstructionsDecision;
 	},
-): Promise<boolean> {
-	if (!existsSync(configPath)) return false;
-
-	const original = await readFile(configPath, "utf-8");
+): string {
 	const preservedFirstPartyMcp = options.preserveFirstPartyMcp
 		? extractFirstPartyOmxMcpSections(original)
 		: "";
@@ -2032,26 +2725,317 @@ async function cleanupPluginModeLegacyConfig(
 		config = `${config.trimEnd()}\n\n${preservedFirstPartyMcp}\n`;
 	}
 	config = config.trim();
-	const nextConfig = config.length > 0 ? `${config}\n` : "";
+	return config.length > 0 ? `${config}\n` : "";
+}
 
-	if (nextConfig === original) return false;
+interface NativeHookSetupTransactionPlan {
+	artifacts: NativeHookTransactionArtifact[];
+	preconditions: NativeHookTransactionPrecondition[];
+	finalConfig: string;
+	hooksRemovedCount: number;
+	pluginScopedHooks: boolean;
+	cleanedLegacyConfig: boolean;
+	pluginMarketplaceResult: "updated" | "unchanged" | "unavailable";
+	pluginDeveloperInstructionsResult: "updated" | "exists" | "skipped";
+	diagnostics: readonly { message: string }[];
+	modelUpgrade?: { currentModel: string; modelOverride: string };
+	repairedLegacyTeamRunTable: boolean;
+}
 
-	if (await ensureBackup(configPath, true, backupContext, options)) {
-		// backup created for pre-existing config
-	}
-	if (!options.dryRun) {
-		if (nextConfig.length === 0) {
-			await rm(configPath, { force: true });
+interface PlanNativeHookSetupTransactionOptions {
+	configPath: string;
+	hooksPath: string;
+	codexHomeDir: string;
+	pkgRoot: string;
+	platform: NodeJS.Platform;
+	isPluginInstallMode: boolean;
+	pluginScopedHooks: boolean;
+	codexHookFeatureFlag: CodexHookFeatureFlag;
+	preserveFirstPartyMcp: boolean;
+	removeFirstPartyMcp: boolean;
+	pluginDeveloperInstructionsDecision: PluginDeveloperInstructionsDecision;
+	pluginMarketplaceAvailable: boolean;
+	sharedMcpRegistry: UnifiedMcpRegistryLoadResult;
+	mcpMode: SetupMcpMode;
+	resolvedScope: SetupScope;
+	modelUpgradePrompt?: SetupOptions["modelUpgradePrompt"];
+	statusLinePreset?: HudPreset;
+	forceStatusLinePreset: boolean;
+	configSnapshot: NativeHookTransactionArtifactSnapshot;
+	notifyMetadataSnapshot?: NativeHookTransactionArtifactSnapshot;
+}
+
+async function planNativeHookSetupTransaction(
+	options: PlanNativeHookSetupTransactionOptions,
+): Promise<NativeHookSetupTransactionPlan> {
+	const existingConfigSnapshot = options.configSnapshot;
+	const existingHooksSnapshot = await captureNativeHookTransactionArtifact(
+		options.hooksPath,
+		`native hooks ${options.hooksPath}`,
+	);
+	const existingConfig = existingConfigSnapshot.bytes
+		? decodeNativeHookTransactionUtf8(
+			existingConfigSnapshot.bytes,
+			`config ${options.configPath}`,
+		)
+		: "";
+	const existingHooksContent = existingHooksSnapshot.bytes
+		? decodeNativeHookTransactionUtf8(
+			existingHooksSnapshot.bytes,
+			`native hooks ${options.hooksPath}`,
+		)
+		: null;
+	let finalConfig = existingConfig;
+	let finalHooksContent = existingHooksContent;
+	let hooksRemovedCount = 0;
+	let cleanedLegacyConfig = false;
+	let pluginMarketplaceResult: NativeHookSetupTransactionPlan["pluginMarketplaceResult"] = "unchanged";
+	let pluginDeveloperInstructionsResult: NativeHookSetupTransactionPlan["pluginDeveloperInstructionsResult"] = "skipped";
+	let diagnostics: readonly { message: string }[] = [];
+	let notifyMetadataArtifact: NativeHookTransactionArtifact | null = null;
+	let notifyMetadataPrecondition: NativeHookTransactionPrecondition | null = null;
+	let modelUpgrade: NativeHookSetupTransactionPlan["modelUpgrade"];
+	let repairedLegacyTeamRunTable = false;
+
+	if (options.isPluginInstallMode) {
+		const pluginPlan = buildPluginModeHooksConfigPlan(
+			existingConfig,
+			existingHooksContent,
+			options.pkgRoot,
+			options.hooksPath,
+			options.codexHomeDir,
+			{
+				codexHookFeatureFlag: options.codexHookFeatureFlag,
+				pluginScopedHooks: options.pluginScopedHooks,
+				preserveFirstPartyMcp: options.preserveFirstPartyMcp,
+				developerInstructionsDecision:
+					options.pluginDeveloperInstructionsDecision,
+				platform: options.platform,
+			},
+		);
+		finalConfig = pluginPlan.finalConfig;
+		finalHooksContent = pluginPlan.hooksFinalContent;
+		hooksRemovedCount = pluginPlan.hooksRemovedCount;
+		cleanedLegacyConfig = pluginPlan.cleanedLegacyConfig;
+		diagnostics = pluginPlan.diagnostics;
+
+		if (options.pluginMarketplaceAvailable) {
+			const withMarketplace = upsertLocalOmxMarketplaceRegistration(
+				upsertLocalOmxPluginMcpServerEnablement(
+					upsertLocalOmxPluginEnablement(finalConfig),
+					options.mcpMode === "compat",
+					{ removeWhenDisabled: options.removeFirstPartyMcp },
+				),
+				options.pkgRoot,
+			);
+			pluginMarketplaceResult =
+				withMarketplace === finalConfig ? "unchanged" : "updated";
+			finalConfig = withMarketplace;
 		} else {
-			await writeFile(configPath, nextConfig);
+			pluginMarketplaceResult = "unavailable";
+		}
+		const developerInstructionsPlan = buildPluginDeveloperInstructionsConfigPlan(
+			finalConfig,
+			options.pluginDeveloperInstructionsDecision,
+		);
+		finalConfig = developerInstructionsPlan.finalConfig;
+		pluginDeveloperInstructionsResult = developerInstructionsPlan.result;
+	} else {
+		const managedHooksPlan = planManagedCodexHooksMerge(
+			existingHooksContent,
+			options.pkgRoot,
+			options.hooksPath,
+			{
+				platform: options.platform,
+				codexHomeDir: options.codexHomeDir,
+			},
+		);
+		if (!managedHooksPlan.ok) throw managedHooksPlan.error;
+		if (managedHooksPlan.finalContent === null) {
+			throw new Error("Native hook merge unexpectedly produced no hooks.json content.");
+		}
+		finalHooksContent = managedHooksPlan.finalContent;
+		hooksRemovedCount = managedHooksPlan.removedCount;
+		diagnostics = managedHooksPlan.diagnostics;
+		const managedConfigPlan = await planManagedConfig(
+			options.hooksPath,
+			options.pkgRoot,
+			options.sharedMcpRegistry,
+			options.mcpMode,
+			options.preserveFirstPartyMcp,
+			options.resolvedScope,
+			options.codexHomeDir,
+			{
+				modelUpgradePrompt: options.modelUpgradePrompt,
+				existingConfig,
+				verbose: false,
+				statusLinePreset: options.statusLinePreset,
+				forceStatusLinePreset: options.forceStatusLinePreset,
+				codexHookFeatureFlag: options.codexHookFeatureFlag,
+				managedHookTrustState: managedHooksPlan.finalTrustState,
+				priorManagedHookTrustState: managedHooksPlan.priorTrustState,
+				legacyHookTrustState: managedHooksPlan.legacyTrustState,
+				hookCommandPlatform: options.platform,
+				notifyMetadataSnapshot: options.notifyMetadataSnapshot,
+			},
+		);
+		finalConfig = managedConfigPlan.finalConfig;
+		if (
+			managedConfigPlan.currentModel &&
+			managedConfigPlan.modelOverride &&
+			managedConfigPlan.currentModel !== managedConfigPlan.modelOverride
+		) {
+			modelUpgrade = {
+				currentModel: managedConfigPlan.currentModel,
+				modelOverride: managedConfigPlan.modelOverride,
+			};
+		}
+		repairedLegacyTeamRunTable = managedConfigPlan.repairedLegacyTeamRunTable;
+		const notifyPlan = managedConfigPlan.notifyPlan;
+		if (notifyPlan.metadataSnapshot && notifyPlan.metadataPath) {
+			notifyMetadataPrecondition = nativeHookTransactionPrecondition(
+				"metadata",
+				notifyPlan.metadataPath,
+				`notification metadata ${notifyPlan.metadataPath}`,
+				notifyPlan.metadataSnapshot,
+			);
+		}
+		if (notifyPlan.metadataPath && notifyPlan.metadata) {
+			const metadataBefore = options.notifyMetadataSnapshot;
+			if (!metadataBefore) {
+				throw new Error(
+					`Missing notification metadata snapshot for ${notifyPlan.metadataPath}; refusing to plan from a newly captured baseline.`,
+				);
+			}
+			notifyMetadataArtifact = nativeHookTransactionArtifact(
+				"metadata",
+				notifyPlan.metadataPath,
+				`notification metadata ${notifyPlan.metadataPath}`,
+				metadataBefore,
+				Buffer.from(JSON.stringify(notifyPlan.metadata, null, 2) + "\n", "utf-8"),
+			);
+			if (!notifyMetadataPrecondition) {
+				notifyMetadataPrecondition = nativeHookTransactionPrecondition(
+					"metadata",
+					notifyPlan.metadataPath,
+					`notification metadata ${notifyPlan.metadataPath}`,
+					metadataBefore,
+				);
+			}
 		}
 	}
-	if (options.verbose) {
-		console.log(
-			`  ${options.dryRun ? "would clean" : nextConfig.length === 0 ? "removed" : "cleaned"} legacy OMX config ${basename(configPath)}`,
+
+	if (options.isPluginInstallMode && options.sharedMcpRegistry.servers.length > 0) {
+		finalConfig = mergeSharedMcpRegistryBlock(
+			finalConfig,
+			options.sharedMcpRegistry.servers,
+			options.sharedMcpRegistry.sourcePath,
 		);
 	}
-	return true;
+	try {
+		TOML.parse(finalConfig);
+	} catch (error) {
+		throw new Error(
+			`Refusing to write invalid planned config.toml: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+
+	const hookArtifact = nativeHookTransactionArtifact(
+		"hooks",
+		options.hooksPath,
+		`native hooks ${options.hooksPath}`,
+		existingHooksSnapshot,
+		finalHooksContent === null ? null : Buffer.from(finalHooksContent, "utf-8"),
+		options.platform,
+	);
+	const configArtifact = nativeHookTransactionArtifact(
+		"config",
+		options.configPath,
+		`config ${options.configPath}`,
+		existingConfigSnapshot,
+		Buffer.from(finalConfig, "utf-8"),
+	);
+
+	let shimArtifact: NativeHookTransactionArtifact | null = null;
+	let shimPrecondition: NativeHookTransactionPrecondition | null = null;
+	if (options.platform === "win32") {
+		const shimPath = buildManagedCodexNativeHookWindowsShimPath(options.codexHomeDir);
+		const shimSnapshot = await captureNativeHookTransactionArtifact(
+			shimPath,
+			`native hook Windows shim ${shimPath}`,
+		);
+		const shimAfter = Buffer.from(
+			buildManagedCodexNativeHookWindowsShimContent(options.pkgRoot),
+			"utf-8",
+		);
+		assertWindowsNativeHookShimOwnership(shimPath, shimSnapshot.bytes, shimAfter);
+		const shimReferencedByFinalHooks = finalHooksContent
+			?.toLowerCase()
+			.includes("omx-native-hook-windows-shim.ps1")
+			?? false;
+		shimArtifact = nativeHookTransactionArtifact(
+			"shim",
+			shimPath,
+			`native hook Windows shim ${shimPath}`,
+			shimSnapshot,
+			options.isPluginInstallMode && options.pluginScopedHooks && !shimReferencedByFinalHooks
+				? null
+				: shimAfter,
+		);
+		shimPrecondition = nativeHookTransactionPrecondition(
+			"shim",
+			shimPath,
+			`native hook Windows shim ${shimPath}`,
+			shimSnapshot,
+		);
+	}
+
+	const windowsShimCreateOrUpdateArtifact =
+		shimArtifact && shimArtifact.after !== null ? shimArtifact : null;
+	const windowsShimDeletionArtifact =
+		shimArtifact && shimArtifact.after === null ? shimArtifact : null;
+	const artifacts = options.platform === "win32"
+		? [
+				windowsShimCreateOrUpdateArtifact,
+				hookArtifact,
+				notifyMetadataArtifact,
+				configArtifact,
+				windowsShimDeletionArtifact,
+			]
+		: [hookArtifact, notifyMetadataArtifact, configArtifact];
+	const preconditions = [
+		shimPrecondition,
+		nativeHookTransactionPrecondition(
+			"hooks",
+			options.hooksPath,
+			`native hooks ${options.hooksPath}`,
+			existingHooksSnapshot,
+		),
+		nativeHookTransactionPrecondition(
+			"config",
+			options.configPath,
+			`config ${options.configPath}`,
+			existingConfigSnapshot,
+		),
+		notifyMetadataPrecondition,
+	];
+	return {
+		artifacts: artifacts.filter(
+			(artifact): artifact is NativeHookTransactionArtifact => artifact !== null,
+		),
+		preconditions: preconditions.filter(
+			(precondition): precondition is NativeHookTransactionPrecondition => precondition !== null,
+		),
+		finalConfig,
+		hooksRemovedCount,
+		pluginScopedHooks: options.pluginScopedHooks,
+		cleanedLegacyConfig,
+		pluginMarketplaceResult,
+		pluginDeveloperInstructionsResult,
+		diagnostics,
+		modelUpgrade,
+		repairedLegacyTeamRunTable,
+	};
 }
 
 export async function setup(options: SetupOptions = {}): Promise<void> {
@@ -2175,9 +3159,45 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 		requestedSkipNativeAgentRefresh ||
 		process.env[SKIP_NATIVE_AGENT_REFRESH_ENV] === "1";
 	const scopeDirs = resolveScopeDirectories(resolvedScope.scope, projectRoot);
-	const existingConfigForMcpMigration = existsSync(scopeDirs.codexConfigFile)
-		? await readFile(scopeDirs.codexConfigFile, "utf-8")
+	const nativeHookTransactionPlatform = nativeHookPlatform();
+	const nativeHookTransactionAncestorPrecondition =
+		await captureNativeHookTransactionAncestorPrecondition(
+			scopeDirs.codexHomeDir,
+			[
+				scopeDirs.codexConfigFile,
+				scopeDirs.codexHooksFile,
+				getNotifyMetadataPath(scopeDirs.codexHomeDir),
+				...(nativeHookTransactionPlatform === "win32"
+					? [
+							buildManagedCodexNativeHookWindowsShimPath(
+								scopeDirs.codexHomeDir,
+							),
+						]
+					: []),
+			],
+		);
+
+	const existingConfigForMcpMigrationSnapshot =
+		await captureNativeHookTransactionArtifact(
+			scopeDirs.codexConfigFile,
+			`config ${scopeDirs.codexConfigFile}`,
+		);
+	const existingConfigForMcpMigration = existingConfigForMcpMigrationSnapshot.bytes
+		? decodeNativeHookTransactionUtf8(
+			existingConfigForMcpMigrationSnapshot.bytes,
+			`config ${scopeDirs.codexConfigFile}`,
+		)
 		: "";
+	const notifyMetadataSnapshot = configRequiresNotificationMetadataSnapshot(
+		existingConfigForMcpMigration,
+		pkgRoot,
+		resolvedScope.scope,
+	)
+		? await captureNativeHookTransactionArtifact(
+			getNotifyMetadataPath(scopeDirs.codexHomeDir),
+			`notification metadata ${getNotifyMetadataPath(scopeDirs.codexHomeDir)}`,
+		)
+		: undefined;
 	const firstPartyMcpRegistrationKinds = [
 		hasFirstPartyOmxMcpRegistrations(existingConfigForMcpMigration)
 			? "config.toml [mcp_servers.omx_*]"
@@ -2217,14 +3237,15 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 	const pluginDeveloperInstructionsDecision: PluginDeveloperInstructionsDecision =
 		isPluginInstallMode
 			? await resolvePluginDeveloperInstructionsDecision(
-					scopeDirs.codexConfigFile,
-					{ pluginDeveloperInstructionsPrompt },
-				)
+				existingConfigForMcpMigration,
+				scopeDirs.codexConfigFile,
+				{ pluginDeveloperInstructionsPrompt },
+			)
 			: {
-					action: "preserve",
-					state: "custom",
-					reason: "non-plugin setup mode",
-				};
+				action: "preserve",
+				state: "custom",
+				reason: "non-plugin setup mode",
+			};
 	let pluginAgentsMdPathExists = false;
 	let pluginAgentsMdIsSymlink = false;
 	try {
@@ -2244,6 +3265,60 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 					? await pluginAgentsMdPrompt(pluginAgentsMdDst)
 					: await promptForPluginAgentsMdDefault(pluginAgentsMdDst)
 		: false;
+	const codexHookFeatureSupport = resolveCodexHookFeatureSupportForCli({
+		codexFeaturesProbe: options.codexFeaturesProbe,
+		codexVersionProbe: options.codexVersionProbe,
+	});
+	const codexHookFeatureFlag = codexHookFeatureSupport.hookFeatureFlag;
+	const pluginScopedHooksSupported = codexHookFeatureSupport.pluginScopedHooks;
+	const shouldSyncSharedMcpRegistry = resolvedMcpMode.mcpMode === "compat";
+	const registryCandidates = getUnifiedMcpRegistryCandidates();
+	const defaultRegistryCandidates = registryCandidates.slice(0, 1);
+	const sharedMcpRegistry: UnifiedMcpRegistryLoadResult = shouldSyncSharedMcpRegistry
+		? await loadUnifiedMcpRegistry({
+				candidates: options.mcpRegistryCandidates ?? defaultRegistryCandidates,
+			})
+		: { servers: [], warnings: [] };
+	const legacyRegistryCandidate = getLegacyUnifiedMcpRegistryCandidate();
+	const preflightMarketplace = isPluginInstallMode
+		? await resolvePackagedOmxMarketplace(pkgRoot)
+		: null;
+	const statusLinePreset = isPluginInstallMode
+		? undefined
+		: await resolveStatusLinePresetForSetup(projectRoot, { force });
+	const nativeHookSetupTransaction = await planNativeHookSetupTransaction({
+		configPath: scopeDirs.codexConfigFile,
+		hooksPath: scopeDirs.codexHooksFile,
+		codexHomeDir: scopeDirs.codexHomeDir,
+		pkgRoot,
+		platform: nativeHookTransactionPlatform,
+
+		isPluginInstallMode,
+		pluginScopedHooks: pluginScopedHooksSupported,
+		codexHookFeatureFlag,
+		preserveFirstPartyMcp:
+			shouldOfferFirstPartyMcpRemoval && !removeFirstPartyMcpRegistrations,
+		removeFirstPartyMcp: removeFirstPartyMcpRegistrations,
+		pluginDeveloperInstructionsDecision,
+		pluginMarketplaceAvailable: preflightMarketplace !== null,
+		sharedMcpRegistry,
+		mcpMode: resolvedMcpMode.mcpMode,
+		resolvedScope: resolvedScope.scope,
+		modelUpgradePrompt,
+		statusLinePreset,
+		forceStatusLinePreset: force,
+		configSnapshot: existingConfigForMcpMigrationSnapshot,
+		notifyMetadataSnapshot,
+	});
+	const summary = createEmptyRunSummary();
+	await commitNativeHookTransaction(
+		nativeHookSetupTransaction.artifacts,
+		nativeHookSetupTransaction.preconditions,
+		nativeHookTransactionAncestorPrecondition,
+		backupContext,
+		summary.config,
+		{ dryRun, verbose },
+	);
 
 	console.log("oh-my-codex setup");
 	console.log("=================\n");
@@ -2337,7 +3412,6 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 	}
 
 	const catalogCounts = getCatalogHeadlineCounts();
-	const summary = createEmptyRunSummary();
 
 	// Step 2: Install agent prompts
 	console.log("[2/8] Installing agent prompts...");
@@ -2485,14 +3559,8 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 
 	// Step 5: Update config.toml
 	console.log("[5/8] Updating config.toml...");
-	let resolvedConfig = "";
-	let omxManagesTui = false;
-	const codexHookFeatureSupport = resolveCodexHookFeatureSupportForCli({
-		codexFeaturesProbe: options.codexFeaturesProbe,
-		codexVersionProbe: options.codexVersionProbe,
-	});
-	const codexHookFeatureFlag = codexHookFeatureSupport.hookFeatureFlag;
-	const pluginScopedHooksSupported = codexHookFeatureSupport.pluginScopedHooks;
+	const resolvedConfig = nativeHookSetupTransaction.finalConfig;
+	const omxManagesTui = !isPluginInstallMode;
 	if (verbose) {
 		console.log(
 			`  Native Codex hook feature flag: [features].${codexHookFeatureFlag}`,
@@ -2501,15 +3569,6 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 			`  Plugin-scoped Codex hooks: ${pluginScopedHooksSupported ? "supported" : "not reported; using legacy setup fallback"}`,
 		);
 	}
-	const shouldSyncSharedMcpRegistry = resolvedMcpMode.mcpMode === "compat";
-	const registryCandidates = getUnifiedMcpRegistryCandidates();
-	const defaultRegistryCandidates = registryCandidates.slice(0, 1);
-	const sharedMcpRegistry: UnifiedMcpRegistryLoadResult = shouldSyncSharedMcpRegistry
-		? await loadUnifiedMcpRegistry({
-				candidates: options.mcpRegistryCandidates ?? defaultRegistryCandidates,
-			})
-		: { servers: [], warnings: [] };
-	const legacyRegistryCandidate = getLegacyUnifiedMcpRegistryCandidate();
 	if (
 		shouldSyncSharedMcpRegistry &&
 		!options.mcpRegistryCandidates &&
@@ -2529,54 +3588,54 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 	for (const warning of sharedMcpRegistry.warnings) {
 		console.log(`  warning: ${warning}`);
 	}
-	if (isPluginInstallMode) {
-		const configCleaned = await cleanupPluginModeLegacyConfig(
-			scopeDirs.codexConfigFile,
-			backupContext,
-			{
-				dryRun,
-				verbose,
-				preserveFirstPartyMcp:
-					shouldOfferFirstPartyMcpRemoval &&
-					!removeFirstPartyMcpRegistrations,
-				developerInstructionsDecision: pluginDeveloperInstructionsDecision,
-			},
-		);
-		if (configCleaned) summary.config.removed += 1;
+	logManagedCodexHooksPlanDiagnostics(nativeHookSetupTransaction.diagnostics, {
+		verbose,
+	});
+	const changedHookArtifact = nativeHookSetupTransaction.artifacts.some(
+		(artifact) => artifact.kind === "hooks",
+	);
+	const changedShimArtifact = nativeHookSetupTransaction.artifacts.some(
+		(artifact) => artifact.kind === "shim",
+	);
+	const changedConfigArtifact = nativeHookSetupTransaction.artifacts.some(
+		(artifact) => artifact.kind === "config",
+	);
+	if (changedHookArtifact) {
+		if (
+			isPluginInstallMode &&
+			nativeHookSetupTransaction.pluginScopedHooks &&
+			nativeHookSetupTransaction.hooksRemovedCount > 0
+		) {
+			summary.config.removed += nativeHookSetupTransaction.hooksRemovedCount;
+		} else {
+			summary.config.updated += 1;
+		}
+	} else if (!isPluginInstallMode || !nativeHookSetupTransaction.pluginScopedHooks) {
+		summary.config.unchanged += 1;
+	}
+	if (changedShimArtifact) summary.config.updated += 1;
+	if (changedConfigArtifact) summary.config.updated += 1;
+	else summary.config.unchanged += 1;
+	if (verbose && nativeHookSetupTransaction.modelUpgrade) {
 		console.log(
-			configCleaned
-				? `  ${dryRun ? "Would clean" : "Cleaned"} legacy OMX config entries for plugin mode.\n`
-				: "  Config refresh skipped; no legacy OMX config entries found.\n",
+			`  ${dryRun ? "would update" : "updated"} root model from ${nativeHookSetupTransaction.modelUpgrade.currentModel} to ${nativeHookSetupTransaction.modelUpgrade.modelOverride}`,
 		);
+	}
 
-		await applyPluginModeHooksConfig(
-			scopeDirs.codexConfigFile,
-			scopeDirs.codexHooksFile,
-			pkgRoot,
-			scopeDirs.codexHomeDir,
-			backupContext,
-			summary.config,
-			{
-				dryRun,
-				verbose,
-				codexHookFeatureFlag,
-				pluginScopedHooks: pluginScopedHooksSupported,
-			},
-		);
-		const pluginMarketplaceResult = await ensurePluginMarketplaceRegistration(
-			scopeDirs.codexConfigFile,
-			pkgRoot,
-			resolvedMcpMode.mcpMode,
-			removeFirstPartyMcpRegistrations,
-			backupContext,
-			summary.config,
-			{ dryRun, verbose },
-		);
-		if (pluginMarketplaceResult === "unavailable") {
+	if (isPluginInstallMode) {
+		if (nativeHookSetupTransaction.cleanedLegacyConfig) {
+			summary.config.removed += 1;
+			console.log(
+				`  ${dryRun ? "Would clean" : "Cleaned"} legacy OMX config entries for plugin mode.\n`,
+			);
+		} else {
+			console.log("  Config refresh skipped; no legacy OMX config entries found.\n");
+		}
+		if (nativeHookSetupTransaction.pluginMarketplaceResult === "unavailable") {
 			console.log(
 				`  warning: packaged ${OMX_LOCAL_MARKETPLACE_NAME} Codex plugin marketplace metadata not found; /skills plugin discovery was not registered.`,
 			);
-		} else if (pluginMarketplaceResult === "updated") {
+		} else if (nativeHookSetupTransaction.pluginMarketplaceResult === "updated") {
 			console.log(
 				`  ${dryRun ? "Would register" : "Registered"} local Codex plugin marketplace ${OMX_LOCAL_MARKETPLACE_NAME} (${pkgRoot}).`,
 			);
@@ -2585,7 +3644,6 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 				`  Local Codex plugin marketplace ${OMX_LOCAL_MARKETPLACE_NAME} already registered (${pkgRoot}).`,
 			);
 		}
-		const packagedMarketplace = await resolvePackagedOmxMarketplace(pkgRoot);
 		const pluginCacheRefresh = await refreshOmxPluginDiscoveryCache(
 			pkgRoot,
 			{
@@ -2605,7 +3663,7 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 		}
 		const pluginCacheMaterialize = await materializePackagedOmxPluginCache(
 			scopeDirs.codexHomeDir,
-			packagedMarketplace,
+			preflightMarketplace,
 			{ dryRun, teamMode: resolvedTeamMode },
 		);
 		if (pluginCacheMaterialize.status === "materialized") {
@@ -2615,51 +3673,27 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 		} else if (pluginCacheMaterialize.status === "unchanged") {
 			console.log("  Local Codex plugin cache already exposes packaged OMX skills.");
 		}
-		if (pluginCacheMaterialize.status === "materialized" || pluginCacheMaterialize.status === "unchanged") {
+		if (
+			pluginCacheMaterialize.status === "materialized" ||
+			pluginCacheMaterialize.status === "unchanged"
+		) {
 			console.log("  Start a new Codex session if /skills still shows stale OMX plugin skill metadata; the current session may keep its in-memory plugin registry until restart.");
 		}
-		if (shouldSyncSharedMcpRegistry) {
-			resolvedConfig = await syncSharedMcpRegistryIntoConfig(
-				scopeDirs.codexConfigFile,
+		if (shouldSyncSharedMcpRegistry && resolvedScope.scope === "user") {
+			await syncClaudeCodeMcpSettings(
 				sharedMcpRegistry,
 				summary.config,
 				backupContext,
 				{ dryRun, verbose },
 			);
-			if (resolvedScope.scope === "user") {
-				await syncClaudeCodeMcpSettings(
-					sharedMcpRegistry,
-					summary.config,
-					backupContext,
-					{ dryRun, verbose },
-				);
-			}
 		}
-		resolvedConfig = existsSync(scopeDirs.codexConfigFile)
-			? await readFile(scopeDirs.codexConfigFile, "utf-8")
-			: "";
 		console.log(
 			pluginScopedHooksSupported
 				? "  Plugin-scoped Codex hooks and runtime feature flags refresh complete (plugin_hooks, goals).\n"
 				: `  Native Codex hooks fallback and runtime feature flags refresh complete (${scopeDirs.codexHooksFile}; hooks, goals).\n`,
 		);
-
 		if (pluginDeveloperInstructionsDecision.action !== "preserve") {
-			const developerInstructionsResult =
-				await applyPluginDeveloperInstructionsDefault(
-					scopeDirs.codexConfigFile,
-					backupContext,
-					summary.config,
-					{
-						dryRun,
-						verbose,
-						decision: pluginDeveloperInstructionsDecision,
-					},
-				);
-			if (developerInstructionsResult === "updated") {
-				resolvedConfig = existsSync(scopeDirs.codexConfigFile)
-					? await readFile(scopeDirs.codexConfigFile, "utf-8")
-					: "";
+			if (nativeHookSetupTransaction.pluginDeveloperInstructionsResult === "updated") {
 				console.log(
 					`  ${dryRun ? "Would add" : "Added"} plugin-mode developer_instructions default (${scopeDirs.codexConfigFile}).\n`,
 				);
@@ -2674,37 +3708,6 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 			);
 		}
 	} else {
-		const statusLinePreset = await resolveStatusLinePresetForSetup(
-			projectRoot,
-			{ force },
-		);
-		const managedConfig = await updateManagedConfig(
-			scopeDirs.codexConfigFile,
-			scopeDirs.codexHooksFile,
-			pkgRoot,
-			sharedMcpRegistry,
-			resolvedMcpMode.mcpMode,
-			shouldOfferFirstPartyMcpRemoval && !removeFirstPartyMcpRegistrations,
-			resolvedScope.scope,
-			scopeDirs.codexHomeDir,
-			summary.config,
-			backupContext,
-			{
-				dryRun,
-				modelUpgradePrompt,
-				verbose,
-				statusLinePreset,
-				forceStatusLinePreset: force,
-				codexHookFeatureFlag,
-			},
-		);
-		resolvedConfig = managedConfig.finalConfig;
-		omxManagesTui = managedConfig.omxManagesTui;
-		if (managedConfig.repairedLegacyTeamRunTable) {
-			console.log(
-				"  Removed retired [mcp_servers.omx_team_run] config during refresh.",
-			);
-		}
 		if (shouldSyncSharedMcpRegistry && resolvedScope.scope === "user") {
 			await syncClaudeCodeMcpSettings(
 				sharedMcpRegistry,
@@ -2713,39 +3716,12 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 				{ dryRun, verbose },
 			);
 		}
+		if (nativeHookSetupTransaction.repairedLegacyTeamRunTable) {
+			console.log(
+				"  Removed retired [mcp_servers.omx_team_run] config during refresh.",
+			);
+		}
 		console.log(`  Config refresh complete (${scopeDirs.codexConfigFile}).\n`);
-
-		const existingHooksContent = existsSync(scopeDirs.codexHooksFile)
-			? await readFile(scopeDirs.codexHooksFile, "utf-8")
-			: null;
-		await migrateLegacyHooksJsonTrustStateToConfig(
-			scopeDirs.codexConfigFile,
-			existingHooksContent,
-			backupContext,
-			summary.config,
-			{ dryRun, verbose },
-		);
-		const hooksConfig = mergeManagedCodexHooksConfig(
-			existingHooksContent,
-			pkgRoot,
-			scopeDirs.codexHooksFile,
-			{ platform: process.platform, codexHomeDir: scopeDirs.codexHomeDir },
-		);
-		await syncManagedContent(
-			hooksConfig,
-			scopeDirs.codexHooksFile,
-			summary.config,
-			backupContext,
-			{ dryRun, verbose },
-			`native hooks ${scopeDirs.codexHooksFile}`,
-		);
-		await syncManagedWindowsNativeHookShim(
-			scopeDirs.codexHomeDir,
-			pkgRoot,
-			summary.config,
-			backupContext,
-			{ dryRun, verbose },
-		);
 		console.log(
 			`  Native Codex hooks refresh complete (${scopeDirs.codexHooksFile}).\n`,
 		);
@@ -3442,26 +4418,6 @@ async function syncNativeAgentToml(
 	}
 }
 
-async function syncManagedWindowsNativeHookShim(
-	codexHomeDir: string,
-	pkgRoot: string,
-	summary: SetupCategorySummary,
-	backupContext: SetupBackupContext,
-	options: Pick<SetupOptions, "dryRun" | "verbose">,
-): Promise<void> {
-	if (process.platform !== "win32") return;
-
-	const shimPath = buildManagedCodexNativeHookWindowsShimPath(codexHomeDir);
-	const shimContent = buildManagedCodexNativeHookWindowsShimContent(pkgRoot);
-	await syncManagedContent(
-		shimContent,
-		shimPath,
-		summary,
-		backupContext,
-		options,
-		`native hook Windows shim ${shimPath}`,
-	);
-}
 
 async function syncManagedAgentsContent(
 	content: string,
@@ -4105,10 +5061,58 @@ interface NotifyMergePlan {
 	notifyCommand: string[] | false;
 	metadataPath?: string;
 	metadata?: Record<string, unknown>;
+	metadataSnapshot?: NativeHookTransactionArtifactSnapshot;
 }
 
 function getNotifyMetadataPath(codexHomeDir: string): string {
 	return join(codexHomeDir, ".omx", "notify-dispatch.json");
+}
+
+function isOmxDispatcherNotifyCommand(
+	notifyCommand: readonly string[] | null | undefined,
+	pkgRoot: string,
+): boolean {
+	return Boolean(
+		isOmxManagedNotifyCommand(notifyCommand, pkgRoot) &&
+			notifyCommand?.some((part) =>
+				/(?:^|[\\/])notify-dispatcher\.js$/.test(part),
+			),
+	);
+}
+
+function configRequiresNotificationMetadataSnapshot(
+	existingConfig: string,
+	pkgRoot: string,
+	scope: SetupScope,
+): boolean {
+	if (scope === "project") return false;
+	const existingNotify = getRootTomlArray(existingConfig, "notify");
+	return Boolean(
+		existingNotify &&
+			(!isOmxManagedNotifyCommand(existingNotify, pkgRoot) ||
+				isOmxDispatcherNotifyCommand(existingNotify, pkgRoot)),
+	);
+}
+
+function parseNotifyMetadataSnapshot(
+	snapshot: NativeHookTransactionArtifactSnapshot,
+	label: string,
+): Record<string, unknown> | null {
+	if (snapshot.bytes === null) return null;
+	const content = decodeNativeHookTransactionUtf8(snapshot.bytes, label);
+	try {
+		const parsed = JSON.parse(content);
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+			throw new Error("expected a JSON object");
+		}
+		return parsed as Record<string, unknown>;
+	} catch (error) {
+		throw new ManagedCodexHooksPlanError(
+			"invalid_document",
+			`Refusing to read ${label}: invalid JSON (${error instanceof Error ? error.message : String(error)}).`,
+			{ label },
+		);
+	}
 }
 
 async function buildNotifyMergePlan(
@@ -4116,6 +5120,7 @@ async function buildNotifyMergePlan(
 	pkgRoot: string,
 	codexHomeDir: string,
 	scope: SetupScope,
+	metadataSnapshot?: NativeHookTransactionArtifactSnapshot,
 ): Promise<NotifyMergePlan> {
 	if (scope === "project") {
 		return { notifyCommand: false };
@@ -4136,45 +5141,44 @@ async function buildNotifyMergePlan(
 	}
 
 	if (isOmxManagedNotifyCommand(existingNotify, pkgRoot)) {
-		if (
-			!existingNotify.some((part) =>
-				/(?:^|[\\/])notify-dispatcher\.js$/.test(part),
-			)
-		) {
+		if (!isOmxDispatcherNotifyCommand(existingNotify, pkgRoot)) {
 			return { notifyCommand: omxNotify };
 		}
-		try {
-			const metadata = JSON.parse(await readFile(metadataPath, "utf-8")) as {
-				previousNotify?: unknown;
-			};
-			const previousNotify = metadata.previousNotify;
-			if (
-				Array.isArray(previousNotify) &&
-				previousNotify.every((item) => typeof item === "string")
-			) {
-				const sanitizedPreviousNotify = sanitizePreviousNotifyCommand(
-					previousNotify,
-					pkgRoot,
-				);
-				if (!sanitizedPreviousNotify) {
-					return { notifyCommand: omxNotify };
-				}
-				return {
-					notifyCommand: dispatcherNotify,
-					metadataPath,
-					metadata: {
-						managedBy: "oh-my-codex",
-						version: 1,
-						previousNotify: sanitizedPreviousNotify,
-						omxNotify,
-						dispatcherNotify,
-					},
-				};
-			}
-		} catch {
-			// Missing dispatcher metadata: fall back to plain OMX notify instead of nesting.
+		if (!metadataSnapshot) {
+			throw new Error(
+				`Missing notification metadata snapshot for ${metadataPath}; refusing to plan from a newly captured baseline.`,
+			);
 		}
-		return { notifyCommand: omxNotify };
+		const metadata = parseNotifyMetadataSnapshot(
+			metadataSnapshot,
+			`notification metadata ${metadataPath}`,
+		);
+		const previousNotify = metadata?.previousNotify;
+		if (
+			Array.isArray(previousNotify) &&
+			previousNotify.every((item) => typeof item === "string")
+		) {
+			const sanitizedPreviousNotify = sanitizePreviousNotifyCommand(
+				previousNotify,
+				pkgRoot,
+			);
+			if (!sanitizedPreviousNotify) {
+				return { notifyCommand: omxNotify, metadataPath, metadataSnapshot };
+			}
+			return {
+				notifyCommand: dispatcherNotify,
+				metadataPath,
+				metadataSnapshot,
+				metadata: {
+					managedBy: "oh-my-codex",
+					version: 1,
+					previousNotify: sanitizedPreviousNotify,
+					omxNotify,
+					dispatcherNotify,
+				},
+			};
+		}
+		return { notifyCommand: omxNotify, metadataPath, metadataSnapshot };
 	}
 
 	return {
@@ -4190,8 +5194,15 @@ async function buildNotifyMergePlan(
 	};
 }
 
-async function updateManagedConfig(
-	configPath: string,
+interface ManagedConfigWritePlan {
+	finalConfig: string;
+	currentModel: string | undefined;
+	modelOverride: string | undefined;
+	notifyPlan: NotifyMergePlan;
+	repairedLegacyTeamRunTable: boolean;
+}
+
+async function planManagedConfig(
 	hooksPath: string,
 	pkgRoot: string,
 	sharedMcpRegistry: UnifiedMcpRegistryLoadResult,
@@ -4199,21 +5210,25 @@ async function updateManagedConfig(
 	preserveExistingFirstPartyMcp: boolean,
 	scope: SetupScope,
 	codexHomeDir: string,
-	summary: SetupCategorySummary,
-	backupContext: SetupBackupContext,
-	options: Pick<SetupOptions, "dryRun" | "verbose" | "modelUpgradePrompt"> & {
+	options: Pick<SetupOptions, "verbose" | "modelUpgradePrompt"> & {
 		statusLinePreset?: HudPreset;
 		forceStatusLinePreset?: boolean;
 		codexHookFeatureFlag: CodexHookFeatureFlag;
+		hookCommandPlatform: NodeJS.Platform;
+		existingConfig?: string;
+		notifyMetadataSnapshot?: NativeHookTransactionArtifactSnapshot;
+		managedHookTrustState: Record<string, { trusted_hash: string }>;
+		priorManagedHookTrustState: Record<string, { trusted_hash: string }>;
+		legacyHookTrustState: Record<
+			string,
+			{ trusted_hash: string; enabled?: boolean }
+		>;
 	},
-): Promise<ManagedConfigResult> {
-	const existing = existsSync(configPath)
-		? await readFile(configPath, "utf-8")
-		: "";
-	const hadLegacyTeamRunTable = hasLegacyOmxTeamRunTable(existing);
-	const currentModel = getRootModelName(existing);
+): Promise<ManagedConfigWritePlan> {
+	const existingConfig = options.existingConfig ?? "";
+	const hadLegacyTeamRunTable = hasLegacyOmxTeamRunTable(existingConfig);
+	const currentModel = getRootModelName(existingConfig);
 	let modelOverride: string | undefined;
-	const omxManagesTui = true;
 
 	if (currentModel && LEGACY_SETUP_MODELS.has(currentModel)) {
 		const shouldPrompt =
@@ -4230,16 +5245,20 @@ async function updateManagedConfig(
 	}
 
 	const notifyPlan = await buildNotifyMergePlan(
-		existing,
+		existingConfig,
 		pkgRoot,
 		codexHomeDir,
 		scope,
+		options.notifyMetadataSnapshot,
 	);
-	const finalConfig = buildMergedConfig(existing, pkgRoot, {
-		includeTui: omxManagesTui,
+	const finalConfig = buildMergedConfig(existingConfig, pkgRoot, {
+		includeTui: true,
 		codexHooksFile: hooksPath,
 		codexHomeDir,
-		hookCommandPlatform: process.platform,
+		hookCommandPlatform: options.hookCommandPlatform,
+		managedHookTrustState: options.managedHookTrustState,
+		priorManagedHookTrustState: options.priorManagedHookTrustState,
+		legacyHookTrustState: options.legacyHookTrustState,
 		codexHookFeatureFlag: options.codexHookFeatureFlag,
 		modelOverride,
 		sharedMcpServers: sharedMcpRegistry.servers,
@@ -4251,108 +5270,17 @@ async function updateManagedConfig(
 		includeFirstPartyMcp: mcpMode === "compat",
 		preserveExistingFirstPartyMcp,
 	});
-	const changed = existing !== finalConfig;
-
-	if (!changed) {
-		summary.unchanged += 1;
-		return {
-			finalConfig,
-			omxManagesTui,
-			repairedLegacyTeamRunTable: false,
-		};
-	}
-
-	if (
-		await ensureBackup(
-			configPath,
-			existsSync(configPath),
-			backupContext,
-			options,
-		)
-	) {
-		summary.backedUp += 1;
-	}
-
-	if (!options.dryRun) {
-		await writeFile(configPath, finalConfig);
-		if (notifyPlan.metadataPath && notifyPlan.metadata) {
-			await mkdir(dirname(notifyPlan.metadataPath), { recursive: true });
-			await writeFile(
-				notifyPlan.metadataPath,
-				JSON.stringify(notifyPlan.metadata, null, 2) + "\n",
-			);
-		}
-	}
-
-	if (
-		options.verbose &&
-		modelOverride &&
-		currentModel &&
-		currentModel !== modelOverride
-	) {
-		console.log(
-			`  ${options.dryRun ? "would update" : "updated"} root model from ${currentModel} to ${modelOverride}`,
-		);
-	}
-
-	summary.updated += 1;
-	if (options.verbose) {
-		console.log(
-			`  ${options.dryRun ? "would update" : "updated"} config ${configPath}`,
-		);
-	}
 	return {
 		finalConfig,
-		omxManagesTui,
+		currentModel,
+		modelOverride,
+		notifyPlan,
 		repairedLegacyTeamRunTable:
 			hadLegacyTeamRunTable && !hasLegacyOmxTeamRunTable(finalConfig),
 	};
 }
 
-async function syncSharedMcpRegistryIntoConfig(
-	configPath: string,
-	sharedMcpRegistry: UnifiedMcpRegistryLoadResult,
-	summary: SetupCategorySummary,
-	backupContext: SetupBackupContext,
-	options: Pick<SetupOptions, "dryRun" | "verbose">,
-): Promise<string> {
-	if (sharedMcpRegistry.servers.length === 0) {
-		return existsSync(configPath) ? await readFile(configPath, "utf-8") : "";
-	}
 
-	const existing = existsSync(configPath)
-		? await readFile(configPath, "utf-8")
-		: "";
-	const finalConfig = mergeSharedMcpRegistryBlock(
-		existing,
-		sharedMcpRegistry.servers,
-		sharedMcpRegistry.sourcePath,
-	);
-	if (existing === finalConfig) {
-		summary.unchanged += 1;
-		return finalConfig;
-	}
-	if (
-		await ensureBackup(
-			configPath,
-			existsSync(configPath),
-			backupContext,
-			options,
-		)
-	) {
-		summary.backedUp += 1;
-	}
-	if (!options.dryRun) {
-		await writeFile(configPath, finalConfig);
-	}
-	summary.updated += 1;
-	if (options.verbose) {
-		console.log(
-			`  ${options.dryRun ? "would sync" : "synced"} shared MCP registry servers into ${configPath}`,
-		);
-	}
-	return finalConfig;
-}
 
 function getClaudeCodeSettingsPath(homeDir = homedir()): string {
 	return join(homeDir, ".claude", "settings.json");

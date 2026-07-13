@@ -19,14 +19,18 @@ import {
 	withPackagedExploreHarnessLock,
 } from "./packaged-explore-harness-lock.js";
 import {
-	checkExploreHarness,
-	checkExternalCodexProcessGuards,
 	buildPostCompactSmokeSpawnInvocation,
-	checkNativeHookDistSmoke,
-	classifyPostCompactHookStdout,
+	checkExternalCodexProcessGuards,
+	checkExploreHarness,
 	checkLegacyMultiAgentCompatibility,
+	checkNativeHookDistSmoke,
+	checkNativeHooks,
+	classifyPostCompactHookStdout,
 } from "../doctor.js";
-import { buildManagedCodexNativeHookCommand } from "../../config/codex-hooks.js";
+import {
+	buildManagedCodexNativeHookCommand,
+	buildManagedCodexNativeHookWindowsShimContent,
+} from "../../config/codex-hooks.js";
 
 const MANAGED_HOOK_EVENTS = [
 	"SessionStart",
@@ -83,6 +87,17 @@ function currentNativeHookCommand(codexHomeDir: string): string {
 	return buildManagedCodexNativeHookCommand(repoRoot(), {
 		codexHomeDir,
 	});
+}
+
+function buildWindowsShimCommand(shimPath: string): string {
+	return `& 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe' -NoProfile -ExecutionPolicy Bypass -File '${shimPath.replace(/'/g, "''")}'`;
+}
+
+function buildWindowsShimHooksJson(shimPath: string, codexHomeDir: string): string {
+	return buildHooksJsonWithPostCompactCommand(
+		buildWindowsShimCommand(shimPath),
+		codexHomeDir,
+	);
 }
 
 async function installPluginCacheFixture(codexDir: string): Promise<string> {
@@ -1191,7 +1206,7 @@ OMX_LORE_COMMIT_GUARD = "truee"
 			);
 			assert.match(
 				res.stdout,
-				/Native hooks: expected setup-owned hooks\.json is missing at .*\.codex[\\/]+hooks\.json even though config\.toml has OMX entries; run "omx setup --force" to restore native hook coverage/,
+				/Native hooks: expected setup-owned hooks\.json is missing at .*\.codex[\\/]+hooks\.json even though config\.toml has OMX entries; run "omx setup" to restore native hook coverage/,
 			);
 			assert.match(res.stdout, /Prompts: prompts directory not found/);
 		} finally {
@@ -1573,7 +1588,7 @@ OMX_LORE_COMMIT_GUARD = "truee"
 			assert.match(
 				res.stdout,
 				new RegExp(
-					`\\[!!\\] Native hooks: plugin-scoped hooks are enabled, but cached plugin hook files or pinned hook launcher in ${cacheDir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} do not match the packaged plugin; setup-owned hooks\\.json is intentionally absent at .*\\.codex[\\/]+hooks\\.json; run "omx setup --plugin --force" to refresh the plugin cache`,
+					`\\[!!\\] Native hooks: plugin-scoped hooks are enabled, but cached plugin hook files or pinned hook launcher in ${cacheDir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} do not match the packaged plugin; setup-owned hooks\\.json is intentionally absent at .*\\.codex[\\/]+hooks\\.json; run "omx setup --plugin" to refresh the plugin cache`,
 				),
 			);
 			assert.doesNotMatch(res.stdout, /plugin cache native hook coverage smoke passed/);
@@ -1641,7 +1656,7 @@ OMX_LORE_COMMIT_GUARD = "truee"
 			assert.match(
 				res.stdout,
 				new RegExp(
-					`\\[OK\\] Native hooks: plugin-scoped hooks are enabled; existing hooks\\.json at .*\\.codex[\\/]+hooks\\.json is treated as user-owned because plugin-scoped hooks are enabled, and plugin cache native hook coverage smoke passed via ${join(cacheDir, "hooks", "hooks.json").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`,
+					`\\[OK\\] Native hooks: plugin-scoped hooks are enabled; existing hooks\\.json at .*\\.codex[\\/]+hooks\\.json is retained read-only and validated separately because plugin-scoped hooks are enabled, and plugin cache native hook coverage smoke passed via ${join(cacheDir, "hooks", "hooks.json").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`,
 				),
 			);
 			assert.doesNotMatch(res.stdout, /hooks\.json is missing OMX-managed coverage/);
@@ -1687,7 +1702,7 @@ OMX_LORE_COMMIT_GUARD = "truee"
 			assert.equal(res.status, 0, res.stderr || res.stdout);
 			assert.match(
 				res.stdout,
-				/Native hooks: hooks\.json is missing OMX-managed coverage for PreToolUse, PostToolUse, UserPromptSubmit, PreCompact, PostCompact, Stop; run "omx setup --force" to restore native hooks/,
+				/Native hooks: hooks\.json is missing OMX-managed coverage for PreToolUse, PostToolUse, UserPromptSubmit, PreCompact, PostCompact, Stop; run "omx setup" to restore native hooks/,
 			);
 		} finally {
 			await rm(wd, { recursive: true, force: true });
@@ -1766,7 +1781,7 @@ command = "node"
 			assert.equal(res.status, 0, res.stderr || res.stdout);
 			assert.match(
 				res.stdout,
-				/Native hooks: expected setup-owned hooks\.json is missing at .*\.codex[\/]+hooks\.json even though config\.toml has OMX entries; run "omx setup --force" to restore native hook coverage/,
+				/Native hooks: expected setup-owned hooks\.json is missing at .*\.codex[\/]+hooks\.json even though config\.toml has OMX entries; run "omx setup" to restore native hook coverage/,
 			);
 		} finally {
 			await rm(wd, { recursive: true, force: true });
@@ -1789,8 +1804,247 @@ command = "node"
 			assert.equal(res.status, 0, res.stderr || res.stdout);
 			assert.match(
 				res.stdout,
-				/\[XX\] Native hooks: invalid hooks\.json; Codex may skip OMX hook coverage until "omx setup --force" repairs it/,
+				/\[XX\] Native hooks: hooks\.json failed strict load validation \(invalid_document\): hooks\.json must contain a JSON object; inspect the file manually because doctor will not modify it/,
 			);
+		} finally {
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
+
+	it("reports matcher-aware discovery warnings without touching hooks.json", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-doctor-hooks-matcher-warning-"));
+		try {
+			const home = join(wd, "home");
+			const codexDir = join(home, ".codex");
+			await mkdir(codexDir, { recursive: true });
+			await writeFile(
+				join(codexDir, "hooks.json"),
+				JSON.stringify({
+					hooks: {
+						SessionStart: [{
+							matcher: "[",
+							hooks: [{ type: "command", command: "echo user-owned" }],
+						}],
+					},
+				}, null, 2) + "\n",
+			);
+
+			const res = runOmx(wd, ["doctor"], { HOME: home, CODEX_HOME: codexDir });
+			if (shouldSkipForSpawnPermissions(res.error)) return;
+			assert.equal(res.status, 0, res.stderr || res.stdout);
+			assert.match(
+				res.stdout,
+				/Native hooks: hooks\.json discovery warnings: SessionStart\[0\]: Codex skips groups whose matcher is not a valid regular expression; Codex may ignore the listed entries, and doctor will not modify them/,
+			);
+			assert.doesNotMatch(res.stdout, /Native hooks:.*--force/);
+		} finally {
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
+
+	it("treats UserPromptSubmit and Stop matcher groups as valid foreign survivors", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-doctor-hooks-foreign-survivors-"));
+		try {
+			const home = join(wd, "home");
+			const codexDir = join(home, ".codex");
+			await mkdir(codexDir, { recursive: true });
+			await writeFile(
+				join(codexDir, "hooks.json"),
+				JSON.stringify({
+					hooks: {
+						UserPromptSubmit: [{ matcher: "[", hooks: [{ type: "command", command: "echo prompt" }] }],
+						Stop: [{ matcher: "[", hooks: [{ type: "command", command: "echo stop" }] }],
+					},
+				}, null, 2) + "\n",
+			);
+
+			const res = runOmx(wd, ["doctor"], { HOME: home, CODEX_HOME: codexDir });
+			if (shouldSkipForSpawnPermissions(res.error)) return;
+			assert.equal(res.status, 0, res.stderr || res.stdout);
+			assert.match(
+				res.stdout,
+				/\[OK\] Native hooks: hooks\.json contains valid foreign hook entries and no OMX-managed wrappers; doctor will preserve the user-owned configuration/,
+			);
+			assert.doesNotMatch(res.stdout, /hooks\.json discovery warnings/);
+			assert.doesNotMatch(res.stdout, /Native hooks:.*--force/);
+		} finally {
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
+
+	it("reports unsafe managed removal without recommending destructive repair", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-doctor-hooks-unsafe-removal-"));
+		try {
+			const home = join(wd, "home");
+			const codexDir = join(home, ".codex");
+			await mkdir(codexDir, { recursive: true });
+			await writeFile(
+				join(codexDir, "hooks.json"),
+				JSON.stringify({
+					hooks: {
+						SessionStart: [{
+							matcher: "startup|resume|clear",
+							hooks: [
+								{ type: "command", command: 'node "/repo/dist/scripts/codex-native-hook.js"' },
+								{ type: "command", command: "echo user-owned" },
+							],
+						}],
+					},
+				}, null, 2) + "\n",
+			);
+
+			const res = runOmx(wd, ["doctor"], { HOME: home, CODEX_HOME: codexDir });
+			if (shouldSkipForSpawnPermissions(res.error)) return;
+			assert.equal(res.status, 0, res.stderr || res.stdout);
+			assert.match(
+				res.stdout,
+				/\[!!\] Native hooks: hooks\.json has OMX entries that cannot be safely removed \(unsafe_managed_removal\): Removing OMX hooks would shift a foreign coordinate or discard opaque metadata; manual cleanup is required because doctor will not overwrite or remove it/,
+			);
+			assert.doesNotMatch(res.stdout, /Native hooks:.*--force/);
+		} finally {
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
+
+	it("fails closed when a Windows native hook references a missing shim", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-doctor-windows-shim-missing-"));
+		try {
+			const codexDir = join(wd, ".codex");
+			const hooksPath = join(codexDir, "hooks.json");
+			const shimPath = join(codexDir, "hooks", "omx-native-hook-windows-shim.ps1");
+			await mkdir(codexDir, { recursive: true });
+			const original = buildWindowsShimHooksJson(shimPath, codexDir);
+			await writeFile(hooksPath, original);
+
+			const check = await checkNativeHooks(hooksPath, join(codexDir, "config.toml"), {
+				codexHomeDir: codexDir,
+				platform: "win32",
+			});
+			assert.equal(check.status, "fail");
+			assert.match(check.message, /referenced Windows native hook shim is missing at/);
+			assert.match(check.message, /manually reinstall the matching oh-my-codex version/);
+			assert.doesNotMatch(check.message, /omx setup|--force/);
+			assert.equal(existsSync(shimPath), false);
+			assert.equal(await readFile(hooksPath, "utf-8"), original);
+		} finally {
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
+
+	it("fails closed when a referenced Windows native hook shim is tampered", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-doctor-windows-shim-tampered-"));
+		try {
+			const codexDir = join(wd, ".codex");
+			const hooksPath = join(codexDir, "hooks.json");
+			const shimPath = join(codexDir, "hooks", "omx-native-hook-windows-shim.ps1");
+			await mkdir(dirname(shimPath), { recursive: true });
+			const original = buildWindowsShimHooksJson(shimPath, codexDir);
+			const tamperedShim = `${buildManagedCodexNativeHookWindowsShimContent(repoRoot())}# user change\n`;
+			await writeFile(hooksPath, original);
+			await writeFile(shimPath, tamperedShim, "utf-8");
+
+			const check = await checkNativeHooks(hooksPath, join(codexDir, "config.toml"), {
+				codexHomeDir: codexDir,
+				platform: "win32",
+			});
+			assert.equal(check.status, "fail");
+			assert.match(check.message, /not an exact current or complete historical generated shim/);
+			assert.match(check.message, /modified, truncated, have extra content, or use ambiguous encoding/);
+			assert.doesNotMatch(check.message, /omx setup|--force/);
+			assert.equal(await readFile(hooksPath, "utf-8"), original);
+			assert.equal(await readFile(shimPath, "utf-8"), tamperedShim);
+		} finally {
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
+
+	it("accepts a complete historical Windows native hook shim without modifying it", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-doctor-windows-shim-historical-"));
+		try {
+			const codexDir = join(wd, ".codex");
+			const hooksPath = join(codexDir, "hooks.json");
+			const shimPath = join(codexDir, "hooks", "omx-native-hook-windows-shim.ps1");
+			await mkdir(dirname(shimPath), { recursive: true });
+			const original = buildWindowsShimHooksJson(shimPath, codexDir);
+			const historicalShim = buildManagedCodexNativeHookWindowsShimContent(
+				join(wd, "historical-oh-my-codex"),
+				{ nodePath: join(wd, "historical", "node.exe") },
+			);
+			await writeFile(hooksPath, original);
+			await writeFile(shimPath, historicalShim, "utf-8");
+
+			const check = await checkNativeHooks(hooksPath, join(codexDir, "config.toml"), {
+				codexHomeDir: codexDir,
+				platform: "win32",
+			});
+			assert.equal(check.status, "pass");
+			assert.match(check.message, /includes OMX-managed coverage for all native hook events/);
+			assert.equal(await readFile(hooksPath, "utf-8"), original);
+			assert.equal(await readFile(shimPath, "utf-8"), historicalShim);
+		} finally {
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
+
+	it("reports exact nested legacy hook trust state as migration-required without modifying hooks.json", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-doctor-hooks-legacy-trust-"));
+		try {
+			const home = join(wd, "home");
+			const codexDir = join(home, ".codex");
+			await mkdir(codexDir, { recursive: true });
+			const parsed = JSON.parse(
+				buildHooksJsonWithPostCompactCommand(currentNativeHookCommand(codexDir), codexDir),
+			) as { hooks: Record<string, unknown> };
+			parsed.hooks.state = {
+				"custom:/hooks.json:stop:0:0": {
+					trusted_hash: "sha256:legacy",
+					enabled: false,
+				},
+			};
+			const hooksPath = join(codexDir, "hooks.json");
+			const original = `${JSON.stringify(parsed, null, 2)}\n`;
+			await writeFile(hooksPath, original);
+
+			const res = runOmx(wd, ["doctor"], { HOME: home, CODEX_HOME: codexDir });
+			if (shouldSkipForSpawnPermissions(res.error)) return;
+			assert.equal(res.status, 0, res.stderr || res.stdout);
+			assert.match(
+				res.stdout,
+				/\[!!\] Native hooks: hooks\.json contains 1 exact historical OMX hook trust-state entry that requires migration; run "omx setup" to migrate it after reviewing the configuration/,
+			);
+			assert.doesNotMatch(res.stdout, /Native hooks: hooks\.json includes OMX-managed coverage/);
+			assert.doesNotMatch(res.stdout, /Native hooks:.*--force/);
+			assert.equal(await readFile(hooksPath, "utf-8"), original);
+		} finally {
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
+
+	it("preserves nonmatching nested hooks.state without reporting a migration", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-doctor-hooks-nonlegacy-state-"));
+		try {
+			const home = join(wd, "home");
+			const codexDir = join(home, ".codex");
+			await mkdir(codexDir, { recursive: true });
+			const parsed = JSON.parse(
+				buildHooksJsonWithPostCompactCommand(currentNativeHookCommand(codexDir), codexDir),
+			) as { hooks: Record<string, unknown> };
+			parsed.hooks.state = {
+				retained: { custom: true, trusted_hash: "sha256:not-omx" },
+			};
+			const hooksPath = join(codexDir, "hooks.json");
+			const original = `${JSON.stringify(parsed, null, 2)}\n`;
+			await writeFile(hooksPath, original);
+
+			const res = runOmx(wd, ["doctor"], { HOME: home, CODEX_HOME: codexDir });
+			if (shouldSkipForSpawnPermissions(res.error)) return;
+			assert.equal(res.status, 0, res.stderr || res.stdout);
+			assert.match(
+				res.stdout,
+				/\[OK\] Native hooks: hooks\.json includes OMX-managed coverage for all native hook events/,
+			);
+			assert.doesNotMatch(res.stdout, /Native hooks:.*legacy OMX hook trust-state/);
+			assert.equal(await readFile(hooksPath, "utf-8"), original);
 		} finally {
 			await rm(wd, { recursive: true, force: true });
 		}
@@ -1926,11 +2180,9 @@ command = "node"
 			assert.equal(check.name, "Native hook dist smoke");
 			assert.equal(check.status, "fail");
 			assert.match(check.message, /minimal UserPromptSubmit smoke/);
-			assert.match(
-				check.message,
-				/npm install -g oh-my-codex@0\.18\.0 --force --min-release-age=0 --before=/,
-			);
-			assert.match(check.message, /omx setup --force/);
+			assert.match(check.message, /reinstall the matching oh-my-codex version/);
+			assert.doesNotMatch(check.message, /--force/);
+			assert.match(check.message, /run "omx setup"/);
 		} finally {
 			await rm(wd, { recursive: true, force: true });
 		}
@@ -2072,6 +2324,153 @@ command = "node"
 			assert.match(res.stdout, /\[!!\] GPT-5\.6 multi-agent compatibility:/);
 			assert.match(res.stdout, /Results: \d+ passed, [1-9]\d* warnings, \d+ failed/);
 			assert.doesNotMatch(res.stdout, /All checks passed!/);
+		} finally {
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
+	it("validates an existing global hooks.json before reporting plugin-cache status", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-doctor-plugin-global-invalid-"));
+		try {
+			const codexDir = join(wd, ".codex");
+			const configPath = join(codexDir, "config.toml");
+			const hooksPath = join(codexDir, "hooks.json");
+			await mkdir(codexDir, { recursive: true });
+			await writeFile(configPath, "plugin_hooks = true\n");
+			await writeFile(hooksPath, '{"state":{}}\n');
+
+			const check = await checkNativeHooks(hooksPath, configPath, {
+				codexHomeDir: codexDir,
+				installMode: "plugin",
+			});
+
+			assert.equal(check.status, "fail");
+			assert.match(check.message, /plugin-scoped hooks are enabled/);
+			assert.match(check.message, /existing global hooks\.json: hooks\.json failed strict load validation/);
+			assert.match(check.message, /unknown root field state/);
+		} finally {
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
+
+	it("fails plugin mode when an existing global Windows shim is tampered", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-doctor-plugin-global-shim-"));
+		try {
+			const codexDir = join(wd, ".codex");
+			const configPath = join(codexDir, "config.toml");
+			const hooksPath = join(codexDir, "hooks.json");
+			const shimPath = join(codexDir, "hooks", "omx-native-hook-windows-shim.ps1");
+			await mkdir(dirname(shimPath), { recursive: true });
+			await writeFile(configPath, "plugin_hooks = true\n");
+			await writeFile(
+				hooksPath,
+				`${JSON.stringify({
+					hooks: {
+						PostCompact: [{ hooks: [{ type: "command", command: buildWindowsShimCommand(shimPath) }] }],
+					},
+				})}\n`,
+			);
+			await writeFile(shimPath, "# modified\n");
+
+			const check = await checkNativeHooks(hooksPath, configPath, {
+				codexHomeDir: codexDir,
+				installMode: "plugin",
+				platform: "win32",
+			});
+
+			assert.equal(check.status, "fail");
+			assert.match(check.message, /not an exact current or complete historical generated shim/);
+			assert.match(check.message, /plugin-scoped hooks are enabled/);
+		} finally {
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
+
+	it("fails ambiguous managed handler ownership instead of downgrading it to a warning", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-doctor-ambiguous-managed-handler-"));
+		try {
+			const codexDir = join(wd, ".codex");
+			const hooksPath = join(codexDir, "hooks.json");
+			await mkdir(codexDir, { recursive: true });
+			await writeFile(
+				hooksPath,
+				`${JSON.stringify({
+					hooks: {
+						SessionStart: [{
+							matcher: "startup|resume|clear",
+							hooks: [{ type: "command", command: "node /repo/dist/scripts/codex-native-hook.js --unexpected" }],
+						}],
+					},
+				})}\n`,
+			);
+
+			const check = await checkNativeHooks(hooksPath, join(codexDir, "config.toml"), {
+				codexHomeDir: codexDir,
+			});
+
+			assert.equal(check.status, "fail");
+			assert.match(check.message, /ambiguous_managed_handler/);
+			assert.match(check.message, /ambiguous or untrusted OMX ownership/);
+		} finally {
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
+
+	it("fails closed instead of recognizing a shell-expanding foreign command as an OMX hook", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-doctor-shell-expanding-handler-"));
+		try {
+			const codexDir = join(wd, ".codex");
+			const hooksPath = join(codexDir, "hooks.json");
+			await mkdir(codexDir, { recursive: true });
+			await writeFile(
+				hooksPath,
+				`${JSON.stringify({
+					hooks: {
+						SessionStart: [{
+							matcher: "startup|resume|clear",
+							hooks: [{ type: "command", command: 'node "$HOME/repo/dist/scripts/codex-native-hook.js"' }],
+						}],
+					},
+				})}\n`,
+			);
+
+			const check = await checkNativeHooks(hooksPath, join(codexDir, "config.toml"), {
+				codexHomeDir: codexDir,
+			});
+			assert.equal(check.status, "fail");
+			assert.match(check.message, /ambiguous_managed_handler|does not match the managed command grammar/i);
+		} finally {
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
+
+	it("ignores prompt, agent, and future-event metadata while scanning Windows shim references", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-doctor-inert-shim-metadata-"));
+		try {
+			const codexDir = join(wd, ".codex");
+			const hooksPath = join(codexDir, "hooks.json");
+			const missingShimPath = join(codexDir, "hooks", "omx-native-hook-windows-shim.ps1");
+			await mkdir(codexDir, { recursive: true });
+			await writeFile(
+				hooksPath,
+				`${JSON.stringify({
+					hooks: {
+						PostCompact: [{ hooks: [
+							{ type: "prompt", command: buildWindowsShimCommand(missingShimPath) },
+							{ type: "agent", commandWindows: buildWindowsShimCommand(missingShimPath) },
+						] }],
+						FutureSerdeEvent: [{ hooks: [{ type: "command", command: buildWindowsShimCommand(missingShimPath) }] }],
+					},
+				})}\n`,
+			);
+
+			const check = await checkNativeHooks(hooksPath, join(codexDir, "config.toml"), {
+				codexHomeDir: codexDir,
+				platform: "win32",
+			});
+
+			assert.equal(check.status, "warn");
+			assert.match(check.message, /hooks\.json discovery warnings/);
+			assert.doesNotMatch(check.message, /referenced Windows native hook shim/);
 		} finally {
 			await rm(wd, { recursive: true, force: true });
 		}

@@ -31,6 +31,8 @@ import {
 import {
   buildManagedCodexHookTrustState,
   escapeTomlBasicString,
+  ManagedCodexHooksPlanError,
+  type CodexHooksJsonTrustStateEntry,
   type ManagedCodexHookTrustState,
   type ManagedCodexHookOptions,
 } from "./codex-hooks.js";
@@ -41,6 +43,13 @@ interface MergeOptions {
   codexHooksFile?: string;
   codexHomeDir?: string;
   hookCommandPlatform?: ManagedCodexHookOptions["platform"];
+  codexHooksContent?: string | null;
+  /** Trust keys scanned from the already-planned final hooks.json content. */
+  managedHookTrustState?: Record<string, ManagedCodexHookTrustState>;
+  /** Trust keys scanned from the prior hooks.json content for proof-based cleanup. */
+  priorManagedHookTrustState?: Record<string, ManagedCodexHookTrustState>;
+  /** Exact historical hooks.json state extracted by a strict hooks plan. */
+  legacyHookTrustState?: Record<string, CodexHooksJsonTrustStateEntry>;
   codexHookFeatureFlag?: CodexHookFeatureFlag;
   modelOverride?: string;
   sharedMcpServers?: UnifiedMcpRegistryServer[];
@@ -1130,158 +1139,562 @@ interface HookTrustStateStripResult {
   preservedConflictKeys: Set<string>;
 }
 
-interface HooksStateHeader {
-  key: string;
-  hasInlineComment: boolean;
+type ManagedHookTrustStateExpectations = ReadonlyMap<string, ReadonlySet<string>>;
+
+type TomlSourceStringMode =
+  | "basic"
+  | "literal"
+  | "multiline-basic"
+  | "multiline-literal";
+
+interface TomlSourceLexicalAnalysis {
+  lines: string[];
+  lineStartsOutsideMultiline: boolean[];
+  lineHasTomlComment: boolean[];
+  isUnambiguous: boolean;
 }
 
-function decodeTomlBasicString(raw: string): string | undefined {
-  try {
-    const parsed = TOML.parse(`value = "${raw}"`) as { value?: unknown };
-    return typeof parsed.value === "string" ? parsed.value : undefined;
-  } catch {
-    return undefined;
+function isMultilineTomlString(mode: TomlSourceStringMode | undefined): boolean {
+  return mode === "multiline-basic" || mode === "multiline-literal";
+}
+
+/**
+ * Tracks only lexical boundaries needed to safely associate source lines with
+ * TOML statements. TOML's parser gives us semantics; this prevents source
+ * repair from treating table-like text in a multiline value as syntax.
+ */
+function analyzeTomlSource(config: string): TomlSourceLexicalAnalysis {
+  const lines = config.split(/\r?\n/);
+  const lineStartsOutsideMultiline: boolean[] = [];
+  const lineHasTomlComment: boolean[] = [];
+  let mode: TomlSourceStringMode | undefined;
+  let isUnambiguous = true;
+
+  for (const line of lines) {
+    lineStartsOutsideMultiline.push(!isMultilineTomlString(mode));
+    let hasComment = false;
+
+    for (let index = 0; index < line.length; index += 1) {
+      const character = line[index]!;
+      if (mode === "basic") {
+        if (character === "\\") {
+          index += 1;
+        } else if (character === "\"") {
+          mode = undefined;
+        }
+        continue;
+      }
+      if (mode === "literal") {
+        if (character === "'") mode = undefined;
+        continue;
+      }
+      if (mode === "multiline-basic" || mode === "multiline-literal") {
+        const delimiter = mode === "multiline-basic" ? "\"" : "'";
+        if (mode === "multiline-basic" && character === "\\") {
+          index += 1;
+          continue;
+        }
+        if (character !== delimiter) continue;
+
+        let runEnd = index + 1;
+        while (line[runEnd] === delimiter) runEnd += 1;
+        if (runEnd - index >= 3) {
+          // TOML permits one or two delimiter characters immediately before
+          // the closing triple delimiter as string content.
+          mode = undefined;
+          index = runEnd - 1;
+        }
+        continue;
+      }
+
+      if (character === "#") {
+        hasComment = true;
+        break;
+      }
+      if (character !== "\"" && character !== "'") continue;
+
+      const isMultiline =
+        line[index + 1] === character && line[index + 2] === character;
+      if (isMultiline) {
+        mode = character === "\"" ? "multiline-basic" : "multiline-literal";
+        index += 2;
+      } else {
+        mode = character === "\"" ? "basic" : "literal";
+      }
+    }
+
+    lineHasTomlComment.push(hasComment);
+    if (mode === "basic" || mode === "literal") isUnambiguous = false;
+  }
+
+  if (isMultilineTomlString(mode)) isUnambiguous = false;
+  return { lines, lineStartsOutsideMultiline, lineHasTomlComment, isUnambiguous };
+}
+
+interface TomlSourceTableHeader {
+  parsed: Record<string, unknown> | undefined;
+}
+
+interface TomlSourceTableScope {
+  parsed: Record<string, unknown> | undefined;
+  hasComment: boolean;
+}
+
+interface ManagedHookTrustStateSourceRepresentation {
+  start: number;
+  end: number;
+  stateEntryCount: number;
+  value: unknown;
+  hasComment: boolean;
+  hasExactSemanticScope: boolean;
+  insideManagedMarkerBlock: boolean;
+}
+
+function managedHookTrustStateExpectations(
+  ...states: Array<ManagedCodexHookTrustStateMap | undefined>
+): ManagedHookTrustStateExpectations {
+  const expectations = new Map<string, Set<string>>();
+  for (const state of states) {
+    if (!state) continue;
+    for (const [key, entry] of Object.entries(state)) {
+      const hashes = expectations.get(key) ?? new Set<string>();
+      hashes.add(entry.trusted_hash);
+      expectations.set(key, hashes);
+    }
+  }
+  return expectations;
+}
+
+function tomlHooksStateEntries(
+  parsed: Record<string, unknown> | undefined,
+): Record<string, unknown> | undefined {
+  if (!parsed) return undefined;
+  const hooks = parsed.hooks;
+  if (!isPlainTomlRecord(hooks)) return undefined;
+  const state = hooks.state;
+  return isPlainTomlRecord(state) ? state : undefined;
+}
+
+function hasOnlyManagedHookTrustStateField(
+  parsed: Record<string, unknown> | undefined,
+  key: string,
+): boolean {
+  if (!parsed || Object.keys(parsed).length !== 1 || !Object.hasOwn(parsed, "hooks")) {
+    return false;
+  }
+  const hooks = parsed.hooks;
+  if (!isPlainTomlRecord(hooks) || Object.keys(hooks).length !== 1 || !Object.hasOwn(hooks, "state")) {
+    return false;
+  }
+  const state = hooks.state;
+  return isPlainTomlRecord(state) &&
+    Object.keys(state).length === 1 &&
+    Object.hasOwn(state, key);
+}
+
+function parseTomlSourceTableHeader(line: string): TomlSourceTableHeader | undefined {
+  const start = line.search(/\S/);
+  if (start === -1 || line[start] !== "[") return undefined;
+
+  const array = line[start + 1] === "[";
+  let quote: "\"" | "'" | undefined;
+  let escaped = false;
+  for (let index = start + (array ? 2 : 1); index < line.length; index += 1) {
+    const character = line[index]!;
+    if (quote === "\"") {
+      if (escaped) {
+        escaped = false;
+      } else if (character === "\\") {
+        escaped = true;
+      } else if (character === quote) {
+        quote = undefined;
+      }
+      continue;
+    }
+    if (quote === "'") {
+      if (character === quote) quote = undefined;
+      continue;
+    }
+    if (character === "\"" || character === "'") {
+      quote = character;
+      continue;
+    }
+    if (character !== "]") continue;
+
+    const end = array ? index + 2 : index + 1;
+    if (array && line[index + 1] !== "]") return undefined;
+    const suffix = line.slice(end).trimStart();
+    if (suffix.length > 0 && !suffix.startsWith("#")) return undefined;
+    return { parsed: safeParseToml(line.slice(start, end)) };
+  }
+  return undefined;
+}
+
+function sourceRangeHasTomlComment(
+  source: TomlSourceLexicalAnalysis,
+  start: number,
+  end: number,
+): boolean {
+  for (let index = start; index < end; index += 1) {
+    if (source.lineHasTomlComment[index]) return true;
+  }
+  return false;
+}
+
+function addManagedHookTrustStateSourceRepresentations(
+  representations: Map<string, ManagedHookTrustStateSourceRepresentation[]>,
+  expectations: ManagedHookTrustStateExpectations,
+  source: TomlSourceLexicalAnalysis,
+  start: number,
+  end: number,
+  parsed: Record<string, unknown> | undefined,
+  insideManagedMarkerBlock: boolean,
+  containingTableScope?: TomlSourceTableScope,
+  fallbackKeys: readonly string[] = [],
+): void {
+  const state = tomlHooksStateEntries(parsed);
+  const hasComment = sourceRangeHasTomlComment(source, start, end);
+  if (state) {
+    const stateEntryCount = Object.keys(state).length;
+    for (const [key, value] of Object.entries(state)) {
+      if (!expectations.has(key)) continue;
+      const hasExactSemanticScope = hasOnlyManagedHookTrustStateField(parsed, key) &&
+        (!containingTableScope ||
+          (!containingTableScope.hasComment &&
+            hasOnlyManagedHookTrustStateField(containingTableScope.parsed, key)));
+
+      const entries = representations.get(key) ?? [];
+      entries.push({
+        start,
+        end,
+        stateEntryCount,
+        value,
+        hasComment,
+        hasExactSemanticScope,
+        insideManagedMarkerBlock,
+      });
+      representations.set(key, entries);
+    }
+    return;
+  }
+
+  for (const key of fallbackKeys) {
+    if (!expectations.has(key)) continue;
+    const entries = representations.get(key) ?? [];
+    entries.push({
+      start,
+      end,
+      stateEntryCount: 0,
+      value: undefined,
+      hasComment,
+      hasExactSemanticScope: false,
+      insideManagedMarkerBlock,
+    });
+    representations.set(key, entries);
   }
 }
 
-function parseHooksStateHeader(line: string): HooksStateHeader | undefined {
-  const match = line.match(
-    /^\s*\[hooks\.state\."((?:\\.|[^"\\])*)"\]\s*(#.*)?$/,
-  );
-  if (!match) return undefined;
-  const key = decodeTomlBasicString(match[1] ?? "");
-  if (key === undefined) return undefined;
-  return { key, hasInlineComment: match[2] !== undefined };
+function collectManagedHookTrustStateSourceRepresentations(
+  config: string,
+  expectations: ManagedHookTrustStateExpectations,
+): {
+  source: TomlSourceLexicalAnalysis;
+  representations: Map<string, ManagedHookTrustStateSourceRepresentation[]>;
+} {
+  const source = analyzeTomlSource(config);
+  const { lines } = source;
+  const headers: Array<{ index: number; header: TomlSourceTableHeader }> = [];
+  for (const [index, line] of lines.entries()) {
+    if (!source.lineStartsOutsideMultiline[index]) continue;
+    const header = parseTomlSourceTableHeader(line);
+    if (header) headers.push({ index, header });
+  }
+
+  const boundaries = new Set<number>(headers.map(({ index }) => index));
+  for (const [index, line] of lines.entries()) {
+    if (
+      source.lineStartsOutsideMultiline[index] &&
+      line.trim() === OMX_HOOK_TRUST_END_MARKER
+    ) {
+      boundaries.add(index);
+    }
+  }
+  const sortedBoundaries = [...boundaries].sort((left, right) => left - right);
+  const representations = new Map<string, ManagedHookTrustStateSourceRepresentation[]>();
+  const managedMarkerRanges: SourceSpan[] = [];
+  for (let start = 0; start < lines.length; start += 1) {
+    if (
+      !source.lineStartsOutsideMultiline[start] ||
+      lines[start]?.trim() !== OMX_HOOK_TRUST_START_MARKER
+    ) continue;
+    const end = lines.findIndex(
+      (line, index) =>
+        index > start &&
+        source.lineStartsOutsideMultiline[index] &&
+        line.trim() === OMX_HOOK_TRUST_END_MARKER,
+    );
+    const nestedStart = lines.findIndex(
+      (line, index) =>
+        index > start &&
+        source.lineStartsOutsideMultiline[index] &&
+        line.trim() === OMX_HOOK_TRUST_START_MARKER,
+    );
+    if (end === -1 || (nestedStart !== -1 && nestedStart < end)) continue;
+    managedMarkerRanges.push({ start, end });
+    start = end;
+  }
+  const isInsideManagedMarkerBlock = (start: number, end: number): boolean =>
+    managedMarkerRanges.some((range) => start > range.start && end <= range.end);
+
+  const collectAssignments = (
+    start: number,
+    end: number,
+    prefix: string | undefined,
+    containingTableScope?: TomlSourceTableScope,
+  ): void => {
+    for (let cursor = start; cursor < end;) {
+      const line = lines[cursor] ?? "";
+      if (
+        !source.lineStartsOutsideMultiline[cursor] ||
+        line.trim().length === 0 ||
+        source.lineHasTomlComment[cursor]
+      ) {
+        cursor += 1;
+        continue;
+      }
+
+      let parsed: Record<string, unknown> | undefined;
+      let statementEnd = cursor + 1;
+      for (; statementEnd <= end; statementEnd += 1) {
+        const statement = lines.slice(cursor, statementEnd).join("\n");
+        parsed = safeParseToml(prefix ? `${prefix}\n${statement}` : statement);
+        if (parsed) break;
+      }
+      if (!parsed) {
+        cursor += 1;
+        continue;
+      }
+      addManagedHookTrustStateSourceRepresentations(
+        representations,
+        expectations,
+        source,
+        cursor,
+        statementEnd,
+        parsed,
+        isInsideManagedMarkerBlock(cursor, statementEnd),
+        containingTableScope,
+      );
+      cursor = statementEnd;
+    }
+  };
+
+  const rootEnd = sortedBoundaries[0] ?? lines.length;
+  collectAssignments(0, rootEnd, undefined);
+  for (const { index, header } of headers) {
+    const boundaryIndex = sortedBoundaries.findIndex((boundary) => boundary === index);
+    const end = boundaryIndex === -1
+      ? lines.length
+      : (sortedBoundaries[boundaryIndex + 1] ?? lines.length);
+    const tableScope = {
+      parsed: safeParseToml(lines.slice(index, end).join("\n")),
+      hasComment: sourceRangeHasTomlComment(source, index, end),
+    };
+    const headerState = tomlHooksStateEntries(header.parsed);
+    const directKeys = Object.keys(headerState ?? {}).filter((key) => expectations.has(key));
+    if (directKeys.length > 0) {
+      addManagedHookTrustStateSourceRepresentations(
+        representations,
+        expectations,
+        source,
+        index,
+        end,
+        tableScope.parsed,
+        isInsideManagedMarkerBlock(index, end),
+        undefined,
+        directKeys,
+      );
+      continue;
+    }
+    collectAssignments(index + 1, end, lines[index], tableScope);
+  }
+
+  return { source, representations };
 }
 
-function isTomlTableHeader(line: string): boolean {
-  return /^\s*\[\[?[^\]]+\]?\]\s*(?:#.*)?$/.test(line);
-}
-
-function isExactlyManagedHookTrustBody(
-  bodyLines: readonly string[],
-  expectedHash: string,
+function isExactlyManagedHookTrustStateValue(
+  value: unknown,
+  expectedHashes: ReadonlySet<string>,
 ): boolean {
-  const nonBlank = bodyLines.filter((line) => line.trim().length > 0);
-  if (nonBlank.length !== 1) return false;
+  return isPlainTomlRecord(value) &&
+    Object.keys(value).length === 1 &&
+    Object.hasOwn(value, "trusted_hash") &&
+    typeof value.trusted_hash === "string" &&
+    expectedHashes.has(value.trusted_hash);
+}
 
-  const expected = expectedHash.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return new RegExp(`^\\s*trusted_hash\\s*=\\s*"${expected}"\\s*$`).test(
-    nonBlank[0] ?? "",
-  );
+function removeEmptyManagedHookTrustStateMarkerBlocks(
+  source: TomlSourceLexicalAnalysis,
+  removed: Set<number>,
+): void {
+  const { lines } = source;
+  for (let start = 0; start < lines.length; start += 1) {
+    if (
+      !source.lineStartsOutsideMultiline[start] ||
+      lines[start]?.trim() !== OMX_HOOK_TRUST_START_MARKER
+    ) continue;
+    const end = lines.findIndex(
+      (line, index) =>
+        index > start &&
+        source.lineStartsOutsideMultiline[index] &&
+        line.trim() === OMX_HOOK_TRUST_END_MARKER,
+    );
+    const nestedStart = lines.findIndex(
+      (line, index) =>
+        index > start &&
+        source.lineStartsOutsideMultiline[index] &&
+        line.trim() === OMX_HOOK_TRUST_START_MARKER,
+    );
+    if (end === -1 || (nestedStart !== -1 && nestedStart < end)) continue;
+
+    let onlyOwnedMarkerContent = true;
+    for (let index = start + 1; index < end; index += 1) {
+      const trimmed = lines[index]!.trim();
+      if (
+        removed.has(index) ||
+        trimmed.length === 0 ||
+        trimmed === "# Trusts only setup-managed native hook wrappers."
+      ) continue;
+      onlyOwnedMarkerContent = false;
+      break;
+    }
+    if (!onlyOwnedMarkerContent) continue;
+
+    removed.add(start);
+    removed.add(end);
+    for (let index = start + 1; index < end; index += 1) {
+      if (lines[index]?.trim() === "# Trusts only setup-managed native hook wrappers.") {
+        removed.add(index);
+      }
+    }
+    start = end;
+  }
 }
 
 function stripProofManagedCodexHookTrustStateTables(
   config: string,
-  managedTrustState: ManagedCodexHookTrustStateMap,
+  expectations: ManagedHookTrustStateExpectations,
 ): HookTrustStateStripResult {
-  if (Object.keys(managedTrustState).length === 0) {
+  if (expectations.size === 0) {
     return { config, preservedConflictKeys: new Set() };
   }
 
-  const lines = config.split(/\r?\n/);
-  const kept: string[] = [];
+  const { source, representations } = collectManagedHookTrustStateSourceRepresentations(
+    config,
+    expectations,
+  );
+  if (!source.isUnambiguous) {
+    return { config, preservedConflictKeys: new Set() };
+  }
+  const { lines } = source;
   const preservedConflictKeys = new Set<string>();
+  const removals = new Map<string, SourceSpan>();
+  const parsedConfigState = tomlHooksStateEntries(safeParseToml(config));
 
-  for (let i = 0; i < lines.length;) {
-    const header = parseHooksStateHeader(lines[i] ?? "");
-    if (!header) {
-      kept.push(lines[i]);
-      i += 1;
-      continue;
+  for (const key of Object.keys(parsedConfigState ?? {})) {
+    if (expectations.has(key) && !representations.has(key)) {
+      preservedConflictKeys.add(key);
     }
-
-    let tableEnd = lines.length;
-    for (let next = i + 1; next < lines.length; next += 1) {
-      if (isTomlTableHeader(lines[next] ?? "")) {
-        tableEnd = next;
-        break;
-      }
-    }
-
-    const expectedState = managedTrustState[header.key];
-    const removable =
-      expectedState !== undefined &&
-      !header.hasInlineComment &&
-      isExactlyManagedHookTrustBody(
-        lines.slice(i + 1, tableEnd),
-        expectedState.trusted_hash,
-      );
-
-    if (removable) {
-      i = tableEnd;
-      continue;
-    }
-
-    if (expectedState !== undefined) {
-      preservedConflictKeys.add(header.key);
-    }
-
-    kept.push(...lines.slice(i, tableEnd));
-    i = tableEnd;
   }
 
-  return { config: kept.join("\n"), preservedConflictKeys };
+  for (const [key, sourceRepresentations] of representations) {
+    const expectedHashes = expectations.get(key)!;
+    const isExactOwnedRepresentation = (
+      representation: ManagedHookTrustStateSourceRepresentation,
+    ): boolean =>
+      representation.stateEntryCount === 1 &&
+      !representation.hasComment &&
+      representation.hasExactSemanticScope &&
+      isExactlyManagedHookTrustStateValue(representation.value, expectedHashes);
+    const mayRemoveAll = sourceRepresentations.length === 1
+      ? isExactOwnedRepresentation(sourceRepresentations[0]!)
+      : sourceRepresentations.every(
+        (representation) =>
+          representation.insideManagedMarkerBlock &&
+          isExactOwnedRepresentation(representation),
+      );
+    if (!mayRemoveAll) {
+      preservedConflictKeys.add(key);
+      continue;
+    }
+    for (const representation of sourceRepresentations) {
+      removals.set(`${representation.start}:${representation.end}`, {
+        start: representation.start,
+        end: representation.end,
+      });
+    }
+  }
+
+  if (removals.size === 0) {
+    return { config, preservedConflictKeys };
+  }
+
+  const removed = new Set<number>();
+  for (const range of removals.values()) {
+    for (let index = range.start; index < range.end; index += 1) {
+      removed.add(index);
+    }
+  }
+  removeEmptyManagedHookTrustStateMarkerBlocks(source, removed);
+  return {
+    config: lines.filter((_, index) => !removed.has(index)).join("\n").trimEnd(),
+    preservedConflictKeys,
+  };
 }
 
-function stripManagedCodexHookTrustStateWithResult(
+function stripManagedCodexHookTrustStateForRefresh(
   config: string,
-  options: { managedTrustState?: ManagedCodexHookTrustStateMap } = {},
+  priorManagedTrustState: ManagedCodexHookTrustStateMap | undefined,
+  finalManagedTrustState: ManagedCodexHookTrustStateMap,
 ): HookTrustStateStripResult {
-  const lines = config.split(/\r?\n/);
-  const kept: string[] = [];
+  return stripProofManagedCodexHookTrustStateTables(
+    config,
+    managedHookTrustStateExpectations(priorManagedTrustState, finalManagedTrustState),
+  );
+}
 
-  for (let i = 0; i < lines.length;) {
-    const trimmed = lines[i].trim();
-    if (trimmed !== OMX_HOOK_TRUST_START_MARKER) {
-      kept.push(lines[i]);
-      i += 1;
-      continue;
-    }
+function rejectManagedCodexHookTrustStateConflicts(
+  conflicts: ReadonlySet<string>,
+): void {
+  if (conflicts.size === 0) return;
 
-    const nextEndIdx = lines.findIndex(
-      (line, index) => index > i && line.trim() === OMX_HOOK_TRUST_END_MARKER,
-    );
-    const nextStartIdx = lines.findIndex(
-      (line, index) => index > i && line.trim() === OMX_HOOK_TRUST_START_MARKER,
-    );
-
-    if (nextEndIdx === -1 || (nextStartIdx !== -1 && nextStartIdx < nextEndIdx)) {
-      kept.push(lines[i]);
-      i += 1;
-      continue;
-    }
-
-    i = nextEndIdx + 1;
-  }
-
-  const withoutFenced = kept.join("\n");
-  const proofStripped = options.managedTrustState
-    ? stripProofManagedCodexHookTrustStateTables(
-        withoutFenced,
-        options.managedTrustState,
-      )
-    : { config: withoutFenced, preservedConflictKeys: new Set<string>() };
-
-  return {
-    config: proofStripped.config.replace(/\n{3,}/g, "\n\n").trimEnd(),
-    preservedConflictKeys: proofStripped.preservedConflictKeys,
-  };
+  const keys = [...conflicts].sort((left, right) => left.localeCompare(right));
+  throw new ManagedCodexHooksPlanError(
+    "managed_trust_key_conflict",
+    `Refusing to replace existing Codex hook trust state for ${keys.join(", ")}. Remove or reconcile the conflicting [hooks.state] entry before running setup.`,
+    { keys },
+  );
 }
 
 export function stripManagedCodexHookTrustState(
   config: string,
-  options: { managedTrustState?: ManagedCodexHookTrustStateMap } = {},
+  options: {
+    managedTrustState?: ManagedCodexHookTrustStateMap;
+    priorManagedHookTrustState?: ManagedCodexHookTrustStateMap;
+  } = {},
 ): string {
-  return stripManagedCodexHookTrustStateWithResult(config, options).config;
+  const stripped = stripManagedCodexHookTrustStateForRefresh(
+    config,
+    options.priorManagedHookTrustState,
+    options.managedTrustState ?? {},
+  );
+  rejectManagedCodexHookTrustStateConflicts(stripped.preservedConflictKeys);
+  return stripped.config;
 }
 
 function renderManagedCodexHookTrustToml(
   managedTrustState: ManagedCodexHookTrustStateMap,
-  excludedKeys: ReadonlySet<string> = new Set(),
 ): string {
   return Object.entries(managedTrustState)
-    .filter(([key]) => !excludedKeys.has(key))
     .sort(([left], [right]) => left.localeCompare(right))
     .flatMap(([key, hookState]) => [
       `[hooks.state."${escapeTomlBasicString(key)}"]`,
@@ -1292,11 +1705,100 @@ function renderManagedCodexHookTrustToml(
     .trimEnd();
 }
 
+function identicalLegacyHookTrustStateEntry(
+  existing: unknown,
+  expected: CodexHooksJsonTrustStateEntry,
+): boolean {
+  if (!isPlainTomlRecord(existing)) return false;
+  if (
+    !Object.hasOwn(existing, "trusted_hash") ||
+    typeof existing.trusted_hash !== "string" ||
+    existing.trusted_hash !== expected.trusted_hash ||
+    Object.keys(existing).some((key) => key !== "trusted_hash" && key !== "enabled")
+  ) {
+    return false;
+  }
+  return Object.hasOwn(existing, "enabled") === Object.hasOwn(expected, "enabled") &&
+    existing.enabled === expected.enabled;
+}
+
+function legacyHookTrustStateConflict(keys: readonly string[], reason?: string): never {
+  throw new ManagedCodexHooksPlanError(
+    "managed_trust_key_conflict",
+    `Refusing to migrate legacy Codex hook trust state into conflicting config.toml entries for ${keys.join(", ")}.`,
+    { keys: [...keys], ...(reason ? { reason } : {}) },
+  );
+}
+
+function appendLegacyHookTrustState(
+  config: string,
+  legacyTrustState: Record<string, CodexHooksJsonTrustStateEntry> | undefined,
+): string {
+  if (!legacyTrustState || Object.keys(legacyTrustState).length === 0) {
+    return config;
+  }
+
+  const parsed = safeParseToml(config);
+  const keys = Object.keys(legacyTrustState).sort((left, right) => left.localeCompare(right));
+  if (!parsed) legacyHookTrustStateConflict(keys, "config_parse_failure");
+  const hooks = parsed.hooks;
+  if (hooks !== undefined && !isPlainTomlRecord(hooks)) {
+    legacyHookTrustStateConflict(keys, "hooks_table_invalid");
+  }
+  const hookState = isPlainTomlRecord(hooks) ? hooks.state : undefined;
+  if (hookState !== undefined && !isPlainTomlRecord(hookState)) {
+    legacyHookTrustStateConflict(keys, "hooks_state_table_invalid");
+  }
+  const existingTrustState = isPlainTomlRecord(hookState) ? hookState : {};
+  const entriesToAppend = Object.entries(legacyTrustState)
+    .filter(([key]) => !Object.hasOwn(existingTrustState, key));
+  const conflictingKeys = Object.entries(legacyTrustState)
+    .filter(([key, expected]) =>
+      Object.hasOwn(existingTrustState, key) &&
+      !identicalLegacyHookTrustStateEntry(existingTrustState[key], expected)
+    )
+    .map(([key]) => key)
+    .sort((left, right) => left.localeCompare(right));
+  if (conflictingKeys.length > 0) legacyHookTrustStateConflict(conflictingKeys);
+  const trustToml = entriesToAppend
+    .sort(([left], [right]) => left.localeCompare(right))
+    .flatMap(([key, state]) => [
+      `[hooks.state."${escapeTomlBasicString(key)}"]`,
+      `trusted_hash = "${escapeTomlBasicString(state.trusted_hash)}"`,
+      ...(typeof state.enabled === "boolean" ? [`enabled = ${state.enabled}`] : []),
+      "",
+    ])
+    .join("\n")
+    .trimEnd();
+  if (!trustToml) return config;
+
+  const base = config.trimEnd();
+  return [
+    base,
+    base ? "" : null,
+    "# Migrated from legacy hooks.json state; kept in Codex config.toml because Codex 0.140 rejects top-level hooks.json state.",
+    trustToml,
+    "",
+  ].filter((line): line is string => line !== null).join("\n");
+}
+
+function managedCodexHookOptionsFromMergeOptions(
+  options: MergeOptions,
+): ManagedCodexHookOptions {
+  return {
+    codexHomeDir: options.codexHomeDir,
+    platform: options.hookCommandPlatform,
+    hooksContent: options.codexHooksContent,
+  };
+}
+
 function buildManagedCodexHookTrustStateForConfig(
   codexHooksFile: string | undefined,
   pkgRoot: string,
   options: ManagedCodexHookOptions = {},
+  precomputedTrustState?: ManagedCodexHookTrustStateMap,
 ): ManagedCodexHookTrustStateMap {
+  if (precomputedTrustState) return precomputedTrustState;
   if (!codexHooksFile) return {};
   return buildManagedCodexHookTrustState(codexHooksFile, pkgRoot, options);
 }
@@ -1305,37 +1807,52 @@ export function upsertManagedCodexHookTrustState(
   config: string,
   pkgRoot: string,
   codexHooksFile: string | undefined,
-  options: ManagedCodexHookOptions = {},
+  options: ManagedCodexHookOptions & {
+    managedTrustState?: ManagedCodexHookTrustStateMap;
+    priorManagedHookTrustState?: ManagedCodexHookTrustStateMap;
+    legacyHookTrustState?: Record<string, CodexHooksJsonTrustStateEntry>;
+  } = {},
 ): string {
   const managedTrustState = buildManagedCodexHookTrustStateForConfig(
     codexHooksFile,
     pkgRoot,
     options,
+    options.managedTrustState,
   );
-  const strippedResult = stripManagedCodexHookTrustStateWithResult(config, {
+  const strippedResult = stripManagedCodexHookTrustStateForRefresh(
+    config,
+    options.priorManagedHookTrustState,
     managedTrustState,
-  });
-  const stripped = strippedResult.config;
-  const hookTrustToml = renderManagedCodexHookTrustToml(
-    managedTrustState,
+  );
+  rejectManagedCodexHookTrustStateConflicts(
     strippedResult.preservedConflictKeys,
   );
-  if (!hookTrustToml) return `${stripped}\n`;
-  return [
-    stripped,
-    "",
-    OMX_HOOK_TRUST_START_MARKER,
-    "# Trusts only setup-managed native hook wrappers.",
-    hookTrustToml,
-    OMX_HOOK_TRUST_END_MARKER,
-    "",
-  ].filter((line, index) => index !== 0 || line.length > 0).join("\n");
+  const stripped = strippedResult.config.trimEnd();
+  const hookTrustToml = renderManagedCodexHookTrustToml(managedTrustState);
+  if (!hookTrustToml) {
+    return appendLegacyHookTrustState(
+      `${stripped}\n`,
+      options.legacyHookTrustState,
+    );
+  }
+  return appendLegacyHookTrustState(
+    [
+      stripped,
+      "",
+      OMX_HOOK_TRUST_START_MARKER,
+      "# Trusts only setup-managed native hook wrappers.",
+      hookTrustToml,
+      OMX_HOOK_TRUST_END_MARKER,
+      "",
+    ].filter((line, index) => index !== 0 || line.length > 0).join("\n"),
+    options.legacyHookTrustState,
+  );
 }
 
 export function upsertPluginModeRuntimeFeatureFlags(
   config: string,
   codexHookFeatureFlag: CodexHookFeatureFlag = DEFAULT_CODEX_HOOK_FEATURE_FLAG,
-  options: { pluginScopedHooks?: boolean } = {},
+  options: { pluginScopedHooks?: boolean; preserveNativeHooks?: boolean } = {},
 ): string {
   const lines = config.split(/\r?\n/);
   const featuresStart = lines.findIndex((line) =>
@@ -1350,6 +1867,9 @@ export function upsertPluginModeRuntimeFeatureFlags(
     const featureBlock = [
       "[features]",
       hookFeatureFlagLine,
+      ...(options.pluginScopedHooks && options.preserveNativeHooks
+        ? [formatCodexHookFeatureFlagLine(codexHookFeatureFlag)]
+        : []),
       "goals = true",
       "",
     ].join("\n");
@@ -1376,14 +1896,28 @@ export function upsertPluginModeRuntimeFeatureFlags(
     }
   }
 
-  ({ sectionEnd } = options.pluginScopedHooks
-    ? upsertPluginScopedHookFeatureFlagInSection(lines, featuresStart, sectionEnd)
-    : upsertCodexHookFeatureFlagInSection(
+  if (options.pluginScopedHooks) {
+    ({ sectionEnd } = upsertPluginScopedHookFeatureFlagInSection(
+      lines,
+      featuresStart,
+      sectionEnd,
+    ));
+    if (options.preserveNativeHooks) {
+      ({ sectionEnd } = upsertCodexHookFeatureFlagInSection(
         lines,
         featuresStart,
         sectionEnd,
         codexHookFeatureFlag,
       ));
+    }
+  } else {
+    ({ sectionEnd } = upsertCodexHookFeatureFlagInSection(
+      lines,
+      featuresStart,
+      sectionEnd,
+      codexHookFeatureFlag,
+    ));
+  }
 
   let goalsIdx = -1;
   for (let i = featuresStart + 1; i < sectionEnd; i++) {
@@ -2378,8 +2912,8 @@ function getOmxTablesBlock(
   statusLinePreset: HudPreset = DEFAULT_STATUS_LINE_PRESET,
   codexHooksFile?: string,
   hookOptions: ManagedCodexHookOptions = {},
+  managedHookTrustState?: ManagedCodexHookTrustStateMap,
   includeFirstPartyMcp = false,
-  excludedHookTrustStateKeys: ReadonlySet<string> = new Set(),
 ): string {
   const lines = [
     "",
@@ -2412,8 +2946,8 @@ function getOmxTablesBlock(
       codexHooksFile,
       pkgRoot,
       hookOptions,
+      managedHookTrustState,
     ),
-    excludedHookTrustStateKeys,
   );
   if (hookTrustToml) {
     lines.push("");
@@ -2462,6 +2996,21 @@ export function buildMergedConfig(
   options: MergeOptions = {},
 ): string {
   let existing = stripOmxSeededBehavioralDefaults(existingConfig);
+  const hookOptions = managedCodexHookOptionsFromMergeOptions(options);
+  const managedTrustState = buildManagedCodexHookTrustStateForConfig(
+    options.codexHooksFile,
+    pkgRoot,
+    hookOptions,
+    options.managedHookTrustState,
+  );
+  const preflightHookTrustStrip = stripManagedCodexHookTrustStateForRefresh(
+    existing,
+    options.priorManagedHookTrustState,
+    managedTrustState,
+  );
+  rejectManagedCodexHookTrustStateConflicts(
+    preflightHookTrustStrip.preservedConflictKeys,
+  );
   const preservedFirstPartyMcpSections =
     options.preserveExistingFirstPartyMcp === true &&
     options.includeFirstPartyMcp !== true
@@ -2495,17 +3044,14 @@ export function buildMergedConfig(
     existing = `${`notify = ${formatTomlStringArray(userNotifyToPreserve)}`}\n${existing.trimStart()}`;
   }
   existing = stripOrphanedManagedNotify(existing, pkgRoot).trimStart();
-  const managedTrustState = buildManagedCodexHookTrustStateForConfig(
-    options.codexHooksFile,
-    pkgRoot,
-    {
-      codexHomeDir: options.codexHomeDir,
-      platform: options.hookCommandPlatform,
-    },
-  );
-  const hookTrustStrip = stripManagedCodexHookTrustStateWithResult(existing, {
+  const hookTrustStrip = stripManagedCodexHookTrustStateForRefresh(
+    existing,
+    options.priorManagedHookTrustState,
     managedTrustState,
-  });
+  );
+  rejectManagedCodexHookTrustStateConflicts(
+    hookTrustStrip.preservedConflictKeys,
+  );
   existing = hookTrustStrip.config;
   if (options.modelOverride) {
     existing = stripRootLevelKeys(existing, ["model"]);
@@ -2536,12 +3082,9 @@ export function buildMergedConfig(
     includeTui && !tuiUpsert.hadExistingTui,
     statusLinePreset,
     options.codexHooksFile,
-    {
-      codexHomeDir: options.codexHomeDir,
-      platform: options.hookCommandPlatform,
-    },
+    hookOptions,
+    managedTrustState,
     options.includeFirstPartyMcp === true,
-    hookTrustStrip.preservedConflictKeys,
   );
   const sharedRegistryBlock = getSharedMcpRegistryBlock(
     options.sharedMcpServers ?? [],
@@ -2555,9 +3098,10 @@ export function buildMergedConfig(
   }
   const bodySeparator = body.length > 0 && !/^\s*\[/.test(body) ? "\n" : "\n\n";
 
-  return addDefaultLauncherMcpStartupTimeouts(
+  const merged = addDefaultLauncherMcpStartupTimeouts(
     topLines.join("\n") + bodySeparator + body + "\n" + tablesBlock,
   );
+  return appendLegacyHookTrustState(merged, options.legacyHookTrustState);
 }
 
 /**
