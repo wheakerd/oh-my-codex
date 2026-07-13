@@ -609,6 +609,11 @@ describe('keyword input classification direct grammar', () => {
       { text: 'Quoted example: "$ralplan plan it".\n$autopilot build it', skills: ['autopilot'] },
       { text: '`$ralplan` is inert.\n$autopilot build it', skills: ['autopilot'] },
       { text: '"Use /prompts:architect"\n$ralplan plan it', skills: ['ralplan'] },
+      { text: '> quoted context\n$ralplan plan it', skills: ['ralplan'] },
+      { text: '```text\nquoted context\n```\n$ralplan plan it', skills: ['ralplan'] },
+      { text: '    quoted context\n$ralplan plan it', skills: ['ralplan'] },
+      { text: '"quoted context"\n$ralplan plan it', skills: ['ralplan'] },
+      { text: 'Use /prompts:architect.\n$ralplan plan it', skills: ['ralplan'] },
     ] as const;
 
     for (const testCase of cases) {
@@ -624,6 +629,11 @@ describe('keyword input classification direct grammar', () => {
       '"$ralplan" mentions $autopilot without a clause boundary',
       'Do not run $ralplan. We only document $autopilot behavior',
       '"$ralplan". The $autopilot workflow is documented',
+      '```text\nquoted context\n$ralplan plan it',
+      '```text\nquoted context\n~~~\n$ralplan plan it',
+      '"quoted context\n$ralplan plan it',
+      '> quoted context\nThe docs mention $ralplan only',
+      '"quoted context"\nDo not run $ralplan',
     ]) {
       assert.deepEqual(classifyKeywordInput(text).matches, [], text);
     }

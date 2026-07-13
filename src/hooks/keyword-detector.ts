@@ -1090,6 +1090,7 @@ interface InertRange {
   start: number;
   end: number;
   reason: StructuralInertDiagnostic;
+  bounded: boolean;
 }
 
 interface InertRangeIndex {
@@ -1208,7 +1209,7 @@ function collectIndentedCodeRanges(text: string): InertRange[] {
     const end = lineEnd(text, lineStart);
     const line = text.slice(lineStart, end);
     if (hasMarkdownCodeIndent(line) || hasListContainedCodeIndent(line)) {
-      ranges.push({ start: lineStart, end, reason: 'indented-code' });
+      ranges.push({ start: lineStart, end, reason: 'indented-code', bounded: true });
     }
     if (end === text.length) break;
     lineStart = nextLineStart(text, end);
@@ -1219,32 +1220,32 @@ function collectIndentedCodeRanges(text: string): InertRange[] {
 function collectFencedCodeRanges(text: string): InertRange[] {
   const ranges: InertRange[] = [];
   let lineStart = 0;
-  let fence: MarkdownFence | null = null;
+  let fence: { definition: MarkdownFence; start: number } | null = null;
 
   while (lineStart <= text.length) {
     const end = lineEnd(text, lineStart);
     const line = text.slice(lineStart, end);
     if (fence) {
-      ranges.push({ start: lineStart, end, reason: 'fenced-code' });
       const closer = markdownFenceAtStart(line);
       if (
-        closer?.marker === fence.marker
-        && closer.length >= fence.length
-        && closer.blockquoteDepth === fence.blockquoteDepth
+        closer?.marker === fence.definition.marker
+        && closer.length >= fence.definition.length
+        && closer.blockquoteDepth === fence.definition.blockquoteDepth
         && !closer.listItem
         && closer.closingEligible
-      ) fence = null;
+      ) {
+        ranges.push({ start: fence.start, end, reason: 'fenced-code', bounded: true });
+        fence = null;
+      }
     } else {
       const opener = markdownFenceAtStart(line);
-      if (opener) {
-        fence = opener;
-        ranges.push({ start: lineStart, end, reason: 'fenced-code' });
-      }
+      if (opener) fence = { definition: opener, start: lineStart };
     }
     if (end === text.length) break;
     lineStart = nextLineStart(text, end);
   }
 
+  if (fence) ranges.push({ start: fence.start, end: text.length, reason: 'fenced-code', bounded: false });
   return ranges;
 }
 
@@ -1265,12 +1266,12 @@ function collectInlineCodeRanges(text: string): InertRange[] {
       const length = runEnd - cursor;
       if (!opener) opener = { start: cursor, length };
       else if (opener.length === length) {
-        ranges.push({ start: opener.start, end: runEnd, reason: 'inline-code' });
+        ranges.push({ start: opener.start, end: runEnd, reason: 'inline-code', bounded: true });
         opener = null;
       }
       cursor = runEnd;
     }
-    if (opener) ranges.push({ start: opener.start, end, reason: 'inline-code' });
+    if (opener) ranges.push({ start: opener.start, end, reason: 'inline-code', bounded: false });
     if (end === text.length) break;
     lineStart = nextLineStart(text, end);
   }
@@ -1292,7 +1293,7 @@ function collectQuoteRanges(text: string): InertRange[] {
       if (hasOddImmediateBackslashes(text, cursor)) continue;
 
       if (opener && character === opener.closing) {
-        ranges.push({ start: opener.start, end: cursor + 1, reason: 'quote' });
+        ranges.push({ start: opener.start, end: cursor + 1, reason: 'quote', bounded: true });
         opener = null;
         continue;
       }
@@ -1302,7 +1303,7 @@ function collectQuoteRanges(text: string): InertRange[] {
       }
       if (!opener && QUOTE_CLOSERS[character]) opener = { start: cursor, closing: QUOTE_CLOSERS[character] };
     }
-    if (opener) ranges.push({ start: opener.start, end, reason: 'quote' });
+    if (opener) ranges.push({ start: opener.start, end, reason: 'quote', bounded: false });
     if (end === text.length) break;
     lineStart = nextLineStart(text, end);
   }
@@ -1315,7 +1316,7 @@ function collectBlockquoteRanges(text: string): InertRange[] {
   while (lineStart <= text.length) {
     const end = lineEnd(text, lineStart);
     if (isBlockquoteLine(text.slice(lineStart, end))) {
-      ranges.push({ start: lineStart, end, reason: 'blockquote' });
+      ranges.push({ start: lineStart, end, reason: 'blockquote', bounded: true });
     }
     if (end === text.length) break;
     lineStart = nextLineStart(text, end);
@@ -1696,21 +1697,33 @@ interface InertPromptRange {
   end: number;
 }
 
-function structurallyInertPromptRanges(text: string, referenceIndex: MarkdownReferenceIndex): InertPromptRange[] {
+function boundedPredecessorRanges(text: string, referenceIndex: MarkdownReferenceIndex): InertPromptRange[] {
   const inertRangeIndexes = collectInertRangeIndexes(text);
-  const ranges: InertPromptRange[] = [];
+  const structuralRanges = [
+    ...collectIndentedCodeRanges(text),
+    ...collectFencedCodeRanges(text),
+    ...collectBlockquoteRanges(text),
+    ...collectInlineCodeRanges(text),
+    ...collectQuoteRanges(text),
+  ];
+  const ranges: InertPromptRange[] = structuralRanges
+    .filter((range) => range.bounded)
+    .map(({ start, end }) => ({ start, end }));
   const pattern = new RegExp(PROMPTS_TOKEN_PATTERN.source, PROMPTS_TOKEN_PATTERN.flags);
+  const activeCommandPrefix = new RegExp(`^\\s*(?:please\\s+)?${DIRECTIVE_VERB}\\s+(?:the\\s+)?$`, 'iu');
   let match: RegExpExecArray | null;
   while ((match = pattern.exec(text)) !== null) {
     const end = match.index + match[0].length;
-    if (!isInactivePromptsMention(text, match.index, end, inertRangeIndexes, referenceIndex)) continue;
-    const markdownRange = markdownDocumentationRange(text, match.index, end, referenceIndex);
+    const inactive = isInactivePromptsMention(text, match.index, end, inertRangeIndexes, referenceIndex);
+    const lineStart = lineStartForPosition(text, match.index);
+    if (!inactive && !activeCommandPrefix.test(text.slice(lineStart, match.index))) continue;
+    const markdownRange = inactive ? markdownDocumentationRange(text, match.index, end, referenceIndex) : null;
     ranges.push({
       start: markdownRange?.start ?? match.index,
-      end: isListItemDocumentation(text, match.index, end) ? lineEnd(text, end) : (markdownRange?.end ?? end),
+      end: inactive && isListItemDocumentation(text, match.index, end) ? lineEnd(text, end) : (markdownRange?.end ?? end),
     });
   }
-  return ranges;
+  return ranges.sort((left, right) => left.start - right.start || left.end - right.end);
 }
 
 function hasOddImmediateBackslashes(text: string, index: number): boolean {
@@ -1780,7 +1793,7 @@ function directCandidateIndexes(text: string, candidates: ExplicitCandidateScan[
   };
 
   addBlock(leadingDirectiveCursor(text, 0, true).cursor);
-  const inertPromptRanges = structurallyInertPromptRanges(text, referenceIndex);
+  const inertPromptRanges = boundedPredecessorRanges(text, referenceIndex);
   let inertPromptCursor = 0;
   let latestInertEnd = -1;
   for (const [candidateIndex, candidate] of candidates.entries()) {
