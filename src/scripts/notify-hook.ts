@@ -23,6 +23,7 @@ import { existsSync } from 'fs';
 import { dirname, join, resolve } from 'path';
 import { fileURLToPath } from 'url';
 import { isSessionStateUsable } from '../hooks/session.js';
+import { readTeamModeConfig } from '../config/team-mode.js';
 
 import { safeString, asNumber } from './notify-hook/utils.js';
 import {
@@ -396,13 +397,17 @@ export async function recordNotifySkillActivation(
   dependencies: NotifySkillActivationDependencies = {},
 ): Promise<SkillActiveState | null> {
   const classification = (dependencies.classifyKeywordInput ?? classifyKeywordInput)(input.text);
+  const teamEnabled = readTeamModeConfig(input.sourceCwd).enabled;
+  const runtimeMatches = teamEnabled
+    ? classification.matches
+    : classification.matches.filter((match) => match.skill !== 'team');
   const terminalAutopilotReplay = await shouldSuppressAutopilotTerminalReplayActivation(
     input.stateDir,
     input.payload,
-    classification.matches.some((match) => match.skill === 'autopilot'),
+    runtimeMatches.some((match) => match.skill === 'autopilot'),
     input.sessionId || '',
   );
-  if (terminalAutopilotReplay && classification.matches[0]?.skill === 'autopilot') return null;
+  if (terminalAutopilotReplay && runtimeMatches[0]?.skill === 'autopilot') return null;
 
   return (dependencies.recordSkillActivation ?? recordSkillActivation)({
     stateDir: input.stateDir,

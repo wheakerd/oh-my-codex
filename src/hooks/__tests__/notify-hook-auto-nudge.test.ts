@@ -2519,6 +2519,48 @@ exit 0
         assert.deepEqual(await readFile(orderedAutopilotPath), orderedAutopilotBefore, orderedCase.text);
       }
 
+      const filteredSessionId = 'sess-notify-disabled-team-terminal-autopilot';
+      const filteredThreadId = 'thread-notify-disabled-team-terminal-autopilot';
+      const filteredTurnId = 'turn-notify-disabled-team-terminal-autopilot';
+      const filteredSessionDir = join(stateDir, 'sessions', filteredSessionId);
+      const filteredAutopilotPath = join(filteredSessionDir, 'autopilot-state.json');
+      await mkdir(filteredSessionDir, { recursive: true });
+      await writeJson(filteredAutopilotPath, {
+        mode: 'autopilot',
+        active: false,
+        current_phase: 'complete',
+        completed_at: '2026-05-31T20:24:39.005Z',
+        session_id: filteredSessionId,
+        thread_id: filteredThreadId,
+        turn_id: filteredTurnId,
+      });
+      const filteredAutopilotBefore = await readFile(filteredAutopilotPath);
+      const previousTeamMode = process.env.OMX_TEAM_MODE;
+      process.env.OMX_TEAM_MODE = 'disabled';
+      try {
+        const filteredResult = await recordNotifySkillActivation({
+          stateDir,
+          sourceCwd: cwd,
+          text: '$team $autopilot retry',
+          sessionId: filteredSessionId,
+          threadId: filteredThreadId,
+          turnId: filteredTurnId,
+          payload: {
+            type: 'agent-turn-complete',
+            'thread-id': filteredThreadId,
+            'turn-id': filteredTurnId,
+            'last-assistant-message': 'Autopilot complete.',
+          },
+        });
+        assert.equal(filteredResult, null);
+        assert.deepEqual(await readFile(filteredAutopilotPath), filteredAutopilotBefore);
+        assert.equal(existsSync(join(filteredSessionDir, 'skill-active-state.json')), false);
+        assert.equal(existsSync(join(stateDir, 'skill-active-state.json')), false);
+      } finally {
+        if (previousTeamMode === undefined) delete process.env.OMX_TEAM_MODE;
+        else process.env.OMX_TEAM_MODE = previousTeamMode;
+      }
+
       const restartText = '$autopilot new task — café';
       const restartBytes = Buffer.from(restartText, 'utf8');
       let restartClassification: ReturnType<typeof classifyKeywordInput> | undefined;

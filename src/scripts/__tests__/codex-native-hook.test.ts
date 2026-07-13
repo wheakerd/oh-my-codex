@@ -35,6 +35,7 @@ import { createUltragoalPlan, readUltragoalPlan } from "../../ultragoal/artifact
 import { getBaseStateDir } from "../../state/paths.js";
 import { maybeNudgeLeaderForAllowedWorkerStop } from "../notify-hook/team-worker-stop.js";
 import { MAX_NATIVE_STDIN_JSON_BYTES } from "../hook-payload-guard.js";
+import { recordNotifySkillActivation } from "../notify-hook.js";
 
 function nativeHookScriptPath(): string {
   return join(process.cwd(), "dist", "scripts", "codex-native-hook.js");
@@ -1494,18 +1495,95 @@ PY`,
     }
   });
 
-  it("preserves exact prompt classification through compiled UserPromptSubmit state and Stop", async () => {
+  it("preserves all structural blockers through raw UserPromptSubmit state and Stop", async () => {
+    const cases = [
+      { name: "unsafe-token-boundary", prompt: "$ralplan\u200B.md", expectedSkill: null },
+      { name: "later-positive", prompt: "Do not run $ralplan, instead $autopilot build it", expectedSkill: "autopilot" },
+      { name: "list-documentation", prompt: "- $ralplan, $autopilot are workflow commands", expectedSkill: null },
+      { name: "list-composition", prompt: "- $ralplan is the consensus-planning command\n$autopilot build it", expectedSkill: "autopilot" },
+      { name: "escaped-quote", prompt: "\"$ralplan \\\"; $autopilot build it", expectedSkill: null },
+      { name: "fence-prefix", prompt: "```\n$ralplan\n> ```\n$autopilot build it", expectedSkill: null },
+      { name: "matching-fence-control", prompt: "> ```\n> $ralplan\n> ```\n$autopilot build it", expectedSkill: "autopilot" },
+    ] as const;
+
+    for (const testCase of cases) {
+      const cwd = await mkdtemp(join(tmpdir(), `omx-native-raw-classification-${testCase.name}-`));
+      const sessionId = `sess-raw-${testCase.name}`;
+      try {
+        const submit = await dispatchCodexNativeHook({
+          hook_event_name: "UserPromptSubmit",
+          cwd,
+          source: "codex-app",
+          session_id: sessionId,
+          thread_id: `thread-${testCase.name}`,
+          turn_id: `turn-${testCase.name}`,
+          prompt: testCase.prompt,
+        }, { cwd });
+        assert.equal((submit.outputJson as { continue?: boolean } | null)?.continue, undefined, testCase.name);
+
+        const sessionDir = join(cwd, ".omx", "state", "sessions", sessionId);
+        const skillStatePath = join(sessionDir, "skill-active-state.json");
+        if (testCase.expectedSkill === null) {
+          assert.equal(existsSync(skillStatePath), false, testCase.name);
+        } else {
+          const skillState = JSON.parse(await readFile(skillStatePath, "utf-8")) as { active?: boolean; skill?: string };
+          assert.equal(skillState.active, true, testCase.name);
+          assert.equal(skillState.skill, testCase.expectedSkill, testCase.name);
+        }
+
+        const stop = await dispatchCodexNativeHook({
+          hook_event_name: "Stop",
+          cwd,
+          source: "codex-app",
+          session_id: sessionId,
+          thread_id: `thread-${testCase.name}`,
+          turn_id: `stop-${testCase.name}`,
+        }, { cwd });
+        if (testCase.expectedSkill === null) assert.equal(stop.outputJson, null, testCase.name);
+        else assert.equal((stop.outputJson as { decision?: string } | null)?.decision, "block", testCase.name);
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it("preserves exact structural prompt classification through compiled UserPromptSubmit state and Stop", async () => {
     const cases = [
       { name: "mixed-indent", prompt: " \t$ralplan plan this", expectedSkill: null },
       { name: "documentation-suffix", prompt: "$ralplan.md is the workflow documentation file", expectedSkill: null },
       { name: "path-suffix", prompt: "$autopilot/config", expectedSkill: null },
       { name: "unicode-suffix", prompt: "$ralplan한글", expectedSkill: null },
+      { name: "zero-width-suffix", prompt: "$ralplan\u200B.md", expectedSkill: null },
+      { name: "compatibility-path-suffix", prompt: "$ralplan／config", expectedSkill: null },
+      { name: "nul-suffix", prompt: "$ralplan\u0000md", expectedSkill: null },
+      { name: "bidi-control-suffix", prompt: "$ralplan\u202Emd", expectedSkill: null },
+      { name: "bom-suffix", prompt: "$ralplan\uFEFF.md", expectedSkill: null },
+      { name: "fullwidth-dot-suffix", prompt: "$ralplan．md", expectedSkill: null },
       { name: "direct-prompts-reservation", prompt: "/prompts:architect $ralplan plan this", expectedSkill: null },
       { name: "list-documentation", prompt: "- $ralplan is the consensus-planning command", expectedSkill: null },
+      { name: "colon-list-documentation", prompt: "- $ralplan: consensus-planning workflow", expectedSkill: null },
+      { name: "dash-list-documentation", prompt: "- $ralplan — consensus-planning command", expectedSkill: null },
+      { name: "plural-list-documentation", prompt: "- $ralplan, $autopilot are workflow commands", expectedSkill: null },
+      { name: "conjunction-list-documentation", prompt: "- $ralplan and $autopilot are workflow commands", expectedSkill: null },
       { name: "negative-then-positive", prompt: "Do not run $ralplan; instead $autopilot build issue #3140", expectedSkill: "autopilot" },
+      { name: "comma-negative-then-positive", prompt: "Do not run $ralplan, instead $autopilot build it", expectedSkill: "autopilot" },
+      { name: "use-negative-then-positive", prompt: "Do not run $ralplan; use $autopilot build it", expectedSkill: "autopilot" },
+      { name: "inline-negative-then-positive", prompt: "Quoted inline-code `$ralplan`; use $autopilot build it", expectedSkill: "autopilot" },
       { name: "negative-line-then-positive", prompt: "Without $ralplan.\n$autopilot build it", expectedSkill: "autopilot" },
       { name: "quoted-then-positive", prompt: "Quoted example: \"$ralplan plan it\".\n$autopilot build it", expectedSkill: "autopilot" },
       { name: "inert-prompts-then-positive", prompt: "\"Use /prompts:architect\"\n$ralplan plan it", expectedSkill: "ralplan" },
+      { name: "list-doc-then-positive", prompt: "- $ralplan is the consensus-planning command\n$autopilot build it", expectedSkill: "autopilot" },
+      { name: "prompt-doc-then-positive", prompt: "- /prompts:architect is the prompt command documentation\n$ralplan plan it", expectedSkill: "ralplan" },
+      { name: "conjunction-list-doc-then-positive", prompt: "- $ralplan and $autopilot are workflow commands\n$autopilot execute it", expectedSkill: "autopilot" },
+      { name: "escaped-quote-range", prompt: "\"$ralplan \\\"; $autopilot build it", expectedSkill: null },
+      { name: "blockquote-fence-closer", prompt: "```\n$ralplan\n> ```\n$autopilot build it", expectedSkill: null },
+      { name: "double-negative-control", prompt: "Do not run $ralplan; do not run $autopilot", expectedSkill: null },
+      { name: "comma-negative-control", prompt: "Do not run $ralplan, $autopilot", expectedSkill: null },
+      { name: "unseparated-control", prompt: "Do not run $ralplan and use $autopilot build it", expectedSkill: null },
+      { name: "even-escape-control", prompt: "\"$ralplan \\\\\"; use $autopilot build it", expectedSkill: "autopilot" },
+      { name: "matching-fence-control", prompt: "> ```\n> $ralplan\n> ```\n$autopilot build it", expectedSkill: "autopilot" },
+      { name: "invalid-fence-closer", prompt: "```\n$ralplan\n``` still code\n$autopilot build it", expectedSkill: null },
+      { name: "documentation-clause-control", prompt: "Do not run $ralplan. We only document $autopilot behavior", expectedSkill: null },
       {
         name: "punctuation-multi-workflow",
         prompt: "$ralplan, $autopilot build issue #3140",
@@ -1569,6 +1647,65 @@ PY`,
       } finally {
         await rm(cwd, { recursive: true, force: true });
       }
+    }
+  });
+
+  it("keeps disabled-Team terminal Autopilot replay inert through notify state and compiled Stop", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-disabled-team-terminal-replay-"));
+    const sessionId = "sess-disabled-team-terminal-replay";
+    const threadId = "thread-disabled-team-terminal-replay";
+    const turnId = "turn-disabled-team-terminal-replay";
+    const stateDir = join(cwd, ".omx", "state");
+    const sessionDir = join(stateDir, "sessions", sessionId);
+    const autopilotPath = join(sessionDir, "autopilot-state.json");
+    const previousTeamMode = process.env.OMX_TEAM_MODE;
+    try {
+      process.env.OMX_TEAM_MODE = "disabled";
+      await writeJson(autopilotPath, {
+        mode: "autopilot",
+        active: false,
+        current_phase: "complete",
+        completed_at: "2026-07-12T23:00:00.000Z",
+        session_id: sessionId,
+        thread_id: threadId,
+        turn_id: turnId,
+      });
+      const before = await readFile(autopilotPath);
+
+      const replay = await recordNotifySkillActivation({
+        stateDir,
+        sourceCwd: cwd,
+        text: "$team $autopilot retry",
+        sessionId,
+        threadId,
+        turnId,
+        payload: {
+          type: "agent-turn-complete",
+          "thread-id": threadId,
+          "turn-id": turnId,
+          "last-assistant-message": "Autopilot complete.",
+        },
+      });
+      assert.equal(replay, null);
+      assert.deepEqual(await readFile(autopilotPath), before);
+      assert.equal(existsSync(join(sessionDir, "skill-active-state.json")), false);
+
+      const stop = parseSingleJsonStdout(runNativeHookCli({
+        hook_event_name: "Stop",
+        cwd,
+        source: "codex-app",
+        session_id: sessionId,
+        thread_id: threadId,
+        turn_id: "stop-disabled-team-terminal-replay",
+      }, {
+        cwd,
+        env: { ...process.env, OMX_TEAM_MODE: "disabled", OMX_ROOT: "", OMX_STATE_ROOT: "" },
+      }));
+      assert.deepEqual(stop, {});
+    } finally {
+      if (previousTeamMode === undefined) delete process.env.OMX_TEAM_MODE;
+      else process.env.OMX_TEAM_MODE = previousTeamMode;
+      await rm(cwd, { recursive: true, force: true });
     }
   });
 

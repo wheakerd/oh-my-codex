@@ -941,9 +941,12 @@ const KEYWORD_INTENT_PATTERNS: Record<IntentKeyword, RegExp[]> = {
 
 const EXPLICIT_TOKEN_START = /\$(?:oh-my-codex:)?([A-Za-z][A-Za-z0-9_-]*)/giu;
 const TOKEN_CONTINUATION = /[\p{L}\p{N}\p{M}\p{Pc}\p{Pd}]/u;
+const UNSAFE_TOKEN_DELIMITER = /[\p{Cc}\p{Cf}\p{Cs}\p{Co}\p{Cn}]/u;
+const SAFE_TOKEN_WHITESPACE = /[\p{Zs}\t\n\r\f\v\u2028\u2029]/u;
 const DIRECTIVE_PUNCTUATION = /^[,;:!?]+$/u;
-const CLAUSE_TRANSITION = /^(?:instead|then|now|please)$/i;
-const LIST_DOCUMENTATION_SUFFIX = /^\s+(?:is|means|refers\s+to|denotes)\b.*\b(?:command|workflow|skill|mode|file|documentation)\b/i;
+const CLAUSE_BOUNDARY = /[,;.!?\r\n\u2028\u2029]/u;
+const DIRECTIVE_CLAUSE_PREFIX = /^(?:(?:instead|then|now|please)(?:\s+(?:use|run|start|enable|launch|invoke|activate|resume|continue))?|(?:use|run|start|enable|launch|invoke|activate|resume|continue))$/i;
+const LIST_DOCUMENTATION_SUFFIX = /^(?:\s*(?::|[—–])\s*\S|\s+(?:is|are|means|refer(?:s)?\s+to|denote(?:s)?)\b.*\b(?:commands?|workflows?|skills?|modes?|files?|documentation)\b)/i;
 
 function codePointAt(text: string, index: number): string {
   const value = text.codePointAt(index);
@@ -953,12 +956,16 @@ function codePointAt(text: string, index: number): string {
 function isExplicitTokenBoundary(text: string, index: number): boolean {
   if (index >= text.length) return true;
   const character = codePointAt(text, index);
-  if (/\s/u.test(character)) return true;
+  if (UNSAFE_TOKEN_DELIMITER.test(character) && !SAFE_TOKEN_WHITESPACE.test(character)) return false;
+  if (SAFE_TOKEN_WHITESPACE.test(character)) return true;
+  const compatibility = character.normalize('NFKC');
+  if (compatibility.includes('/') || compatibility.includes('\\') || compatibility.includes('$')) return false;
+  if ([...compatibility].some((value) => TOKEN_CONTINUATION.test(value))) return false;
   if (character === '$' || character === '/' || character === '\\') return false;
   if (TOKEN_CONTINUATION.test(character)) return false;
-  if (character === '.') {
+  if (compatibility === '.') {
     const next = codePointAt(text, index + character.length);
-    return !next || /\s/u.test(next) || next === '$';
+    return !next || SAFE_TOKEN_WHITESPACE.test(next) || next === '$';
   }
   return true;
 }
@@ -1027,6 +1034,8 @@ interface InertRangeIndex {
 interface MarkdownFence {
   marker: '`' | '~';
   length: number;
+  blockquoteDepth: number;
+  closingEligible: boolean;
 }
 
 function lineEnd(text: string, start: number): number {
@@ -1049,18 +1058,22 @@ function advanceSpaces(text: string, start: number, maximum: number): number {
 
 function markdownFenceAtStart(line: string): MarkdownFence | null {
   let cursor = advanceSpaces(line, 0, 3);
-  if (line[cursor] === '>') {
+  let blockquoteDepth = 0;
+  while (line[cursor] === '>') {
+    blockquoteDepth += 1;
     cursor += 1;
     if (line[cursor] === ' ') cursor += 1;
+    cursor = advanceSpaces(line, cursor, 3);
   }
-  cursor = advanceSpaces(line, cursor, 3);
 
   const marker = line[cursor];
   if (marker !== '`' && marker !== '~') return null;
   const start = cursor;
   while (line[cursor] === marker) cursor += 1;
   const length = cursor - start;
-  return length >= 3 ? { marker, length } : null;
+  return length >= 3
+    ? { marker, length, blockquoteDepth, closingEligible: /^[\t ]*$/.test(line.slice(cursor)) }
+    : null;
 }
 
 function isBlockquoteLine(line: string): boolean {
@@ -1104,7 +1117,12 @@ function collectFencedCodeRanges(text: string): InertRange[] {
     if (fence) {
       ranges.push({ start: lineStart, end, reason: 'fenced-code' });
       const closer = markdownFenceAtStart(line);
-      if (closer?.marker === fence.marker && closer.length >= fence.length) fence = null;
+      if (
+        closer?.marker === fence.marker
+        && closer.length >= fence.length
+        && closer.blockquoteDepth === fence.blockquoteDepth
+        && closer.closingEligible
+      ) fence = null;
     } else {
       const opener = markdownFenceAtStart(line);
       if (opener) {
@@ -1159,6 +1177,7 @@ function collectQuoteRanges(text: string): InertRange[] {
       const previous = text[cursor - 1] ?? '';
       const next = text[cursor + 1] ?? '';
       if ((character === "'" || character === '’') && LETTER_OR_NUMBER.test(previous) && LETTER_OR_NUMBER.test(next)) continue;
+      if (hasOddImmediateBackslashes(text, cursor)) continue;
 
       if (opener && character === opener.closing) {
         ranges.push({ start: opener.start, end: cursor + 1, reason: 'quote' });
@@ -1261,26 +1280,32 @@ function punctuationSeparatedCandidateStart(text: string, cursor: number): numbe
   return text[next] === '$' ? next : null;
 }
 
-function clauseDirectiveStart(text: string, candidateStart: number): boolean {
-  const lineStart = lineStartForPosition(text, candidateStart);
-  const linePrefix = text.slice(lineStart, candidateStart);
-  if (/^[^\S\r\n\u2028\u2029]*$/u.test(linePrefix)) return true;
-
-  const delimiter = Math.max(
-    text.lastIndexOf(';', candidateStart - 1),
-    text.lastIndexOf('.', candidateStart - 1),
-    text.lastIndexOf('!', candidateStart - 1),
-    text.lastIndexOf('?', candidateStart - 1),
-  );
-  if (delimiter < lineStart) return false;
-  const prefix = text.slice(delimiter + 1, candidateStart).trim();
-  return prefix === '' || CLAUSE_TRANSITION.test(prefix);
+function clauseDirectiveStart(text: string, predecessorEnd: number, candidateStart: number): boolean {
+  const between = text.slice(predecessorEnd, candidateStart);
+  let clauseStart = -1;
+  for (let cursor = between.length - 1; cursor >= 0; cursor -= 1) {
+    if (CLAUSE_BOUNDARY.test(between[cursor])) {
+      clauseStart = cursor + 1;
+      break;
+    }
+  }
+  if (clauseStart < 0) return false;
+  return DIRECTIVE_CLAUSE_PREFIX.test(between.slice(clauseStart).trim());
 }
 
 function isNegativeExplicitMention(text: string, candidate: ExplicitCandidateScan): boolean {
   const lineStart = lineStartForPosition(text, candidate.start);
-  const prefix = text.slice(lineStart, candidate.start);
-  return /(?:\b(?:do\s+not|don't|without|never|not)\b|не\s+(?:запускай|используй)|実行しないで|使わないで)/iu.test(prefix);
+  const linePrefix = text.slice(lineStart, candidate.start);
+  let clauseStart = 0;
+  for (let cursor = linePrefix.length - 1; cursor >= 0; cursor -= 1) {
+    if (CLAUSE_BOUNDARY.test(linePrefix[cursor])) {
+      clauseStart = cursor + 1;
+      break;
+    }
+  }
+  const prefix = linePrefix.slice(clauseStart);
+  const effectivePrefix = prefix.trim() || linePrefix.slice(0, Math.max(0, clauseStart - 1));
+  return /(?:\b(?:do\s+not|don't|without|never|not)\b|не\s+(?:запускай|используй)|実行しないで|使わないで)/iu.test(effectivePrefix);
 }
 
 function isInertOrNegativeMention(text: string, candidate: ExplicitCandidateScan): boolean {
@@ -1292,7 +1317,9 @@ function isListItemDocumentation(text: string, candidateStart: number, blockEnd:
   const leading = leadingDirectiveCursor(text, lineStart, false);
   if (!leading.listItem || leading.cursor !== candidateStart) return false;
   const end = lineEnd(text, blockEnd);
-  return LIST_DOCUMENTATION_SUFFIX.test(text.slice(blockEnd, end));
+  const tokenSequence = /^(?:(?:\$(?:oh-my-codex:)?[A-Za-z][A-Za-z0-9_-]*)|(?:\/prompts:[\w.-]+))(?:(?:\s*,\s*|\s+(?:and|or)\s+)(?:(?:\$(?:oh-my-codex:)?[A-Za-z][A-Za-z0-9_-]*)|(?:\/prompts:[\w.-]+)))*/iu.exec(text.slice(candidateStart, end));
+  if (!tokenSequence) return false;
+  return LIST_DOCUMENTATION_SUFFIX.test(text.slice(candidateStart + tokenSequence[0].length, end));
 }
 
 function hasDirectPromptsInvocation(
@@ -1306,15 +1333,23 @@ function hasDirectPromptsInvocation(
   return !leading.listItem || !isListItemDocumentation(text, leading.cursor, leading.cursor + match[0].length);
 }
 
-function structurallyInertPromptPositions(text: string): number[] {
+interface InertPromptRange {
+  start: number;
+  end: number;
+}
+
+function structurallyInertPromptRanges(text: string): InertPromptRange[] {
   const inertRangeIndexes = collectInertRangeIndexes(text);
-  const positions: number[] = [];
+  const ranges: InertPromptRange[] = [];
   const pattern = /\/prompts:[\w.-]+/giu;
   let match: RegExpExecArray | null;
   while ((match = pattern.exec(text)) !== null) {
-    if (isStructurallyInert(inertRangeIndexes, match.index)) positions.push(match.index);
+    const end = match.index + match[0].length;
+    if (isStructurallyInert(inertRangeIndexes, match.index) || isListItemDocumentation(text, match.index, end)) {
+      ranges.push({ start: match.index, end: lineEnd(text, end) });
+    }
   }
-  return positions;
+  return ranges;
 }
 
 function hasOddImmediateBackslashes(text: string, index: number): boolean {
@@ -1360,6 +1395,7 @@ function directCandidateIndexes(text: string, candidates: ExplicitCandidateScan[
   for (const [index, candidate] of candidates.entries()) candidateIndexByStart.set(candidate.start, index);
 
   const indexes = new Set<number>();
+  const documentationIndexes = new Set<number>();
   const addBlock = (start: number): void => {
     let candidateIndex = candidateIndexByStart.get(start);
     if (candidateIndex === undefined || candidates[candidateIndex].reasons.size > 0) return;
@@ -1374,25 +1410,30 @@ function directCandidateIndexes(text: string, candidates: ExplicitCandidateScan[
       candidateIndex = candidateIndexByStart.get(nextStart);
     }
     if (isListItemDocumentation(text, start, blockEnd)) {
-      for (const index of added) indexes.delete(index);
+      for (const index of added) {
+        indexes.delete(index);
+        documentationIndexes.add(index);
+      }
     }
   };
 
   addBlock(leadingDirectiveCursor(text, 0, true).cursor);
-  const inertPromptPositions = structurallyInertPromptPositions(text);
+  const inertPromptRanges = structurallyInertPromptRanges(text);
   let inertPromptCursor = 0;
-  let hasEarlierInertOrNegativeCandidate = false;
-  for (const candidate of candidates) {
-    while (inertPromptCursor < inertPromptPositions.length && inertPromptPositions[inertPromptCursor] < candidate.start) {
+  let latestInertEnd = -1;
+  for (const [candidateIndex, candidate] of candidates.entries()) {
+    while (inertPromptCursor < inertPromptRanges.length && inertPromptRanges[inertPromptCursor].start < candidate.start) {
+      latestInertEnd = Math.max(latestInertEnd, inertPromptRanges[inertPromptCursor].end);
       inertPromptCursor += 1;
     }
-    const hasEarlierInertPrompt = inertPromptCursor > 0;
-    const candidateIndex = candidateIndexByStart.get(candidate.start);
-    if (candidateIndex !== undefined && !indexes.has(candidateIndex) && candidate.reasons.size === 0) {
-      const canOpenLaterDirective = indexes.size > 0 || hasEarlierInertOrNegativeCandidate || hasEarlierInertPrompt;
-      if (canOpenLaterDirective && clauseDirectiveStart(text, candidate.start)) addBlock(candidate.start);
+    if (documentationIndexes.has(candidateIndex) || isInertOrNegativeMention(text, candidate)) {
+      latestInertEnd = Math.max(latestInertEnd, candidate.end);
+      continue;
     }
-    hasEarlierInertOrNegativeCandidate ||= isInertOrNegativeMention(text, candidate);
+    if (!indexes.has(candidateIndex) && latestInertEnd >= 0 && !isNegativeExplicitMention(text, candidate)) {
+      const lineLeading = leadingDirectiveCursor(text, lineStartForPosition(text, candidate.start), false).cursor === candidate.start;
+      if (lineLeading || clauseDirectiveStart(text, latestInertEnd, candidate.start)) addBlock(candidate.start);
+    }
   }
   return indexes;
 }

@@ -556,7 +556,7 @@ describe('keyword input classification direct grammar', () => {
     }
   });
 
-  it('scans maximal explicit tokens and rejects documentation, paths, and Unicode suffixes', () => {
+  it('scans maximal explicit tokens and rejects documentation, paths, Unicode, compatibility, and control suffixes', () => {
     const cases = [
       { text: '$ralplan.md is the workflow documentation file', rawKeyword: '$ralplan.md' },
       { text: '$autopilot/config', rawKeyword: '$autopilot/config' },
@@ -564,6 +564,12 @@ describe('keyword input classification direct grammar', () => {
       { text: '$oh-my-codex:ralplan.md', rawKeyword: '$oh-my-codex:ralplan.md' },
       { text: '$ralplan..md', rawKeyword: '$ralplan..md' },
       { text: '$ralplan‐suffix', rawKeyword: '$ralplan‐suffix' },
+      { text: '$ralplan\u200B.md', rawKeyword: '$ralplan\u200B.md' },
+      { text: '$ralplan／config', rawKeyword: '$ralplan／config' },
+      { text: '$ralplan\u0000md', rawKeyword: '$ralplan\u0000md' },
+      { text: '$ralplan\u202Emd', rawKeyword: '$ralplan\u202Emd' },
+      { text: '$ralplan\uFEFF.md', rawKeyword: '$ralplan\uFEFF.md' },
+      { text: '$ralplan．md', rawKeyword: '$ralplan．md' },
     ] as const;
 
     for (const testCase of cases) {
@@ -574,11 +580,18 @@ describe('keyword input classification direct grammar', () => {
       assert.equal(classification.candidates[0]?.skill, null, testCase.text);
       assert.deepEqual(classification.candidates[0]?.reasons, [], testCase.text);
     }
+
+    for (const text of ['$ralplan, plan this', '$ralplan； plan this', '$ralplan\nplan this']) {
+      assert.deepEqual(classifyKeywordInput(text).matches.map((match) => match.skill), ['ralplan'], text);
+    }
   });
 
-  it('accepts later directives after inert or negative mentions without reactivating them', () => {
+  it('accepts later directives after structurally separated inert or negative mentions', () => {
     const cases = [
       { text: 'Do not run $ralplan; instead $autopilot build issue #3140', skills: ['autopilot'] },
+      { text: 'Do not run $ralplan, instead $autopilot build it', skills: ['autopilot'] },
+      { text: 'Do not run $ralplan; use $autopilot build it', skills: ['autopilot'] },
+      { text: 'Quoted inline-code `$ralplan`; use $autopilot build it', skills: ['autopilot'] },
       { text: 'Without $ralplan.\n$autopilot build it', skills: ['autopilot'] },
       { text: 'Quoted example: "$ralplan plan it".\n$autopilot build it', skills: ['autopilot'] },
       { text: '`$ralplan` is inert.\n$autopilot build it', skills: ['autopilot'] },
@@ -590,9 +603,20 @@ describe('keyword input classification direct grammar', () => {
       assert.deepEqual(classification.matches.map((match) => match.skill), testCase.skills, testCase.text);
       assert.equal(classification.reservedInput, null, testCase.text);
     }
+
+    for (const text of [
+      'Do not run $ralplan and use $autopilot build it',
+      'Do not run $ralplan; do not run $autopilot',
+      'Do not run $ralplan, $autopilot',
+      '"$ralplan" mentions $autopilot without a clause boundary',
+      'Do not run $ralplan. We only document $autopilot behavior',
+      '"$ralplan". The $autopilot workflow is documented',
+    ]) {
+      assert.deepEqual(classifyKeywordInput(text).matches, [], text);
+    }
   });
 
-  it('keeps prompt reservations and list documentation structural', () => {
+  it('keeps prompt reservations and list documentation structural and composable', () => {
     const reserved = classifyKeywordInput('/prompts:architect analyze this issue');
     assert.equal(reserved.reservedInput, 'prompts');
     assert.deepEqual(reserved.matches, []);
@@ -603,10 +627,23 @@ describe('keyword input classification direct grammar', () => {
       '- $ralplan is the consensus-planning command',
       '1. $autopilot refers to the autonomous workflow command',
       '- /prompts:architect is the prompt command documentation',
+      '- $ralplan: consensus-planning workflow',
+      '- $ralplan — consensus-planning command',
+      '- $ralplan, $autopilot are workflow commands',
+      '- $ralplan and $autopilot are workflow commands',
     ]) {
       const classification = classifyKeywordInput(text);
       assert.equal(classification.reservedInput, null, text);
       assert.deepEqual(classification.matches, [], text);
+    }
+
+    for (const testCase of [
+      { text: '- $ralplan is the consensus-planning command\n$autopilot build it', skills: ['autopilot'] },
+      { text: '- /prompts:architect is the prompt command documentation\n$ralplan plan it', skills: ['ralplan'] },
+      { text: '- $ralplan, $autopilot are workflow commands\n$team execute it', skills: ['team'] },
+      { text: '- $ralplan and $autopilot are workflow commands\n$team execute it', skills: ['team'] },
+    ] as const) {
+      assert.deepEqual(classifyKeywordInput(testCase.text).matches.map((match) => match.skill), testCase.skills, testCase.text);
     }
 
     assert.deepEqual(detectKeywords('- $ralplan plan this').map((match) => match.skill), ['ralplan']);
@@ -677,6 +714,54 @@ describe('keyword input classification direct grammar', () => {
       const classification = classifyKeywordInput(testCase.text);
       assert.deepEqual(classification.matches, [], testCase.text);
       assert.deepEqual(classification.candidates[0]?.reasons, testCase.reasons, testCase.text);
+    }
+  });
+
+  it('respects quote escape parity and fence container prefixes', () => {
+    const escapedQuote = '"$ralplan \\"; $autopilot build it';
+    const escapedQuoteClassification = classifyKeywordInput(escapedQuote);
+    assert.deepEqual(escapedQuoteClassification.matches, []);
+    assert.deepEqual(escapedQuoteClassification.candidates.map((candidate) => candidate.reasons), [
+      ['quote', 'not-leading-region'],
+      ['quote', 'not-leading-region'],
+    ]);
+
+    const evenBackslashQuote = '"$ralplan \\\\"; use $autopilot build it';
+    assert.deepEqual(classifyKeywordInput(evenBackslashQuote).matches.map((match) => match.skill), ['autopilot']);
+
+    const unquotedFence = '```\n$ralplan\n> ```\n$autopilot build it';
+    assert.deepEqual(classifyKeywordInput(unquotedFence).matches, []);
+    const unquotedFenceCandidates = classifyKeywordInput(unquotedFence).candidates;
+    assert.ok(unquotedFenceCandidates.every((candidate) => candidate.reasons.includes('fenced-code')));
+
+    const quotedFence = '> ```\n> $ralplan\n```\n> $autopilot build it';
+    assert.deepEqual(classifyKeywordInput(quotedFence).matches, []);
+    assert.ok(classifyKeywordInput(quotedFence).candidates.every((candidate) => candidate.reasons.length > 0));
+
+    const matchingQuotedFence = '> ```\n> $ralplan\n> ```\n$autopilot build it';
+    assert.deepEqual(classifyKeywordInput(matchingQuotedFence).matches.map((match) => match.skill), ['autopilot']);
+
+    const nestedQuotedFence = '> > ```\n> > $ralplan\n> ```\n$autopilot build it';
+    assert.deepEqual(classifyKeywordInput(nestedQuotedFence).matches, []);
+  });
+
+  it('requires valid fence closers and directive clause prefixes after inert mentions', () => {
+    for (const text of [
+      '```\n$ralplan\n``` still code\n$autopilot build it',
+      '> ```\n> $ralplan\n> ``` still code\n> $autopilot build it',
+    ]) {
+      const classification = classifyKeywordInput(text);
+      assert.deepEqual(classification.matches, [], text);
+      assert.ok(classification.candidates.every((candidate) => candidate.reasons.length > 0), text);
+    }
+
+    for (const testCase of [
+      { text: '"$ralplan"; now $autopilot build it', skills: ['autopilot'] },
+      { text: '"$ralplan"; please use $autopilot build it', skills: ['autopilot'] },
+      { text: '"$ralplan". We only document $autopilot behavior', skills: [] },
+      { text: '"$ralplan". The $autopilot workflow is documented', skills: [] },
+    ] as const) {
+      assert.deepEqual(classifyKeywordInput(testCase.text).matches.map((match) => match.skill), testCase.skills, testCase.text);
     }
   });
 
