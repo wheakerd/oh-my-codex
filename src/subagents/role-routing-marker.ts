@@ -1,0 +1,195 @@
+import { randomUUID } from 'node:crypto';
+import {
+  closeSync,
+  existsSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
+import { dirname, join } from 'node:path';
+import type { RoleRoutingUnavailableMarker } from '../leader/contract.js';
+
+export const NATIVE_SUBAGENT_ROLE_ROUTING_MARKER_FILE = 'native-subagent-role-routing.json';
+
+const ROLE_ROUTING_MARKER_SCHEMA_VERSION = 1;
+const ROLE_ROUTING_MARKER_LOCK_RETRY_MS = 10;
+const ROLE_ROUTING_MARKER_LOCK_TIMEOUT_MS = 5_000;
+
+type RoleRoutingMarkerStore = {
+  schema_version: 1;
+  markers: RoleRoutingUnavailableMarker[];
+};
+
+function markerStorePath(baseStateDir: string): string {
+  return join(baseStateDir, NATIVE_SUBAGENT_ROLE_ROUTING_MARKER_FILE);
+}
+
+function markerLockPath(baseStateDir: string): string {
+  return `${markerStorePath(baseStateDir)}.lock`;
+}
+
+function waitForLockRetry(): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ROLE_ROUTING_MARKER_LOCK_RETRY_MS);
+}
+
+function withRoleRoutingMarkerLock<T>(baseStateDir: string, operation: () => T): T {
+  const lockPath = markerLockPath(baseStateDir);
+  mkdirSync(dirname(lockPath), { recursive: true });
+  const startedAt = Date.now();
+  let lastError: unknown;
+
+  while (Date.now() - startedAt < ROLE_ROUTING_MARKER_LOCK_TIMEOUT_MS) {
+    let descriptor: number | undefined;
+    let acquired = false;
+    try {
+      descriptor = openSync(lockPath, 'wx');
+      acquired = true;
+      writeFileSync(descriptor, `${process.pid}:${randomUUID()}\n`);
+      closeSync(descriptor);
+      descriptor = undefined;
+      try {
+        return operation();
+      } finally {
+        unlinkSync(lockPath);
+      }
+    } catch (error) {
+      if (descriptor !== undefined) {
+        try {
+          closeSync(descriptor);
+        } catch {
+          // Preserve the original lock acquisition failure.
+        }
+      }
+      if (acquired) {
+        try {
+          unlinkSync(lockPath);
+        } catch {
+          // Preserve the persistence failure that caused lock release.
+        }
+        throw error;
+      }
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== 'EEXIST') throw error;
+      lastError = error;
+      waitForLockRetry();
+    }
+  }
+
+  throw new Error(
+    `Timed out acquiring role-routing marker lock at ${lockPath}: ${lastError instanceof Error ? lastError.message : String(lastError ?? 'lock remained busy')}`,
+  );
+}
+
+function readString(value: unknown): string | null {
+  const normalized = typeof value === 'string' ? value.trim() : '';
+  return normalized || null;
+}
+
+function normalizeMarker(value: unknown): RoleRoutingUnavailableMarker | null {
+  if (!value || typeof value !== 'object') return null;
+  const candidate = value as Partial<RoleRoutingUnavailableMarker>;
+  const sessionId = readString(candidate.session_id);
+  const observedAt = readString(candidate.observed_at);
+  const expiresAt = readString(candidate.expires_at);
+  if (!sessionId || !observedAt || !expiresAt) return null;
+  if (!Number.isFinite(Date.parse(observedAt)) || !Number.isFinite(Date.parse(expiresAt))) return null;
+
+  const cwd = readString(candidate.cwd);
+  const parentThreadId = readString(candidate.parent_thread_id);
+  const evidence = readString(candidate.evidence);
+  return {
+    schema_version: ROLE_ROUTING_MARKER_SCHEMA_VERSION,
+    ...(cwd ? { cwd } : {}),
+    session_id: sessionId,
+    ...(parentThreadId ? { parent_thread_id: parentThreadId } : {}),
+    observed_at: observedAt,
+    expires_at: expiresAt,
+    ...(evidence ? { evidence } : {}),
+  };
+}
+
+function readMarkerStore(baseStateDir: string): RoleRoutingMarkerStore {
+  const path = markerStorePath(baseStateDir);
+  if (!existsSync(path)) return { schema_version: ROLE_ROUTING_MARKER_SCHEMA_VERSION, markers: [] };
+  try {
+    const parsed = JSON.parse(readFileSync(path, 'utf-8')) as Partial<RoleRoutingMarkerStore>;
+    if (parsed.schema_version !== ROLE_ROUTING_MARKER_SCHEMA_VERSION || !Array.isArray(parsed.markers)) {
+      return { schema_version: ROLE_ROUTING_MARKER_SCHEMA_VERSION, markers: [] };
+    }
+    return {
+      schema_version: ROLE_ROUTING_MARKER_SCHEMA_VERSION,
+      markers: parsed.markers
+        .map((marker) => normalizeMarker(marker))
+        .filter((marker): marker is RoleRoutingUnavailableMarker => marker !== null),
+    };
+  } catch {
+    return { schema_version: ROLE_ROUTING_MARKER_SCHEMA_VERSION, markers: [] };
+  }
+}
+
+function writeMarkerStore(baseStateDir: string, store: RoleRoutingMarkerStore): void {
+  const path = markerStorePath(baseStateDir);
+  mkdirSync(dirname(path), { recursive: true });
+  const temporaryPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  writeFileSync(temporaryPath, `${JSON.stringify(store, null, 2)}\n`);
+  renameSync(temporaryPath, path);
+}
+
+function isExpired(marker: RoleRoutingUnavailableMarker, nowMs: number): boolean {
+  const expiresAtMs = Date.parse(marker.expires_at);
+  return !Number.isFinite(expiresAtMs) || expiresAtMs <= nowMs;
+}
+
+function markerSortTimestamp(marker: RoleRoutingUnavailableMarker): number {
+  const observedAtMs = Date.parse(marker.observed_at);
+  return Number.isFinite(observedAtMs) ? observedAtMs : Number.NEGATIVE_INFINITY;
+}
+
+// Session-isolated, expiring, cross-process-safe store. File shape:
+//   { schema_version: 1, markers: RoleRoutingUnavailableMarker[] }
+export function writeRoleRoutingMarker(baseStateDir: string, marker: RoleRoutingUnavailableMarker): void {
+  const normalizedMarker = normalizeMarker(marker);
+  if (!normalizedMarker) {
+    throw new Error('Role-routing marker requires a session_id plus valid observed_at and expires_at timestamps.');
+  }
+  const parentThreadId = normalizedMarker.parent_thread_id ?? '';
+
+  withRoleRoutingMarkerLock(baseStateDir, () => {
+    const nowMs = Date.now();
+    const store = readMarkerStore(baseStateDir);
+    const markers = store.markers.filter((candidate) => (
+      !isExpired(candidate, nowMs)
+      && (candidate.session_id !== normalizedMarker.session_id || (candidate.parent_thread_id ?? '') !== parentThreadId)
+    ));
+    markers.push(normalizedMarker);
+    writeMarkerStore(baseStateDir, {
+      schema_version: ROLE_ROUTING_MARKER_SCHEMA_VERSION,
+      markers,
+    });
+  });
+}
+
+// readRoleRoutingMarker: return the newest non-expired marker matching scope
+// (cwd optional, session_id required, parent_thread_id optional), else null.
+export function readRoleRoutingMarker(
+  baseStateDir: string,
+  scope: { cwd?: string; sessionId: string; parentThreadId?: string; nowMs?: number },
+): RoleRoutingUnavailableMarker | null {
+  const sessionId = scope.sessionId.trim();
+  if (!sessionId) return null;
+  const cwd = scope.cwd?.trim();
+  const parentThreadId = scope.parentThreadId?.trim();
+  const nowMs = typeof scope.nowMs === 'number' && Number.isFinite(scope.nowMs) ? scope.nowMs : Date.now();
+
+  return readMarkerStore(baseStateDir).markers
+    .filter((marker) => (
+      !isExpired(marker, nowMs)
+      && marker.session_id === sessionId
+      && (!marker.cwd || marker.cwd === cwd)
+      && (!parentThreadId || marker.parent_thread_id === parentThreadId)
+    ))
+    .sort((left, right) => markerSortTimestamp(right) - markerSortTimestamp(left))[0] ?? null;
+}

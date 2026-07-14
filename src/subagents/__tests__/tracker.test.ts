@@ -1,12 +1,152 @@
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, it } from 'node:test';
-import {
-  buildSubagentResumeLedger,
-  createSubagentTrackingState,
-  recordSubagentTurn,
-  selectReusableSubagentEntry,
-  summarizeSubagentSession,
-} from '../tracker.js';
+import { buildSubagentResumeLedger, createSubagentTrackingState, consumePendingRoleIntent, recordSubagentTurn, NATIVE_SUBAGENT_PROVENANCE, OMX_ADAPTED_PROVENANCE, readSubagentTrackingState, recordPendingRoleIntent, selectReusableSubagentEntry, summarizeSubagentSession } from '../tracker.js';
+
+interface PendingRoleIntentRecordWorkerInput {
+  operation: 'record';
+  cwd: string;
+  role: string;
+  sessionId: string;
+  parentThreadId: string;
+  nowMs: number;
+}
+
+interface PendingRoleIntentConsumeWorkerInput {
+  operation: 'consume';
+  cwd: string;
+  sessionId: string;
+  parentThreadId: string;
+  nowMs: number;
+}
+
+type PendingRoleIntentWorkerInput = PendingRoleIntentRecordWorkerInput | PendingRoleIntentConsumeWorkerInput | PendingRoleIntentRecordTurnWorkerInput;
+
+interface PendingRoleIntentRecordTurnWorkerInput {
+  operation: 'record-turn';
+  cwd: string;
+  sessionId: string;
+  threadId: string;
+}
+type PendingRoleIntentWorkerResult = { ok: boolean; reason?: string } | { role: string; provenanceKind: string } | null;
+
+interface PendingRoleIntentWorker {
+  ready: Promise<void>;
+  result: Promise<PendingRoleIntentWorkerResult>;
+}
+
+const PENDING_ROLE_INTENT_WORKER_SOURCE = `
+  import { existsSync } from 'node:fs';
+
+  const input = JSON.parse(process.env.OMX_PENDING_ROLE_INTENT_WORKER_INPUT ?? '{}');
+  const tracker = await import(process.env.OMX_TRACKER_MODULE_URL ?? '');
+  const startSignal = process.env.OMX_PENDING_ROLE_INTENT_START_SIGNAL ?? '';
+  const waitArray = new Int32Array(new SharedArrayBuffer(4));
+  const startedAt = Date.now();
+
+  process.stdout.write('ready\\n');
+  while (!existsSync(startSignal)) {
+    if (Date.now() - startedAt > 10_000) {
+      throw new Error('Timed out waiting for pending role intent test start signal');
+    }
+    Atomics.wait(waitArray, 0, 0, 5);
+  }
+
+  const result = input.operation === 'record'
+    ? tracker.recordPendingRoleIntent(input.cwd, input)
+    : input.operation === 'consume'
+      ? tracker.consumePendingRoleIntent(input.cwd, input)
+      : (await tracker.recordSubagentTurnForSession(input.cwd, input), { ok: true });
+  process.stdout.write(JSON.stringify(result));
+`;
+
+function spawnPendingRoleIntentWorker(startSignal: string, input: PendingRoleIntentWorkerInput): PendingRoleIntentWorker {
+  const child = spawn(process.execPath, ['--input-type=module', '--eval', PENDING_ROLE_INTENT_WORKER_SOURCE], {
+    env: {
+      ...process.env,
+      OMX_PENDING_ROLE_INTENT_START_SIGNAL: startSignal,
+      OMX_PENDING_ROLE_INTENT_WORKER_INPUT: JSON.stringify(input),
+      OMX_TRACKER_MODULE_URL: new URL('../tracker.js', import.meta.url).href,
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  if (!child.stdout || !child.stderr) {
+    throw new Error('Pending role intent test worker did not expose output streams');
+  }
+
+  let stdout = '';
+  let stderr = '';
+  let ready = false;
+  let resolveReady!: () => void;
+  let rejectReady!: (error: Error) => void;
+  let resolveResult!: (result: PendingRoleIntentWorkerResult) => void;
+  let rejectResult!: (error: Error) => void;
+  const readyPromise = new Promise<void>((resolve, reject) => {
+    resolveReady = resolve;
+    rejectReady = reject;
+  });
+  const resultPromise = new Promise<PendingRoleIntentWorkerResult>((resolve, reject) => {
+    resolveResult = resolve;
+    rejectResult = reject;
+  });
+
+  child.stdout.setEncoding('utf-8');
+  child.stdout.on('data', (chunk: string) => {
+    stdout += chunk;
+    if (!ready && stdout.includes('ready\n')) {
+      ready = true;
+      resolveReady();
+    }
+  });
+  child.stderr.setEncoding('utf-8');
+  child.stderr.on('data', (chunk: string) => {
+    stderr += chunk;
+  });
+  child.once('error', (error) => {
+    if (!ready) rejectReady(error);
+    rejectResult(error);
+  });
+  child.once('close', (code) => {
+    if (!ready) {
+      rejectReady(new Error(`Pending role intent test worker exited before ready: ${stderr || `code ${code}`}`));
+    }
+    if (code !== 0) {
+      rejectResult(new Error(`Pending role intent test worker failed: ${stderr || `code ${code}`}`));
+      return;
+    }
+    try {
+      const resultJson = stdout.slice(stdout.indexOf('ready\n') + 'ready\n'.length);
+      resolveResult(JSON.parse(resultJson) as PendingRoleIntentWorkerResult);
+    } catch (error) {
+      rejectResult(error instanceof Error ? error : new Error(String(error)));
+    }
+  });
+
+  return { ready: readyPromise, result: resultPromise };
+}
+
+async function runConcurrentPendingRoleIntentWorkers(cwd: string, inputs: [PendingRoleIntentWorkerInput, PendingRoleIntentWorkerInput]): Promise<[PendingRoleIntentWorkerResult, PendingRoleIntentWorkerResult]> {
+  const startSignal = join(cwd, 'pending-role-intent-workers-start');
+  const workers = inputs.map((input) => spawnPendingRoleIntentWorker(startSignal, input));
+  await Promise.all(workers.map((worker) => worker.ready));
+  await writeFile(startSignal, 'start\n');
+  return Promise.all(workers.map((worker) => worker.result)) as Promise<[PendingRoleIntentWorkerResult, PendingRoleIntentWorkerResult]>;
+}
+
+function isSuccessfulRoleIntentRecord(result: PendingRoleIntentWorkerResult): result is { ok: true; reason?: string } {
+  return result !== null && 'ok' in result && result.ok === true;
+}
+
+function isSingleFlightConflict(result: PendingRoleIntentWorkerResult): result is { ok: false; reason: 'single_flight_conflict' } {
+  return result !== null && 'ok' in result && result.ok === false && result.reason === 'single_flight_conflict';
+}
+
+function isConsumedRoleIntent(result: PendingRoleIntentWorkerResult): result is { role: string; provenanceKind: string } {
+  return result !== null && 'role' in result;
+}
 
 describe('subagents/tracker', () => {
   it('tracks leader and subagent threads per session and computes active windows', () => {
@@ -44,8 +184,20 @@ describe('subagents/tracker', () => {
       allSubagentThreadIds: ['sub-thread-1', 'sub-thread-2'],
       activeSubagentThreadIds: ['sub-thread-1', 'sub-thread-2'],
       savedSubagents: [
-        { agentId: 'sub-thread-1', threadId: 'sub-thread-1', role: 'ralph', laneId: 'ralph', status: 'available' },
-        { agentId: 'sub-thread-2', threadId: 'sub-thread-2', role: 'ralph', laneId: 'ralph', status: 'available' },
+        {
+          agentId: 'sub-thread-1',
+          threadId: 'sub-thread-1',
+          role: 'ralph',
+          laneId: 'ralph',
+          status: 'available',
+        },
+        {
+          agentId: 'sub-thread-2',
+          threadId: 'sub-thread-2',
+          role: 'ralph',
+          laneId: 'ralph',
+          status: 'available',
+        },
       ],
       updatedAt: '2026-03-17T00:01:00.000Z',
     });
@@ -244,10 +396,7 @@ describe('subagents/tracker', () => {
 
     assert.deepEqual(summary?.allSubagentThreadIds, ['sub-thread-1']);
     assert.deepEqual(summary?.activeSubagentThreadIds, []);
-    assert.equal(
-      state.sessions['sess-1']?.threads['sub-thread-1']?.completion_source,
-      'notify-fallback-watcher',
-    );
+    assert.equal(state.sessions['sess-1']?.threads['sub-thread-1']?.completion_source, 'notify-fallback-watcher');
   });
 
   it('preserves explicit unavailable and closed status in summaries even when threads are still recent', () => {
@@ -288,8 +437,20 @@ describe('subagents/tracker', () => {
 
     assert.deepEqual(summary?.activeSubagentThreadIds, []);
     assert.deepEqual(summary?.savedSubagents, [
-      { agentId: 'sub-thread-closed', threadId: 'sub-thread-closed', role: 'critic', laneId: 'critic', status: 'closed' },
-      { agentId: 'sub-thread-unavailable', threadId: 'sub-thread-unavailable', role: 'architect', laneId: 'architect', status: 'unavailable' },
+      {
+        agentId: 'sub-thread-closed',
+        threadId: 'sub-thread-closed',
+        role: 'critic',
+        laneId: 'critic',
+        status: 'closed',
+      },
+      {
+        agentId: 'sub-thread-unavailable',
+        threadId: 'sub-thread-unavailable',
+        role: 'architect',
+        laneId: 'architect',
+        status: 'unavailable',
+      },
     ]);
     assert.deepEqual(ledger?.activeSubagentThreadIds, []);
   });
@@ -332,7 +493,13 @@ describe('subagents/tracker', () => {
 
     assert.deepEqual(summary?.activeSubagentThreadIds, ['sub-thread-1']);
     assert.deepEqual(summary?.savedSubagents, [
-      { agentId: 'sub-thread-1', threadId: 'sub-thread-1', role: 'architect', laneId: 'architect', status: 'available' },
+      {
+        agentId: 'sub-thread-1',
+        threadId: 'sub-thread-1',
+        role: 'architect',
+        laneId: 'architect',
+        status: 'available',
+      },
     ]);
     assert.deepEqual(ledger?.activeSubagentThreadIds, ['sub-thread-1']);
     assert.equal(ledger?.savedSubagents[0]?.status, 'available');
@@ -358,6 +525,7 @@ describe('subagents/tracker', () => {
       timestamp: '2026-06-29T00:00:30.000Z',
       mode: 'executor',
       role: 'executor',
+      provenanceKind: NATIVE_SUBAGENT_PROVENANCE,
       laneId: 'implementation-fix',
       scope: 'runtime hook guard',
       agentNickname: 'worker-1',
@@ -383,6 +551,7 @@ describe('subagents/tracker', () => {
     ]);
     assert.equal(state.sessions['sess-conductor']?.threads['thread-executor']?.role, 'executor');
     assert.equal(state.sessions['sess-conductor']?.threads['thread-executor']?.lane_id, 'implementation-fix');
+    assert.equal(state.sessions['sess-conductor']?.threads['thread-executor']?.provenance_kind, NATIVE_SUBAGENT_PROVENANCE);
   });
 
   it('builds a reusable ledger that preserves unavailable status and handoff summaries', () => {
@@ -428,7 +597,10 @@ describe('subagents/tracker', () => {
     });
 
     assert.ok(ledger);
-    assert.deepEqual(ledger?.resumeTargets.map((entry) => entry.agentId), ['thread-architect', 'thread-critic']);
+    assert.deepEqual(
+      ledger?.resumeTargets.map((entry) => entry.agentId),
+      ['thread-architect', 'thread-critic'],
+    );
     assert.equal(ledger?.savedSubagents.find((entry) => entry.agentId === 'thread-architect')?.status, 'available');
     assert.equal(ledger?.savedSubagents.find((entry) => entry.agentId === 'thread-architect')?.lastHandoffSummary, 'architect reviewed v1 and requested reuse of the same lane');
     assert.equal(ledger?.savedSubagents.find((entry) => entry.agentId === 'thread-critic')?.status, 'unavailable');
@@ -442,67 +614,79 @@ describe('subagents/tracker', () => {
       'thread-architect',
     );
     assert.equal(
-      selectReusableSubagentEntry([
+      selectReusableSubagentEntry(
+        [
+          {
+            agentId: 'thread-executor',
+            threadId: 'thread-executor',
+            role: 'executor',
+            laneId: 'plan-review',
+            scope: 'runtime hook guard',
+            status: 'available',
+            lastSeenAt: '2026-06-29T00:01:25.000Z',
+          },
+          {
+            agentId: 'thread-architect',
+            threadId: 'thread-architect',
+            role: 'architect',
+            laneId: 'plan-review',
+            scope: 'runtime hook guard',
+            status: 'closed',
+            lastSeenAt: '2026-06-29T00:01:20.000Z',
+          },
+        ],
         {
-          agentId: 'thread-executor',
-          threadId: 'thread-executor',
-          role: 'executor',
-          laneId: 'plan-review',
-          scope: 'runtime hook guard',
-          status: 'available',
-          lastSeenAt: '2026-06-29T00:01:25.000Z',
-        },
-        {
-          agentId: 'thread-architect',
-          threadId: 'thread-architect',
           role: 'architect',
           laneId: 'plan-review',
           scope: 'runtime hook guard',
-          status: 'closed',
-          lastSeenAt: '2026-06-29T00:01:20.000Z',
         },
-      ], {
-        role: 'architect',
-        laneId: 'plan-review',
-        scope: 'runtime hook guard',
-      })?.agentId,
+      )?.agentId,
       'thread-architect',
     );
     assert.equal(
-      selectReusableSubagentEntry([
+      selectReusableSubagentEntry(
+        [
+          {
+            agentId: 'thread-critic',
+            threadId: 'thread-critic',
+            role: 'critic',
+            laneId: 'risk-review',
+            scope: 'runtime hook guard',
+            status: 'unavailable',
+          },
+        ],
         {
-          agentId: 'thread-critic',
-          threadId: 'thread-critic',
           role: 'critic',
           laneId: 'risk-review',
           scope: 'runtime hook guard',
-          status: 'unavailable',
         },
-      ], {
-        role: 'critic',
-        laneId: 'risk-review',
-        scope: 'runtime hook guard',
-      }),
+      ),
       null,
     );
     assert.equal(
-      selectReusableSubagentEntry([
+      selectReusableSubagentEntry(
+        [
+          {
+            agentId: 'thread-executor',
+            threadId: 'thread-executor',
+            role: 'executor',
+            laneId: 'plan-review',
+            scope: 'runtime hook guard',
+            status: 'available',
+          },
+        ],
         {
-          agentId: 'thread-executor',
-          threadId: 'thread-executor',
-          role: 'executor',
+          role: 'architect',
           laneId: 'plan-review',
           scope: 'runtime hook guard',
-          status: 'available',
         },
-      ], {
-        role: 'architect',
-        laneId: 'plan-review',
-        scope: 'runtime hook guard',
-      }),
+      ),
       null,
     );
-    assert.deepEqual(ledger?.unavailableSubagents.map((entry) => entry.agentId), ['thread-critic']);
+    assert.deepEqual(
+      ledger?.unavailableSubagents.map((entry) => entry.agentId),
+      ['thread-critic'],
+    );
   });
 
   it('preserves explicit closed ledger status so older available lanes win reuse selection', () => {
@@ -546,10 +730,10 @@ describe('subagents/tracker', () => {
 
     assert.ok(ledger);
     assert.equal(ledger.savedSubagents.find((entry) => entry.agentId === 'thread-closed-recent')?.status, 'closed');
-    assert.deepEqual(ledger.resumeTargets.map((entry) => entry.agentId), [
-      'thread-available-older',
-      'thread-closed-recent',
-    ]);
+    assert.deepEqual(
+      ledger.resumeTargets.map((entry) => entry.agentId),
+      ['thread-available-older', 'thread-closed-recent'],
+    );
     assert.equal(
       selectReusableSubagentEntry(ledger.resumeTargets, {
         role: 'executor',
@@ -560,4 +744,221 @@ describe('subagents/tracker', () => {
     );
   });
 
+  it('rejects pending role intents for unknown roles', () => {
+    assert.deepEqual(
+      recordPendingRoleIntent(process.cwd(), {
+        role: 'not-a-known-role',
+        sessionId: 'sess-role-intent',
+        parentThreadId: 'thread-parent',
+      }),
+      { ok: false, reason: 'unknown_role' },
+    );
+  });
+
+  it('rejects a second live role intent for the same parent thread', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-subagent-tracker-'));
+    try {
+      assert.equal(
+        recordPendingRoleIntent(cwd, {
+          role: 'architect',
+          sessionId: 'sess-role-intent',
+          parentThreadId: 'thread-parent',
+          nowMs: 1_000,
+        }).ok,
+        true,
+      );
+      assert.deepEqual(
+        recordPendingRoleIntent(cwd, {
+          role: 'critic',
+          sessionId: 'sess-role-intent',
+          parentThreadId: 'thread-parent',
+          nowMs: 1_001,
+        }),
+        { ok: false, reason: 'single_flight_conflict' },
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('serializes concurrent pending role intent records across processes', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-subagent-tracker-'));
+    try {
+      const results = await runConcurrentPendingRoleIntentWorkers(cwd, [
+        {
+          operation: 'record',
+          cwd,
+          role: 'architect',
+          sessionId: 'sess-role-intent-concurrent-record',
+          parentThreadId: 'thread-parent',
+          nowMs: 1_000,
+        },
+        {
+          operation: 'record',
+          cwd,
+          role: 'critic',
+          sessionId: 'sess-role-intent-concurrent-record',
+          parentThreadId: 'thread-parent',
+          nowMs: 1_000,
+        },
+      ]);
+
+      assert.equal(results.filter(isSuccessfulRoleIntentRecord).length, 1);
+      assert.equal(results.filter(isSingleFlightConflict).length, 1);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('consumes a pending role intent exactly once', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-subagent-tracker-'));
+    try {
+      assert.equal(
+        recordPendingRoleIntent(cwd, {
+          role: 'architect',
+          sessionId: 'sess-role-intent',
+          parentThreadId: 'thread-parent',
+          nowMs: 1_000,
+        }).ok,
+        true,
+      );
+      assert.deepEqual(
+        consumePendingRoleIntent(cwd, {
+          sessionId: 'sess-role-intent',
+          parentThreadId: 'thread-parent',
+          nowMs: 1_001,
+        }),
+        { role: 'architect', provenanceKind: OMX_ADAPTED_PROVENANCE },
+      );
+      assert.equal(
+        consumePendingRoleIntent(cwd, {
+          sessionId: 'sess-role-intent',
+          parentThreadId: 'thread-parent',
+          nowMs: 1_002,
+        }),
+        null,
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('serializes concurrent pending role intent consumes across processes', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-subagent-tracker-'));
+    try {
+      assert.equal(
+        recordPendingRoleIntent(cwd, {
+          role: 'architect',
+          sessionId: 'sess-role-intent-concurrent-consume',
+          parentThreadId: 'thread-parent',
+          nowMs: 1_000,
+        }).ok,
+        true,
+      );
+
+      const results = await runConcurrentPendingRoleIntentWorkers(cwd, [
+        {
+          operation: 'consume',
+          cwd,
+          sessionId: 'sess-role-intent-concurrent-consume',
+          parentThreadId: 'thread-parent',
+          nowMs: 1_001,
+        },
+        {
+          operation: 'consume',
+          cwd,
+          sessionId: 'sess-role-intent-concurrent-consume',
+          parentThreadId: 'thread-parent',
+          nowMs: 1_001,
+        },
+      ]);
+
+      assert.equal(results.filter(isConsumedRoleIntent).length, 1);
+      assert.equal(results.filter((result) => result === null).length, 1);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('serializes lifecycle tracking writes with pending role intent records and consumes', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-subagent-tracker-'));
+    const sessionId = 'sess-role-intent-lifecycle-race';
+    const parentThreadId = 'thread-parent';
+    try {
+      const recordResults = await runConcurrentPendingRoleIntentWorkers(cwd, [
+        {
+          operation: 'record',
+          cwd,
+          role: 'architect',
+          sessionId,
+          parentThreadId,
+          nowMs: 1_000,
+        },
+        {
+          operation: 'record-turn',
+          cwd,
+          sessionId,
+          threadId: 'thread-lifecycle-before-consume',
+        },
+      ]);
+      assert.equal(isSuccessfulRoleIntentRecord(recordResults[0]), true);
+      assert.equal(isSuccessfulRoleIntentRecord(recordResults[1]), true);
+
+      const recorded = await readSubagentTrackingState(cwd);
+      assert.equal(recorded.pending_role_intents.length, 1);
+      assert.equal(recorded.pending_role_intents[0]?.role, 'architect');
+      assert.equal(recorded.sessions[sessionId]?.threads['thread-lifecycle-before-consume']?.kind, 'leader');
+
+      const consumeResults = await runConcurrentPendingRoleIntentWorkers(cwd, [
+        {
+          operation: 'consume',
+          cwd,
+          sessionId,
+          parentThreadId,
+          nowMs: 1_001,
+        },
+        {
+          operation: 'record-turn',
+          cwd,
+          sessionId,
+          threadId: 'thread-lifecycle-after-consume',
+        },
+      ]);
+      assert.equal(isConsumedRoleIntent(consumeResults[0]), true);
+      assert.equal(isSuccessfulRoleIntentRecord(consumeResults[1]), true);
+
+      const consumed = await readSubagentTrackingState(cwd);
+      assert.deepEqual(consumed.pending_role_intents, []);
+      assert.equal(consumed.sessions[sessionId]?.threads['thread-lifecycle-before-consume']?.kind, 'leader');
+      assert.equal(consumed.sessions[sessionId]?.threads['thread-lifecycle-after-consume']?.kind, 'subagent');
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('does not consume expired pending role intents', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-subagent-tracker-'));
+    try {
+      assert.equal(
+        recordPendingRoleIntent(cwd, {
+          role: 'architect',
+          sessionId: 'sess-role-intent',
+          parentThreadId: 'thread-parent',
+          nowMs: 1_000,
+          ttlMs: 10,
+        }).ok,
+        true,
+      );
+      assert.equal(
+        consumePendingRoleIntent(cwd, {
+          sessionId: 'sess-role-intent',
+          parentThreadId: 'thread-parent',
+          nowMs: 1_010,
+        }),
+        null,
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
 });

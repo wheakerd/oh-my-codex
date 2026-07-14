@@ -27,6 +27,7 @@ import { hudCommand } from "../hud/index.js";
 import { sidecarCommand } from "../sidecar/index.js";
 import { teamCommand } from "./team.js";
 import { ralphCommand } from "./ralph.js";
+import { ralplanCommand } from "./ralplan.js";
 import { ultragoalCommand } from "./ultragoal.js";
 import { performanceGoalCommand } from "./performance-goal.js";
 import { askCommand } from "./ask.js";
@@ -261,6 +262,7 @@ Usage:
                 Alias for agents-init (lightweight AGENTS bootstrap only)
   omx team      Spawn parallel worker panes in tmux and bootstrap inbox/task state
   omx ralph     Launch Codex with ralph persistence mode active
+  omx ralplan   Record validated role intents for adapted native subagent spawns
   omx ultragoal Create, resume, and checkpoint durable multi-goal plans over Codex goal mode
   omx performance-goal
                 Create, hand off, and gate evaluator-backed performance goals
@@ -467,6 +469,7 @@ const NESTED_HELP_COMMANDS = new Set<CliCommand>([
   "wiki",
   "mcp-serve",
   "ralph",
+  "ralplan",
   "ultragoal",
   "performance-goal",
   "resume",
@@ -2660,6 +2663,7 @@ export async function main(args: string[]): Promise<void> {
     "sparkshell",
     "team",
     "ralph",
+    "ralplan",
     "ultragoal",
     "performance-goal",
     "session",
@@ -2814,6 +2818,9 @@ export async function main(args: string[]): Promise<void> {
         break;
       case "ralph":
         await ralphCommand(args.slice(1));
+        break;
+      case "ralplan":
+        await ralplanCommand(args.slice(1));
         break;
       case "ultragoal":
         await ultragoalCommand(args.slice(1));

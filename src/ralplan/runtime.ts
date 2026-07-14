@@ -41,7 +41,8 @@ export interface RalplanReviewResult {
   verdict: RalplanReviewVerdict;
   summary?: string;
   artifacts?: Record<string, unknown>;
-  provenance_kind?: 'native_subagent' | 'codex_exec';
+  provenance_kind?: 'native_subagent' | 'omx_adapted' | 'codex_exec';
+
   session_id?: string;
   thread_id?: string;
   native_session_id?: string;
@@ -264,6 +265,7 @@ function buildRalplanConsensusGate(
 
 function hasNativeOrThreadEvidence(review: RalplanReviewResult): boolean {
   return review.provenance_kind === 'native_subagent'
+    || review.provenance_kind === 'omx_adapted'
     || Boolean(review.thread_id?.trim())
     || Boolean(review.native_session_id?.trim())
     || Boolean(review.tracker_path?.trim());

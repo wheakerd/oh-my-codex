@@ -4,8 +4,115 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { getBaseStateDir } from '../../state/paths.js';
+import { writeRoleRoutingMarker } from '../../subagents/role-routing-marker.js';
 import { subagentTrackingPath } from '../../subagents/tracker.js';
 import { buildRalplanConsensusGateForCwd, buildRalplanConsensusGateFromSources } from '../consensus-gate.js';
+
+function adaptedConsensus(
+  sessionId: string,
+  overrides: {
+    architect?: Record<string, unknown>;
+    critic?: Record<string, unknown>;
+  } = {},
+): Record<string, unknown> {
+  return {
+    ralplan_consensus_gate: {
+      complete: true,
+      sequence: ['architect-review', 'critic-review'],
+      ralplan_architect_review: {
+        agent_role: 'architect',
+        provenance_kind: 'omx_adapted',
+        verdict: 'approve',
+        session_id: sessionId,
+        thread_id: 'thread-architect',
+        tracker_path: '.omx/state/subagent-tracking.json',
+        completed_at: '2026-07-13T10:00:00.000Z',
+        ...overrides.architect,
+      },
+      ralplan_critic_review: {
+        agent_role: 'critic',
+        provenance_kind: 'omx_adapted',
+        verdict: 'approve',
+        session_id: sessionId,
+        thread_id: 'thread-critic',
+        tracker_path: '.omx/state/subagent-tracking.json',
+        completed_at: '2026-07-13T10:05:00.000Z',
+        ...overrides.critic,
+      },
+    },
+  };
+}
+
+async function writeAdaptedSubagentTracking(
+  cwd: string,
+  sessionId: string,
+  options: {
+    architectRole?: string;
+    criticRole?: string;
+    architectCompletedAt?: string;
+    criticFirstSeenAt?: string | null;
+    criticCompletedAt?: string;
+    writeRoleRoutingMarker?: boolean;
+  } = {},
+): Promise<void> {
+  const trackingPath = subagentTrackingPath(cwd);
+  const architectCompletedAt = options.architectCompletedAt ?? '2026-07-13T10:00:00.000Z';
+  const criticFirstSeenAt = options.criticFirstSeenAt === undefined
+    ? '2026-07-13T10:05:00.000Z'
+    : options.criticFirstSeenAt;
+  const criticCompletedAt = options.criticCompletedAt ?? '2026-07-13T10:10:00.000Z';
+  await mkdir(join(trackingPath, '..'), { recursive: true });
+  await writeFile(trackingPath, JSON.stringify({
+    schemaVersion: 1,
+    sessions: {
+      [sessionId]: {
+        session_id: sessionId,
+        leader_thread_id: 'thread-leader',
+        updated_at: architectCompletedAt,
+        threads: {
+          'thread-leader': {
+            thread_id: 'thread-leader',
+            kind: 'leader',
+            first_seen_at: architectCompletedAt,
+            last_seen_at: architectCompletedAt,
+            turn_count: 1,
+          },
+          'thread-architect': {
+            thread_id: 'thread-architect',
+            kind: 'subagent',
+            first_seen_at: architectCompletedAt,
+            last_seen_at: architectCompletedAt,
+            completed_at: architectCompletedAt,
+            turn_count: 1,
+            role: options.architectRole ?? 'architect',
+            provenance_kind: 'omx_adapted',
+          },
+          'thread-critic': {
+            thread_id: 'thread-critic',
+            kind: 'subagent',
+            ...(criticFirstSeenAt === null ? {} : { first_seen_at: criticFirstSeenAt }),
+            last_seen_at: criticCompletedAt,
+            completed_at: criticCompletedAt,
+            turn_count: 1,
+            role: options.criticRole ?? 'critic',
+            provenance_kind: 'omx_adapted',
+          },
+        },
+      },
+    },
+    pending_role_intents: [],
+  }, null, 2));
+  if (options.writeRoleRoutingMarker === false) return;
+  writeRoleRoutingMarker(getBaseStateDir(cwd), {
+    schema_version: 1,
+    cwd,
+    session_id: sessionId,
+    parent_thread_id: 'thread-leader',
+    observed_at: architectCompletedAt,
+    expires_at: new Date(Date.now() + 60_000).toISOString(),
+    evidence: 'OMX adapted role intent consumed for native child SessionStart',
+  });
+}
 
 describe('ralplan consensus gate state roots', () => {
 
@@ -938,4 +1045,140 @@ describe('ralplan consensus gate state roots', () => {
       await rm(cwd, { recursive: true, force: true });
     }
   });
+  it('accepts tracker-backed OMX-adapted Architect and Critic lanes only with valid ledger order and scoped routing evidence', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-ralplan-consensus-adapted-ok-'));
+    const sessionId = 'sess-adapted-consensus-ok';
+    try {
+      await writeAdaptedSubagentTracking(cwd, sessionId);
+      const gate = buildRalplanConsensusGateFromSources([{
+        source: 'adapted-consensus',
+        value: adaptedConsensus(sessionId),
+      }], { cwd, sessionId });
+
+      assert.equal(gate.complete, true);
+      assert.equal(gate.blockedReason, null);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+  it('rejects an OMX-adapted lane when tracker order evidence is missing', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-ralplan-consensus-adapted-no-order-'));
+    const sessionId = 'sess-adapted-consensus-no-order';
+    try {
+      await writeAdaptedSubagentTracking(cwd, sessionId, { criticFirstSeenAt: null });
+      const gate = buildRalplanConsensusGateFromSources([{
+        source: 'adapted-missing-order',
+        value: adaptedConsensus(sessionId),
+      }], { cwd, sessionId });
+
+      assert.equal(gate.complete, false);
+      assert.equal(gate.blockedReason, 'native_subagent_consensus_evidence_missing');
+      assert.match(gate.blockedDetails?.join(' ') ?? '', /tracker review order is missing.*critic first_seen_at/i);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects forged OMX-adapted artifact timestamps when tracker ledger order is reversed', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-ralplan-consensus-adapted-reversed-order-'));
+    const sessionId = 'sess-adapted-consensus-reversed-order';
+    try {
+      await writeAdaptedSubagentTracking(cwd, sessionId, {
+        architectCompletedAt: '2026-07-13T10:10:00.000Z',
+        criticFirstSeenAt: '2026-07-13T10:05:00.000Z',
+        criticCompletedAt: '2026-07-13T10:15:00.000Z',
+      });
+      const gate = buildRalplanConsensusGateFromSources([{
+        source: 'adapted-forged-artifact-order',
+        value: adaptedConsensus(sessionId, {
+          architect: { completed_at: '2026-07-13T09:00:00.000Z' },
+          critic: { completed_at: '2026-07-13T09:05:00.000Z' },
+        }),
+      }], { cwd, sessionId, requireNativeSubagents: true });
+
+      assert.equal(gate.complete, false);
+      assert.equal(gate.blockedReason, 'native_subagent_consensus_evidence_missing');
+      assert.match(gate.blockedDetails?.join(' ') ?? '', /tracker review order is reversed/i);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects an OMX-adapted lane when the ledger role does not match its review role', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-ralplan-consensus-adapted-role-'));
+    const sessionId = 'sess-adapted-consensus-role';
+    try {
+      await writeAdaptedSubagentTracking(cwd, sessionId, { architectRole: 'critic' });
+      const gate = buildRalplanConsensusGateFromSources([{
+        source: 'adapted-role-mismatch',
+        value: adaptedConsensus(sessionId),
+      }], { cwd, sessionId, requireNativeSubagents: true });
+
+      assert.equal(gate.complete, false);
+      assert.equal(gate.blockedReason, 'native_subagent_consensus_evidence_missing');
+      assert.match(gate.blockedDetails?.join(' ') ?? '', /thread-architect has role=critic, expected architect/);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects OMX-adapted reviews that reuse one tracker thread', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-ralplan-consensus-adapted-reused-thread-'));
+    const sessionId = 'sess-adapted-consensus-reused-thread';
+    try {
+      await writeAdaptedSubagentTracking(cwd, sessionId);
+      const gate = buildRalplanConsensusGateFromSources([{
+        source: 'adapted-reused-thread',
+        value: adaptedConsensus(sessionId, {
+          critic: { thread_id: 'thread-architect' },
+        }),
+      }], { cwd, sessionId, requireNativeSubagents: true });
+
+      assert.equal(gate.complete, false);
+      assert.equal(gate.blockedReason, 'native_subagent_consensus_evidence_missing');
+      assert.match(gate.blockedDetails?.join(' ') ?? '', /distinct tracker threads/);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects OMX-adapted lanes without scoped role-routing-unavailable evidence', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-ralplan-consensus-adapted-no-marker-'));
+    const sessionId = 'sess-adapted-consensus-no-marker';
+    try {
+      await writeAdaptedSubagentTracking(cwd, sessionId, { writeRoleRoutingMarker: false });
+      const gate = buildRalplanConsensusGateFromSources([{
+        source: 'adapted-missing-marker',
+        value: adaptedConsensus(sessionId),
+      }], { cwd, sessionId, requireNativeSubagents: true });
+
+      assert.equal(gate.complete, false);
+      assert.equal(gate.blockedReason, 'native_subagent_consensus_evidence_missing');
+      assert.match(gate.blockedDetails?.join(' ') ?? '', /lacks scoped role_routing_unavailable evidence/);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a native-provenance artifact that points to OMX-adapted ledger threads', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-ralplan-consensus-adapted-native-claim-'));
+    const sessionId = 'sess-adapted-consensus-native-claim';
+    try {
+      await writeAdaptedSubagentTracking(cwd, sessionId);
+      const gate = buildRalplanConsensusGateFromSources([{
+        source: 'adapted-native-claim',
+        value: adaptedConsensus(sessionId, {
+          architect: { provenance_kind: 'native_subagent' },
+          critic: { provenance_kind: 'native_subagent' },
+        }),
+      }], { cwd, sessionId, requireNativeSubagents: true });
+
+      assert.equal(gate.complete, false);
+      assert.equal(gate.blockedReason, 'native_subagent_consensus_evidence_missing');
+      assert.match(gate.blockedDetails?.join(' ') ?? '', /conflicting with native_subagent review provenance/);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
 });
