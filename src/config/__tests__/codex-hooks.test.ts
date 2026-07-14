@@ -1178,6 +1178,46 @@ describe("codex hooks helpers", () => {
     assert.equal(state[`${hooksPath}:stop:0:0`], undefined);
   });
 
+  it("distinguishes an absent final hooks artifact from fallback and scanned content", () => {
+    const hooksPath = "/home/me/.codex/hooks.json";
+    const fallbackState = buildManagedCodexHookTrustState(hooksPath, "/repo");
+    const fallbackToml = buildManagedCodexHookTrustToml(hooksPath, "/repo");
+    const normalFinalContent = mergeManagedCodexHooksConfig(
+      JSON.stringify({
+        hooks: {
+          PreToolUse: [{ hooks: [{ type: "command", command: "echo foreign" }] }],
+        },
+      }),
+      "/repo",
+      hooksPath,
+    );
+    const normalState = buildManagedCodexHookTrustState(hooksPath, "/repo", {
+      hooksContent: normalFinalContent,
+    });
+    const normalToml = buildManagedCodexHookTrustToml(hooksPath, "/repo", {
+      hooksContent: normalFinalContent,
+    });
+
+    assert.deepEqual(buildManagedCodexHookTrustState(hooksPath, "/repo", { hooksContent: null }), {});
+    assert.equal(buildManagedCodexHookTrustToml(hooksPath, "/repo", { hooksContent: null }), "");
+
+    assert.deepEqual(
+      buildManagedCodexHookTrustState(hooksPath, "/repo", { hooksContent: undefined }),
+      fallbackState,
+    );
+    assert.equal(
+      buildManagedCodexHookTrustToml(hooksPath, "/repo", { hooksContent: undefined }),
+      fallbackToml,
+    );
+
+    assert.deepEqual(buildManagedCodexHookTrustState(hooksPath, "/repo", { hooksContent: "{}" }), {});
+    assert.equal(buildManagedCodexHookTrustToml(hooksPath, "/repo", { hooksContent: "{}" }), "");
+
+    assert.ok(normalState[`${hooksPath}:pre_tool_use:1:0`]);
+    assert.equal(normalState[`${hooksPath}:pre_tool_use:0:0`], undefined);
+    assert.ok(normalToml.includes(`[hooks.state."${hooksPath}:pre_tool_use:1:0"]`));
+  });
+
   it("builds trust state only for generated OMX hook handlers", () => {
     const state = buildManagedCodexHookTrustState("/home/me/.codex/hooks.json", "/repo");
     const keys = Object.keys(state).sort();

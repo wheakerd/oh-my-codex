@@ -2,10 +2,10 @@
  * omx doctor - Validate oh-my-codex installation
  */
 
-import { constants, existsSync, readFileSync } from "fs";
-import { access, chown, lstat, mkdtemp, readdir, readFile, rm } from "fs/promises";
+import { constants, existsSync, readFileSync, type Stats } from "fs";
+import { access, chown, lstat, mkdtemp, readdir, readFile, rmdir, rm } from "fs/promises";
 import { spawnSync } from "child_process";
-import { basename, join, relative } from "path";
+import { basename, dirname, join, relative } from "path";
 import { tmpdir } from "os";
 import {
 	codexHome,
@@ -1704,6 +1704,41 @@ function referencedWindowsNativeHookShimPaths(
 	return [...shimPaths];
 }
 
+async function checkWindowsNativeHookShimParentTopology(
+	shimPath: string,
+	codexHomeDir: string,
+): Promise<Check | null> {
+	let ancestorPath = dirname(shimPath);
+	for (;;) {
+		try {
+			const ancestorStat = await lstat(ancestorPath);
+			if (ancestorStat.isSymbolicLink() || !ancestorStat.isDirectory()) {
+				return {
+					name: "Native hooks",
+					status: "fail",
+					message: `referenced Windows native hook shim at ${shimPath} has an unsafe parent topology at ${ancestorPath}; doctor will not follow or modify it`,
+				};
+			}
+		} catch {
+			return {
+				name: "Native hooks",
+				status: "fail",
+				message: `referenced Windows native hook shim at ${shimPath} has a parent topology that cannot be safely validated; doctor will not follow or modify it`,
+			};
+		}
+		if (ancestorPath === codexHomeDir) return null;
+		const parentPath = dirname(ancestorPath);
+		if (parentPath === ancestorPath) {
+			return {
+				name: "Native hooks",
+				status: "fail",
+				message: `referenced Windows native hook shim at ${shimPath} is outside the controlled Codex home topology; doctor will not follow or modify it`,
+			};
+		}
+		ancestorPath = parentPath;
+	}
+}
+
 async function checkWindowsNativeHookShims(
 	root: Record<string, unknown>,
 	diagnostics: Parameters<typeof referencedWindowsNativeHookShimPaths>[1],
@@ -1725,7 +1760,19 @@ async function checkWindowsNativeHookShims(
 					message: `referenced Windows native hook shim at ${shimPath} is not a regular file; doctor will not follow or modify it`,
 				};
 			}
+			if (shimStat.nlink !== 1) {
+				return {
+					name: "Native hooks",
+					status: "fail",
+					message: `referenced Windows native hook shim at ${shimPath} is hard-linked; doctor will not execute or modify it`,
+				};
+			}
 			shimContent = await readFile(shimPath);
+			const topologyCheck = await checkWindowsNativeHookShimParentTopology(
+				shimPath,
+				codexHomeDir,
+			);
+			if (topologyCheck) return topologyCheck;
 		} catch (error) {
 			const code = typeof error === "object" && error !== null && "code" in error
 				? String(error.code)
@@ -2245,7 +2292,6 @@ export function classifyPostCompactHookStdout(stdout: string): Check | null {
 	}
 }
 
-
 interface PostCompactSmokeSpawnInvocation {
 	command: string;
 	args: string[];
@@ -2281,11 +2327,111 @@ export function buildPostCompactSmokeSpawnInvocation(
 	};
 }
 
+function buildInMemoryWindowsShimSmokeInvocation(
+	expectedShimContent: Buffer,
+	options: { env?: NodeJS.ProcessEnv } = {},
+): PostCompactSmokeSpawnInvocation | null {
+	const shimSource = decodeStrictUtf8(expectedShimContent);
+	if (shimSource === null) return null;
+
+	const encodedShimBytes = expectedShimContent.toString("base64");
+	const command = [
+		"$ErrorActionPreference = 'Stop'",
+		`$omxShimSource = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('${encodedShimBytes}'))`,
+		"if ($omxShimSource.Length -gt 0 -and [int][char]$omxShimSource[0] -eq 0xFEFF) { $omxShimSource = $omxShimSource.Substring(1) }",
+		"& ([ScriptBlock]::Create($omxShimSource))",
+		"exit $LASTEXITCODE",
+	].join("; ");
+	return {
+		command: resolveWindowsPowerShellPath(options.env),
+		args: [
+			"-NoProfile",
+			"-ExecutionPolicy",
+			"Bypass",
+			"-EncodedCommand",
+			Buffer.from(command, "utf16le").toString("base64"),
+		],
+		shell: false,
+	};
+}
+
+interface SmokeDirectoryIdentity {
+	dev: number;
+	ino: number;
+}
+
+function smokeDirectoryIdentity(stat: Stats): SmokeDirectoryIdentity | null {
+	if (
+		!stat.isDirectory() ||
+		stat.isSymbolicLink() ||
+		(process.platform !== "win32" && (stat.mode & 0o077) !== 0)
+	) return null;
+	return { dev: stat.dev, ino: stat.ino };
+}
+
+async function readSmokeDirectoryIdentity(
+	smokeCwd: string,
+): Promise<SmokeDirectoryIdentity | null> {
+	try {
+		return smokeDirectoryIdentity(await lstat(smokeCwd));
+	} catch {
+		return null;
+	}
+}
+
+function sameSmokeDirectoryIdentity(
+	expected: SmokeDirectoryIdentity,
+	actual: SmokeDirectoryIdentity | null,
+): boolean {
+	return actual !== null && actual.dev === expected.dev && actual.ino === expected.ino;
+}
+
+function smokeDirectorySafetyCheck(message: string): Check {
+	return {
+		name: "Native PostCompact hook",
+		status: "warn",
+		message,
+	};
+}
+
+async function cleanupSmokeDirectoryIfUnchanged(
+	smokeCwd: string,
+	identity: SmokeDirectoryIdentity,
+): Promise<Check | null> {
+	if (!sameSmokeDirectoryIdentity(identity, await readSmokeDirectoryIdentity(smokeCwd))) {
+		return smokeDirectorySafetyCheck(
+			"temporary PostCompact smoke directory changed during validation; doctor preserved it for manual recovery and skipped cleanup for safety",
+		);
+	}
+	try {
+		// Only remove the empty, identity-checked directory. Never recursively remove
+		// a directory that another process could have replaced or populated.
+		await rmdir(smokeCwd);
+		return null;
+	} catch {
+		return smokeDirectorySafetyCheck(
+			"temporary PostCompact smoke directory could not be removed without recursive deletion; doctor preserved it for manual recovery",
+		);
+	}
+}
+
+function inMemoryWindowsShimSmokeCheck(): Check {
+	return {
+		name: "Native PostCompact hook",
+		status: "warn",
+		message: "doctor could not build an in-memory Windows native hook smoke command from exact validated shim bytes; doctor skipped execution for safety",
+	};
+}
+
 interface NativePostCompactHookRuntimeOptions {
 	nativeHooksCheck?: Check;
 	platform?: NodeJS.Platform;
 	expectedCommand?: string;
 	runner?: typeof spawnSync;
+	beforeWindowsShimSmoke?: (paths: {
+		canonicalShimPath: string;
+		smokeCwd: string;
+	}) => void | Promise<void>;
 }
 
 function getManagedPostCompactHookCommands(
@@ -2357,6 +2503,12 @@ export async function checkNativePostCompactHookRuntime(
 	}
 
 	const smokeCwd = await mkdtemp(join(tmpdir(), "omx-doctor-postcompact-"));
+	const smokeDirectory = await readSmokeDirectoryIdentity(smokeCwd);
+	if (!smokeDirectory) {
+		return smokeDirectorySafetyCheck(
+			"temporary PostCompact smoke directory could not be validated; doctor preserved it for manual recovery and skipped execution for safety",
+		);
+	}
 	try {
 		const revalidatedIntegrity = await checkExistingNativeHooks(hooksPath, {
 			codexHomeDir,
@@ -2418,18 +2570,52 @@ export async function checkNativePostCompactHookRuntime(
 			if (currentShimCheck) return skippedPostCompactIntegrityCheck(currentShimCheck);
 		}
 
+		let smokeInvocation: PostCompactSmokeSpawnInvocation;
+		if (platform === "win32") {
+			const canonicalShimPath = parseManagedCodexNativeHookWindowsShimCommand(expectedCommand, {
+				platform,
+				codexHomeDir,
+			});
+			if (!canonicalShimPath) return currentPostCompactCommandCheck();
+
+			const expectedShimContent = Buffer.from(
+				buildManagedCodexNativeHookWindowsShimContent(getPackageRoot()),
+				"utf-8",
+			);
+			const inMemoryInvocation = buildInMemoryWindowsShimSmokeInvocation(expectedShimContent);
+			if (!inMemoryInvocation) return inMemoryWindowsShimSmokeCheck();
+			smokeInvocation = inMemoryInvocation;
+			try {
+				await options.beforeWindowsShimSmoke?.({ canonicalShimPath, smokeCwd });
+			} catch {
+				return smokeDirectorySafetyCheck(
+					"Windows native hook changed during validation; doctor skipped execution for safety",
+				);
+			}
+		} else {
+			smokeInvocation = buildPostCompactSmokeSpawnInvocation(expectedCommand, { platform });
+		}
+		if (!sameSmokeDirectoryIdentity(smokeDirectory, await readSmokeDirectoryIdentity(smokeCwd))) {
+			return smokeDirectorySafetyCheck(
+				"temporary PostCompact smoke directory changed during validation; doctor preserved it for manual recovery and skipped execution for safety",
+			);
+		}
+
 		const payload = JSON.stringify({
 			hook_event_name: "PostCompact",
 			cwd: smokeCwd,
 			session_id: "omx-doctor-postcompact-smoke",
 		});
-		const smokeInvocation = buildPostCompactSmokeSpawnInvocation(expectedCommand, { platform });
 		const result = (options.runner ?? spawnSync)(smokeInvocation.command, smokeInvocation.args, {
 			cwd,
 			encoding: "utf-8",
 			env: {
 				...process.env,
 				OMX_NATIVE_HOOK_DOCTOR_SMOKE: "1",
+				OMX_ROOT: smokeCwd,
+				OMX_SESSION_ID: "omx-doctor-postcompact-smoke",
+				OMX_SOURCE_CWD: smokeCwd,
+				OMX_STARTUP_CWD: smokeCwd,
 			},
 			input: payload,
 			shell: smokeInvocation.shell,
@@ -2461,7 +2647,8 @@ export async function checkNativePostCompactHookRuntime(
 				"verbose smoke validation confirmed the effective PostCompact hook exits successfully with no stdout",
 		};
 	} finally {
-		await rm(smokeCwd, { recursive: true, force: true });
+		const cleanupCheck = await cleanupSmokeDirectoryIfUnchanged(smokeCwd, smokeDirectory);
+		if (cleanupCheck) return cleanupCheck;
 	}
 }
 

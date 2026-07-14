@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { lstat, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
-import { existsSync, lstatSync, readFileSync, renameSync, rmSync } from 'node:fs';
+import { existsSync, lstatSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
@@ -2984,6 +2984,113 @@ describe('omx uninstall', () => {
         assert.deepEqual(await readFile(configPath), config);
         assert.equal(existsSync(shimPath), false);
         assert.equal(existsSync(hooksPath), false);
+      });
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+  it('preserves a foreign inode injected after final uninstall rename validation', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-uninstall-final-rename-claim-'));
+    try {
+      await withCwd(wd, async () => {
+        const codexDir = join(wd, '.codex');
+        const configPath = join(codexDir, 'config.toml');
+        const config = Buffer.from(buildOmxConfig(), 'utf-8');
+        const foreignConfig = Buffer.from('model = "foreign-final-rename"\n', 'utf-8');
+        await mkdir(codexDir, { recursive: true });
+        await writeFile(configPath, config);
+        let foreignInode: number | undefined;
+        await assert.rejects(
+          uninstall({
+            scope: 'project',
+            transactionFailureInjector: (stage) => {
+              if (stage !== 'after-final-rename-validation') return;
+              const foreignPath = join(codexDir, '.foreign-final-rename-config');
+              writeFileSync(foreignPath, foreignConfig);
+              foreignInode = lstatSync(foreignPath).ino;
+              rmSync(configPath);
+              renameSync(foreignPath, configPath);
+            },
+          }),
+          /replacement claim.*not the planned artifact/,
+        );
+        assert.ok(foreignInode);
+        assert.equal(lstatSync(configPath).ino, foreignInode);
+        assert.deepEqual(await readFile(configPath), foreignConfig);
+      });
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+  it('preserves a foreign inode injected after final uninstall removal validation', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-uninstall-final-remove-claim-'));
+    try {
+      await withCwd(wd, async () => {
+        const codexDir = join(wd, '.codex');
+        const configPath = join(codexDir, 'config.toml');
+        const hooksPath = join(codexDir, 'hooks.json');
+        const config = Buffer.from(buildOmxConfig(), 'utf-8');
+        const hooks = Buffer.from(`${JSON.stringify(buildManagedCodexHooksConfig(packageRoot()), null, 2)}\n`, 'utf-8');
+        const foreignHooks = Buffer.from('{"hooks":{"Stop":[]}}\n', 'utf-8');
+        await mkdir(codexDir, { recursive: true });
+        await writeFile(configPath, config);
+        await writeFile(hooksPath, hooks);
+        let foreignInode: number | undefined;
+        await assert.rejects(
+          uninstall({
+            scope: 'project',
+            transactionFailureInjector: (stage) => {
+              if (stage !== 'after-final-remove-validation') return;
+              const foreignPath = join(codexDir, '.foreign-final-remove-hooks');
+              writeFileSync(foreignPath, foreignHooks);
+              foreignInode = lstatSync(foreignPath).ino;
+              rmSync(hooksPath);
+              renameSync(foreignPath, hooksPath);
+            },
+          }),
+          /removal claim.*not the planned artifact/,
+        );
+        assert.ok(foreignInode);
+        assert.equal(lstatSync(hooksPath).ino, foreignInode);
+        assert.deepEqual(await readFile(hooksPath), foreignHooks);
+        assert.deepEqual(await readFile(configPath), config);
+      });
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+  it('preserves a foreign inode injected after final uninstall rollback validation', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-uninstall-final-restore-claim-'));
+    try {
+      await withCwd(wd, async () => {
+        const codexDir = join(wd, '.codex');
+        const configPath = join(codexDir, 'config.toml');
+        const hooksPath = join(codexDir, 'hooks.json');
+        const config = Buffer.from(buildOmxConfig(), 'utf-8');
+        const hooks = Buffer.from(`${JSON.stringify(buildManagedCodexHooksConfig(packageRoot()), null, 2)}\n`, 'utf-8');
+        const foreignHooks = Buffer.from('{"hooks":{"Stop":[]}}\n', 'utf-8');
+        await mkdir(codexDir, { recursive: true });
+        await writeFile(configPath, config);
+        await writeFile(hooksPath, hooks);
+        let foreignInode: number | undefined;
+        await assert.rejects(
+          uninstall({
+            scope: 'project',
+            transactionFailureInjector: (stage) => {
+              if (stage === 'before-config-commit') throw new Error('injected rollback start');
+              if (stage !== 'after-final-restore-validation') return;
+              const foreignPath = join(codexDir, '.foreign-final-restore-hooks');
+              writeFileSync(foreignPath, foreignHooks);
+              foreignInode = lstatSync(foreignPath).ino;
+              renameSync(foreignPath, hooksPath);
+            },
+          }),
+          /Uninstall artifact rollback failed/,
+        );
+        assert.ok(foreignInode);
+        assert.equal(lstatSync(hooksPath).ino, foreignInode);
+        assert.deepEqual(await readFile(hooksPath), foreignHooks);
+        assert.deepEqual(await readFile(configPath), config);
       });
     } finally {
       await rm(wd, { recursive: true, force: true });

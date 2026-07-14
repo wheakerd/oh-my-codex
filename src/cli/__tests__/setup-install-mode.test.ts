@@ -5471,6 +5471,126 @@ describe("omx setup install mode behavior", () => {
 			await rm(wd, { recursive: true, force: true });
 		}
 	});
+	it("preserves a foreign inode injected after final setup rename validation", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-setup-final-rename-claim-"));
+		let resetFailureInjector: (() => void) | undefined;
+		try {
+			await withIsolatedUserHome(wd, async (codexHomeDir) => {
+				await withTempCwd(wd, async () => {
+					const hooksPath = join(codexHomeDir, "hooks.json");
+					const configPath = join(codexHomeDir, "config.toml");
+					const configBefore = Buffer.from('model = "before"\n', "utf-8");
+					const foreignHooks = Buffer.from('{"hooks":{"Stop":[]}}\n', "utf-8");
+					await writeFile(configPath, configBefore);
+					await writeFile(hooksPath, '{"hooks": {}}\n');
+					let foreignInode: number | undefined;
+					resetFailureInjector = setNativeHookTransactionFailureInjectorForTest(
+						(stage, target) => {
+							if (stage !== "after_final_rename_validation" || target.kind !== "hooks") return;
+							const foreignPath = join(codexHomeDir, ".foreign-final-rename-hooks");
+							writeFileSync(foreignPath, foreignHooks);
+							foreignInode = lstatSync(foreignPath).ino;
+							rmSync(hooksPath);
+							renameSync(foreignPath, hooksPath);
+						},
+					);
+					await assert.rejects(
+						setup({ scope: "user", installMode: "legacy", skipNativeAgentRefresh: true }),
+						/precondition changed/,
+					);
+					assert.ok(foreignInode);
+					assert.equal(lstatSync(hooksPath).ino, foreignInode);
+					assert.deepEqual(await readFile(hooksPath), foreignHooks);
+					assert.deepEqual(await readFile(configPath), configBefore);
+				});
+			});
+		} finally {
+			resetFailureInjector?.();
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
+	it("preserves a foreign inode injected after final setup removal validation", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-setup-final-remove-claim-"));
+		let resetFailureInjector: (() => void) | undefined;
+		try {
+			await withIsolatedUserHome(wd, async (codexHomeDir) => {
+				await withTempCwd(wd, async () => {
+					await setup({ scope: "user", installMode: "legacy", skipNativeAgentRefresh: true });
+					const hooksPath = join(codexHomeDir, "hooks.json");
+					const configPath = join(codexHomeDir, "config.toml");
+					const configBefore = await readFile(configPath);
+					const foreignHooks = Buffer.from('{"hooks":{"Stop":[]}}\n', "utf-8");
+					let foreignInode: number | undefined;
+					resetFailureInjector = setNativeHookTransactionFailureInjectorForTest(
+						(stage, target) => {
+							if (stage !== "after_final_remove_validation" || target.kind !== "hooks") return;
+							const foreignPath = join(codexHomeDir, ".foreign-final-remove-hooks");
+							writeFileSync(foreignPath, foreignHooks);
+							foreignInode = lstatSync(foreignPath).ino;
+							rmSync(hooksPath);
+							renameSync(foreignPath, hooksPath);
+						},
+					);
+					await assert.rejects(
+						setup({
+							scope: "user",
+							installMode: "plugin",
+							pluginAgentsMdPrompt: async () => false,
+							skipNativeAgentRefresh: true,
+						}),
+						/precondition changed/,
+					);
+					assert.ok(foreignInode);
+					assert.equal(lstatSync(hooksPath).ino, foreignInode);
+					assert.deepEqual(await readFile(hooksPath), foreignHooks);
+					assert.deepEqual(await readFile(configPath), configBefore);
+				});
+			});
+		} finally {
+			resetFailureInjector?.();
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
+	it("preserves a foreign inode injected after final setup rollback validation", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-setup-final-restore-claim-"));
+		let resetFailureInjector: (() => void) | undefined;
+		try {
+			await withIsolatedUserHome(wd, async (codexHomeDir) => {
+				await withTempCwd(wd, async () => {
+					const hooksPath = join(codexHomeDir, "hooks.json");
+					const configPath = join(codexHomeDir, "config.toml");
+					const configBefore = Buffer.from('model = "before"\n', "utf-8");
+					const foreignHooks = Buffer.from('{"hooks":{"Stop":[]}}\n', "utf-8");
+					await writeFile(configPath, configBefore);
+					let foreignInode: number | undefined;
+					resetFailureInjector = setNativeHookTransactionFailureInjectorForTest(
+						(stage, target) => {
+							if (stage === "before_temp_write" && target.kind === "config") {
+								throw new Error("injected rollback start");
+							}
+							if (stage !== "after_final_restore_validation" || target.kind !== "hooks") return;
+							const foreignPath = join(codexHomeDir, ".foreign-final-restore-hooks");
+							writeFileSync(foreignPath, foreignHooks);
+							foreignInode = lstatSync(foreignPath).ino;
+							rmSync(hooksPath);
+							renameSync(foreignPath, hooksPath);
+						},
+					);
+					await assert.rejects(
+						setup({ scope: "user", installMode: "legacy", skipNativeAgentRefresh: true }),
+						/rollback failed/,
+					);
+					assert.ok(foreignInode);
+					assert.equal(lstatSync(hooksPath).ino, foreignInode);
+					assert.deepEqual(await readFile(hooksPath), foreignHooks);
+					assert.deepEqual(await readFile(configPath), configBefore);
+				});
+			});
+		} finally {
+			resetFailureInjector?.();
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
 });
 
 describe("persisted merge policy lifecycle", () => {

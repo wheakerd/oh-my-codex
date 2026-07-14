@@ -15,8 +15,10 @@ import {
 	lstat,
 	rm,
 	open,
+	link,
 	chmod,
 } from "fs/promises";
+
 import { join, dirname, relative, basename, isAbsolute, sep, win32 } from "path";
 
 import { existsSync } from "fs";
@@ -441,20 +443,24 @@ function logManagedCodexHooksPlanDiagnostics(
 }
 
 type NativeHookTransactionArtifactKind = "shim" | "hooks" | "config" | "metadata";
-	type NativeHookTransactionFailureStage =
+type NativeHookTransactionFailureStage =
 	| "before_precondition"
 	| "before_backup"
 	| "before_temp_write"
 	| "before_rename"
+	| "after_final_rename_validation"
 	| "after_rename"
 	| "before_remove"
+	| "after_final_remove_validation"
 	| "after_remove"
 	| "before_readback"
 	| "before_rollback"
 	| "before_rollback_rename"
+	| "after_final_restore_validation"
 	| "before_rollback_remove"
 	| "before_staged_cleanup"
 	| "after_staged_cleanup";
+
 
 type NativeHookTransactionTopology =
 	| { kind: "absent" }
@@ -525,6 +531,8 @@ let nativeHookTransactionTemporaryPathOverride:
 	| ((path: string, purpose: "write" | "delete") => string)
 	| undefined;
 
+
+
 /** @internal Test seam for deterministic atomic-write and rollback coverage. */
 export function setNativeHookTransactionFailureInjectorForTest(
 	injector:
@@ -557,6 +565,8 @@ export function setNativeHookTransactionTemporaryPathForTest(
 	resolver:
 		| ((path: string, purpose: "write" | "delete") => string)
 		| undefined,
+
+
 ): () => void {
 	const previous = nativeHookTransactionTemporaryPathOverride;
 	nativeHookTransactionTemporaryPathOverride = resolver;
@@ -1048,6 +1058,15 @@ function nativeHookTransactionTemporaryPath(
 	);
 }
 
+function nativeHookTransactionClaimPath(path: string): string {
+	nativeHookTransactionSequence += 1;
+	return join(
+		dirname(path),
+		`.${basename(path)}.omx-claim-${process.pid}-${nativeHookTransactionSequence}.tmp`,
+	);
+}
+
+
 async function atomicWriteNativeHookTransactionArtifact(
 	artifact: NativeHookTransactionArtifact,
 	content: Buffer,
@@ -1055,11 +1074,15 @@ async function atomicWriteNativeHookTransactionArtifact(
 	expectedCurrent: NativeHookTransactionArtifactSnapshot,
 	ancestorPrecondition: NativeHookTransactionAncestorPrecondition,
 	onWriteApplied?: (snapshot: NativeHookTransactionArtifactSnapshot) => void,
+	onWriteStabilized?: (snapshot: NativeHookTransactionArtifactSnapshot) => void,
 	assertApplied?: () => Promise<void>,
+
 ): Promise<void> {
 	const temporaryPath = nativeHookTransactionTemporaryPath(artifact.path, "write");
 	let temporaryCreated = false;
 	let temporarySnapshot: NativeHookTransactionArtifactSnapshot | undefined;
+	let claimPath: string | undefined;
+	let claimCreated = false;
 	try {
 		await assertNativeHookTransactionAncestorPrecondition(ancestorPrecondition);
 		await assertApplied?.();
@@ -1125,13 +1148,53 @@ async function atomicWriteNativeHookTransactionArtifact(
 			"read-back",
 		);
 		await assertApplied?.();
+		injectNativeHookTransactionFailure(
+			stage === "write"
+				? "after_final_rename_validation"
+				: "after_final_restore_validation",
+			artifact,
+		);
 
 		if (!temporarySnapshot) {
 			throw new Error("temporary path was not fully captured after writing");
 		}
-		await rename(temporaryPath, artifact.path);
+		await assertNativeHookTransactionArtifactSnapshot(
+			temporaryPath,
+			`${artifact.label} temporary`,
+			temporarySnapshot,
+			"read-back",
+		);
+		if (expectedCurrent.bytes !== null) {
+			claimPath = nativeHookTransactionClaimPath(artifact.path);
+
+
+			await rename(artifact.path, claimPath);
+			claimCreated = true;
+			await assertNativeHookTransactionAncestorPrecondition(ancestorPrecondition);
+
+			await assertNativeHookTransactionArtifactSnapshot(
+				claimPath,
+				`${artifact.label} claim`,
+				expectedCurrent,
+				stage === "write" ? "precondition" : "rollback",
+			);
+		}
+		// link() atomically installs only into an absent target; it never replaces a
+		// concurrent object that appeared after the final snapshot validation.
+		const linkedSnapshot: NativeHookTransactionArtifactSnapshot = {
+			...temporarySnapshot,
+			links: (temporarySnapshot.links ?? 0) + 1,
+		};
+		await link(temporaryPath, artifact.path);
+		onWriteApplied?.(linkedSnapshot);
+		await rm(temporaryPath);
 		temporaryCreated = false;
-		onWriteApplied?.(temporarySnapshot);
+		onWriteStabilized?.(temporarySnapshot);
+		if (claimPath) {
+			await rm(claimPath);
+			claimCreated = false;
+		}
+
 		if (stage === "write") {
 			injectNativeHookTransactionFailure("after_rename", artifact);
 		}
@@ -1142,6 +1205,29 @@ async function atomicWriteNativeHookTransactionArtifact(
 			stage === "write" ? "precondition" : "rollback",
 		);
 	} catch (error) {
+		if (claimCreated && claimPath) {
+			try {
+				const claimed = await captureNativeHookTransactionArtifact(
+					claimPath,
+					`${artifact.label} claim`,
+				);
+				await link(claimPath, artifact.path);
+				await rm(claimPath);
+				claimCreated = false;
+				await assertNativeHookTransactionArtifactSnapshot(
+					artifact.path,
+					artifact.label,
+					claimed,
+					stage === "write" ? "precondition" : "rollback",
+				);
+
+			} catch (recoveryError) {
+				const message = error instanceof Error ? error.message : String(error);
+				throw new Error(
+					`Native hook transaction ${stage} failed (${message}) and preserved claim ${claimPath} for manual recovery: ${recoveryError instanceof Error ? recoveryError.message : String(recoveryError)}`,
+				);
+			}
+		}
 		if (temporaryCreated) {
 			try {
 				if (!temporarySnapshot) {
@@ -1165,6 +1251,7 @@ async function atomicWriteNativeHookTransactionArtifact(
 		throw error;
 	}
 }
+
 
 async function assertNativeHookTransactionArtifactState(
 	path: string,
@@ -1293,6 +1380,12 @@ async function applyNativeHookTransactionArtifact(
 				entry = { artifact, appliedSnapshot };
 				applied.push(entry);
 			},
+			(stabilizedSnapshot) => {
+				if (!entry) {
+					throw new Error("native hook transaction write was not registered as applied");
+				}
+				entry.appliedSnapshot = stabilizedSnapshot;
+			},
 			() => assertAppliedNativeHookTransactionSnapshots(applied),
 		);
 		if (!entry) {
@@ -1354,9 +1447,17 @@ async function applyNativeHookTransactionArtifact(
 			"read-back",
 		);
 		await assertAppliedNativeHookTransactionSnapshots(applied);
+		injectNativeHookTransactionFailure("after_final_remove_validation", artifact);
+		await assertNativeHookTransactionArtifactSnapshot(
+			stagedDeletionPath,
+			`${artifact.label} staged deletion`,
+			stagedDeletionSnapshot,
+			"read-back",
+		);
+		const claimPath = nativeHookTransactionClaimPath(artifact.path);
 
-		await rm(artifact.path);
-		originalRemoved = true;
+
+		await rename(artifact.path, claimPath);
 		const entry: AppliedNativeHookTransactionArtifact = {
 			artifact,
 			appliedSnapshot: { bytes: null, topology: { kind: "absent" } },
@@ -1364,6 +1465,44 @@ async function applyNativeHookTransactionArtifact(
 			stagedDeletionSnapshot,
 		};
 		applied.push(entry);
+		try {
+
+
+			await assertNativeHookTransactionAncestorPrecondition(ancestorPrecondition);
+
+			await assertNativeHookTransactionArtifactSnapshot(
+				claimPath,
+				`${artifact.label} removal claim`,
+				artifact.before,
+				"precondition",
+			);
+		} catch (error) {
+
+			try {
+				const claimed = await captureNativeHookTransactionArtifact(
+					claimPath,
+					`${artifact.label} removal claim`,
+				);
+				await link(claimPath, artifact.path);
+				await rm(claimPath);
+				await assertNativeHookTransactionArtifactSnapshot(
+					artifact.path,
+					artifact.label,
+					claimed,
+					"precondition",
+				);
+				const entryIndex = applied.indexOf(entry);
+				if (entryIndex >= 0) applied.splice(entryIndex, 1);
+			} catch (recoveryError) {
+				throw new Error(
+					`Native hook transaction removal claim failed (${error instanceof Error ? error.message : String(error)}) and preserved ${claimPath} for manual recovery: ${recoveryError instanceof Error ? recoveryError.message : String(recoveryError)}`,
+				);
+			}
+			throw error;
+
+		}
+		await rm(claimPath);
+		originalRemoved = true;
 		injectNativeHookTransactionFailure("after_remove", artifact);
 		return entry;
 	} catch (error) {
@@ -1379,7 +1518,28 @@ async function applyNativeHookTransactionArtifact(
 					"read-back",
 				);
 				await assertNativeHookTransactionAncestorPrecondition(ancestorPrecondition);
-				await rm(stagedDeletionPath);
+				const claimPath = nativeHookTransactionClaimPath(artifact.path);
+
+				await rename(stagedDeletionPath, claimPath);
+				try {
+					await assertNativeHookTransactionArtifactSnapshot(
+						claimPath,
+						`${artifact.label} staged deletion cleanup claim`,
+						stagedDeletionSnapshot,
+						"read-back",
+					);
+				} catch (claimError) {
+					try {
+						await link(claimPath, stagedDeletionPath);
+						await rm(claimPath);
+					} catch (recoveryError) {
+						throw new Error(
+							`Native hook transaction staged deletion cleanup claim failed (${claimError instanceof Error ? claimError.message : String(claimError)}) and preserved ${claimPath} for manual recovery: ${recoveryError instanceof Error ? recoveryError.message : String(recoveryError)}`,
+						);
+					}
+					throw claimError;
+				}
+				await rm(claimPath);
 			} catch (cleanupError) {
 				const message = error instanceof Error ? error.message : String(error);
 				throw new Error(
@@ -1440,9 +1600,42 @@ async function restoreNativeHookTransactionArtifact(
 		);
 		await assertNativeHookTransactionAncestorPrecondition(ancestorPrecondition);
 		await assertRollbackState();
+		injectNativeHookTransactionFailure("after_final_restore_validation", artifact);
+		const claimPath = nativeHookTransactionClaimPath(artifact.path);
 
-		await rm(artifact.path);
+		await rename(artifact.path, claimPath);
 		applied.appliedSnapshot = { bytes: null, topology: { kind: "absent" } };
+		try {
+
+
+			await assertNativeHookTransactionArtifactSnapshot(
+				claimPath,
+				`${artifact.label} rollback removal claim`,
+				current,
+				"rollback",
+			);
+		} catch (error) {
+			try {
+				const claimed = await captureNativeHookTransactionArtifact(
+					claimPath,
+					`${artifact.label} rollback removal claim`,
+				);
+				await link(claimPath, artifact.path);
+				await rm(claimPath);
+				await assertNativeHookTransactionArtifactSnapshot(
+					artifact.path,
+					artifact.label,
+					claimed,
+					"rollback",
+				);
+			} catch (recoveryError) {
+				throw new Error(
+					`Native hook transaction rollback removal claim failed (${error instanceof Error ? error.message : String(error)}) and preserved ${claimPath} for manual recovery: ${recoveryError instanceof Error ? recoveryError.message : String(recoveryError)}`,
+				);
+			}
+			throw error;
+		}
+		await rm(claimPath);
 	} else {
 		const restoreArtifact: NativeHookTransactionArtifact = {
 			...artifact,
@@ -1457,6 +1650,9 @@ async function restoreNativeHookTransactionArtifact(
 			ancestorPrecondition,
 			(restoredSnapshot) => {
 				applied.appliedSnapshot = restoredSnapshot;
+			},
+			(stabilizedSnapshot) => {
+				applied.appliedSnapshot = stabilizedSnapshot;
 			},
 			assertRollbackState,
 		);
@@ -1505,14 +1701,36 @@ async function cleanupNativeHookTransactionStagedDeletions(
 		if (rollbackApplied) {
 			await assertNativeHookTransactionRollbackState(rollbackApplied);
 		}
+		const stagedDeletionPath = entry.stagedDeletionPath;
+		const stagedDeletionSnapshot = entry.stagedDeletionSnapshot;
 		await assertNativeHookTransactionArtifactSnapshot(
-			entry.stagedDeletionPath,
+			stagedDeletionPath,
 			`${entry.artifact.label} staged deletion`,
-			entry.stagedDeletionSnapshot,
+			stagedDeletionSnapshot,
 			"read-back",
 		);
 		await assertNativeHookTransactionAncestorPrecondition(ancestorPrecondition);
-		await rm(entry.stagedDeletionPath);
+		const claimPath = nativeHookTransactionClaimPath(entry.artifact.path);
+		await rename(stagedDeletionPath, claimPath);
+		try {
+			await assertNativeHookTransactionArtifactSnapshot(
+				claimPath,
+				`${entry.artifact.label} staged deletion cleanup claim`,
+				stagedDeletionSnapshot,
+				"read-back",
+			);
+		} catch (error) {
+			try {
+				await link(claimPath, stagedDeletionPath);
+				await rm(claimPath);
+			} catch (recoveryError) {
+				throw new Error(
+					`Native hook transaction staged deletion cleanup claim failed (${error instanceof Error ? error.message : String(error)}) and preserved ${claimPath} for manual recovery: ${recoveryError instanceof Error ? recoveryError.message : String(recoveryError)}`,
+				);
+			}
+			throw error;
+		}
+		await rm(claimPath);
 		entry.stagedDeletionCleaned = true;
 		if (rollbackApplied) {
 			await assertNativeHookTransactionRollbackState(rollbackApplied);
@@ -3026,7 +3244,10 @@ function buildPluginModeLegacyConfig(
 		: "";
 	let config = original;
 	config = stripFirstPartyOmxMcpSections(config);
-	config = stripExistingOmxBlocks(config).cleaned;
+	config = stripExistingOmxBlocks(config, {
+		managedTrustState: options.managedHookTrustState,
+		priorManagedHookTrustState: options.priorManagedHookTrustState,
+	}).cleaned;
 	config = stripExistingSharedMcpRegistryBlock(config).cleaned;
 	config = stripPluginModeLegacyRootDefaults(
 		config,

@@ -2,14 +2,16 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
 	cp,
+	link,
 	mkdir,
 	mkdtemp,
 	readFile,
+	rename,
 	rm,
 	symlink,
 	writeFile,
 } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
@@ -2035,16 +2037,20 @@ command = "node"
 		}
 	});
 
-	it("never executes missing, tampered, or historical Windows shim sentinels during verbose validation", async () => {
+	it("never executes missing, tampered, historical, hard-linked, or symlinked Windows shim sentinels during verbose validation", async () => {
 		for (const fixture of [
 			{
 				name: "missing",
 				shimContent: null,
+				hardLink: false,
+				symlinkTarget: null,
 				expected: /referenced Windows native hook shim is missing at/,
 			},
 			{
 				name: "tampered",
 				shimContent: `${buildManagedCodexNativeHookWindowsShimContent(repoRoot())}# verbose-execution sentinel\n`,
+				hardLink: false,
+				symlinkTarget: null,
 				expected: /not an exact current or complete historical generated shim/,
 			},
 			{
@@ -2054,7 +2060,23 @@ command = "node"
 					hookScriptPath:
 						"C:\\Historical Install\\oh-my-codex\\dist\\scripts\\codex-native-hook.js",
 				}),
+				hardLink: false,
+				symlinkTarget: null,
 				expected: /complete historical generated shim.*run "omx setup" to migrate/,
+			},
+			{
+				name: "hard-linked",
+				shimContent: buildManagedCodexNativeHookWindowsShimContent(repoRoot()),
+				hardLink: true,
+				symlinkTarget: null,
+				expected: /is hard-linked; doctor will not execute or modify it/,
+			},
+			{
+				name: "symlinked",
+				shimContent: null,
+				hardLink: false,
+				symlinkTarget: buildManagedCodexNativeHookWindowsShimContent(repoRoot()),
+				expected: /is not a regular file; doctor will not follow or modify it/,
 			},
 		] as const) {
 			const wd = await mkdtemp(join(tmpdir(), `omx-doctor-verbose-windows-shim-${fixture.name}-`));
@@ -2065,9 +2087,17 @@ command = "node"
 				const command = buildWindowsShimCommand(shimPath);
 				await mkdir(codexDir, { recursive: true });
 				await writeFile(hooksPath, buildWindowsShimHooksJson(shimPath, codexDir));
-				if (fixture.shimContent !== null) {
+				if (fixture.symlinkTarget !== null) {
+					const symlinkTargetPath = join(wd, "symlink-target.ps1");
+					await mkdir(dirname(shimPath), { recursive: true });
+					await writeFile(symlinkTargetPath, fixture.symlinkTarget, "utf-8");
+					await symlink(symlinkTargetPath, shimPath);
+				} else if (fixture.shimContent !== null) {
 					await mkdir(dirname(shimPath), { recursive: true });
 					await writeFile(shimPath, fixture.shimContent, "utf-8");
+					if (fixture.hardLink) {
+						await link(shimPath, join(wd, "canonical-shim-hardlink.ps1"));
+					}
 				}
 
 				let spawned = false;
@@ -2086,6 +2116,105 @@ command = "node"
 			} finally {
 				await rm(wd, { recursive: true, force: true });
 			}
+		}
+	});
+
+	it("runs exact current Windows shim bytes in memory after canonical replacement, hard-linking, and ancestor retargeting", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-doctor-verbose-windows-shim-in-memory-"));
+		try {
+			const codexDir = join(wd, ".codex");
+			const hooksPath = join(codexDir, "hooks.json");
+			const hooksDir = join(codexDir, "hooks");
+			const shimPath = join(hooksDir, "omx-native-hook-windows-shim.ps1");
+			const command = buildWindowsShimCommand(shimPath);
+			const currentShim = buildManagedCodexNativeHookWindowsShimContent(repoRoot());
+			const sentinel = "# foreign canonical shim sentinel\n";
+			const foreignHooksDir = join(codexDir, "foreign-hooks");
+			const foreignShimPath = join(foreignHooksDir, "omx-native-hook-windows-shim.ps1");
+			const foreignHardLinkPath = join(foreignHooksDir, "foreign-shim-hard-link.ps1");
+			await mkdir(hooksDir, { recursive: true });
+			await writeFile(hooksPath, buildWindowsShimHooksJson(shimPath, codexDir));
+			await writeFile(shimPath, currentShim, "utf-8");
+
+			const check = await checkNativePostCompactHookRuntime(hooksPath, wd, codexDir, {
+				platform: "win32",
+				expectedCommand: command,
+				beforeWindowsShimSmoke: async () => {
+					const parkedHooksDir = join(codexDir, "validated-hooks");
+					await rename(hooksDir, parkedHooksDir);
+					await mkdir(foreignHooksDir, { recursive: true });
+					await writeFile(foreignShimPath, sentinel);
+					await link(foreignShimPath, foreignHardLinkPath);
+					await symlink(foreignHooksDir, hooksDir, "dir");
+				},
+				runner: ((_command: string, args: readonly string[]) => {
+					const encodedCommand = args[args.indexOf("-EncodedCommand") + 1];
+					if (typeof encodedCommand !== "string") {
+						throw new Error("PowerShell smoke must receive an encoded in-memory command");
+					}
+					assert.doesNotMatch(args.join("\u0000"), /(?:^|\u0000)-File(?:\u0000|$)/);
+					const smokeCommand = Buffer.from(encodedCommand, "base64").toString("utf16le");
+					assert.doesNotMatch(smokeCommand, /(?:^|\s)-File(?:\s|$)/);
+					assert.equal(smokeCommand.includes(shimPath), false);
+					assert.match(smokeCommand, /\[ScriptBlock\]::Create\(\$omxShimSource\)/);
+					const encodedShimBytes = /FromBase64String\('([A-Za-z0-9+/=]+)'\)/.exec(smokeCommand)?.[1];
+					if (encodedShimBytes === undefined) {
+						throw new Error("encoded PowerShell smoke command omitted validated shim bytes");
+					}
+					assert.deepEqual(Buffer.from(encodedShimBytes, "base64"), Buffer.from(currentShim, "utf-8"));
+					assert.equal(readFileSync(shimPath, "utf-8"), sentinel);
+					assert.equal(readFileSync(foreignHardLinkPath, "utf-8"), sentinel);
+					return { status: 0, stdout: "", stderr: "" };
+				}) as unknown as typeof spawnSync,
+			});
+
+			assert.equal(check?.status, "pass");
+		} finally {
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
+
+	it("preserves a swapped Windows PostCompact smoke root instead of recursively deleting it", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-doctor-verbose-windows-smoke-root-"));
+		let foreignSmokeCwd: string | null = null;
+		let parkedSmokeCwd: string | null = null;
+		try {
+			const codexDir = join(wd, ".codex");
+			const hooksPath = join(codexDir, "hooks.json");
+			const hooksDir = join(codexDir, "hooks");
+			const shimPath = join(hooksDir, "omx-native-hook-windows-shim.ps1");
+			const command = buildWindowsShimCommand(shimPath);
+			await mkdir(hooksDir, { recursive: true });
+			await writeFile(hooksPath, buildWindowsShimHooksJson(shimPath, codexDir));
+			await writeFile(shimPath, buildManagedCodexNativeHookWindowsShimContent(repoRoot()), "utf-8");
+
+			const check = await checkNativePostCompactHookRuntime(hooksPath, wd, codexDir, {
+				platform: "win32",
+				expectedCommand: command,
+				beforeWindowsShimSmoke: ({ smokeCwd }) => {
+					foreignSmokeCwd = smokeCwd;
+				},
+				runner: (() => {
+					const currentSmokeCwd = foreignSmokeCwd;
+					if (currentSmokeCwd === null) {
+						throw new Error("Windows smoke root was not captured before execution");
+					}
+					parkedSmokeCwd = `${currentSmokeCwd}-parked`;
+					renameSync(currentSmokeCwd, parkedSmokeCwd);
+					mkdirSync(currentSmokeCwd, { mode: 0o700 });
+					writeFileSync(join(currentSmokeCwd, "foreign-sentinel.txt"), "foreign smoke root\n");
+					return { status: 0, stdout: "", stderr: "" };
+				}) as unknown as typeof spawnSync,
+			});
+
+			assert.equal(check?.status, "warn");
+			assert.match(check?.message ?? "", /temporary PostCompact smoke directory changed during validation/);
+			if (foreignSmokeCwd === null) assert.fail("Windows smoke root was not captured");
+			assert.equal(readFileSync(join(foreignSmokeCwd, "foreign-sentinel.txt"), "utf-8"), "foreign smoke root\n");
+		} finally {
+			if (foreignSmokeCwd !== null) await rm(foreignSmokeCwd, { recursive: true, force: true });
+			if (parkedSmokeCwd !== null) await rm(parkedSmokeCwd, { recursive: true, force: true });
+			await rm(wd, { recursive: true, force: true });
 		}
 	});
 

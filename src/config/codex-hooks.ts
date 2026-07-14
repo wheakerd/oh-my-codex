@@ -179,7 +179,10 @@ export interface ManagedCodexHookOptions {
   nodePath?: string;
   hookScriptPath?: string;
   env?: NodeJS.ProcessEnv;
-  /** Final hooks.json content to derive Codex hook trust keys from. */
+  /**
+   * Final hooks.json content to derive Codex hook trust keys from. Omit it to
+   * retain the historical canonical-builder fallback; null declares no final artifact.
+   */
   hooksContent?: string | null;
 }
 
@@ -2743,6 +2746,7 @@ export function buildManagedCodexHookTrustState(
   options: ManagedCodexHookOptions = {},
 ): Record<string, ManagedCodexHookTrustState> {
   const resolvedOptions = resolveManagedCodexHookOptions(options, hooksPath);
+  if (options.hooksContent === null) return {};
   const content = typeof options.hooksContent === "string"
     ? options.hooksContent
     : serializeCodexHooksConfig(jsonObjectFromUnknown(buildManagedCodexHooksConfig(pkgRoot, resolvedOptions)));

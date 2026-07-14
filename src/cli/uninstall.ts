@@ -2,7 +2,8 @@
  * omx uninstall - Remove oh-my-codex configuration and installed artifacts
  */
 
-import { chmod, lstat, open, readFile, readdir, rename, rm } from "fs/promises";
+import { chmod, link, lstat, open, readFile, readdir, rename, rm } from "fs/promises";
+
 import { existsSync } from "fs";
 import { join, basename, dirname, isAbsolute, relative } from "path";
 import { randomUUID } from "crypto";
@@ -50,15 +51,19 @@ export type UninstallTransactionFailureStage =
   | "before-config-commit"
   | "before-temp-write"
   | "before-rename"
+  | "after-final-rename-validation"
   | "after-rename"
   | "before-remove"
+  | "after-final-remove-validation"
   | "after-remove"
   | "before-rollback"
   | "before-rollback-rename"
+  | "after-final-restore-validation"
   | "before-rollback-remove"
   | "before-staged-cleanup"
   | "after-staged-cleanup"
   | "after-config-commit";
+
 
 export interface UninstallOptions {
   codexFeaturesProbe?: () => string | null;
@@ -79,6 +84,8 @@ export interface UninstallOptions {
     path: string,
     purpose: "write" | "delete",
   ) => string;
+
+
 }
 
 interface UninstallSummary {
@@ -611,7 +618,10 @@ async function planConfigCleanup(
 
   // Strip OMX tables block (MCP servers, agents, tui)
   let config = original;
-  const { cleaned } = stripExistingOmxBlocks(config);
+  const { cleaned } = stripExistingOmxBlocks(config, {
+    managedTrustState: options.finalHookTrustState,
+    priorManagedHookTrustState: options.priorHookTrustState,
+  });
   config = cleaned;
 
   // Strip OMX top-level keys, then restore a pre-existing user notify when
@@ -832,6 +842,14 @@ function transactionTemporaryPath(
   );
 }
 
+function transactionClaimPath(path: string): string {
+  return join(
+    dirname(path),
+    `.${basename(path)}.omx-uninstall-claim-${process.pid}-${randomUUID()}.tmp`,
+  );
+}
+
+
 function snapshotReadOptions(snapshot: FileSnapshot): {
   strictUtf8: false;
   controlledRoot?: string;
@@ -902,6 +920,30 @@ async function assertSnapshotCurrent(snapshot: FileSnapshot): Promise<void> {
   throw new Error(`Refusing uninstall because planned artifact ${snapshot.path} changed, was created, or was removed after planning.`);
 }
 
+async function assertSnapshotAtPath(
+  path: string,
+  expected: FileSnapshot,
+  context: string,
+): Promise<FileSnapshot> {
+  await assertControlledTopologyCurrent(expected.topology);
+  const actual = await readFileSnapshot(path, snapshotReadOptions(expected));
+  if (
+    expected.bytes === null ||
+    actual.bytes === null ||
+    expected.identity === null ||
+    actual.identity === null ||
+    !expected.bytes.equals(actual.bytes) ||
+    actual.mode !== expected.mode ||
+    actual.identity.dev !== expected.identity.dev ||
+    actual.identity.ino !== expected.identity.ino
+  ) {
+    throw new Error(`Refusing uninstall because ${context} ${path} is not the planned artifact.`);
+  }
+  return actual;
+
+}
+
+
 async function assertSnapshotMatchesPlannedContent(
   actual: FileSnapshot,
   expected: FileSnapshot,
@@ -928,12 +970,29 @@ async function removeOwnedTemporary(
   originalError: unknown,
   description: "temporary" | "staged deletion",
 ): Promise<void> {
+
   try {
     if (!snapshot) {
       throw new Error(`${description} path was not fully captured after writing.`);
     }
     await assertSnapshotCurrent(snapshot);
-    await rm(path);
+    const claimPath = transactionClaimPath(path);
+
+    await rename(path, claimPath);
+    try {
+      await assertSnapshotAtPath(claimPath, snapshot, `${description} cleanup claim`);
+    } catch (error) {
+      try {
+        await link(claimPath, path);
+        await rm(claimPath);
+      } catch (recoveryError) {
+        throw new Error(
+          `${error instanceof Error ? error.message : String(error)}; preserved claim ${claimPath} for manual recovery: ${recoveryError instanceof Error ? recoveryError.message : String(recoveryError)}`,
+        );
+      }
+      throw error;
+    }
+    await rm(claimPath);
   } catch (cleanupError) {
     const message = originalError instanceof Error
       ? originalError.message
@@ -944,13 +1003,15 @@ async function removeOwnedTemporary(
   }
 }
 
+
 async function atomicReplaceFile(
   mutation: PlannedFileMutation,
   expectedCurrent: FileSnapshot,
   content: Buffer,
   options: Pick<UninstallOptions, "transactionFailureInjector" | "transactionTemporaryPath">,
   stage: "write" | "rollback",
-  onRename: (ownership: RenamedDestinationOwnership) => void | Promise<void>,
+  onRename: (ownership: RenamedDestinationOwnership) => void,
+
   assertApplied?: () => Promise<void>,
 ): Promise<FileSnapshot> {
   if (mutation.snapshot.mode === null) {
@@ -960,6 +1021,8 @@ async function atomicReplaceFile(
   let handle: Awaited<ReturnType<typeof open>> | undefined;
   let temporaryCreated = false;
   let temporarySnapshot: FileSnapshot | undefined;
+  let claimPath: string | undefined;
+  let claimCreated = false;
   try {
     await options.transactionFailureInjector?.(
       stage === "write" ? "before-temp-write" : "before-rollback",
@@ -988,20 +1051,40 @@ async function atomicReplaceFile(
       stage === "write" ? "before-rename" : "before-rollback-rename",
     );
     await assertApplied?.();
-    // Recheck at the mutation primitive immediately before replacing the target.
     await assertControlledTopologyCurrent(mutation.snapshot.topology);
     await assertSnapshotCurrent(expectedCurrent);
-    // Recheck the transaction-owned temporary immediately before replacing the target.
+    await assertSnapshotCurrent(temporarySnapshot);
+    await options.transactionFailureInjector?.(
+      stage === "write"
+        ? "after-final-rename-validation"
+        : "after-final-restore-validation",
+    );
     await assertSnapshotCurrent(temporarySnapshot);
 
-    await rename(temporaryPath, mutation.snapshot.path);
-    temporaryCreated = false;
+    if (expectedCurrent.bytes !== null) {
+      claimPath = transactionClaimPath(mutation.snapshot.path);
+
+
+      await rename(mutation.snapshot.path, claimPath);
+      claimCreated = true;
+      await assertSnapshotAtPath(claimPath, expectedCurrent, "replacement claim");
+    }
+    // link() is a no-overwrite claim of the now-absent destination. It fails
+    // rather than replacing anything concurrently created at that coordinate.
+    await link(temporaryPath, mutation.snapshot.path);
     const ownership = renamedDestinationOwnership(
       temporarySnapshot,
       mutation.snapshot.path,
       mutation.snapshot.topology,
     );
-    await onRename(ownership);
+    onRename(ownership);
+    await rm(temporaryPath);
+    temporaryCreated = false;
+    if (claimPath) {
+      await rm(claimPath);
+      claimCreated = false;
+    }
+
     if (stage === "write") {
       await options.transactionFailureInjector?.("after-rename");
     }
@@ -1013,6 +1096,18 @@ async function atomicReplaceFile(
     return actual;
   } catch (error) {
     await handle?.close().catch(() => undefined);
+    if (claimCreated && claimPath) {
+      try {
+        await link(claimPath, mutation.snapshot.path);
+        await rm(claimPath);
+        claimCreated = false;
+      } catch (recoveryError) {
+        const message = error instanceof Error ? error.message : String(error);
+        throw new Error(
+          `Uninstall replacement failed (${message}) and preserved claim ${claimPath} for manual recovery: ${recoveryError instanceof Error ? recoveryError.message : String(recoveryError)}`,
+        );
+      }
+    }
     if (temporaryCreated) {
       await removeOwnedTemporary(
         temporaryPath,
@@ -1020,10 +1115,12 @@ async function atomicReplaceFile(
         error,
         "temporary",
       );
+
     }
     throw error;
   }
 }
+
 
 async function stageAndRemoveFile(
   mutation: PlannedFileMutation,
@@ -1060,13 +1157,16 @@ async function stageAndRemoveFile(
     execution.stagedDeletion = stagedDeletion;
 
     await options.transactionFailureInjector?.("before-remove");
-    // Recheck at the mutation primitive immediately before removing the target.
     await assertControlledTopologyCurrent(mutation.snapshot.topology);
     await assertSnapshotCurrent(mutation.snapshot);
-    // Recheck the transaction-owned staged copy immediately before removing the target.
     await assertSnapshotCurrent(stagedDeletion);
     await assertApplied();
-    await rm(mutation.snapshot.path);
+    await options.transactionFailureInjector?.("after-final-remove-validation");
+    await assertSnapshotCurrent(stagedDeletion);
+    const claimPath = transactionClaimPath(mutation.snapshot.path);
+
+
+    await rename(mutation.snapshot.path, claimPath);
     execution.appliedSnapshot = {
       path: mutation.snapshot.path,
       content: null,
@@ -1076,6 +1176,24 @@ async function stageAndRemoveFile(
       topology: mutation.snapshot.topology,
     };
     execution.phase = "destructive";
+    try {
+
+
+      await assertSnapshotAtPath(claimPath, mutation.snapshot, "removal claim");
+    } catch (error) {
+      try {
+        await link(claimPath, mutation.snapshot.path);
+        await rm(claimPath);
+        execution.appliedSnapshot = undefined;
+        execution.phase = "prepared";
+      } catch (recoveryError) {
+        throw new Error(
+          `Uninstall removal claim failed (${error instanceof Error ? error.message : String(error)}) and preserved ${claimPath} for manual recovery: ${recoveryError instanceof Error ? recoveryError.message : String(recoveryError)}`,
+        );
+      }
+      throw error;
+    }
+    await rm(claimPath);
     await options.transactionFailureInjector?.("after-remove");
     await assertControlledTopologyCurrent(mutation.snapshot.topology);
     const absent = await captureCurrentSnapshot(mutation.snapshot);
@@ -1170,7 +1288,10 @@ async function restoreFileSnapshot(
     await assertRollbackState();
     await assertControlledTopologyCurrent(mutation.snapshot.topology);
     await assertSnapshotCurrent(appliedSnapshot);
-    await rm(mutation.snapshot.path);
+    await options.transactionFailureInjector?.("after-final-restore-validation");
+    const claimPath = transactionClaimPath(mutation.snapshot.path);
+
+    await rename(mutation.snapshot.path, claimPath);
     execution.appliedSnapshot = {
       path: mutation.snapshot.path,
       content: null,
@@ -1180,6 +1301,21 @@ async function restoreFileSnapshot(
       topology: mutation.snapshot.topology,
     };
     execution.renamedOwnership = undefined;
+    try {
+
+      await assertSnapshotAtPath(claimPath, appliedSnapshot, "rollback removal claim");
+    } catch (error) {
+      try {
+        await link(claimPath, mutation.snapshot.path);
+        await rm(claimPath);
+      } catch (recoveryError) {
+        throw new Error(
+          `Uninstall rollback removal claim failed (${error instanceof Error ? error.message : String(error)}) and preserved ${claimPath} for manual recovery: ${recoveryError instanceof Error ? recoveryError.message : String(recoveryError)}`,
+        );
+      }
+      throw error;
+    }
+    await rm(claimPath);
     const absent = await captureCurrentSnapshot(mutation.snapshot);
     if (absent.bytes !== null) {
       throw new Error(`Uninstall rollback mismatch for ${mutation.snapshot.path}: expected absence.`);
@@ -1222,9 +1358,24 @@ async function cleanupStagedDeletions(
     }
     await assertRollbackState?.();
 
-    // Recheck immediately before removing the transaction-owned staged copy.
-    await assertSnapshotCurrent(execution.stagedDeletion);
-    await rm(execution.stagedDeletion.path);
+    const stagedDeletion = execution.stagedDeletion;
+    await assertSnapshotCurrent(stagedDeletion);
+    const claimPath = transactionClaimPath(stagedDeletion.path);
+    await rename(stagedDeletion.path, claimPath);
+    try {
+      await assertSnapshotAtPath(claimPath, stagedDeletion, "staged deletion cleanup claim");
+    } catch (error) {
+      try {
+        await link(claimPath, stagedDeletion.path);
+        await rm(claimPath);
+      } catch (recoveryError) {
+        throw new Error(
+          `Uninstall staged deletion cleanup claim failed (${error instanceof Error ? error.message : String(error)}) and preserved ${claimPath} for manual recovery: ${recoveryError instanceof Error ? recoveryError.message : String(recoveryError)}`,
+        );
+      }
+      throw error;
+    }
+    await rm(claimPath);
     execution.stagedDeletionCleaned = true;
     await assertRollbackState?.();
   }

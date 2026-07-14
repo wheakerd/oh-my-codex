@@ -32,10 +32,12 @@ import {
   buildManagedCodexHookTrustState,
   escapeTomlBasicString,
   ManagedCodexHooksPlanError,
+  scanManagedCodexHookTrustStateFromContent,
   type CodexHooksJsonTrustStateEntry,
   type ManagedCodexHookTrustState,
   type ManagedCodexHookOptions,
 } from "./codex-hooks.js";
+
 import type { HudPreset } from "../hud/types.js";
 
 interface MergeOptions {
@@ -1284,7 +1286,7 @@ function parseTomlSourceKeySegment(
 }
 
 function isTomlSourceKey(segment: TomlSourceKeySegment, key: string): boolean {
-  return segment.key?.toLowerCase() === key;
+  return segment.key === key;
 }
 
 function findTomlSourceAssignmentSeparator(line: string): number | undefined {
@@ -1725,23 +1727,29 @@ function collectMarkerRanges(
   startMarker: string,
   endMarker: string,
   includeUnterminatedRange = false,
+  inertAssignmentSpans: readonly SourceSpan[] = [],
 ): SourceSpan[] {
+  const isInsideInertAssignment = (line: number): boolean =>
+    inertAssignmentSpans.some((span) => span.start <= line && line < span.end);
   const ranges: SourceSpan[] = [];
   for (let start = 0; start < source.lines.length; start += 1) {
     if (
       !source.lineStartsOutsideMultiline[start] ||
+      isInsideInertAssignment(start) ||
       source.lines[start]?.trim() !== startMarker
     ) continue;
     const end = source.lines.findIndex(
       (line, index) =>
         index > start &&
         source.lineStartsOutsideMultiline[index] &&
+        !isInsideInertAssignment(index) &&
         line.trim() === endMarker,
     );
     const nestedStart = source.lines.findIndex(
       (line, index) =>
         index > start &&
         source.lineStartsOutsideMultiline[index] &&
+        !isInsideInertAssignment(index) &&
         line.trim() === startMarker,
     );
     if (end === -1 || (nestedStart !== -1 && nestedStart < end)) {
@@ -1887,12 +1895,15 @@ function collectManagedHookTrustStateSourceRepresentations(
       source,
       OMX_HOOK_TRUST_START_MARKER,
       OMX_HOOK_TRUST_END_MARKER,
+      false,
+      parsedAssignmentSpans,
     ),
     ...collectMarkerRanges(
       source,
       OMX_CONFIG_START_MARKER,
       OMX_CONFIG_END_MARKER,
       true,
+      parsedAssignmentSpans,
     ),
   ];
   const isInsideManagedMarkerBlock = (start: number, end: number): boolean =>
@@ -2016,7 +2027,9 @@ function managedMarkerTrustStateConflicts(
   expectations: ManagedHookTrustStateExpectations,
 ): Set<string> {
   const conflicts = new Set<string>();
-  if (invalidMarkerContainedHooksStateSpans.length > 0 ||
+  const isInsideManagedMarkerRange = (span: SourceSpan): boolean =>
+    managedMarkerRanges.some((range) => span.start > range.start && span.end <= range.end);
+  if (invalidMarkerContainedHooksStateSpans.some(isInsideManagedMarkerRange) ||
     hasUnprovenManagedMarkerHooksStateSyntax(
       source,
       managedMarkerRanges,
@@ -2028,7 +2041,7 @@ function managedMarkerTrustStateConflicts(
 
   for (const [key, sourceRepresentations] of representations) {
     for (const representation of sourceRepresentations) {
-      if (!representation.insideManagedMarkerBlock) continue;
+      if (!isInsideManagedMarkerRange(representation)) continue;
       const expectedHashes = expectedManagedHookTrustHashes(
         expectations,
         key,
@@ -3077,27 +3090,40 @@ function upsertTuiStatusLine(
 // OMX [table] sections block (appended at end of file)
 // ---------------------------------------------------------------------------
 
-export function stripExistingOmxBlocks(config: string): {
+export function stripExistingOmxBlocks(
+  config: string,
+  options: {
+    managedTrustState?: ManagedCodexHookTrustStateMap;
+    priorManagedHookTrustState?: ManagedCodexHookTrustStateMap;
+  } = {},
+): {
   cleaned: string;
   removed: number;
 } {
-  const source = analyzeTomlSource(config);
+  const inventory = collectManagedHookTrustStateSourceRepresentations(config);
+  const { source } = inventory;
   const markerRanges = collectMarkerRanges(
     source,
     OMX_CONFIG_START_MARKER,
     OMX_CONFIG_END_MARKER,
+    false,
+    inventory.parsedAssignmentSpans,
   );
   if (markerRanges.length === 0) return { cleaned: config, removed: 0 };
-  const { parsedAssignmentSpans, parsedStatementSpans } =
-    collectManagedHookTrustStateSourceRepresentations(config);
-  if (hasUnprovenManagedMarkerHooksStateSyntax(
+  const conflicts = managedMarkerTrustStateConflicts(
     source,
+    inventory.representations,
     markerRanges,
-    parsedStatementSpans,
-    parsedAssignmentSpans,
-  )) {
-    rejectManagedCodexHookTrustStateConflicts(new Set(["marker-contained hooks.state"]));
-  }
+    inventory.markerContainedHooksStateSpans,
+    inventory.invalidMarkerContainedHooksStateSpans,
+    inventory.parsedStatementSpans,
+    inventory.parsedAssignmentSpans,
+    managedHookTrustStateExpectations(
+      options.priorManagedHookTrustState,
+      options.managedTrustState,
+    ),
+  );
+  rejectManagedCodexHookTrustStateConflicts(conflicts);
   if (!source.isUnambiguous) return { cleaned: config, removed: 0 };
 
   const lines = sourceLines(config);
@@ -3575,7 +3601,10 @@ export function buildMergedConfig(
     extractCustomizedTuiSectionsFromOmxBlocks(existing);
 
   if (existing.includes(OMX_CONFIG_MARKER)) {
-    const stripped = stripExistingOmxBlocks(existing);
+    const stripped = stripExistingOmxBlocks(existing, {
+      managedTrustState,
+      priorManagedHookTrustState: options.priorManagedHookTrustState,
+    });
     existing = stripped.cleaned;
     if (customizedManagedTuiSections.length > 0) {
       existing = `${existing.trimEnd()}\n\n${customizedManagedTuiSections.join("\n\n")}\n`;
@@ -3667,6 +3696,58 @@ export function buildMergedConfig(
  *
  * Returns `true` if a repair was performed.
  */
+function managedHookTrustProofRequiredForRepair(config: string): boolean {
+  const inventory = collectManagedHookTrustStateSourceRepresentations(config);
+  return managedMarkerTrustStateConflicts(
+    inventory.source,
+    inventory.representations,
+    inventory.managedMarkerRanges,
+    inventory.markerContainedHooksStateSpans,
+    inventory.invalidMarkerContainedHooksStateSpans,
+    inventory.parsedStatementSpans,
+    inventory.parsedAssignmentSpans,
+    managedHookTrustStateExpectations(),
+  ).size > 0;
+}
+
+async function launchRepairOptionsWithManagedHookTrustProof(
+  configPath: string,
+  config: string,
+  options: MergeOptions,
+): Promise<MergeOptions> {
+  if (!managedHookTrustProofRequiredForRepair(config)) {
+
+    return options;
+  }
+
+  const hooksPath = options.codexHooksFile ?? resolve(configPath, "..", "hooks.json");
+  let hooksContent: string;
+  try {
+    hooksContent = await readFile(hooksPath, "utf-8");
+  } catch (error) {
+    throw new ManagedCodexHooksPlanError(
+      "invalid_document",
+      `Cannot safely repair config.toml because the current hooks artifact at ${hooksPath} could not be read.`,
+      { cause: String(error), hooksPath },
+    );
+  }
+
+  const trustScan = scanManagedCodexHookTrustStateFromContent(
+    hooksContent,
+    hooksPath,
+    managedCodexHookOptionsFromMergeOptions(options),
+  );
+  if (!trustScan.ok) throw trustScan.error;
+
+  return {
+    ...options,
+    codexHooksFile: hooksPath,
+    codexHooksContent: hooksContent,
+    managedHookTrustState: trustScan.trustState,
+    priorManagedHookTrustState: trustScan.trustState,
+  };
+}
+
 export async function repairConfigIfNeeded(
   configPath: string,
   pkgRoot: string,
@@ -3682,8 +3763,14 @@ export async function repairConfigIfNeeded(
   if (tuiCount <= 1 && !hasLegacyTeamRunTable && !hasLauncherTimeoutGap)
     return false;
 
-  // Managed config compatibility issue detected — run full merge to repair
-  const repaired = buildMergedConfig(content, pkgRoot, options);
+  // Managed config compatibility issue detected — derive proof from the current
+  // hooks artifact before any marker stripping can replace managed trust state.
+  const repairOptions = await launchRepairOptionsWithManagedHookTrustProof(
+    configPath,
+    content,
+    options,
+  );
+  const repaired = buildMergedConfig(content, pkgRoot, repairOptions);
   if (repaired === content) return false;
   await writeFile(configPath, repaired);
   return true;
@@ -3700,12 +3787,6 @@ export async function mergeConfig(
     existing = await readFile(configPath, "utf-8");
   }
 
-  if (existing.includes("oh-my-codex (OMX) Configuration")) {
-    const stripped = stripExistingOmxBlocks(existing);
-    if (options.verbose && stripped.removed > 0) {
-      console.log("  Updating existing OMX config block.");
-    }
-  }
 
   const finalConfig = buildMergedConfig(existing, pkgRoot, options);
 
