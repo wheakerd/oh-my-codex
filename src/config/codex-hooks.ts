@@ -187,9 +187,10 @@ function resolveManagedCodexHookOptions(
   options: ManagedCodexHookOptions,
   hooksPath: string,
 ): ManagedCodexHookOptions {
+  const platform = options.platform ?? process.platform;
   return {
     ...options,
-    ...(options.platform === "win32" && !options.codexHomeDir
+    ...(platform === "win32" && !options.codexHomeDir
       ? { codexHomeDir: dirname(hooksPath) }
       : {}),
   };
@@ -275,11 +276,13 @@ function decodeGeneratedWindowsProcessArgument(value: string): string | null {
 
 function isProofValidNodeExecutable(nodePath: string): boolean {
   const executable = nodePath.split(/[\\/]/).pop()?.toLowerCase();
-  return executable === "node" || executable === "node.exe";
+  return isQualifiedWindowsFilesystemPath(nodePath) &&
+    (executable === "node" || executable === "node.exe");
 }
 
 function isProofValidNativeHookScriptPath(hookScriptPath: string): boolean {
-  return /(?:^|\\)dist\\scripts\\codex-native-hook\.js$/i.test(hookScriptPath);
+  return isQualifiedWindowsFilesystemPath(hookScriptPath) &&
+    /(?:^|\\)dist\\scripts\\codex-native-hook\.js$/i.test(hookScriptPath);
 }
 
 /**
@@ -1271,6 +1274,7 @@ function tokenizePosixCommand(
   command: string,
   preserveWindowsBackslashes = false,
 ): string[] | null {
+  if (containsControlCharacter(command)) return null;
   const words: string[] = [];
   let word = "";
   let tokenStarted = false;
@@ -1334,14 +1338,154 @@ function tokenizePosixCommand(
   return words.length > 0 ? words : null;
 }
 
-/** Decode only literal PowerShell command words; interpolation is never owned. */
-function tokenizePowerShellCommand(command: string): string[] | null {
+const ALWAYS_UNSAFE_WINDOWS_DIRECT_COMMAND_CHARACTERS = new Set(["%", "!", "$", "`"]);
+const UNQUOTED_UNSAFE_WINDOWS_DIRECT_COMMAND_CHARACTERS = new Set([
+  "&", "|", "<", ">", "(", ")", "^", ";", "@", "*", "?", "[", "]", "{", "}", "~",
+]);
+
+/**
+ * Empty/concatenated double-quote runs have cmd/UCRT and PowerShell parsing
+ * rules that this ownership grammar intentionally does not model. Reject them
+ * before tokenization so they cannot disappear into an owned proof path.
+ */
+function containsAdjacentDoubleQuotes(command: string): boolean {
+  return command.includes('""');
+}
+
+
+/**
+ * Decode only cmd.exe-static argv. This intentionally permits only double-quote
+ * grouping and the CommandLineToArgvW backslash/quote convention; all cmd
+ * expansion and unquoted operator syntax is rejected during tokenization.
+ */
+function tokenizeWindowsDirectCommand(command: string): string[] | null {
+  if (containsControlCharacter(command) || containsAdjacentDoubleQuotes(command)) return null;
+
   const words: string[] = [];
   let word = "";
   let tokenStarted = false;
-  let quote: "'" | '"' | undefined;
-  let callOperatorSeen = false;
+  let quoted = false;
+  for (let index = 0; index < command.length;) {
+    const character = command[index]!;
+    if (
+      ALWAYS_UNSAFE_WINDOWS_DIRECT_COMMAND_CHARACTERS.has(character) ||
+      (!quoted && UNQUOTED_UNSAFE_WINDOWS_DIRECT_COMMAND_CHARACTERS.has(character))
+    ) return null;
+    if (character === "\\") {
+      const start = index;
+      while (command[index] === "\\") index += 1;
+      const count = index - start;
+      if (command[index] === '"') {
+        word += "\\".repeat(Math.floor(count / 2));
+        if (count % 2 === 0) quoted = !quoted;
+        else word += '"';
+        tokenStarted = true;
+        index += 1;
+      } else {
+        word += "\\".repeat(count);
+        tokenStarted = true;
+      }
+      continue;
+    }
+    if (character === '"') {
+      quoted = !quoted;
+      tokenStarted = true;
+      index += 1;
+      continue;
+    }
+    if (isShellWhitespace(character)) {
+      if (quoted) {
+        word += character;
+      } else if (tokenStarted) {
+        words.push(word);
+        word = "";
+        tokenStarted = false;
+      }
+      index += 1;
+      continue;
+    }
+    word += character;
+    tokenStarted = true;
+    index += 1;
+  }
+  if (quoted) return null;
+  if (tokenStarted) words.push(word);
+  return words.length > 0 && words.every((value) => !value.includes('"')) ? words : null;
+}
 
+
+function containsControlCharacter(value: string): boolean {
+  for (const character of value) {
+    const codePoint = character.codePointAt(0)!;
+    if (codePoint <= 0x1f || (codePoint >= 0x7f && codePoint <= 0x9f)) return true;
+  }
+  return false;
+}
+
+const WINDOWS_RESERVED_DEVICE_STEM = /^(?:con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³])$/i;
+
+function isReservedWindowsDeviceComponent(component: string): boolean {
+  const dot = component.indexOf(".");
+  const deviceStem = (dot === -1 ? component : component.slice(0, dot)).replace(/ +$/, "");
+  return WINDOWS_RESERVED_DEVICE_STEM.test(deviceStem);
+}
+
+/**
+ * Managed command ownership accepts only ordinary Win32 path syntax. Namespace,
+ * device, stream, and wildcard forms can be lexically static yet resolve outside
+ * the filesystem path the command appears to name, so do not own them.
+ */
+function isValidWindowsFilesystemPath(path: string): boolean {
+  if (!path || containsControlCharacter(path) || /["<>|?*]/.test(path)) return false;
+  if (
+    /^(?:[\\/]{3,}|[\\/]{1,2}[?.][\\/]|[\\/]{1,2}\?\?[\\/]|[\\/](?:device|globalroot)[\\/])/i.test(path)
+  ) return false;
+
+  const firstColon = path.indexOf(":");
+  if (
+    firstColon !== -1 &&
+    (firstColon !== 1 || !/[A-Za-z]/.test(path[0]!) || path.indexOf(":", firstColon + 1) !== -1)
+  ) return false;
+
+  return path.split(/[\\/]+/).every((segment) =>
+    !segment || /^[A-Za-z]:$/.test(segment) ||
+      (!segment.endsWith(".") && !segment.endsWith(" ") && !isReservedWindowsDeviceComponent(segment))
+  );
+}
+
+/** Accept only drive-absolute or complete UNC paths as ownership proof. */
+function isQualifiedWindowsFilesystemPath(path: string): boolean {
+  if (!isValidWindowsFilesystemPath(path)) return false;
+  if (/^[A-Za-z]:[\\/]/.test(path)) return true;
+  if (!/^[\\/]{2}/.test(path)) return false;
+  const uncSegments = path.slice(2).split(/[\\/]+/);
+  return uncSegments.length >= 2 && uncSegments[0]!.length > 0 && uncSegments[1]!.length > 0;
+}
+
+function isAbsolutePosixFilesystemPath(path: string): boolean {
+  return path.startsWith("/") && !containsControlCharacter(path);
+}
+
+interface StaticPowerShellCommandToken {
+  value: string;
+  quoted: boolean;
+}
+
+interface StaticPowerShellCommand {
+  tokens: StaticPowerShellCommandToken[];
+  hasCallOperator: boolean;
+}
+
+/** Decode only literal PowerShell command words; interpolation is never owned. */
+function tokenizePowerShellCommand(command: string): StaticPowerShellCommand | null {
+  const tokens: StaticPowerShellCommandToken[] = [];
+  let word = "";
+  let tokenStarted = false;
+  let tokenQuoted = false;
+  let quote: "'" | '"' | undefined;
+  let hasCallOperator = false;
+
+  if (containsControlCharacter(command) || containsAdjacentDoubleQuotes(command)) return null;
   for (let index = 0; index < command.length; index += 1) {
     const character = command[index]!;
     if (quote === "'") {
@@ -1370,24 +1514,26 @@ function tokenizePowerShellCommand(command: string): string[] | null {
     if (character === "'" || character === '"') {
       quote = character;
       tokenStarted = true;
+      tokenQuoted = true;
       continue;
     }
     if (character === "&") {
       if (
-        callOperatorSeen ||
+        hasCallOperator ||
         tokenStarted ||
-        words.length > 0 ||
+        tokens.length > 0 ||
         !isShellWhitespace(command[index + 1] ?? "")
       ) return null;
-      callOperatorSeen = true;
+      hasCallOperator = true;
       continue;
     }
     if (UNQUOTED_POWERSHELL_ACTIVE_CHARACTERS.has(character)) return null;
     if (isShellWhitespace(character)) {
       if (tokenStarted) {
-        words.push(word);
+        tokens.push({ value: word, quoted: tokenQuoted });
         word = "";
         tokenStarted = false;
+        tokenQuoted = false;
       }
       continue;
     }
@@ -1395,8 +1541,8 @@ function tokenizePowerShellCommand(command: string): string[] | null {
     tokenStarted = true;
   }
   if (quote) return null;
-  if (tokenStarted) words.push(word);
-  return words.length > 0 ? words : null;
+  if (tokenStarted) tokens.push({ value: word, quoted: tokenQuoted });
+  return tokens.length > 0 ? { tokens, hasCallOperator } : null;
 }
 
 function commandBasename(path: string, platform: HookCommandPlatform): string {
@@ -1408,39 +1554,95 @@ function commandBasename(path: string, platform: HookCommandPlatform): string {
 
 function isNativeHookScriptPath(path: string, platform: HookCommandPlatform): boolean {
   return platform === "win32"
-    ? /(?:^|[\\/])dist[\\/]scripts[\\/]codex-native-hook\.js$/i.test(path)
-    : /(?:^|\/)dist\/scripts\/codex-native-hook\.js$/.test(path);
+    ? isQualifiedWindowsFilesystemPath(path) &&
+      /(?:^|[\\/])dist[\\/]scripts[\\/]codex-native-hook\.js$/i.test(path)
+    : isAbsolutePosixFilesystemPath(path) &&
+      /(?:^|\/)dist\/scripts\/codex-native-hook\.js$/.test(path);
 }
 
-function isNativeHookShimPath(path: string): boolean {
+function hasNativeHookShimSuffix(path: string): boolean {
   return /(?:^|[\\/])hooks[\\/]omx-native-hook-windows-shim\.ps1$/i.test(path);
 }
 
+function isNativeHookShimPath(path: string): boolean {
+  return isQualifiedWindowsFilesystemPath(path) && hasNativeHookShimSuffix(path);
+}
+
+function isSupportedDirectNodeExecutablePath(
+  executablePath: string,
+  platform: HookCommandPlatform,
+): boolean {
+  const bareExecutable = platform === "win32" ? executablePath.toLowerCase() : executablePath;
+  const supportedBareExecutable = platform === "win32"
+    ? bareExecutable === "node" || bareExecutable === "node.exe"
+    : bareExecutable === "node";
+  return supportedBareExecutable ||
+    (platform === "win32"
+      ? isQualifiedWindowsFilesystemPath(executablePath)
+      : isAbsolutePosixFilesystemPath(executablePath)) &&
+      (platform === "win32"
+        ? commandBasename(executablePath, "win32") === "node" ||
+          commandBasename(executablePath, "win32") === "node.exe"
+        : commandBasename(executablePath, "linux") === "node");
+}
+
+function isSupportedPowerShellExecutablePath(executablePath: string): boolean {
+  return executablePath.toLowerCase() === "powershell.exe" ||
+    (isQualifiedWindowsFilesystemPath(executablePath) &&
+      commandBasename(executablePath, "win32") === "powershell.exe");
+}
+
 function isValidDirectNodeCommand(command: string, platform: HookCommandPlatform): boolean {
-  const words = tokenizePosixCommand(command, platform === "win32");
-  const executable = words?.[0] === undefined ? "" : commandBasename(words[0], platform);
+  const words = platform === "win32"
+    ? tokenizeWindowsDirectCommand(command)
+    : tokenizePosixCommand(command);
+  const executablePath = words?.[0];
+  const scriptPath = words?.[1];
   return words?.length === 2 &&
-    (platform === "win32" ? executable === "node" || executable === "node.exe" : executable === "node") &&
-    isNativeHookScriptPath(words[1]!, platform);
+    executablePath !== undefined &&
+    scriptPath !== undefined &&
+    isSupportedDirectNodeExecutablePath(executablePath, platform) &&
+    isNativeHookScriptPath(scriptPath, platform);
+}
+
+function hasStaticWindowsShimCommandGrammar(command: string): boolean {
+  const parsed = tokenizePowerShellCommand(command);
+  if (!parsed) return false;
+  const { tokens, hasCallOperator } = parsed;
+  const powerShellToken = tokens[0];
+  const powerShellPath = powerShellToken?.value;
+  const shimPath = tokens[5]?.value;
+  return tokens.length === 6 &&
+    powerShellToken !== undefined &&
+    powerShellPath !== undefined &&
+    shimPath !== undefined &&
+    (!powerShellToken.quoted || hasCallOperator) &&
+    isSupportedPowerShellExecutablePath(powerShellPath) &&
+    isValidWindowsFilesystemPath(shimPath) &&
+    tokens[1]?.value.toLowerCase() === "-noprofile" &&
+    tokens[2]?.value.toLowerCase() === "-executionpolicy" &&
+    tokens[3]?.value.toLowerCase() === "bypass" &&
+    tokens[4]?.value.toLowerCase() === "-file" &&
+    hasNativeHookShimSuffix(shimPath);
 }
 
 /**
  * Parse an OMX Windows shim invocation using the managed-command ownership
  * grammar. Returns the validated shim path; returns null for every other
- * command.
+ * command. Supplying current install options additionally recognizes the exact
+ * non-Windows host-path spelling used by platform-seam validation.
  */
-export function parseManagedCodexNativeHookWindowsShimCommand(command: string): string | null {
-  const words = tokenizePowerShellCommand(command);
-  if (!words) return null;
-  const shimPath = words[5];
-  return words.length === 6 &&
-    commandBasename(words[0]!, "win32") === "powershell.exe" &&
-    words[1]?.toLowerCase() === "-noprofile" &&
-    words[2]?.toLowerCase() === "-executionpolicy" &&
-    words[3]?.toLowerCase() === "bypass" &&
-    words[4]?.toLowerCase() === "-file" &&
-    shimPath !== undefined &&
-    isNativeHookShimPath(shimPath)
+export function parseManagedCodexNativeHookWindowsShimCommand(
+  command: string,
+  options?: ManagedCodexHookOptions,
+): string | null {
+  const parsed = tokenizePowerShellCommand(command);
+  const shimPath = parsed?.tokens[5]?.value;
+  return shimPath !== undefined &&
+      hasStaticWindowsShimCommandGrammar(command) &&
+      (isNativeHookShimPath(shimPath) ||
+        (options !== undefined &&
+          isExactCurrentWindowsShimCommand(command, "win32", options)))
     ? shimPath
     : null;
 }
@@ -1449,13 +1651,123 @@ function isValidWindowsShimCommand(command: string): boolean {
   return parseManagedCodexNativeHookWindowsShimCommand(command) !== null;
 }
 
+const OMX_COMMAND_PATTERN = /(?:codex-native-hook\.js|omx-native-hook-windows-shim\.ps1)/i;
+
+/**
+ * Lex only static POSIX word fragments for ambiguity detection. This is
+ * deliberately more permissive than the ownership grammar: backslash-newline
+ * continuations and escaped characters must identify OMX-looking commands as
+ * ambiguous, never make them owned.
+ */
+function decodedPosixCommandWords(command: string): string[] {
+  const words: string[] = [];
+  let word = "";
+  let quote: "'" | '"' | undefined;
+  const flushWord = (): void => {
+    if (word) words.push(word);
+    word = "";
+  };
+
+  for (let index = 0; index < command.length; index += 1) {
+    const character = command[index]!;
+    if (quote === "'") {
+      if (character === "'") quote = undefined;
+      else word += character;
+      continue;
+    }
+    if (quote === '"') {
+      if (character === '"') {
+        quote = undefined;
+      } else if (character === "\\") {
+        const escaped = command[index + 1];
+        if (escaped === "\n") {
+          index += 1;
+        } else if (escaped === "\r" && command[index + 2] === "\n") {
+          index += 2;
+        } else if (escaped && ["$", "`", '"', "\\"].includes(escaped)) {
+          word += escaped;
+          index += 1;
+        } else {
+          word += "\\";
+        }
+      } else {
+        word += character;
+      }
+      continue;
+    }
+    if (character === "'" || character === '"') {
+      quote = character;
+      continue;
+    }
+    if (character === "\\") {
+      const escaped = command[index + 1];
+      if (escaped === "\n") {
+        index += 1;
+      } else if (escaped === "\r" && command[index + 2] === "\n") {
+        index += 2;
+      } else if (escaped) {
+        word += escaped;
+        index += 1;
+      } else {
+        word += character;
+      }
+      continue;
+    }
+    if (isShellWhitespace(character) || UNQUOTED_POSIX_SHELL_ACTIVE_CHARACTERS.has(character)) {
+      flushWord();
+      continue;
+    }
+    word += character;
+  }
+  flushWord();
+  return words;
+}
+
+function commandMentionsDecodedPosixOmx(command: string): boolean {
+  return decodedPosixCommandWords(command).some((word) => OMX_COMMAND_PATTERN.test(word));
+}
+
 function commandMentionsOmx(command: string): boolean {
-  return /(?:codex-native-hook\.js|omx-native-hook-windows-shim\.ps1)/i.test(command);
+  return OMX_COMMAND_PATTERN.test(command) || OMX_COMMAND_PATTERN.test(command.replace(/["']/g, ""));
 }
 
 function isValidManagedCommand(command: string, platform: HookCommandPlatform): boolean {
   return isValidDirectNodeCommand(command, platform) ||
     (platform === "win32" && isValidWindowsShimCommand(command));
+}
+
+function buildExactCurrentWindowsHostShimCommand(
+  options: ManagedCodexHookOptions,
+): string | null {
+  if (
+    process.platform === "win32" ||
+    (options.platform ?? process.platform) !== "win32" ||
+    options.codexHomeDir === undefined
+  ) return null;
+  const shimPath = join(options.codexHomeDir, ...WINDOWS_NATIVE_HOOK_SHIM_RELATIVE_PATH);
+  const powerShellPath = resolveWindowsPowerShellPath(options.env);
+  return `& ${quotePowerShellLiteral(powerShellPath)} -NoProfile -ExecutionPolicy Bypass -File ${quotePowerShellLiteral(shimPath)}`;
+}
+
+/**
+ * A current Windows command may have a drive-less shim path in non-Windows
+ * platform seams. Accept only byte-identical canonical or host-joined command
+ * spellings produced from resolved current options; generic historical
+ * classification remains provenance-qualified.
+ */
+function isExactCurrentWindowsShimCommand(
+  command: string,
+  platform: HookCommandPlatform,
+  options: ManagedCodexHookOptions,
+): boolean {
+  if (
+    platform !== "win32" ||
+    (options.platform ?? process.platform) !== "win32" ||
+    options.codexHomeDir === undefined ||
+    !hasStaticWindowsShimCommandGrammar(command)
+  ) return false;
+  return command === buildManagedCodexNativeHookCommand("", options) ||
+    command === buildExactCurrentWindowsHostShimCommand(options);
 }
 
 function isValidHistoricalManagedCommand(command: string): boolean {
@@ -1466,10 +1778,10 @@ function isValidHistoricalManagedCommand(command: string): boolean {
 
 /**
  * Returns whether a command has the exact approved token grammar of an OMX
- * native hook from this or a historical installation. Ownership intentionally
- * depends on the executable and terminal script/shim suffixes, never a current
- * package-root path. The union is deliberately narrow and accepts only
- * shell-static POSIX, Windows, or PowerShell command spellings.
+ * native hook from this or a historical installation. Ownership requires a
+ * shell-static executable and provenance-qualified terminal script path, but
+ * never a current package-root path. The union is deliberately narrow and
+ * accepts only shell-static POSIX, Windows, or PowerShell command spellings.
  */
 export function isManagedCodexHookCommand(command: string): boolean {
   return isValidHistoricalManagedCommand(command);
@@ -1485,20 +1797,33 @@ function classifyManagedCommand(
   const windows = nullableStringProperty(handler, "commandWindows") ??
     nullableStringProperty(handler, "command_windows");
   const platform = options.platform ?? process.platform;
-  const effective = effectiveCommandForPlatform(handler, platform);
-  const supplied = [command, windows].filter((value): value is string => typeof value === "string");
-  const effectiveOwned = isValidManagedCommand(effective, platform);
-  if (effectiveOwned) {
-    for (const suppliedCommand of supplied) {
-      if (suppliedCommand === effective) continue;
-      if (!isManagedCodexHookCommand(suppliedCommand)) {
-        return "ambiguous";
-      }
+  const commandPlatform = typeof windows === "string" ? "linux" : platform;
+  const supplied = [
+    { command, platform: commandPlatform },
+    ...(typeof windows === "string" ? [{ command: windows, platform: "win32" as const }] : []),
+  ];
+  let hasOwnedCommand = false;
+  let hasForeignAlternative = false;
+  for (const suppliedCommand of supplied) {
+    // Examine static POSIX word decoding before exact grammar validation. A
+    // non-exact invocation can hide an OMX filename with escapes or a line
+    // continuation, and must fail closed rather than become a foreign hook.
+    const mentionsDecodedPosixOmx = commandMentionsDecodedPosixOmx(suppliedCommand.command);
+    if (
+      isValidManagedCommand(suppliedCommand.command, suppliedCommand.platform) ||
+      isExactCurrentWindowsShimCommand(suppliedCommand.command, suppliedCommand.platform, options)
+    ) {
+      hasOwnedCommand = true;
+      continue;
     }
-    return "owned";
+    if (mentionsDecodedPosixOmx || commandMentionsOmx(suppliedCommand.command)) return "ambiguous";
+    hasForeignAlternative = true;
   }
-  return supplied.some(commandMentionsOmx) ? "ambiguous" : "foreign";
+  return hasOwnedCommand
+    ? hasForeignAlternative ? "ambiguous" : "owned"
+    : "foreign";
 }
+
 
 interface ManagedOwner {
   eventName: ManagedHookEventName;
@@ -1534,8 +1859,8 @@ function hasOpaqueProperties(node: JsonObjectNode, known: ReadonlySet<string>): 
   return node.properties.some((property) => !known.has(property.key));
 }
 
-function groupMatcher(node: JsonObjectNode): string | undefined {
-  return stringProperty(node, "matcher");
+function groupMatcher(node: JsonObjectNode): string | null | undefined {
+  return nullableStringProperty(node, "matcher");
 }
 
 function matcherOwnershipError(
@@ -1543,24 +1868,25 @@ function matcherOwnershipError(
   group: RawGroupModel,
 ): ManagedCodexHooksPlanError | null {
   const matcher = groupMatcher(group.node);
-  if (matcherIsAware(eventName) && matcher !== undefined && !isValidCodexMatcher(matcher)) {
+  if (matcherIsAware(eventName) && typeof matcher === "string" && !isValidCodexMatcher(matcher)) {
     return planError("ambiguous_managed_group", "Cannot mutate an OMX group with an invalid matcher.", {
       eventName,
       groupIndex: group.groupIndex,
     });
   }
   const foreignSiblings = group.handlers.some((handler) => !handler.owner);
+
   if (eventName === "SessionStart") {
     const allowed = foreignSiblings
       ? matcher === "startup|resume|clear"
-      : matcher === undefined || matcher === "startup" || matcher === "startup|resume" || matcher === "startup|resume|clear";
+      : matcher === undefined || matcher === null || matcher === "startup" || matcher === "startup|resume" || matcher === "startup|resume|clear";
     if (!allowed) {
       return planError("ambiguous_managed_group", "SessionStart matcher is not compatible with OMX ownership.", {
         eventName,
         groupIndex: group.groupIndex,
       });
     }
-  } else if (matcher !== undefined) {
+  } else if (matcher !== undefined && matcher !== null) {
     return planError("ambiguous_managed_group", "OMX managed groups must not carry a matcher for this event.", {
       eventName,
       groupIndex: group.groupIndex,
@@ -2287,14 +2613,17 @@ export function planManagedCodexHooksMerge(
     }
     const primary = eventOwners[0]!;
     patches.push(...knownFieldPatches(prepared.content, primary.handlerNode, canonicalHookForEvent(canonicalEntry), KNOWN_COMMAND_FIELDS));
-    patches.push(
-      ...knownFieldPatches(
-        prepared.content,
-        primary.groupNode,
-        canonicalMatcherForEvent(canonicalEntry),
-        KNOWN_MATCHER_FIELD,
-      ),
-    );
+    const primaryGroup = ownership.groups.find((group) => group.node === primary.groupNode);
+    if (!primaryGroup?.foreign) {
+      patches.push(
+        ...knownFieldPatches(
+          prepared.content,
+          primary.groupNode,
+          canonicalMatcherForEvent(canonicalEntry),
+          KNOWN_MATCHER_FIELD,
+        ),
+      );
+    }
   }
 
   if (validation.hooksNode && missingEventProperties.length > 0) {

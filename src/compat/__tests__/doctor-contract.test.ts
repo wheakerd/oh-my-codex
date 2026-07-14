@@ -19,6 +19,7 @@ const repoRoot = join(testDir, '..', '..', '..');
 const defaultTarget = join(repoRoot, 'dist', 'cli', 'omx.js');
 const fixturesRoot = join(repoRoot, 'src', 'compat', 'fixtures', 'doctor');
 const SAFE_DOCTOR_RECOVERY = 'Review warnings above. Follow the check-specific recovery guidance; for AGENTS.md preservation prefer "omx setup --merge-agents".';
+const SAFE_DOCTOR_FAILURE = 'Review failed checks above. Follow the check-specific recovery guidance; inspect invalid or ambiguous hook documents manually because doctor will not modify them.';
 
 function readFixture(name: string): string {
   return readFileSync(join(fixturesRoot, name), 'utf-8');
@@ -86,7 +87,7 @@ function normalizeInstallDoctorOutput(text: string, home: string, cwd: string): 
       if (line.startsWith('Run "omx setup')) {
         return 'Run <SETUP_FOLLOWUP>';
       }
-      if (line === SAFE_DOCTOR_RECOVERY) {
+      if (line === SAFE_DOCTOR_RECOVERY || line === SAFE_DOCTOR_FAILURE) {
         return 'Run <SETUP_FOLLOWUP>';
       }
       return line;
@@ -108,8 +109,8 @@ describe('compat doctor contract', () => {
       assert.equal(result.status, Number.parseInt(readFixture('install-onboarding.exitcode.txt').trim(), 10), result.stderr || result.stdout);
       assert.equal(result.stderr, '');
       assert.equal(normalizeInstallDoctorOutput(result.stdout, home, wd), readFixture('install-onboarding.stdout.txt'));
-      assert.match(result.stdout, new RegExp(SAFE_DOCTOR_RECOVERY.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
-      assert.doesNotMatch(result.stdout, /^Review warnings above\.[^\n]*--force/m);
+      assert.ok(result.stdout.includes(SAFE_DOCTOR_RECOVERY) || result.stdout.includes(SAFE_DOCTOR_FAILURE));
+      assert.doesNotMatch(result.stdout, /^Review (?:warnings|failed checks) above\.[^\n]*--force/m);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }

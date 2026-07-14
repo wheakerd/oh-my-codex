@@ -40,14 +40,13 @@ import {
 	buildManagedCodexNativeHookWindowsShimContent,
 	classifyManagedCodexNativeHookWindowsShimOwnership,
 	discoverCodexHookConfigPaths,
-	getManagedCodexHookCommandsForEvent,
+	isManagedCodexHookCommand,
 	parseManagedCodexNativeHookWindowsShimCommand,
 	planManagedCodexHooksRemoval,
 	resolveWindowsPowerShellPath,
 	type ManagedCodexHooksPlan,
 	validateCodexHooksConfigStrict,
 } from "../config/codex-hooks.js";
-
 import { OMX_FIRST_PARTY_MCP_SERVER_NAMES } from "../config/omx-first-party-mcp.js";
 import { getDefaultBridge, isBridgeEnabled } from "../runtime/bridge.js";
 import {
@@ -348,18 +347,18 @@ export async function doctor(options: DoctorOptions = {}): Promise<void> {
 	}
 
 	// Check 4.25: Native hooks coverage
-	checks.push(
-		await checkNativeHooks(paths.hooksPath, paths.configPath, {
-			codexHomeDir: paths.codexHomeDir,
-			installMode: scopeResolution.installMode,
-		}),
-	);
+	const nativeHooksCheck = await checkNativeHooks(paths.hooksPath, paths.configPath, {
+		codexHomeDir: paths.codexHomeDir,
+		installMode: scopeResolution.installMode,
+	});
+	checks.push(nativeHooksCheck);
 	checks.push(await checkNativeHookDistSmoke());
 	if (options.verbose) {
 		const postCompactRuntimeCheck = await checkNativePostCompactHookRuntime(
 			paths.hooksPath,
 			cwd,
 			paths.codexHomeDir,
+			{ nativeHooksCheck },
 		);
 		if (postCompactRuntimeCheck) checks.push(postCompactRuntimeCheck);
 	}
@@ -1666,6 +1665,7 @@ function referencedWindowsNativeHookShimPaths(
 		groupIndex: number;
 		handlerIndex?: number;
 	}[],
+	codexHomeDir: string,
 ): string[] {
 	if (!isJsonRecord(root.hooks)) return [];
 
@@ -1693,7 +1693,10 @@ function referencedWindowsNativeHookShimPaths(
 				) continue;
 				const command = effectiveWindowsHookCommand(handler);
 				if (!command) continue;
-				const shimPath = parseManagedCodexNativeHookWindowsShimCommand(command);
+				const shimPath = parseManagedCodexNativeHookWindowsShimCommand(command, {
+					platform: "win32",
+					codexHomeDir,
+				});
 				if (shimPath) shimPaths.add(shimPath);
 			}
 		}
@@ -1704,12 +1707,14 @@ function referencedWindowsNativeHookShimPaths(
 async function checkWindowsNativeHookShims(
 	root: Record<string, unknown>,
 	diagnostics: Parameters<typeof referencedWindowsNativeHookShimPaths>[1],
+	codexHomeDir: string,
+	requireCurrent = false,
 ): Promise<Check | null> {
 	const expected = Buffer.from(
 		buildManagedCodexNativeHookWindowsShimContent(getPackageRoot()),
 		"utf-8",
 	);
-	for (const shimPath of referencedWindowsNativeHookShimPaths(root, diagnostics)) {
+	for (const shimPath of referencedWindowsNativeHookShimPaths(root, diagnostics, codexHomeDir)) {
 		let shimContent: Buffer;
 		try {
 			const shimStat = await lstat(shimPath);
@@ -1733,11 +1738,19 @@ async function checkWindowsNativeHookShims(
 					: `cannot read referenced Windows native hook shim at ${shimPath}; inspect it and manually reinstall the matching oh-my-codex version because doctor will not modify shims`,
 			};
 		}
-		if (classifyManagedCodexNativeHookWindowsShimOwnership(shimContent, expected) === "modified") {
+		const ownership = classifyManagedCodexNativeHookWindowsShimOwnership(shimContent, expected);
+		if (ownership === "modified") {
 			return {
 				name: "Native hooks",
 				status: "fail",
 				message: `referenced Windows native hook shim at ${shimPath} is not an exact current or complete historical generated shim; it may be modified, truncated, have extra content, or use ambiguous encoding. Manually reinstall the matching oh-my-codex version because doctor will not overwrite it`,
+			};
+		}
+		if (requireCurrent && ownership !== "current") {
+			return {
+				name: "Native hooks",
+				status: "warn",
+				message: `referenced Windows native hook shim at ${shimPath} is a complete historical generated shim, but verbose execution requires exact current shim bytes; run "omx setup" to migrate it before retrying`,
 			};
 		}
 	}
@@ -1959,6 +1972,20 @@ function combinePluginAndGlobalNativeHookChecks(plugin: Check, global: Check | n
 	};
 }
 
+function combineNativeHookIntegrityAndRemovalChecks(
+	integrityCheck: Check | null,
+	removalCheck: Check,
+): Check {
+	if (!integrityCheck) return removalCheck;
+	return {
+		name: "Native hooks",
+		status: integrityCheck.status === "fail" || removalCheck.status === "fail"
+			? "fail"
+			: "warn",
+		message: `${integrityCheck.message}; ${removalCheck.message}`,
+	};
+}
+
 async function checkExistingNativeHooks(
 	hooksPath: string,
 	context: NativeHookCheckContext,
@@ -1997,20 +2024,25 @@ async function checkExistingNativeHooks(
 			platform,
 			codexHomeDir: context.codexHomeDir,
 		});
+		const windowsShimCheck = platform === "win32"
+			? await checkWindowsNativeHookShims(
+				validation.root,
+				validation.diagnostics,
+				context.codexHomeDir,
+			)
+			: null;
 		if (!removalPlan.ok) {
 			const removalIsCoordinateOnly = removalPlan.error.code === "unsafe_managed_removal";
-			return {
+			const removalCheck: Check = {
 				name: "Native hooks",
 				status: removalIsCoordinateOnly ? "warn" : "fail",
 				message: removalIsCoordinateOnly
 					? `hooks.json has OMX entries that cannot be safely removed (${removalPlan.error.code}): ${trimNativeHookDetailTerminalPeriod(removalPlan.error.message)}; manual cleanup is required because doctor will not overwrite or remove it`
 					: `hooks.json has ambiguous or untrusted OMX ownership (${removalPlan.error.code}): ${trimNativeHookDetailTerminalPeriod(removalPlan.error.message)}; inspect the file manually because doctor will not overwrite or remove it`,
 			};
+			return combineNativeHookIntegrityAndRemovalChecks(windowsShimCheck, removalCheck);
 		}
-		if (platform === "win32") {
-			const windowsShimCheck = await checkWindowsNativeHookShims(validation.root, validation.diagnostics);
-			if (windowsShimCheck) return windowsShimCheck;
-		}
+		if (windowsShimCheck) return windowsShimCheck;
 		const legacyTrustStateEntries = Object.keys(removalPlan.legacyTrustState).length;
 		if (legacyTrustStateEntries > 0) {
 			return {
@@ -2249,50 +2281,150 @@ export function buildPostCompactSmokeSpawnInvocation(
 	};
 }
 
-async function checkNativePostCompactHookRuntime(
+interface NativePostCompactHookRuntimeOptions {
+	nativeHooksCheck?: Check;
+	platform?: NodeJS.Platform;
+	expectedCommand?: string;
+	runner?: typeof spawnSync;
+}
+
+function getManagedPostCompactHookCommands(
+	content: string,
+	platform: NodeJS.Platform,
+	codexHomeDir: string,
+): string[] | null {
+	const validation = validateCodexHooksConfigStrict(content, {
+		platform,
+		codexHomeDir,
+	});
+	if (!validation.ok) return null;
+	return validation.discoveredCommands
+		.filter((command) => command.eventName === "PostCompact")
+		.map((command) => command.command)
+		.filter((command) =>
+			isManagedCodexHookCommand(command) ||
+			(platform === "win32" && parseManagedCodexNativeHookWindowsShimCommand(command, {
+				platform,
+				codexHomeDir,
+			}) !== null),
+		);
+}
+
+function currentPostCompactCommandCheck(): Check {
+	return {
+		name: "Native PostCompact hook",
+		status: "warn",
+		message:
+			"effective PostCompact OMX command does not match this installation's managed hook command; doctor skipped execution for safety, and rerunning \"omx setup\" should refresh stale hooks.json entries",
+	};
+}
+
+function skippedPostCompactIntegrityCheck(integrityCheck: Check): Check {
+	return {
+		name: "Native PostCompact hook",
+		status: integrityCheck.status === "fail" ? "fail" : "warn",
+		message: `${integrityCheck.message}; doctor skipped execution because native hook integrity validation did not pass`,
+	};
+}
+
+export async function checkNativePostCompactHookRuntime(
 	hooksPath: string,
 	cwd: string,
 	codexHomeDir: string,
+	options: NativePostCompactHookRuntimeOptions = {},
 ): Promise<Check | null> {
 	if (!existsSync(hooksPath)) return null;
+	if (options.nativeHooksCheck && options.nativeHooksCheck.status !== "pass") return null;
 
-	let content: string;
+	const platform = options.platform ?? process.platform;
+	const expectedCommand = options.expectedCommand ?? buildManagedCodexNativeHookCommand(getPackageRoot(), {
+		codexHomeDir,
+		platform,
+	});
+	let content: string | null;
 	try {
-		content = await readFile(hooksPath, "utf-8");
+		content = decodeStrictUtf8(await readFile(hooksPath));
 	} catch {
 		return null;
 	}
+	if (content === null) return null;
 
-	const postCompactCommands = getManagedCodexHookCommandsForEvent(
-		content,
-		"PostCompact",
-	);
-	if (postCompactCommands === null || postCompactCommands.length === 0) {
-		return null;
-	}
-
-	const expectedCommand = buildManagedCodexNativeHookCommand(getPackageRoot(), {
-		codexHomeDir,
-	});
+	const postCompactCommands = getManagedPostCompactHookCommands(content, platform, codexHomeDir);
+	if (postCompactCommands === null || postCompactCommands.length === 0) return null;
 	const uniqueCommands = [...new Set(postCompactCommands)];
 	if (uniqueCommands.length !== 1 || uniqueCommands[0] !== expectedCommand) {
-		return {
-			name: "Native PostCompact hook",
-			status: "warn",
-			message:
-				"effective PostCompact OMX command does not match this installation's managed hook command; doctor skipped execution for safety, and rerunning \"omx setup\" should refresh stale hooks.json entries",
-		};
+		return currentPostCompactCommandCheck();
 	}
 
 	const smokeCwd = await mkdtemp(join(tmpdir(), "omx-doctor-postcompact-"));
 	try {
+		const revalidatedIntegrity = await checkExistingNativeHooks(hooksPath, {
+			codexHomeDir,
+			platform,
+		});
+		if (revalidatedIntegrity.status !== "pass") {
+			return skippedPostCompactIntegrityCheck(revalidatedIntegrity);
+		}
+
+		let revalidatedContent: string | null;
+		try {
+			revalidatedContent = decodeStrictUtf8(await readFile(hooksPath));
+		} catch {
+			return {
+				name: "Native PostCompact hook",
+				status: "warn",
+				message: "hooks.json changed during verbose validation; doctor skipped execution for safety",
+			};
+		}
+		if (revalidatedContent === null) {
+			return {
+				name: "Native PostCompact hook",
+				status: "warn",
+				message: "hooks.json changed during verbose validation; doctor skipped execution for safety",
+			};
+		}
+		const revalidatedCommands = getManagedPostCompactHookCommands(
+			revalidatedContent,
+			platform,
+			codexHomeDir,
+		);
+		if (
+			revalidatedCommands === null ||
+			revalidatedCommands.length === 0 ||
+			new Set(revalidatedCommands).size !== 1 ||
+			revalidatedCommands[0] !== expectedCommand
+		) {
+			return currentPostCompactCommandCheck();
+		}
+
+		if (platform === "win32") {
+			const validation = validateCodexHooksConfigStrict(revalidatedContent, {
+				platform,
+				codexHomeDir,
+			});
+			if (!validation.ok) {
+				return {
+					name: "Native PostCompact hook",
+					status: "warn",
+					message: "hooks.json changed during verbose validation; doctor skipped execution for safety",
+				};
+			}
+			const currentShimCheck = await checkWindowsNativeHookShims(
+				validation.root,
+				validation.diagnostics,
+				codexHomeDir,
+				true,
+			);
+			if (currentShimCheck) return skippedPostCompactIntegrityCheck(currentShimCheck);
+		}
+
 		const payload = JSON.stringify({
 			hook_event_name: "PostCompact",
 			cwd: smokeCwd,
 			session_id: "omx-doctor-postcompact-smoke",
 		});
-		const smokeInvocation = buildPostCompactSmokeSpawnInvocation(expectedCommand);
-		const result = spawnSync(smokeInvocation.command, smokeInvocation.args, {
+		const smokeInvocation = buildPostCompactSmokeSpawnInvocation(expectedCommand, { platform });
+		const result = (options.runner ?? spawnSync)(smokeInvocation.command, smokeInvocation.args, {
 			cwd,
 			encoding: "utf-8",
 			env: {
@@ -2303,7 +2435,6 @@ async function checkNativePostCompactHookRuntime(
 			shell: smokeInvocation.shell,
 			timeout: 5_000,
 		});
-
 		if (result.error) {
 			return {
 				name: "Native PostCompact hook",

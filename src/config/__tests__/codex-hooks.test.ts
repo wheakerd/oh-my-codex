@@ -164,7 +164,565 @@ describe("codex hooks helpers", () => {
     const posix = planManagedCodexHooksRemoval(caseVariant, "/hooks.json", { platform: "linux" });
     const windows = planManagedCodexHooksRemoval(caseVariant, "C:\\Users\\Ada\\.codex\\hooks.json", { platform: "win32" });
     assert.equal(posix.ok, false);
-    assert.equal(windows.ok, true);
+    assert.equal(windows.ok, false);
+    if (!windows.ok) assert.equal(windows.error.code, "ambiguous_managed_handler");
+  });
+
+  it("requires absolute, control-free POSIX OMX paths before ownership proof", () => {
+    const historicalCommand = `node "/historical install/O'Brien/dist/scripts/codex-native-hook.js"`;
+    const ownedSource = JSON.stringify({
+      hooks: {
+        PreToolUse: [{ hooks: [{ type: "command", command: historicalCommand }] }],
+      },
+    });
+    const ownedMerge = planManagedCodexHooksMerge(ownedSource, "/repo", "/hooks.json", { platform: "linux" });
+    const ownedRemoval = planManagedCodexHooksRemoval(ownedSource, "/hooks.json", { platform: "linux" });
+    assert.equal(isManagedCodexHookCommand(historicalCommand), true);
+    assert.equal(ownedMerge.ok, true);
+    assert.equal(ownedRemoval.ok, true);
+    if (ownedRemoval.ok) {
+      assert.equal(ownedRemoval.removedCount, 1);
+      assert.equal(ownedRemoval.finalContent, null);
+    }
+
+    const foreignCommand = "node ./foreign-hook.js";
+    const foreignSource = JSON.stringify({
+      hooks: {
+        PreToolUse: [{ hooks: [{ type: "command", command: foreignCommand }] }],
+      },
+    });
+    const foreignMerge = planManagedCodexHooksMerge(foreignSource, "/repo", "/hooks.json", { platform: "linux" });
+    const foreignRemoval = planManagedCodexHooksRemoval(foreignSource, "/hooks.json", { platform: "linux" });
+    assert.equal(foreignMerge.ok, true);
+    assert.equal(foreignRemoval.ok, true);
+    if (foreignMerge.ok) {
+      assert.equal(foreignMerge.hasForeignHooks, true);
+      assert.ok(foreignMerge.finalContent?.includes(foreignCommand));
+    }
+    if (foreignRemoval.ok) assert.equal(foreignRemoval.finalContent, foreignSource);
+
+    const controlCodePoints = [
+      ...Array.from({ length: 0x20 }, (_, codePoint) => codePoint),
+      ...Array.from({ length: 0x21 }, (_, offset) => 0x7f + offset),
+    ];
+    const ambiguousCommands = [
+      "node ./dist/scripts/codex-native-hook.js",
+      "node dist/scripts/codex-native-hook.js",
+      "node ../historical/dist/scripts/codex-native-hook.js",
+      ...controlCodePoints.map(
+        (codePoint) => `node "/historical/dist/scripts/codex-native-hook.js${String.fromCodePoint(codePoint)}"`,
+      ),
+    ];
+    for (const command of ambiguousCommands) {
+      const source = JSON.stringify({
+        hooks: {
+          PreToolUse: [{ hooks: [{ type: "command", command }] }],
+        },
+      });
+      const merge = planManagedCodexHooksMerge(source, "/repo", "/hooks.json", { platform: "linux" });
+      const removal = planManagedCodexHooksRemoval(source, "/hooks.json", { platform: "linux" });
+      const context = JSON.stringify(command);
+      assert.equal(isManagedCodexHookCommand(command), false, context);
+      assert.equal(merge.ok, false, context);
+      assert.equal(removal.ok, false, context);
+      if (!merge.ok) {
+        assert.equal(merge.error.code, "ambiguous_managed_handler", context);
+        assert.equal("finalContent" in merge, false, context);
+      }
+      if (!removal.ok) {
+        assert.equal(removal.error.code, "ambiguous_managed_handler", context);
+        assert.equal("finalContent" in removal, false, context);
+      }
+    }
+  });
+
+  it("fails closed for decoded POSIX OMX spellings across command fields", () => {
+    const exactEscapedCommand = String.raw`node /repo/dist/scripts/codex-native-ho\ok.js`;
+    assert.equal(isManagedCodexHookCommand(exactEscapedCommand), true);
+
+    const decodedNonExactCommands = [
+      ["escaped filename with extra argv", String.raw`node /repo/dist/scripts/codex-native-ho\ok.js --extra`],
+      ["escaped filename with comment", String.raw`node /repo/dist/scripts/codex-native-ho\ok.js # retained comment`],
+      ["backslash-newline filename split", "node /repo/dist/scripts/codex-native-ho\\\nok.js --extra"],
+    ] as const;
+    const commandFields = [
+      ["command", (command: string) => ({ command })],
+      ["commandWindows", (command: string) => ({
+        command: 'node "/repo/dist/scripts/codex-native-hook.js"',
+        commandWindows: command,
+      })],
+      ["command_windows", (command: string) => ({
+        command: 'node "/repo/dist/scripts/codex-native-hook.js"',
+        command_windows: command,
+      })],
+    ] as const;
+
+    for (const [description, command] of decodedNonExactCommands) {
+      for (const [field, commandFieldsForHandler] of commandFields) {
+        const source = JSON.stringify({
+          hooks: {
+            PreToolUse: [{
+              hooks: [{ type: "command", ...commandFieldsForHandler(command) }],
+            }],
+          },
+        });
+        const context = `${field}: ${description}`;
+        const merge = planManagedCodexHooksMerge(source, "/repo", "/hooks.json", { platform: "linux" });
+        const removal = planManagedCodexHooksRemoval(source, "/hooks.json", { platform: "linux" });
+
+        assert.equal(isManagedCodexHookCommand(command), false, context);
+        assert.equal(merge.ok, false, context);
+        assert.equal(removal.ok, false, context);
+        if (!merge.ok) {
+          assert.equal(merge.error.code, "ambiguous_managed_handler", context);
+          assert.equal("finalContent" in merge, false, context);
+        }
+        if (!removal.ok) {
+          assert.equal(removal.error.code, "ambiguous_managed_handler", context);
+          assert.equal("finalContent" in removal, false, context);
+        }
+      }
+    }
+  });
+
+  it("owns only the exact current drive-less Windows shim command from supplied options", () => {
+    const options = {
+      platform: "win32" as const,
+      codexHomeDir: "/fixture codex home",
+      env: { SystemRoot: "C:\\Windows" },
+    };
+    const command = buildManagedCodexNativeHookCommand("/repo", options);
+    const source = JSON.stringify({
+      hooks: {
+        PreToolUse: [{ hooks: [{ type: "command", command }] }],
+      },
+    });
+    const merge = planManagedCodexHooksMerge(source, "/repo", "/fixture codex home/hooks.json", options);
+    const removal = planManagedCodexHooksRemoval(source, "/fixture codex home/hooks.json", options);
+    assert.match(command, /-File '\\fixture codex home\\hooks\\omx-native-hook-windows-shim\.ps1'$/);
+    assert.equal(isManagedCodexHookCommand(command), false);
+    assert.equal(merge.ok, true);
+    assert.equal(removal.ok, true);
+    if (removal.ok) assert.equal(removal.finalContent, null);
+
+    const altered = command.replace("\\fixture codex home\\", "\\foreign codex home\\");
+    const alteredSource = JSON.stringify({
+      hooks: {
+        PreToolUse: [{ hooks: [{ type: "command", command: altered }] }],
+      },
+    });
+    const alteredMerge = planManagedCodexHooksMerge(
+      alteredSource,
+      "/repo",
+      "/fixture codex home/hooks.json",
+      options,
+    );
+    const alteredRemoval = planManagedCodexHooksRemoval(
+      alteredSource,
+      "/fixture codex home/hooks.json",
+      options,
+    );
+    assert.equal(alteredMerge.ok, false);
+    assert.equal(alteredRemoval.ok, false);
+    if (!alteredMerge.ok) assert.equal(alteredMerge.error.code, "ambiguous_managed_handler");
+    if (!alteredRemoval.ok) assert.equal(alteredRemoval.error.code, "ambiguous_managed_handler");
+  });
+
+  it("owns only exact current host-joined Windows shim commands on non-Windows seams", () => {
+    if (process.platform === "win32") return;
+    const env = { SystemRoot: "C:\\Windows" };
+    const fixtures = [
+      {
+        label: "supplied codex home",
+        options: { platform: "win32" as const, codexHomeDir: "/fixture codex home", env },
+        hooksPath: "/fixture codex home/hooks.json",
+        codexHomeDir: "/fixture codex home",
+      },
+      {
+        label: "derived codex home",
+        options: { platform: "win32" as const, env },
+        hooksPath: "/derived codex home/hooks.json",
+        codexHomeDir: "/derived codex home",
+      },
+    ];
+    for (const { label, options, hooksPath, codexHomeDir } of fixtures) {
+      const hostShimPath = join(codexHomeDir, "hooks", "omx-native-hook-windows-shim.ps1");
+      const powerShellPath = resolveWindowsPowerShellPath(env);
+      const command = `& '${powerShellPath}' -NoProfile -ExecutionPolicy Bypass -File '${hostShimPath}'`;
+      const source = JSON.stringify({
+        hooks: {
+          PreToolUse: [{ hooks: [{ type: "command", command }] }],
+        },
+      });
+      const merge = planManagedCodexHooksMerge(source, "/repo", hooksPath, options);
+      const removal = planManagedCodexHooksRemoval(source, hooksPath, options);
+      assert.match(command, /\/hooks\/omx-native-hook-windows-shim\.ps1'$/);
+      assert.equal(isManagedCodexHookCommand(command), false, label);
+      assert.equal(merge.ok, true, label);
+      assert.equal(removal.ok, true, label);
+      if (removal.ok) assert.equal(removal.finalContent, null, label);
+
+      const alteredShimPath = join("/foreign codex home", "hooks", "omx-native-hook-windows-shim.ps1");
+      const altered = command.replace(hostShimPath, alteredShimPath);
+      const alteredSource = JSON.stringify({
+        hooks: {
+          PreToolUse: [{ hooks: [{ type: "command", command: altered }] }],
+        },
+      });
+      const alteredMerge = planManagedCodexHooksMerge(alteredSource, "/repo", hooksPath, options);
+      const alteredRemoval = planManagedCodexHooksRemoval(alteredSource, hooksPath, options);
+      assert.equal(alteredMerge.ok, false, label);
+      assert.equal(alteredRemoval.ok, false, label);
+      if (!alteredMerge.ok) assert.equal(alteredMerge.error.code, "ambiguous_managed_handler", label);
+      if (!alteredRemoval.ok) assert.equal(alteredRemoval.error.code, "ambiguous_managed_handler", label);
+    }
+  });
+
+  it("fails closed for Windows direct command expansion, quoting, wrappers, and invalid cross-fields", () => {
+    const script = "C:\\repo\\dist\\scripts\\codex-native-hook.js";
+    const direct = `node "${script}"`;
+    const invalidDirectCommands = [
+      `node "%OMX_ROOT%\\dist\\scripts\\codex-native-hook.js"`,
+      `node "!OMX_ROOT!\\dist\\scripts\\codex-native-hook.js"`,
+      `node "$(Get-Location)\\dist\\scripts\\codex-native-hook.js"`,
+      `node '${script}'`,
+      `node "${script}`,
+      `node "${script}\\"`,
+      `${direct} & echo injected`,
+      `${direct} ^& echo injected`,
+      `${direct} --extra`,
+      `cmd.exe /d /c ${direct}`,
+      `${direct}\r\necho injected`,
+      `node ".\\dist\\scripts\\codex-native-hook.js"`,
+      `node "C:historical\\dist\\scripts\\codex-native-hook.js"`,
+    ];
+    const crossFieldHandlers = [
+      { command: `node '${script}'`, commandWindows: direct },
+      { command: direct, command_windows: `node '${script}'` },
+      {
+        command: 'node "/repo/dist/scripts/codex-native-hook.js"',
+        commandWindows: "node '/repo/dist/scripts/codex-native-hook.js'",
+      },
+    ];
+    const cases = [
+      ...invalidDirectCommands.map((command) => ({
+        handler: { command },
+        options: { platform: "win32" as const },
+      })),
+      {
+        handler: crossFieldHandlers[0]!,
+        options: { platform: "win32" as const },
+      },
+      {
+        handler: crossFieldHandlers[1]!,
+        options: { platform: "win32" as const },
+      },
+      {
+        handler: crossFieldHandlers[2]!,
+        options: { platform: "linux" as const },
+      },
+    ];
+
+    for (const { handler, options } of cases) {
+      const source = JSON.stringify({
+        hooks: {
+          PreToolUse: [{ hooks: [{ type: "command", ...handler }] }],
+        },
+      });
+      const merge = planManagedCodexHooksMerge(source, "C:\\repo", "C:\\Users\\Ada\\.codex\\hooks.json", options);
+      const removal = planManagedCodexHooksRemoval(source, "C:\\Users\\Ada\\.codex\\hooks.json", options);
+      assert.equal(merge.ok, false, source);
+      assert.equal(removal.ok, false, source);
+      if (!merge.ok) {
+        assert.equal(merge.error.code, "ambiguous_managed_handler", source);
+        assert.equal("finalContent" in merge, false);
+      }
+      if (!removal.ok) {
+        assert.equal(removal.error.code, "ambiguous_managed_handler", source);
+        assert.equal("finalContent" in removal, false);
+      }
+    }
+
+    const staticSpecialPath = `"C:\\Program Files (x86)\\node.exe" "C:\\Users\\O'Brien\\@scope & safe\\dist\\scripts\\codex-native-hook.js"`;
+    assert.equal(isManagedCodexHookCommand(staticSpecialPath), true);
+
+    const validCrossField = JSON.stringify({
+      hooks: {
+        PreToolUse: [{
+          hooks: [{
+            type: "command",
+            command: 'node "/repo/dist/scripts/codex-native-hook.js"',
+            commandWindows: direct,
+          }],
+        }],
+      },
+    });
+    for (const platform of ["linux", "win32"] as const) {
+      const pkgRoot = platform === "win32" ? "C:\\repo" : "/repo";
+      const hooksPath = platform === "win32" ? "C:\\Users\\Ada\\.codex\\hooks.json" : "/hooks.json";
+      const options = { platform };
+      const merge = planManagedCodexHooksMerge(validCrossField, pkgRoot, hooksPath, options);
+      const removal = planManagedCodexHooksRemoval(validCrossField, hooksPath, options);
+      assert.equal(merge.ok, true, `${platform} must accept platform-specific managed command fields`);
+      assert.equal(removal.ok, true, `${platform} must remove platform-specific managed command fields`);
+    }
+  });
+
+  it("fails closed for unqualified direct executables and quoted PowerShell executable paths across command fields", () => {
+    const posixScript = "/historical/dist/scripts/codex-native-hook.js";
+    const windowsScript = "C:\\historical\\dist\\scripts\\codex-native-hook.js";
+    const powerShellExecutable = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
+    const shimPath = "C:\\Users\\Ada\\.codex\\hooks\\omx-native-hook-windows-shim.ps1";
+    const fallbackPosixCommand = `node "${posixScript}"`;
+    const unsafeCommands = [
+      ["POSIX dot-relative executable", `./node "${posixScript}"`, "linux"],
+      ["POSIX parent-relative executable", `../node "${posixScript}"`, "linux"],
+      ["POSIX relative executable", `tools/node "${posixScript}"`, "linux"],
+      ["Windows dot-relative executable", `.\\node.exe "${windowsScript}"`, "win32"],
+      ["Windows relative executable", `tools\\node.exe "${windowsScript}"`, "win32"],
+      ["Windows drive-relative executable", `C:node.exe "${windowsScript}"`, "win32"],
+      [
+        "PowerShell dot-relative executable",
+        `.\\powershell.exe -NoProfile -ExecutionPolicy Bypass -File '${shimPath}'`,
+        "win32",
+      ],
+      [
+        "PowerShell relative executable",
+        `tools\\powershell.exe -NoProfile -ExecutionPolicy Bypass -File '${shimPath}'`,
+        "win32",
+      ],
+      [
+        "PowerShell drive-relative executable",
+        `C:powershell.exe -NoProfile -ExecutionPolicy Bypass -File '${shimPath}'`,
+        "win32",
+      ],
+      [
+        "quoted PowerShell executable without call operator",
+        `'${powerShellExecutable}' -NoProfile -ExecutionPolicy Bypass -File '${shimPath}'`,
+        "win32",
+      ],
+    ] as const;
+
+    const assertAmbiguous = (
+      source: string,
+      platform: "linux" | "win32",
+      context: string,
+    ) => {
+      const pkgRoot = platform === "win32" ? "C:\\repo" : "/repo";
+      const hooksPath = platform === "win32" ? "C:\\Users\\Ada\\.codex\\hooks.json" : "/hooks.json";
+      const merge = planManagedCodexHooksMerge(source, pkgRoot, hooksPath, { platform });
+      const removal = planManagedCodexHooksRemoval(source, hooksPath, { platform });
+      assert.equal(merge.ok, false, context);
+      assert.equal(removal.ok, false, context);
+      if (!merge.ok) {
+        assert.equal(merge.error.code, "ambiguous_managed_handler", context);
+        assert.equal("finalContent" in merge, false, context);
+      }
+      if (!removal.ok) {
+        assert.equal(removal.error.code, "ambiguous_managed_handler", context);
+        assert.equal("finalContent" in removal, false, context);
+      }
+    };
+
+    for (const [spelling, unsafeCommand, primaryPlatform] of unsafeCommands) {
+      assert.equal(isManagedCodexHookCommand(unsafeCommand), false, spelling);
+      assertAmbiguous(
+        JSON.stringify({
+          hooks: {
+            PreToolUse: [{ hooks: [{ type: "command", command: unsafeCommand }] }],
+          },
+        }),
+        primaryPlatform,
+        `${spelling} in command`,
+      );
+      for (const [field, handler] of [
+        ["commandWindows", { command: fallbackPosixCommand, commandWindows: unsafeCommand }],
+        ["command_windows", { command: fallbackPosixCommand, command_windows: unsafeCommand }],
+      ] as const) {
+        assertAmbiguous(
+          JSON.stringify({
+            hooks: {
+              PreToolUse: [{ hooks: [{ type: "command", ...handler }] }],
+            },
+          }),
+          "win32",
+          `${spelling} in ${field}`,
+        );
+      }
+    }
+  });
+
+  it("fails closed for Windows direct-node and PowerShell shim quote concatenation across command fields", () => {
+    const posixScript = "/repo/dist/scripts/codex-native-hook.js";
+    const windowsScript = "C:\\repo\\dist\\scripts\\codex-native-hook.js";
+    const shimPath = "C:\\Users\\Ada\\.codex\\hooks\\omx-native-hook-windows-shim.ps1";
+    const shimPrefix = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File";
+    const malformedCommands = [
+      ["direct doubled", `node "C:\\repo\\dist\\scripts\\codex""-native-hook.js"`],
+      ["direct adjacent", `node ""${windowsScript}""`],
+      ["direct triple", `node """${windowsScript}"""`],
+      ["shim doubled", `${shimPrefix} "C:\\Users\\Ada\\.codex\\hooks\\omx""-native-hook-windows-shim.ps1"`],
+      ["shim adjacent", `${shimPrefix} ""${shimPath}""`],
+      ["shim triple", `${shimPrefix} """${shimPath}"""`],
+    ] as const;
+
+    for (const [spelling, malformed] of malformedCommands) {
+      for (const [field, handler] of [
+        ["command", { command: malformed }],
+        ["commandWindows", { command: `node "${posixScript}"`, commandWindows: malformed }],
+        ["command_windows", { command: `node "${posixScript}"`, command_windows: malformed }],
+      ] as const) {
+        const source = JSON.stringify({
+          hooks: {
+            PreToolUse: [{ hooks: [{ type: "command", ...handler }] }],
+          },
+        });
+        const context = `${spelling} in ${field}: ${source}`;
+        const merge = planManagedCodexHooksMerge(
+          source,
+          "C:\\repo",
+          "C:\\Users\\Ada\\.codex\\hooks.json",
+          { platform: "win32" },
+        );
+        const removal = planManagedCodexHooksRemoval(
+          source,
+          "C:\\Users\\Ada\\.codex\\hooks.json",
+          { platform: "win32" },
+        );
+
+        assert.equal(merge.ok, false, context);
+        assert.equal(removal.ok, false, context);
+        if (!merge.ok) {
+          assert.equal(merge.error.code, "ambiguous_managed_handler", context);
+          assert.equal("finalContent" in merge, false, context);
+        }
+        if (!removal.ok) {
+          assert.equal(removal.error.code, "ambiguous_managed_handler", context);
+          assert.equal("finalContent" in removal, false, context);
+        }
+      }
+    }
+  });
+
+  it("fails closed for invalid Windows path syntax in direct and PowerShell commands", () => {
+    const posixCommand = 'node "/repo/dist/scripts/codex-native-hook.js"';
+    const directExecutable = "C:\\base\\node.exe";
+    const directScript = "C:\\base\\dist\\scripts\\codex-native-hook.js";
+    const powerShellExecutable = "C:\\base\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
+    const shimPath = "C:\\base\\hooks\\omx-native-hook-windows-shim.ps1";
+    const invalidWindowsPaths: Array<[string, (path: string) => string]> = [
+      ["pipe", (path) => path.replace("\\base\\", "\\ba|se\\")],
+      ["angle brackets", (path) => path.replace("\\base\\", "\\ba<>se\\")],
+      ["wildcards", (path) => path.replace("\\base\\", "\\ba?*se\\")],
+      ["embedded quote", (path) => path.replace("\\base\\", '\\ba\\"se\\')],
+      ["control character", (path) => path.replace("\\base\\", "\\ba\u0000se\\")],
+      ["alternate data stream", (path) => path.replace("\\base\\", "\\base:stream\\")],
+      ["extended namespace", (path) => `\\\\?\\${path}`],
+      ["device namespace", (path) => `\\\\.\\${path}`],
+      ["NT device namespace", (path) => `\\Device\\HarddiskVolume2${path.slice(2)}`],
+      ["DOS device name", (path) => path.replace("\\base\\", "\\NUL\\")],
+      ["DOS COM device stem before extension", (path) => path.replace("\\base\\", "\\COM1 .cache\\")],
+      ["DOS NUL device stem before extension", (path) => path.replace("\\base\\", "\\NUL .dir\\")],
+      ["superscript COM device name", (path) => path.replace("\\base\\", "\\COM¹\\")],
+      ["superscript LPT device name", (path) => path.replace("\\base\\", "\\LPT²\\")],
+      ["trailing component period", (path) => path.replace("\\base\\", "\\base.\\")],
+      ["trailing component space", (path) => path.replace("\\base\\", "\\base " + String.fromCharCode(92))],
+    ];
+    const invalidCommands = invalidWindowsPaths.flatMap(([syntax, invalidPath]) => [
+      [`direct executable ${syntax}`, `"${invalidPath(directExecutable)}" "${directScript}"`],
+      [`direct script ${syntax}`, `node "${invalidPath(directScript)}"`],
+      [
+        `PowerShell executable ${syntax}`,
+        `& '${invalidPath(powerShellExecutable)}' -NoProfile -ExecutionPolicy Bypass -File '${shimPath}'`,
+      ],
+      [
+        `PowerShell shim ${syntax}`,
+        `& '${powerShellExecutable}' -NoProfile -ExecutionPolicy Bypass -File '${invalidPath(shimPath)}'`,
+      ],
+    ]);
+
+    const validDirect = '"C:\\Program Files (x86)\\node.exe" "C:\\Users\\O\'Brien\\@scope & safe\\(fixture)\\dist\\scripts\\codex-native-hook.js"';
+    const validUncDirect = '"\\\\server\\share\\node.exe" "\\\\server\\share\\repo\\dist\\scripts\\codex-native-hook.js"';
+    const validShimPath = "C:\\Users\\O'Brien\\@scope & safe\\(fixture)\\.codex\\hooks\\omx-native-hook-windows-shim.ps1";
+    const validPowerShell = "& 'C:\\Program Files (x86)\\WindowsPowerShell\\v1.0\\powershell.exe' -NoProfile -ExecutionPolicy Bypass -File 'C:\\Users\\O''Brien\\@scope & safe\\(fixture)\\.codex\\hooks\\omx-native-hook-windows-shim.ps1'";
+    const rootedPowerShell = "& '\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe' -NoProfile -ExecutionPolicy Bypass -File '\\Users\\Ada\\.codex\\hooks\\omx-native-hook-windows-shim.ps1'";
+    assert.equal(isManagedCodexHookCommand(validDirect), true);
+    assert.equal(isManagedCodexHookCommand(validUncDirect), true);
+    assert.equal(parseManagedCodexNativeHookWindowsShimCommand(validPowerShell), validShimPath);
+    assert.equal(parseManagedCodexNativeHookWindowsShimCommand(rootedPowerShell), null);
+    assert.equal(isManagedCodexHookCommand(rootedPowerShell), false);
+
+    for (const [spelling, invalid] of invalidCommands) {
+      assert.equal(isManagedCodexHookCommand(invalid), false, spelling);
+      for (const [field, handler] of [
+        ["command", { command: invalid }],
+        ["commandWindows", { command: posixCommand, commandWindows: invalid }],
+        ["command_windows", { command: posixCommand, command_windows: invalid }],
+      ] as const) {
+        const source = JSON.stringify({
+          hooks: {
+            PreToolUse: [{ hooks: [{ type: "command", ...handler }] }],
+          },
+        });
+        const context = `${spelling} in ${field}: ${source}`;
+        const merge = planManagedCodexHooksMerge(
+          source,
+          "C:\\repo",
+          "C:\\Users\\Ada\\.codex\\hooks.json",
+          { platform: "win32" },
+        );
+        const removal = planManagedCodexHooksRemoval(
+          source,
+          "C:\\Users\\Ada\\.codex\\hooks.json",
+          { platform: "win32" },
+        );
+
+        assert.equal(merge.ok, false, context);
+        assert.equal(removal.ok, false, context);
+        if (!merge.ok) {
+          assert.equal(merge.error.code, "ambiguous_managed_handler", context);
+          assert.equal("finalContent" in merge, false, context);
+        }
+        if (!removal.ok) {
+          assert.equal(removal.error.code, "ambiguous_managed_handler", context);
+          assert.equal("finalContent" in removal, false, context);
+        }
+      }
+    }
+  });
+
+  it("preserves compatible mixed matcher source and managed coordinates", () => {
+    const matcherCases = [
+      {
+        eventName: "PreToolUse",
+        eventLabel: "pre_tool_use",
+        matcherSlice: '"matcher" : null',
+      },
+      {
+        eventName: "SessionStart",
+        eventLabel: "session_start",
+        matcherSlice: String.raw`"matcher" : "\u0073tartup\u007cresume\u007cclear"`,
+      },
+    ] as const;
+
+    for (const { eventName, eventLabel, matcherSlice } of matcherCases) {
+      const source = String.raw`{"hooks":{"${eventName}":[{${matcherSlice},"hooks":[{"type":"command","command":"echo foreign"},{"type":"command","command":"node \"/old/dist/scripts/codex-native-hook.js\""}]}]}}`;
+      const merged = planManagedCodexHooksMerge(source, "/repo", "/hooks.json");
+      assert.equal(merged.ok, true, source);
+      if (!merged.ok) continue;
+      assert.equal(merged.coordinateProof.safe, true);
+      assert.equal(merged.hasForeignHooks, true);
+      assert.ok(merged.finalContent?.includes(matcherSlice));
+      assert.ok(merged.finalTrustState[`/hooks.json:${eventLabel}:0:1`]);
+
+      const removal = planManagedCodexHooksRemoval(merged.finalContent!, "/hooks.json");
+      assert.equal(removal.ok, true, merged.finalContent ?? source);
+      if (!removal.ok) continue;
+      assert.equal(removal.coordinateProof.safe, true);
+      assert.ok(removal.finalContent?.includes(matcherSlice));
+      assert.match(removal.finalContent ?? "", /echo foreign/);
+      assert.deepEqual(removal.finalTrustState, {});
+    }
   });
 
   it("emits Windows hooks.json entries with only the cmd-compatible command field", () => {
@@ -319,6 +877,66 @@ describe("codex hooks helpers", () => {
       classifyManagedCodexNativeHookWindowsShimOwnership(historical, expected),
       "historical",
     );
+  });
+
+  it("requires qualified valid paths before recognizing historical Windows shim ownership", () => {
+    const expected = Buffer.from(buildManagedCodexNativeHookWindowsShimContent(
+      "C:\\Current Install\\oh-my-codex",
+      {
+        nodePath: "C:\\Current Node\\node.exe",
+        hookScriptPath: "C:\\Current Install\\oh-my-codex\\dist\\scripts\\codex-native-hook.js",
+      },
+    ), "utf-8");
+    const validNodePath = "D:\\Historical Node\\node.exe";
+    const validHookScriptPath = "D:\\Historical Install\\oh-my-codex\\dist\\scripts\\codex-native-hook.js";
+    const invalidHistoricalPaths = [
+      { nodePath: "node.exe", hookScriptPath: validHookScriptPath },
+      { nodePath: "D:node.exe", hookScriptPath: validHookScriptPath },
+      { nodePath: ".\\node.exe", hookScriptPath: validHookScriptPath },
+      { nodePath: "D:\\bad|node\\node.exe", hookScriptPath: validHookScriptPath },
+      { nodePath: "D:\\bad\u0000node\\node.exe", hookScriptPath: validHookScriptPath },
+      { nodePath: String.raw`\\?\D:\\Historical Node\\node.exe`, hookScriptPath: validHookScriptPath },
+      { nodePath: String.raw`\Device\HarddiskVolume2\node.exe`, hookScriptPath: validHookScriptPath },
+      { nodePath: "D:\\COM¹\\node.exe", hookScriptPath: validHookScriptPath },
+      { nodePath: "D:\\LPT²\\node.exe", hookScriptPath: validHookScriptPath },
+      { nodePath: "D:\\COM1 .cache\\node.exe", hookScriptPath: validHookScriptPath },
+      { nodePath: "D:\\NUL .dir\\node.exe", hookScriptPath: validHookScriptPath },
+      { nodePath: "D:\\Historical Node.\\node.exe", hookScriptPath: validHookScriptPath },
+      { nodePath: "D:\\Historical Node \\node.exe", hookScriptPath: validHookScriptPath },
+      { nodePath: validNodePath, hookScriptPath: ".\\dist\\scripts\\codex-native-hook.js" },
+      { nodePath: validNodePath, hookScriptPath: "D:historical\\dist\\scripts\\codex-native-hook.js" },
+      { nodePath: validNodePath, hookScriptPath: "D:\\bad?script\\dist\\scripts\\codex-native-hook.js" },
+      { nodePath: validNodePath, hookScriptPath: "D:\\bad\u0000script\\dist\\scripts\\codex-native-hook.js" },
+      { nodePath: validNodePath, hookScriptPath: String.raw`\\?\D:\\Historical Install\\dist\\scripts\\codex-native-hook.js` },
+      { nodePath: validNodePath, hookScriptPath: String.raw`\Device\HarddiskVolume2\dist\scripts\codex-native-hook.js` },
+      { nodePath: validNodePath, hookScriptPath: "D:\\Historical Install.\\dist\\scripts\\codex-native-hook.js" },
+      { nodePath: validNodePath, hookScriptPath: "D:\\Historical Install \\dist\\scripts\\codex-native-hook.js" },
+      { nodePath: validNodePath, hookScriptPath: "D:\\COM1 .cache\\dist\\scripts\\codex-native-hook.js" },
+      { nodePath: validNodePath, hookScriptPath: "D:\\NUL .dir\\dist\\scripts\\codex-native-hook.js" },
+    ];
+    const uncHistorical = Buffer.from(buildManagedCodexNativeHookWindowsShimContent(
+      "\\\\server\\share\\Historical Install\\oh-my-codex",
+      {
+        nodePath: "\\\\server\\share\\Node O'Brien\\node.exe",
+        hookScriptPath: "\\\\server\\share\\Historical Install\\O'Brien\\oh-my-codex\\dist\\scripts\\codex-native-hook.js",
+      },
+    ), "utf-8");
+
+    assert.equal(
+      classifyManagedCodexNativeHookWindowsShimOwnership(uncHistorical, expected),
+      "historical",
+    );
+    for (const paths of invalidHistoricalPaths) {
+      const content = Buffer.from(buildManagedCodexNativeHookWindowsShimContent(
+        "D:\\Historical Install\\oh-my-codex",
+        paths,
+      ), "utf-8");
+      assert.equal(
+        classifyManagedCodexNativeHookWindowsShimOwnership(content, expected),
+        "modified",
+        JSON.stringify(paths),
+      );
+    }
   });
 
   it("rejects incomplete, altered, encoding-ambiguous, and unverifiable Windows shim ownership", () => {

@@ -17,7 +17,7 @@ import {
 	open,
 	chmod,
 } from "fs/promises";
-import { join, dirname, relative, basename, isAbsolute, sep } from "path";
+import { join, dirname, relative, basename, isAbsolute, sep, win32 } from "path";
 
 import { existsSync } from "fs";
 import { spawnSync } from "child_process";
@@ -66,8 +66,10 @@ import {
 	planManagedCodexHooksRemoval,
 	classifyManagedCodexNativeHookWindowsShimOwnership,
 	ManagedCodexHooksPlanError,
+	type ManagedCodexHookTrustState,
 	validateCodexHooksConfigStrict,
 } from "../config/codex-hooks.js";
+
 import {
 	getLegacyUnifiedMcpRegistryCandidate,
 	getUnifiedMcpRegistryCandidates,
@@ -451,7 +453,8 @@ type NativeHookTransactionArtifactKind = "shim" | "hooks" | "config" | "metadata
 	| "before_rollback"
 	| "before_rollback_rename"
 	| "before_rollback_remove"
-	| "before_staged_cleanup";
+	| "before_staged_cleanup"
+	| "after_staged_cleanup";
 
 type NativeHookTransactionTopology =
 	| { kind: "absent" }
@@ -503,7 +506,12 @@ interface AppliedNativeHookTransactionArtifact {
 	appliedSnapshot: NativeHookTransactionArtifactSnapshot;
 	stagedDeletionPath?: string;
 	stagedDeletionSnapshot?: NativeHookTransactionArtifactSnapshot;
+	stagedDeletionCleaned?: boolean;
+
 }
+
+
+
 
 let nativeHookTransactionFailureInjector:
 	| ((
@@ -865,6 +873,160 @@ function assertWindowsNativeHookShimOwnership(
 	);
 }
 
+type WindowsNativeHookShimReferenceDecision =
+	| "not_referenced"
+	| "referenced"
+	| "ambiguous";
+
+function isWindowsShimReferenceRecord(
+	value: unknown,
+): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function normalizeWindowsShimReferencePath(path: string): string | null {
+	const windowsPath = path.replace(/\//g, "\\");
+	if (
+		windowsPath.length === 0 ||
+		/[\0-\x1f\x7f-\x9f`<>"|?*]/.test(windowsPath) ||
+		/^\\\\\.(?:\\|$)/.test(windowsPath)
+	) {
+		return null;
+	}
+	const isDriveAbsolute = /^[A-Za-z]:\\(?:[^\\:]+(?:\\[^\\:]+)*)?$/.test(windowsPath);
+	const isUncAbsolute = /^\\\\[^\\:]+\\[^\\:]+(?:\\[^\\:]+)*$/.test(windowsPath);
+	if (!isDriveAbsolute && !isUncAbsolute) return null;
+	return win32.normalize(windowsPath).toLowerCase();
+}
+
+function windowsShimPathBasename(path: string): string | null {
+	const name = win32.basename(path.replace(/\//g, "\\")).replace(/[. ]+$/, "");
+	return name.length > 0 ? name.toLowerCase() : null;
+}
+
+function decodePowerShellSingleQuotedLiteral(value: string): string {
+	return value.replace(/''/g, "'");
+}
+
+/**
+ * Parses the only foreign command form that proves its -File target is a
+ * static literal. All other PowerShell forms remain ambiguous because they can
+ * construct an executable target dynamically or through a nested evaluator.
+ */
+function decodeWindowsShimReferencePath(command: string): string | null {
+	if (/["`]/.test(command)) return null;
+	const match = command.match(
+		/^\s*&\s+'((?:''|[^'\r\n])*)'\s+-noprofile\s+-executionpolicy\s+bypass\s+-file\s+'((?:''|[^'\r\n])*)'\s*$/i,
+	);
+	if (!match) return null;
+	const powerShellPath = decodePowerShellSingleQuotedLiteral(match[1]);
+	if (
+		windowsShimPathBasename(powerShellPath) !== "powershell.exe" ||
+		normalizeWindowsShimReferencePath(powerShellPath) === null ||
+		hasPotentialWindowsPathAlias(powerShellPath)
+	) {
+		return null;
+	}
+	return decodePowerShellSingleQuotedLiteral(match[2]);
+}
+
+function hasPotentialWindowsPathAlias(path: string): boolean {
+	const windowsPath = path.replace(/\//g, "\\");
+	return windowsPath.split("\\").some(
+		(component) =>
+			component === "." ||
+			component === ".." ||
+			/[. ]$/.test(component) ||
+			/~\d+(?:\.[^\\]*)?$/i.test(component),
+	);
+}
+
+function windowsShimCommandReferenceDecision(
+	command: string,
+	shimPath: string,
+): WindowsNativeHookShimReferenceDecision {
+	const decodedShimPath = decodeWindowsShimReferencePath(command);
+	if (decodedShimPath === null) return "ambiguous";
+
+	const normalizedDecodedPath = normalizeWindowsShimReferencePath(decodedShimPath);
+	const normalizedShimPath = normalizeWindowsShimReferencePath(shimPath);
+	if (normalizedDecodedPath === null || normalizedShimPath === null) {
+		return "ambiguous";
+	}
+	if (normalizedDecodedPath === normalizedShimPath) return "referenced";
+
+	// A distinct fully qualified spelling is not proof that the foreign target
+	// cannot resolve to this shim: reparse points, SUBST, mapped drives, and UNC
+	// aliases can all refer to the same file. No race-safe file-identity proof is
+	// available here, so preserve the proof-owned shim.
+	return "ambiguous";
+}
+
+/**
+ * Decides whether a proof-owned Windows shim must remain after a hooks.json
+ * transition. JSON is strictly validated and decoded before inspection so
+ * escaped paths are handled semantically. Unknown future event members are
+ * scanned only through the established executable group/command shape; prompt
+ * and agent payloads remain inert metadata.
+ */
+export function decideWindowsNativeHookShimReference(
+	finalHooksContent: string | null,
+	shimPath: string,
+): WindowsNativeHookShimReferenceDecision {
+	if (finalHooksContent === null) return "not_referenced";
+	const validation = validateCodexHooksConfigStrict(finalHooksContent, {
+		platform: "win32",
+	});
+	if (!validation.ok) return "ambiguous";
+	const hooks = validation.root.hooks;
+	if (!isWindowsShimReferenceRecord(hooks)) return "not_referenced";
+
+	let ambiguous = false;
+	for (const eventGroups of Object.values(hooks)) {
+		if (!Array.isArray(eventGroups)) continue;
+		for (const group of eventGroups) {
+
+			if (
+				!isWindowsShimReferenceRecord(group) ||
+				!Array.isArray(group.hooks)
+			) {
+				continue;
+			}
+
+			for (const handler of group.hooks) {
+				if (
+					!isWindowsShimReferenceRecord(handler) ||
+					handler.type !== "command"
+				) {
+					continue;
+				}
+				for (const command of [
+					handler.commandWindows,
+					handler.command_windows,
+					handler.command,
+				]) {
+					if (typeof command !== "string") continue;
+					const decision = windowsShimCommandReferenceDecision(command, shimPath);
+					if (decision === "referenced") return decision;
+					if (decision === "ambiguous") ambiguous = true;
+				}
+			}
+		}
+	}
+	return ambiguous ? "ambiguous" : "not_referenced";
+}
+
+function preflightManagedCodexHookTrustState(
+	config: string,
+	priorManagedHookTrustState: Record<string, ManagedCodexHookTrustState>,
+	managedHookTrustState: Record<string, ManagedCodexHookTrustState>,
+): void {
+	stripManagedCodexHookTrustState(config, {
+		priorManagedHookTrustState,
+		managedTrustState: managedHookTrustState,
+	});
+}
+
 function injectNativeHookTransactionFailure(
 	stage: NativeHookTransactionFailureStage,
 	target: NativeHookTransactionArtifact | NativeHookTransactionPrecondition,
@@ -893,12 +1055,14 @@ async function atomicWriteNativeHookTransactionArtifact(
 	expectedCurrent: NativeHookTransactionArtifactSnapshot,
 	ancestorPrecondition: NativeHookTransactionAncestorPrecondition,
 	onWriteApplied?: (snapshot: NativeHookTransactionArtifactSnapshot) => void,
+	assertApplied?: () => Promise<void>,
 ): Promise<void> {
 	const temporaryPath = nativeHookTransactionTemporaryPath(artifact.path, "write");
 	let temporaryCreated = false;
 	let temporarySnapshot: NativeHookTransactionArtifactSnapshot | undefined;
 	try {
 		await assertNativeHookTransactionAncestorPrecondition(ancestorPrecondition);
+		await assertApplied?.();
 		await mkdir(dirname(artifact.path), { recursive: true });
 		await refreshNativeHookTransactionAncestorPrecondition(
 			ancestorPrecondition,
@@ -917,6 +1081,7 @@ async function atomicWriteNativeHookTransactionArtifact(
 			stage === "write" ? "precondition" : "rollback",
 		);
 		await assertNativeHookTransactionAncestorPrecondition(ancestorPrecondition);
+		await assertApplied?.();
 
 		const handle = await open(
 			temporaryPath,
@@ -959,16 +1124,23 @@ async function atomicWriteNativeHookTransactionArtifact(
 			temporarySnapshot,
 			"read-back",
 		);
+		await assertApplied?.();
 
 		if (!temporarySnapshot) {
 			throw new Error("temporary path was not fully captured after writing");
 		}
 		await rename(temporaryPath, artifact.path);
 		temporaryCreated = false;
+		onWriteApplied?.(temporarySnapshot);
 		if (stage === "write") {
-			onWriteApplied?.(temporarySnapshot);
 			injectNativeHookTransactionFailure("after_rename", artifact);
 		}
+		await assertNativeHookTransactionArtifactSnapshot(
+			artifact.path,
+			artifact.label,
+			temporarySnapshot,
+			stage === "write" ? "precondition" : "rollback",
+		);
 	} catch (error) {
 		if (temporaryCreated) {
 			try {
@@ -1044,6 +1216,58 @@ async function assertNativeHookTransactionPrecondition(
 	);
 }
 
+async function assertUnmutatedNativeHookTransactionPreconditions(
+	preconditions: readonly NativeHookTransactionPrecondition[],
+	applied: readonly AppliedNativeHookTransactionArtifact[],
+): Promise<void> {
+	const mutatedPaths = new Set(applied.map((entry) => entry.artifact.path));
+	for (const precondition of preconditions) {
+		if (mutatedPaths.has(precondition.path)) continue;
+		await assertNativeHookTransactionPrecondition(precondition);
+	}
+}
+
+async function assertAppliedNativeHookTransactionSnapshots(
+	applied: readonly AppliedNativeHookTransactionArtifact[],
+): Promise<void> {
+	for (const entry of applied) {
+		await assertNativeHookTransactionArtifactSnapshot(
+			entry.artifact.path,
+			entry.artifact.label,
+			entry.appliedSnapshot,
+			"precondition",
+		);
+	}
+}
+
+async function assertNativeHookTransactionStagedRecoveryCopies(
+	applied: readonly AppliedNativeHookTransactionArtifact[],
+): Promise<void> {
+	for (const entry of applied) {
+		if (
+			!entry.stagedDeletionPath ||
+			!entry.stagedDeletionSnapshot ||
+			entry.stagedDeletionCleaned
+		) {
+			continue;
+		}
+		await assertNativeHookTransactionArtifactSnapshot(
+			entry.stagedDeletionPath,
+			`${entry.artifact.label} staged deletion`,
+			entry.stagedDeletionSnapshot,
+			"rollback",
+		);
+	}
+}
+
+async function assertNativeHookTransactionRollbackState(
+	applied: readonly AppliedNativeHookTransactionArtifact[],
+): Promise<void> {
+	await assertNativeHookTransactionStagedRecoveryCopies(applied);
+	await assertAppliedNativeHookTransactionSnapshots(applied);
+}
+
+
 async function applyNativeHookTransactionArtifact(
 	artifact: NativeHookTransactionArtifact,
 	ancestorPrecondition: NativeHookTransactionAncestorPrecondition,
@@ -1069,6 +1293,7 @@ async function applyNativeHookTransactionArtifact(
 				entry = { artifact, appliedSnapshot };
 				applied.push(entry);
 			},
+			() => assertAppliedNativeHookTransactionSnapshots(applied),
 		);
 		if (!entry) {
 			throw new Error("native hook transaction write was not registered as applied");
@@ -1089,6 +1314,7 @@ async function applyNativeHookTransactionArtifact(
 			"precondition",
 		);
 		await assertNativeHookTransactionAncestorPrecondition(ancestorPrecondition);
+		await assertAppliedNativeHookTransactionSnapshots(applied);
 
 		const handle = await open(
 			stagedDeletionPath,
@@ -1127,6 +1353,7 @@ async function applyNativeHookTransactionArtifact(
 			stagedDeletionSnapshot,
 			"read-back",
 		);
+		await assertAppliedNativeHookTransactionSnapshots(applied);
 
 		await rm(artifact.path);
 		originalRemoved = true;
@@ -1193,6 +1420,7 @@ async function verifyNativeHookTransactionArtifact(
 async function restoreNativeHookTransactionArtifact(
 	applied: AppliedNativeHookTransactionArtifact,
 	ancestorPrecondition: NativeHookTransactionAncestorPrecondition,
+	assertRollbackState: () => Promise<void>,
 ): Promise<void> {
 	const { artifact } = applied;
 	const current = await captureNativeHookTransactionArtifact(artifact.path, artifact.label);
@@ -1211,8 +1439,10 @@ async function restoreNativeHookTransactionArtifact(
 			"rollback",
 		);
 		await assertNativeHookTransactionAncestorPrecondition(ancestorPrecondition);
+		await assertRollbackState();
 
 		await rm(artifact.path);
+		applied.appliedSnapshot = { bytes: null, topology: { kind: "absent" } };
 	} else {
 		const restoreArtifact: NativeHookTransactionArtifact = {
 			...artifact,
@@ -1225,9 +1455,18 @@ async function restoreNativeHookTransactionArtifact(
 			"rollback",
 			applied.appliedSnapshot,
 			ancestorPrecondition,
+			(restoredSnapshot) => {
+				applied.appliedSnapshot = restoredSnapshot;
+			},
+			assertRollbackState,
 		);
 	}
-	const restored = await captureNativeHookTransactionArtifact(artifact.path, artifact.label);
+	const restored = await assertNativeHookTransactionArtifactSnapshot(
+		artifact.path,
+		artifact.label,
+		applied.appliedSnapshot,
+		"rollback",
+	);
 	if (
 		!nativeHookTransactionSnapshotMatchesExpected(restored, {
 			bytes: artifact.before.bytes,
@@ -1243,10 +1482,29 @@ async function restoreNativeHookTransactionArtifact(
 async function cleanupNativeHookTransactionStagedDeletions(
 	applied: readonly AppliedNativeHookTransactionArtifact[],
 	ancestorPrecondition: NativeHookTransactionAncestorPrecondition,
+	preconditions?: readonly NativeHookTransactionPrecondition[],
+	rollbackApplied?: readonly AppliedNativeHookTransactionArtifact[],
 ): Promise<void> {
 	for (const entry of applied) {
-		if (!entry.stagedDeletionPath || !entry.stagedDeletionSnapshot) continue;
+		if (
+			!entry.stagedDeletionPath ||
+			!entry.stagedDeletionSnapshot ||
+			entry.stagedDeletionCleaned
+		) {
+			continue;
+		}
 		injectNativeHookTransactionFailure("before_staged_cleanup", entry.artifact);
+		if (preconditions) {
+			await assertUnmutatedNativeHookTransactionPreconditions(
+				preconditions,
+				applied,
+			);
+			await assertAppliedNativeHookTransactionSnapshots(applied);
+		}
+
+		if (rollbackApplied) {
+			await assertNativeHookTransactionRollbackState(rollbackApplied);
+		}
 		await assertNativeHookTransactionArtifactSnapshot(
 			entry.stagedDeletionPath,
 			`${entry.artifact.label} staged deletion`,
@@ -1255,6 +1513,10 @@ async function cleanupNativeHookTransactionStagedDeletions(
 		);
 		await assertNativeHookTransactionAncestorPrecondition(ancestorPrecondition);
 		await rm(entry.stagedDeletionPath);
+		entry.stagedDeletionCleaned = true;
+		if (rollbackApplied) {
+			await assertNativeHookTransactionRollbackState(rollbackApplied);
+		}
 	}
 }
 
@@ -1288,63 +1550,104 @@ async function commitNativeHookTransaction(
 			summary.backedUp += 1;
 		}
 	}
-	for (const precondition of preconditions) {
-		await assertNativeHookTransactionPrecondition(precondition);
-	}
+	await assertUnmutatedNativeHookTransactionPreconditions(preconditions, []);
 	await assertNativeHookTransactionAncestorPrecondition(ancestorPrecondition);
 
-
 	const applied: AppliedNativeHookTransactionArtifact[] = [];
+	let stagedCleanupStarted = false;
 	try {
 		for (const artifact of artifacts) {
+			await assertUnmutatedNativeHookTransactionPreconditions(
+				preconditions,
+				applied,
+			);
+			await assertAppliedNativeHookTransactionSnapshots(applied);
 			const entry = await applyNativeHookTransactionArtifact(
 				artifact,
 				ancestorPrecondition,
 				applied,
 			);
 			await verifyNativeHookTransactionArtifact(entry);
+			await assertUnmutatedNativeHookTransactionPreconditions(
+				preconditions,
+				applied,
+			);
+			await assertAppliedNativeHookTransactionSnapshots(applied);
 		}
+		await assertUnmutatedNativeHookTransactionPreconditions(preconditions, applied);
+		await assertAppliedNativeHookTransactionSnapshots(applied);
+		stagedCleanupStarted = true;
+		await cleanupNativeHookTransactionStagedDeletions(
+			applied,
+			ancestorPrecondition,
+			preconditions,
+		);
+		injectNativeHookTransactionFailure(
+			"after_staged_cleanup",
+			artifacts[artifacts.length - 1],
+		);
+		await assertUnmutatedNativeHookTransactionPreconditions(preconditions, applied);
+		await assertNativeHookTransactionAncestorPrecondition(ancestorPrecondition);
+		await assertAppliedNativeHookTransactionSnapshots(applied);
 	} catch (error) {
+		if (
+			stagedCleanupStarted &&
+			applied.some((entry) => entry.stagedDeletionCleaned)
+		) {
+			throw new Error(
+				`Native hook transaction committed but staged deletion cleanup failed during finalization: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
 		const rollbackFailures: string[] = [];
 		const restored: AppliedNativeHookTransactionArtifact[] = [];
-		for (const entry of [...applied].reverse()) {
-			try {
-				await restoreNativeHookTransactionArtifact(entry, ancestorPrecondition);
-				restored.push(entry);
-			} catch (rollbackError) {
-				rollbackFailures.push(
-					`${entry.artifact.label}: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`,
-				);
+		try {
+			await assertNativeHookTransactionRollbackState(applied);
+		} catch (rollbackError) {
+			rollbackFailures.push(
+				`recovery preflight: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`,
+			);
+		}
+		if (rollbackFailures.length === 0) {
+			for (const entry of [...applied].reverse()) {
+				try {
+					await assertNativeHookTransactionRollbackState(applied);
+					await restoreNativeHookTransactionArtifact(
+						entry,
+						ancestorPrecondition,
+						() => assertNativeHookTransactionRollbackState(applied),
+					);
+					restored.push(entry);
+					await assertNativeHookTransactionRollbackState(applied);
+				} catch (rollbackError) {
+					rollbackFailures.push(
+						`${entry.artifact.label}: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`,
+					);
+				}
 			}
 		}
-		try {
-			await cleanupNativeHookTransactionStagedDeletions(
-				restored,
-				ancestorPrecondition,
-			);
-		} catch (cleanupError) {
-			rollbackFailures.push(
-				`staged deletion cleanup: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`,
-			);
+		if (rollbackFailures.length === 0) {
+			try {
+				await assertNativeHookTransactionRollbackState(applied);
+				await cleanupNativeHookTransactionStagedDeletions(
+					restored,
+					ancestorPrecondition,
+					undefined,
+					applied,
+				);
+				await assertNativeHookTransactionRollbackState(applied);
+			} catch (cleanupError) {
+				rollbackFailures.push(
+					`staged deletion cleanup: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`,
+				);
+			}
 		}
 		const message = error instanceof Error ? error.message : String(error);
 		if (rollbackFailures.length > 0) {
 			throw new Error(
-				`Native hook transaction failed (${message}) and rollback failed (${rollbackFailures.join("; ")}).`,
+				`Native hook transaction failed (${message}) and rollback failed; manual recovery is required (${rollbackFailures.join("; ")}).`,
 			);
 		}
 		throw new Error(`Native hook transaction failed and was rolled back: ${message}`);
-	}
-
-	try {
-		await cleanupNativeHookTransactionStagedDeletions(
-			applied,
-			ancestorPrecondition,
-		);
-	} catch (error) {
-		throw new Error(
-			`Native hook transaction committed but staged deletion cleanup failed: ${error instanceof Error ? error.message : String(error)}`,
-		);
 	}
 }
 
@@ -2635,10 +2938,20 @@ function buildPluginModeHooksConfigPlan(
 	const managedHookTrustState = managedHooksPlan?.finalTrustState ?? {};
 	const priorManagedHookTrustState = managedHooksPlan?.priorTrustState ?? {};
 	const legacyHookTrustState = managedHooksPlan?.legacyTrustState ?? {};
+	preflightManagedCodexHookTrustState(
+		existingConfig,
+		priorManagedHookTrustState,
+		managedHookTrustState,
+	);
 	const configAfterLegacyCleanup = buildPluginModeLegacyConfig(
 		existingConfig,
-		options,
+		{
+			...options,
+			managedHookTrustState,
+			priorManagedHookTrustState,
+		},
 	);
+
 	const configWithRuntimeFeatures = upsertPluginModeRuntimeFeatureFlags(
 		configAfterLegacyCleanup,
 		options.codexHookFeatureFlag,
@@ -2704,6 +3017,8 @@ function buildPluginModeLegacyConfig(
 	options: {
 		preserveFirstPartyMcp?: boolean;
 		developerInstructionsDecision: PluginDeveloperInstructionsDecision;
+		managedHookTrustState: Record<string, ManagedCodexHookTrustState>;
+		priorManagedHookTrustState: Record<string, ManagedCodexHookTrustState>;
 	},
 ): string {
 	const preservedFirstPartyMcp = options.preserveFirstPartyMcp
@@ -2719,7 +3034,10 @@ function buildPluginModeLegacyConfig(
 	);
 	config = stripOmxSeededBehavioralDefaults(config);
 	config = stripOmxFeatureFlags(config, { preserveMultiAgent: true });
-	config = stripManagedCodexHookTrustState(config);
+	config = stripManagedCodexHookTrustState(config, {
+		managedTrustState: options.managedHookTrustState,
+		priorManagedHookTrustState: options.priorManagedHookTrustState,
+	});
 	config = stripOmxEnvSettings(config);
 	if (preservedFirstPartyMcp) {
 		config = `${config.trimEnd()}\n\n${preservedFirstPartyMcp}\n`;
@@ -2969,16 +3287,17 @@ async function planNativeHookSetupTransaction(
 			"utf-8",
 		);
 		assertWindowsNativeHookShimOwnership(shimPath, shimSnapshot.bytes, shimAfter);
-		const shimReferencedByFinalHooks = finalHooksContent
-			?.toLowerCase()
-			.includes("omx-native-hook-windows-shim.ps1")
-			?? false;
+		const shimReference = decideWindowsNativeHookShimReference(
+			finalHooksContent,
+			shimPath,
+		);
 		shimArtifact = nativeHookTransactionArtifact(
 			"shim",
 			shimPath,
 			`native hook Windows shim ${shimPath}`,
 			shimSnapshot,
-			options.isPluginInstallMode && options.pluginScopedHooks && !shimReferencedByFinalHooks
+			options.isPluginInstallMode && options.pluginScopedHooks &&
+			shimReference === "not_referenced"
 				? null
 				: shimAfter,
 		);
@@ -2995,12 +3314,18 @@ async function planNativeHookSetupTransaction(
 	const windowsShimDeletionArtifact =
 		shimArtifact && shimArtifact.after === null ? shimArtifact : null;
 	const artifacts = options.platform === "win32"
-		? [
+		? windowsShimDeletionArtifact
+			? [
+				hookArtifact,
+				windowsShimDeletionArtifact,
+				notifyMetadataArtifact,
+				configArtifact,
+			]
+			: [
 				windowsShimCreateOrUpdateArtifact,
 				hookArtifact,
 				notifyMetadataArtifact,
 				configArtifact,
-				windowsShimDeletionArtifact,
 			]
 		: [hookArtifact, notifyMetadataArtifact, configArtifact];
 	const preconditions = [

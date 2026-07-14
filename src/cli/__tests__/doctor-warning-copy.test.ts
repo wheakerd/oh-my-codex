@@ -24,6 +24,7 @@ import {
 	checkExploreHarness,
 	checkLegacyMultiAgentCompatibility,
 	checkNativeHookDistSmoke,
+	checkNativePostCompactHookRuntime,
 	checkNativeHooks,
 	classifyPostCompactHookStdout,
 } from "../doctor.js";
@@ -94,10 +95,8 @@ function buildWindowsShimCommand(shimPath: string): string {
 }
 
 function buildWindowsShimHooksJson(shimPath: string, codexHomeDir: string): string {
-	return buildHooksJsonWithPostCompactCommand(
-		buildWindowsShimCommand(shimPath),
-		codexHomeDir,
-	);
+	const command = buildWindowsShimCommand(shimPath);
+	return buildHooksJsonWithPostCompactCommand(command, codexHomeDir, command);
 }
 
 async function installPluginCacheFixture(codexDir: string): Promise<string> {
@@ -149,8 +148,8 @@ async function packagedPluginVersion(): Promise<string> {
 function buildHooksJsonWithPostCompactCommand(
 	postCompactCommand: string,
 	codexHomeDir: string,
+	expectedCommand = currentNativeHookCommand(codexHomeDir),
 ): string {
-	const expectedCommand = currentNativeHookCommand(codexHomeDir);
 	return `${JSON.stringify({
 		hooks: Object.fromEntries(
 			MANAGED_HOOK_EVENTS.map((eventName) => [
@@ -1966,10 +1965,11 @@ command = "node"
 			const shimPath = join(codexDir, "hooks", "omx-native-hook-windows-shim.ps1");
 			await mkdir(dirname(shimPath), { recursive: true });
 			const original = buildWindowsShimHooksJson(shimPath, codexDir);
-			const historicalShim = buildManagedCodexNativeHookWindowsShimContent(
-				join(wd, "historical-oh-my-codex"),
-				{ nodePath: join(wd, "historical", "node.exe") },
-			);
+			const historicalShim = buildManagedCodexNativeHookWindowsShimContent("", {
+				nodePath: "C:\\Historical Node\\node.exe",
+				hookScriptPath:
+					"C:\\Historical Install\\oh-my-codex\\dist\\scripts\\codex-native-hook.js",
+			});
 			await writeFile(hooksPath, original);
 			await writeFile(shimPath, historicalShim, "utf-8");
 
@@ -1983,6 +1983,109 @@ command = "node"
 			assert.equal(await readFile(shimPath, "utf-8"), historicalShim);
 		} finally {
 			await rm(wd, { recursive: true, force: true });
+		}
+	});
+
+	it("reports Windows shim integrity before an unsafe managed/foreign group coordinate warning", async () => {
+		for (const fixture of [
+			{
+				name: "missing",
+				shimContent: null,
+				integrity: /referenced Windows native hook shim is missing at/,
+			},
+			{
+				name: "tampered",
+				shimContent: `${buildManagedCodexNativeHookWindowsShimContent(repoRoot())}# mixed-group sentinel\n`,
+				integrity: /not an exact current or complete historical generated shim/,
+			},
+		] as const) {
+			const wd = await mkdtemp(join(tmpdir(), `omx-doctor-windows-shim-${fixture.name}-unsafe-`));
+			try {
+				const codexDir = join(wd, ".codex");
+				const hooksPath = join(codexDir, "hooks.json");
+				const shimPath = join(codexDir, "hooks", "omx-native-hook-windows-shim.ps1");
+				const parsed = JSON.parse(buildWindowsShimHooksJson(shimPath, codexDir)) as {
+					hooks: Record<string, Array<{ hooks: unknown[] }>>;
+				};
+				parsed.hooks.PreToolUse![0]!.hooks.push({
+					type: "command",
+					command: "echo foreign-handler",
+				});
+				await mkdir(codexDir, { recursive: true });
+				await writeFile(hooksPath, `${JSON.stringify(parsed, null, 2)}\n`);
+				if (fixture.shimContent !== null) {
+					await mkdir(dirname(shimPath), { recursive: true });
+					await writeFile(shimPath, fixture.shimContent, "utf-8");
+				}
+
+				const check = await checkNativeHooks(hooksPath, join(codexDir, "config.toml"), {
+					codexHomeDir: codexDir,
+					platform: "win32",
+				});
+				assert.equal(check.status, "fail", fixture.name);
+				assert.match(check.message, fixture.integrity, fixture.name);
+				assert.match(check.message, /unsafe_managed_removal/, fixture.name);
+				assert.ok(
+					check.message.search(fixture.integrity) < check.message.indexOf("unsafe_managed_removal"),
+					`${fixture.name} shim integrity must take precedence over the coordinate warning`,
+				);
+			} finally {
+				await rm(wd, { recursive: true, force: true });
+			}
+		}
+	});
+
+	it("never executes missing, tampered, or historical Windows shim sentinels during verbose validation", async () => {
+		for (const fixture of [
+			{
+				name: "missing",
+				shimContent: null,
+				expected: /referenced Windows native hook shim is missing at/,
+			},
+			{
+				name: "tampered",
+				shimContent: `${buildManagedCodexNativeHookWindowsShimContent(repoRoot())}# verbose-execution sentinel\n`,
+				expected: /not an exact current or complete historical generated shim/,
+			},
+			{
+				name: "historical",
+				shimContent: buildManagedCodexNativeHookWindowsShimContent("", {
+					nodePath: "C:\\Historical Node\\node.exe",
+					hookScriptPath:
+						"C:\\Historical Install\\oh-my-codex\\dist\\scripts\\codex-native-hook.js",
+				}),
+				expected: /complete historical generated shim.*run "omx setup" to migrate/,
+			},
+		] as const) {
+			const wd = await mkdtemp(join(tmpdir(), `omx-doctor-verbose-windows-shim-${fixture.name}-`));
+			try {
+				const codexDir = join(wd, ".codex");
+				const hooksPath = join(codexDir, "hooks.json");
+				const shimPath = join(codexDir, "hooks", "omx-native-hook-windows-shim.ps1");
+				const command = buildWindowsShimCommand(shimPath);
+				await mkdir(codexDir, { recursive: true });
+				await writeFile(hooksPath, buildWindowsShimHooksJson(shimPath, codexDir));
+				if (fixture.shimContent !== null) {
+					await mkdir(dirname(shimPath), { recursive: true });
+					await writeFile(shimPath, fixture.shimContent, "utf-8");
+				}
+
+				let spawned = false;
+				const check = await checkNativePostCompactHookRuntime(hooksPath, wd, codexDir, {
+					platform: "win32",
+					expectedCommand: command,
+					runner: (() => {
+						spawned = true;
+						throw new Error("unverified Windows shim execution");
+					}) as unknown as typeof spawnSync,
+				});
+				assert.equal(spawned, false, `${fixture.name} shim executed`);
+				assert.ok(check, `${fixture.name} shim must produce a safety diagnostic`);
+				assert.notEqual(check.status, "pass", fixture.name);
+				assert.match(check.message, fixture.expected, fixture.name);
+			} finally {
+				await rm(wd, { recursive: true, force: true });
+			}
 		}
 	});
 

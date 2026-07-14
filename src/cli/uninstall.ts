@@ -31,7 +31,12 @@ import {
 import { getPackageRoot } from "../utils/package.js";
 import { AGENT_DEFINITIONS } from "../agents/definitions.js";
 import { detectLegacySkillRootOverlap } from "../utils/paths.js";
-import { resolveScopeDirectories, type SetupScope } from "./setup.js";
+import {
+  decideWindowsNativeHookShimReference,
+  resolveScopeDirectories,
+  type SetupScope,
+} from "./setup.js";
+
 import { resolveCodexHookFeatureFlagForCli } from "./codex-feature-probe.js";
 import { readPersistedSetupScope } from "./index.js";
 import { isOmxGeneratedAgentsMd } from "../utils/agents-md.js";
@@ -45,11 +50,14 @@ export type UninstallTransactionFailureStage =
   | "before-config-commit"
   | "before-temp-write"
   | "before-rename"
+  | "after-rename"
   | "before-remove"
+  | "after-remove"
   | "before-rollback"
   | "before-rollback-rename"
   | "before-rollback-remove"
   | "before-staged-cleanup"
+  | "after-staged-cleanup"
   | "after-config-commit";
 
 export interface UninstallOptions {
@@ -189,6 +197,7 @@ interface PlannedHooksRemoval {
   hooks: FileSnapshot;
   plan?: ManagedCodexHooksPlan;
   shim?: FileSnapshot;
+  preservedShimPrecondition?: FileSnapshot;
 }
 
 function fileIdentity(stat: Awaited<ReturnType<typeof lstat>>): FileIdentity {
@@ -385,15 +394,14 @@ async function planHooksRemoval(
         `Refusing to remove modified native hook Windows shim at ${shim.path}.`,
       );
     }
-    if (
-      plan?.finalContent?.toLowerCase().includes(
-        "omx-native-hook-windows-shim.ps1",
-      )
-    ) {
-      throw new Error(
-        `Refusing to remove native hook Windows shim at ${shim.path} while surviving hooks still reference it.`,
-      );
+    const shimReference = decideWindowsNativeHookShimReference(
+      plan?.finalContent ?? null,
+      shim.path,
+    );
+    if (shimReference !== "not_referenced") {
+      return { hooks, plan, preservedShimPrecondition: shim };
     }
+
   }
 
   return { hooks, plan, shim };
@@ -566,6 +574,7 @@ async function planConfigCleanup(
   > & {
     preserveHooksFeatureFlag?: boolean;
     priorHookTrustState?: Record<string, ManagedCodexHookTrustState>;
+    finalHookTrustState?: Record<string, ManagedCodexHookTrustState>;
     notifyMetadata?: PlannedNotifyMetadata;
   },
 ): Promise<PlannedConfigCleanup> {
@@ -593,6 +602,13 @@ async function planConfigCleanup(
   result.topLevelKeysRemoved = detected.hasTopLevelKeys;
   result.featureFlagsRemoved = detected.hasFeatureFlags;
 
+  // Verify proof ownership against the untouched source before marker stripping
+  // can hide a foreign sibling in an otherwise OMX-looking trust declaration.
+  stripManagedCodexHookTrustState(original, {
+    priorManagedHookTrustState: options.priorHookTrustState,
+    managedTrustState: options.finalHookTrustState,
+  });
+
   // Strip OMX tables block (MCP servers, agents, tui)
   let config = original;
   const { cleaned } = stripExistingOmxBlocks(config);
@@ -613,7 +629,8 @@ async function planConfigCleanup(
   // Remove only trust tables whose hashes and coordinates match the planned
   // managed hooks before their removal. User-owned conflicts remain intact.
   config = stripManagedCodexHookTrustState(config, {
-    managedTrustState: options.priorHookTrustState,
+    priorManagedHookTrustState: options.priorHookTrustState,
+    managedTrustState: options.finalHookTrustState,
   });
 
   // Strip feature flags
@@ -776,12 +793,25 @@ interface UninstallArtifactTransaction {
   config?: PlannedFileMutation;
 }
 
+interface RenamedDestinationOwnership {
+  path: string;
+  bytes: Buffer;
+  mode: number;
+  identity: Pick<FileIdentity, "dev" | "ino">;
+  topology: FileTopology | null;
+}
+
 interface MutationExecution {
   mutation: PlannedFileMutation;
   phase: "prepared" | "destructive" | "verified";
   appliedSnapshot?: FileSnapshot;
+  renamedOwnership?: RenamedDestinationOwnership;
   stagedDeletion?: FileSnapshot;
+  stagedDeletionCleaned?: boolean;
 }
+
+
+
 
 function assertValidHooksJson(content: string): void {
   JSON.parse(content);
@@ -815,6 +845,45 @@ function snapshotReadOptions(snapshot: FileSnapshot): {
 async function captureCurrentSnapshot(reference: FileSnapshot): Promise<FileSnapshot> {
   return readFileSnapshot(reference.path, snapshotReadOptions(reference));
 }
+
+function renamedDestinationOwnership(
+  snapshot: FileSnapshot,
+  destinationPath: string,
+  topology: FileTopology | null,
+): RenamedDestinationOwnership {
+  if (snapshot.bytes === null || snapshot.mode === null || snapshot.identity === null) {
+    throw new Error(`Replacement temporary ${snapshot.path} was not fully captured before rename.`);
+  }
+  return {
+    path: destinationPath,
+    bytes: snapshot.bytes,
+    mode: snapshot.mode,
+    identity: { dev: snapshot.identity.dev, ino: snapshot.identity.ino },
+    topology,
+  };
+}
+
+async function captureRenamedDestinationOwnership(
+  ownership: RenamedDestinationOwnership,
+): Promise<FileSnapshot> {
+  await assertControlledTopologyCurrent(ownership.topology);
+  const current = await readFileSnapshot(ownership.path, {
+    strictUtf8: false,
+    controlledRoot: ownership.topology?.root,
+  });
+  if (
+    current.bytes === null ||
+    current.mode !== ownership.mode ||
+    !current.bytes.equals(ownership.bytes) ||
+    current.identity === null ||
+    current.identity.dev !== ownership.identity.dev ||
+    current.identity.ino !== ownership.identity.ino
+  ) {
+    throw new Error(`Uninstall replacement ownership changed for ${ownership.path}.`);
+  }
+  return current;
+}
+
 
 async function assertSnapshotCurrent(snapshot: FileSnapshot): Promise<void> {
   await assertControlledTopologyCurrent(snapshot.topology);
@@ -881,7 +950,8 @@ async function atomicReplaceFile(
   content: Buffer,
   options: Pick<UninstallOptions, "transactionFailureInjector" | "transactionTemporaryPath">,
   stage: "write" | "rollback",
-  onRename: () => void,
+  onRename: (ownership: RenamedDestinationOwnership) => void | Promise<void>,
+  assertApplied?: () => Promise<void>,
 ): Promise<FileSnapshot> {
   if (mutation.snapshot.mode === null) {
     throw new Error(`Refusing to replace ${mutation.snapshot.path}: uninstall did not plan a regular-file mode.`);
@@ -894,6 +964,7 @@ async function atomicReplaceFile(
     await options.transactionFailureInjector?.(
       stage === "write" ? "before-temp-write" : "before-rollback",
     );
+    await assertApplied?.();
     await assertSnapshotCurrent(expectedCurrent);
     handle = await open(temporaryPath, "wx", mutation.snapshot.mode);
     temporaryCreated = true;
@@ -916,6 +987,7 @@ async function atomicReplaceFile(
     await options.transactionFailureInjector?.(
       stage === "write" ? "before-rename" : "before-rollback-rename",
     );
+    await assertApplied?.();
     // Recheck at the mutation primitive immediately before replacing the target.
     await assertControlledTopologyCurrent(mutation.snapshot.topology);
     await assertSnapshotCurrent(expectedCurrent);
@@ -924,19 +996,19 @@ async function atomicReplaceFile(
 
     await rename(temporaryPath, mutation.snapshot.path);
     temporaryCreated = false;
-    onRename();
-
-    await assertControlledTopologyCurrent(mutation.snapshot.topology);
-    const actual = await captureCurrentSnapshot(mutation.snapshot);
-    if (
-      actual.bytes === null ||
-      actual.mode !== mutation.snapshot.mode ||
-      !actual.bytes.equals(content)
-    ) {
-      throw new Error(`Read-back verification failed for ${mutation.snapshot.path}: content bytes differ.`);
+    const ownership = renamedDestinationOwnership(
+      temporarySnapshot,
+      mutation.snapshot.path,
+      mutation.snapshot.topology,
+    );
+    await onRename(ownership);
+    if (stage === "write") {
+      await options.transactionFailureInjector?.("after-rename");
     }
+
+    const actual = await captureRenamedDestinationOwnership(ownership);
     if (stage === "write" && mutation.validate) {
-      mutation.validate(decodeStrictUtf8(mutation.snapshot.path, actual.bytes));
+      mutation.validate(decodeStrictUtf8(mutation.snapshot.path, actual.bytes!));
     }
     return actual;
   } catch (error) {
@@ -957,6 +1029,7 @@ async function stageAndRemoveFile(
   mutation: PlannedFileMutation,
   execution: MutationExecution,
   options: Pick<UninstallOptions, "transactionFailureInjector" | "transactionTemporaryPath">,
+  assertApplied: () => Promise<void>,
 ): Promise<void> {
   if (mutation.snapshot.bytes === null || mutation.snapshot.mode === null) {
     throw new Error(`Refusing to remove ${mutation.snapshot.path}: uninstall did not plan a regular-file snapshot.`);
@@ -964,9 +1037,9 @@ async function stageAndRemoveFile(
   const stagedPath = transactionTemporaryPath(mutation.snapshot.path, "delete", options);
   let handle: Awaited<ReturnType<typeof open>> | undefined;
   let stagedCreated = false;
-  let removalAttempted = false;
   try {
     await options.transactionFailureInjector?.("before-temp-write");
+    await assertApplied();
     await assertSnapshotCurrent(mutation.snapshot);
     handle = await open(stagedPath, "wx", mutation.snapshot.mode);
     stagedCreated = true;
@@ -992,30 +1065,26 @@ async function stageAndRemoveFile(
     await assertSnapshotCurrent(mutation.snapshot);
     // Recheck the transaction-owned staged copy immediately before removing the target.
     await assertSnapshotCurrent(stagedDeletion);
-    removalAttempted = true;
+    await assertApplied();
     await rm(mutation.snapshot.path);
+    execution.appliedSnapshot = {
+      path: mutation.snapshot.path,
+      content: null,
+      bytes: null,
+      mode: null,
+      identity: null,
+      topology: mutation.snapshot.topology,
+    };
     execution.phase = "destructive";
+    await options.transactionFailureInjector?.("after-remove");
     await assertControlledTopologyCurrent(mutation.snapshot.topology);
     const absent = await captureCurrentSnapshot(mutation.snapshot);
     if (absent.bytes !== null) {
       throw new Error(`Read-back verification failed for ${mutation.snapshot.path}: expected absence.`);
     }
-    execution.appliedSnapshot = absent;
     execution.phase = "verified";
   } catch (error) {
     await handle?.close().catch(() => undefined);
-    if (stagedCreated && execution.phase === "prepared" && removalAttempted) {
-      try {
-        const current = await captureCurrentSnapshot(mutation.snapshot);
-        if (current.bytes === null) {
-          execution.phase = "destructive";
-          execution.appliedSnapshot = current;
-        }
-      } catch {
-        // Preserve the staged copy for manual recovery when removal state is unknown.
-        execution.phase = "destructive";
-      }
-    }
     if (stagedCreated && execution.phase === "prepared") {
       await removeOwnedTemporary(
         stagedPath,
@@ -1030,23 +1099,33 @@ async function stageAndRemoveFile(
 
 async function applyFileMutation(
   execution: MutationExecution,
+  executions: readonly MutationExecution[],
   options: Pick<UninstallOptions, "transactionFailureInjector" | "transactionTemporaryPath">,
 ): Promise<void> {
   const { mutation } = execution;
   if (mutation.finalContent === null) {
-    await stageAndRemoveFile(mutation, execution, options);
+    await stageAndRemoveFile(
+      mutation,
+      execution,
+      options,
+      () => assertAppliedTransactionSnapshots(executions),
+    );
     return;
   }
-  execution.appliedSnapshot = await atomicReplaceFile(
+  const appliedSnapshot = await atomicReplaceFile(
     mutation,
     mutation.snapshot,
     Buffer.from(mutation.finalContent, "utf-8"),
     options,
     "write",
-    () => {
+    (ownership) => {
+      execution.renamedOwnership = ownership;
       execution.phase = "destructive";
     },
+    () => assertAppliedTransactionSnapshots(executions),
   );
+  execution.appliedSnapshot = appliedSnapshot;
+  execution.renamedOwnership = undefined;
   execution.phase = "verified";
 }
 
@@ -1061,23 +1140,46 @@ function mutationStage(kind: UninstallArtifactKind): UninstallTransactionFailure
   }
 }
 
+async function captureRollbackOwnedSnapshot(
+  execution: MutationExecution,
+): Promise<FileSnapshot> {
+  if (execution.appliedSnapshot) {
+    await assertSnapshotCurrent(execution.appliedSnapshot);
+    return execution.appliedSnapshot;
+  }
+  if (execution.renamedOwnership) {
+    return captureRenamedDestinationOwnership(execution.renamedOwnership);
+  }
+  throw new Error(`Refusing stale rollback for ${execution.mutation.snapshot.path}: the mutation did not produce a verifiable state.`);
+}
+
 async function restoreFileSnapshot(
   execution: MutationExecution,
   options: Pick<UninstallOptions, "transactionFailureInjector" | "transactionTemporaryPath">,
+  assertRollbackState: () => Promise<void>,
 ): Promise<void> {
-  const { mutation, appliedSnapshot } = execution;
-  if (!appliedSnapshot) {
-    throw new Error(`Refusing stale rollback for ${mutation.snapshot.path}: the mutation did not produce a verifiable state.`);
+  const { mutation } = execution;
+  const appliedSnapshot = await captureRollbackOwnedSnapshot(execution);
+  if (execution.stagedDeletion && !execution.stagedDeletionCleaned) {
+    await assertSnapshotCurrent(execution.stagedDeletion);
   }
-  await assertSnapshotCurrent(appliedSnapshot);
-  if (execution.stagedDeletion) await assertSnapshotCurrent(execution.stagedDeletion);
 
   if (mutation.snapshot.bytes === null) {
     await options.transactionFailureInjector?.("before-rollback");
     await options.transactionFailureInjector?.("before-rollback-remove");
+    await assertRollbackState();
     await assertControlledTopologyCurrent(mutation.snapshot.topology);
     await assertSnapshotCurrent(appliedSnapshot);
     await rm(mutation.snapshot.path);
+    execution.appliedSnapshot = {
+      path: mutation.snapshot.path,
+      content: null,
+      bytes: null,
+      mode: null,
+      identity: null,
+      topology: mutation.snapshot.topology,
+    };
+    execution.renamedOwnership = undefined;
     const absent = await captureCurrentSnapshot(mutation.snapshot);
     if (absent.bytes !== null) {
       throw new Error(`Uninstall rollback mismatch for ${mutation.snapshot.path}: expected absence.`);
@@ -1091,8 +1193,13 @@ async function restoreFileSnapshot(
     mutation.snapshot.bytes,
     options,
     "rollback",
-    () => undefined,
+    (ownership) => {
+      execution.renamedOwnership = ownership;
+    },
+    assertRollbackState,
   );
+  execution.appliedSnapshot = restored;
+  execution.renamedOwnership = undefined;
   await assertSnapshotMatchesPlannedContent(restored, mutation.snapshot, "rollback");
 }
 
@@ -1100,16 +1207,38 @@ async function cleanupStagedDeletions(
   executions: readonly MutationExecution[],
   options: Pick<UninstallOptions, "transactionFailureInjector">,
   stage: "commit" | "rollback",
+  transaction?: UninstallArtifactTransaction,
+  assertRollbackState?: () => Promise<void>,
 ): Promise<void> {
   for (const execution of executions) {
-    if (!execution.stagedDeletion) continue;
+    if (!execution.stagedDeletion || execution.stagedDeletionCleaned) continue;
     if (stage === "rollback") {
       await options.transactionFailureInjector?.("before-rollback-remove");
     }
     await options.transactionFailureInjector?.("before-staged-cleanup");
+    if (transaction) {
+      await assertUnmutatedTransactionPreconditions(transaction, executions);
+      await assertAppliedTransactionSnapshots(executions);
+    }
+    await assertRollbackState?.();
+
     // Recheck immediately before removing the transaction-owned staged copy.
     await assertSnapshotCurrent(execution.stagedDeletion);
     await rm(execution.stagedDeletion.path);
+    execution.stagedDeletionCleaned = true;
+    await assertRollbackState?.();
+  }
+}
+
+async function assertRollbackTransactionState(
+  executions: readonly MutationExecution[],
+): Promise<void> {
+  for (const execution of executions) {
+    if (execution.phase === "prepared") continue;
+    if (execution.stagedDeletion && !execution.stagedDeletionCleaned) {
+      await assertSnapshotCurrent(execution.stagedDeletion);
+    }
+    await captureRollbackOwnedSnapshot(execution);
   }
 }
 
@@ -1119,19 +1248,42 @@ async function rollbackArtifactMutations(
 ): Promise<void> {
   const failures: string[] = [];
   const restored: MutationExecution[] = [];
-  for (const execution of [...executions].reverse()) {
-    if (execution.phase === "prepared") continue;
-    try {
-      await restoreFileSnapshot(execution, options);
-      restored.push(execution);
-    } catch (error) {
-      failures.push(`${execution.mutation.kind}: ${String(error)}`);
+  try {
+    await assertRollbackTransactionState(executions);
+  } catch (error) {
+    failures.push(`recovery preflight: ${String(error)}`);
+  }
+  if (failures.length === 0) {
+    for (const execution of [...executions].reverse()) {
+      if (execution.phase === "prepared") continue;
+      try {
+        await assertRollbackTransactionState(executions);
+        await restoreFileSnapshot(
+          execution,
+          options,
+          () => assertRollbackTransactionState(executions),
+        );
+        restored.push(execution);
+        await assertRollbackTransactionState(executions);
+      } catch (error) {
+        failures.push(`${execution.mutation.kind}: ${String(error)}`);
+      }
     }
   }
-  try {
-    await cleanupStagedDeletions(restored, options, "rollback");
-  } catch (error) {
-    failures.push(`staged deletion cleanup: ${String(error)}`);
+  if (failures.length === 0) {
+    try {
+      await assertRollbackTransactionState(executions);
+      await cleanupStagedDeletions(
+        restored,
+        options,
+        "rollback",
+        undefined,
+        () => assertRollbackTransactionState(executions),
+      );
+      await assertRollbackTransactionState(executions);
+    } catch (error) {
+      failures.push(`staged deletion cleanup: ${String(error)}`);
+    }
   }
   if (failures.length > 0) {
     throw new Error(
@@ -1154,6 +1306,19 @@ async function assertUnmutatedTransactionPreconditions(
   );
 }
 
+async function assertAppliedTransactionSnapshots(
+  executions: readonly MutationExecution[],
+): Promise<void> {
+  for (const execution of executions) {
+    if (execution.phase === "prepared") continue;
+    if (!execution.appliedSnapshot) {
+      throw new Error(`Refusing uninstall because ${execution.mutation.snapshot.path} did not register an applied snapshot.`);
+    }
+    await assertSnapshotCurrent(execution.appliedSnapshot);
+  }
+}
+
+
 async function commitUninstallArtifactTransaction(
   transaction: UninstallArtifactTransaction,
   options: Pick<
@@ -1170,18 +1335,37 @@ async function commitUninstallArtifactTransaction(
   if (mutations.length === 0) return;
 
   const executions: MutationExecution[] = [];
+  let stagedCleanupStarted = false;
   try {
     for (const mutation of mutations) {
       await options.transactionFailureInjector?.(mutationStage(mutation.kind));
       await assertUnmutatedTransactionPreconditions(transaction, executions);
+      await assertAppliedTransactionSnapshots(executions);
       const execution: MutationExecution = { mutation, phase: "prepared" };
       executions.push(execution);
-      await applyFileMutation(execution, options);
+      await applyFileMutation(execution, executions, options);
       if (mutation.kind === "config") {
         await options.transactionFailureInjector?.("after-config-commit");
       }
+      await assertUnmutatedTransactionPreconditions(transaction, executions);
+      await assertAppliedTransactionSnapshots(executions);
     }
+    await assertUnmutatedTransactionPreconditions(transaction, executions);
+    await assertAppliedTransactionSnapshots(executions);
+    stagedCleanupStarted = true;
+    await cleanupStagedDeletions(executions, options, "commit", transaction);
+    await options.transactionFailureInjector?.("after-staged-cleanup");
+    await assertUnmutatedTransactionPreconditions(transaction, executions);
+    await assertAppliedTransactionSnapshots(executions);
   } catch (error) {
+    if (
+      stagedCleanupStarted &&
+      executions.some((execution) => execution.stagedDeletionCleaned)
+    ) {
+      throw new Error(
+        `Uninstall artifact transaction committed but staged deletion cleanup failed during finalization: ${String(error)}`,
+      );
+    }
     try {
       await rollbackArtifactMutations(executions, options);
     } catch (rollbackError) {
@@ -1190,14 +1374,6 @@ async function commitUninstallArtifactTransaction(
       );
     }
     throw error;
-  }
-
-  try {
-    await cleanupStagedDeletions(executions, options, "commit");
-  } catch (error) {
-    throw new Error(
-      `Uninstall artifact transaction committed but staged deletion cleanup failed: ${String(error)}`,
-    );
   }
 }
 
@@ -1357,6 +1533,7 @@ export async function uninstall(options: UninstallOptions = {}): Promise<void> {
         {
           preserveHooksFeatureFlag,
           priorHookTrustState: hooksRemoval.plan?.priorTrustState,
+          finalHookTrustState: hooksRemoval.plan?.finalTrustState,
           notifyMetadata,
           codexFeaturesProbe: options.codexFeaturesProbe,
           codexVersionProbe: options.codexVersionProbe,
@@ -1365,7 +1542,11 @@ export async function uninstall(options: UninstallOptions = {}): Promise<void> {
   const artifactTransaction: UninstallArtifactTransaction = {
     preconditions: [
       hooksRemoval.hooks,
-      ...(hooksRemoval.shim ? [hooksRemoval.shim] : []),
+      ...(hooksRemoval.shim
+        ? [hooksRemoval.shim]
+        : hooksRemoval.preservedShimPrecondition
+          ? [hooksRemoval.preservedShimPrecondition]
+          : []),
       configSnapshot,
       ...(notifyMetadata ? [notifyMetadata.snapshot] : []),
     ],
