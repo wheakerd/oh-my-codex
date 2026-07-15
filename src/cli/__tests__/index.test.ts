@@ -78,6 +78,7 @@ import {
   buildDetachedWindowsBootstrapScript,
   acquireTmuxExtendedKeysLease,
   resolveNativeSessionName,
+  establishCurrentTmuxInstanceBinding,
   releaseTmuxExtendedKeysLease,
   withTmuxExtendedKeys,
   serializeDetachedSessionParentEnv,
@@ -3317,6 +3318,72 @@ describe("classifyCodexExecFailure", () => {
     const classified = classifyCodexExecFailure(err);
     assert.equal(classified.kind, "launch-error");
     assert.equal(classified.code, "ENOENT");
+  });
+});
+
+describe("opaque tmux instance births", () => {
+  it("preserves existing births instead of overwriting them with the reusable session id", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-tmux-birth-preserve-"));
+    const bin = join(cwd, "bin");
+    const tmux = join(bin, "tmux");
+    const log = join(cwd, "tmux.log");
+    const previousPath = process.env.PATH;
+    try {
+      await mkdir(bin, { recursive: true });
+      await writeFile(tmux, `#!/bin/sh
+printf '%s\\n' "$*" >> "${log}"
+case "$1" in
+  display-message) printf 'leader\\t$1\\t@1\\t%%1\\n' ;;
+  show-option)
+    case "$*" in
+      *' -p '*) printf 'pane-birth-existing\\n' ;;
+      *) printf 'session-birth-existing\\n' ;;
+    esac
+    ;;
+  set-option) exit 99 ;;
+esac
+`);
+      await chmod(tmux, 0o755);
+      process.env.PATH = `${bin}:${previousPath ?? ""}`;
+      const evidence = await establishCurrentTmuxInstanceBinding("reusable-session-id", "%1");
+      assert.equal(evidence?.sessionInstanceId, "session-birth-existing");
+      assert.equal(evidence?.paneInstanceId, "pane-birth-existing");
+      assert.doesNotMatch(await readFile(log, "utf-8"), /set-option/);
+    } finally {
+      if (typeof previousPath === "string") process.env.PATH = previousPath;
+      else delete process.env.PATH;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects an ABA-reused pane when its immutable context changes during verification", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-tmux-birth-aba-"));
+    const bin = join(cwd, "bin");
+    const tmux = join(bin, "tmux");
+    const state = join(cwd, "display-count");
+    const previousPath = process.env.PATH;
+    try {
+      await mkdir(bin, { recursive: true });
+      await writeFile(tmux, `#!/bin/sh
+count=0
+[ -f "${state}" ] && count=$(cat "${state}")
+case "$1" in
+  display-message)
+    count=$((count + 1)); printf '%s' "$count" > "${state}"
+    [ "$count" -gt 2 ] && printf 'leader\\t$1\\t@2\\t%%1\\n' || printf 'leader\\t$1\\t@1\\t%%1\\n'
+    ;;
+  show-option) printf 'pane-birth-existing\\n' ;;
+  show-options) printf 'session-birth-existing\\n' ;;
+esac
+`);
+      await chmod(tmux, 0o755);
+      process.env.PATH = `${bin}:${previousPath ?? ""}`;
+      assert.equal(await establishCurrentTmuxInstanceBinding("reusable-session-id", "%1"), null);
+    } finally {
+      if (typeof previousPath === "string") process.env.PATH = previousPath;
+      else delete process.env.PATH;
+      await rm(cwd, { recursive: true, force: true });
+    }
   });
 });
 

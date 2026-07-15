@@ -963,7 +963,7 @@ function buildTeamHookCondition(evidence?: TeamHudHookEvidence): string {
 
 function buildGuardedTeamResizeCommand(hudPaneId: string, heightLines: number, evidence?: TeamHudHookEvidence): string {
   const condition = buildTeamHookCondition(evidence);
-  if (condition === '#{==:0,1}') return ':';
+  if (condition === '#{==:0,1}') return buildBestEffortShellCommand(buildNestedTmuxShellCommand(buildHudResizeCommand(hudPaneId, heightLines)));
   const resizeCommand = buildHudResizeCommand(hudPaneId, heightLines);
   const guarded = `if-shell -t ${buildHudPaneTarget(hudPaneId)} -F ${shellQuoteSingle(condition)} ${shellQuoteSingle(resizeCommand)} ''`;
   return buildBestEffortShellCommand(buildNestedTmuxShellCommand(guarded));
@@ -1055,6 +1055,24 @@ export function registerHudHookIfVacant(hookTarget: string, args: string[]): boo
   return appendHudHook(hookTarget, args);
 }
 
+function teamHookGenerationOption(hookTarget: string): string {
+  return `@omx_team_hook_generation_${normalizeTmuxHookToken(hookTarget)}`;
+}
+
+function teamHookReceiptOption(hookTarget: string): string {
+  return `@omx_team_hook_receipt_${normalizeTmuxHookToken(hookTarget)}`;
+}
+
+function hasVerifiedTeamHookPair(hookTarget: string, generation: string): boolean {
+  const marker = `omx-generation=${generation}`;
+  for (const event of ['client-resized', 'client-attached']) {
+    const observed = runTmux(['show-hooks', '-t', hookTarget, event]);
+    if (!observed.ok || !observed.stdout.split('\n').some((line) => line.includes(marker))) return false;
+  }
+  return true;
+}
+
+/** Appends an inert pair, verifies receipts, then publishes it with an expected-generation CAS. */
 export function registerHudHooksTransactionally(
   hookTarget: string,
   resizeHookName: string,
@@ -1063,13 +1081,40 @@ export function registerHudHooksTransactionally(
   generation?: string,
   evidence?: Omit<TeamHudHookEvidence, 'generation'>,
 ): boolean {
-  if (!generation || !evidence) return false;
-  // Enable before append. A partial pair is safe only after a failed registration
-  // makes its unique generation inert; retained append-only commands then cannot resize.
-  if (!runTmux(['set-option', '-t', hookTarget, teamHookActiveOption(generation), '1']).ok) return false;
+  if (!generation || !evidence || !/^[0-9a-f-]{36}$/.test(generation)) return false;
+  const generationOption = teamHookGenerationOption(hookTarget);
+  const prior = runTmux(['show-options', '-qv', '-t', hookTarget, generationOption]);
+  if (!prior.ok) return false;
+  const priorGeneration = prior.stdout.trim();
+  if (priorGeneration && !/^[0-9a-f-]{36}$/.test(priorGeneration)) return false;
+  if (priorGeneration) {
+    const priorActive = runTmux(['show-options', '-qv', '-t', hookTarget, teamHookActiveOption(priorGeneration)]);
+    if (priorActive.ok && priorActive.stdout.trim() === '1' && hasVerifiedTeamHookPair(hookTarget, priorGeneration)) return true;
+  }
+
+  // The new pair is intentionally inert until both append receipts have been observed.
+  if (!runTmux(['set-option', '-t', hookTarget, teamHookActiveOption(generation), '0']).ok) return false;
   const resizeArgs = buildRegisterResizeHookArgs(hookTarget, resizeHookName, hudPaneId, HUD_TMUX_TEAM_HEIGHT_LINES, generation, evidence);
   const attachedArgs = buildRegisterClientAttachedReconcileArgs(hookTarget, clientAttachedHookName, hudPaneId, HUD_TMUX_TEAM_HEIGHT_LINES, generation, evidence);
-  if (appendHudHook(hookTarget, resizeArgs) && appendHudHook(hookTarget, attachedArgs)) return true;
+  if (!appendHudHook(hookTarget, resizeArgs) || !appendHudHook(hookTarget, attachedArgs) || !hasVerifiedTeamHookPair(hookTarget, generation)) {
+    runTmux(['set-option', '-t', hookTarget, teamHookActiveOption(generation), '0']);
+    return false;
+  }
+
+  const receiptOption = teamHookReceiptOption(hookTarget);
+  const receipt = randomUUID();
+  const condition = `#{==:#{${generationOption}},${priorGeneration}}`;
+  const publish = [
+    `set-option -t ${hookTarget} ${generationOption} ${generation}`,
+    `set-option -t ${hookTarget} ${teamHookActiveOption(generation)} 1`,
+    ...(priorGeneration ? [`set-option -t ${hookTarget} ${teamHookActiveOption(priorGeneration)} 0`] : []),
+    `set-option -t ${hookTarget} ${receiptOption} ${receipt}`,
+  ].join(' \\; ');
+  if (!runTmux(['if-shell', '-t', hookTarget, '-F', condition, publish, '']).ok) return false;
+  const applied = runTmux(['show-options', '-qv', '-t', hookTarget, receiptOption]);
+  const published = runTmux(['show-options', '-qv', '-t', hookTarget, generationOption]);
+  const active = runTmux(['show-options', '-qv', '-t', hookTarget, teamHookActiveOption(generation)]);
+  if (applied.ok && published.ok && active.ok && applied.stdout.trim() === receipt && published.stdout.trim() === generation && active.stdout.trim() === '1') return true;
   runTmux(['set-option', '-t', hookTarget, teamHookActiveOption(generation), '0']);
   return false;
 
@@ -1086,8 +1131,14 @@ export function unregisterHudHooksTransactionally(
   void resizeHookName;
   void clientAttachedHookName;
   void hudPaneId;
-  if (!generation) return false;
-  return runTmux(['set-option', '-t', hookTarget, teamHookActiveOption(generation), '0']).ok;
+  if (!generation || !/^[0-9a-f-]{36}$/.test(generation)) return false;
+  const receiptOption = teamHookReceiptOption(hookTarget);
+  const receipt = randomUUID();
+  const condition = `#{==:#{${teamHookGenerationOption(hookTarget)}},${generation}}`;
+  const deactivate = `set-option -t ${hookTarget} ${teamHookActiveOption(generation)} 0 \\; set-option -t ${hookTarget} ${receiptOption} ${receipt}`;
+  if (!runTmux(['if-shell', '-t', hookTarget, '-F', condition, deactivate, '']).ok) return false;
+  const applied = runTmux(['show-options', '-qv', '-t', hookTarget, receiptOption]);
+  return applied.ok && applied.stdout.trim() === receipt;
 }
 
 export function buildScheduleDelayedHudResizeArgs(
@@ -2027,15 +2078,15 @@ export function createTeamSession(
     const [retainedHudPaneId, ...duplicateHudPaneIds] = hasExactHudAuthority
       ? findExactTeamHudPaneIds(teamTarget, hudExactCandidate)
       : [];
+    // A duplicate's command and live tags prove only that it resembles this
+    // generation. They are not a transferable lifecycle receipt, so killing it
+    // would risk an ABA-reused pane. Stop before provisioning workers rather
+    // than silently running multiple HUD actors.
+    if (duplicateHudPaneIds.length > 0) {
+      throw new Error(`duplicate_exact_team_hud_without_receipts:${duplicateHudPaneIds.join(',')}`);
+    }
     const omxEntry = resolveOmxCliEntryPath();
     const canRecreateTeamHud = hasExactHudAuthority && Boolean(omxEntry && omxEntry.trim() !== '');
-    // Reclaim only exact, resolver-verified duplicate candidates. Legacy or
-    // unverified panes are preserved rather than inferred from their command.
-    if (canRecreateTeamHud) {
-      for (const hudPaneId of duplicateHudPaneIds) {
-        killExactTeamHudPane(teamTarget, hudPaneId, hudExactCandidate!, teamPaneOwnerId);
-      }
-    }
     const workerPaneIds: string[] = [];
     let rightStackRootPaneId: string | null = null;
     for (let i = 1; i <= workerCount; i++) {

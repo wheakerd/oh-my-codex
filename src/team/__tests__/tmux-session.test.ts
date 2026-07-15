@@ -64,6 +64,7 @@ import {
   probeExactTeamHudCandidate,
   unregisterHudHooksTransactionally,
   registerHudHookIfVacant,
+  registerHudHooksTransactionally,
 } from '../tmux-session.js';
 import { HUD_RESIZE_RECONCILE_DELAY_SECONDS, HUD_TMUX_TEAM_HEIGHT_LINES } from '../../hud/constants.js';
 import * as tmuxSessionModule from '../tmux-session.js';
@@ -197,14 +198,14 @@ if [ "${'$'}{1:-}" = "if-shell" ]; then
   receipt_file="$(option_path "${'$'}hook_target" "${'$'}receipt_option")"
   actual_receipt="$(cat "$receipt_file" 2>/dev/null || true)"
   if [ -z "${'$'}receipt_option" ] || [ "${'$'}actual_receipt" = "${'$'}expected_receipt" ]; then
-    first="${'$'}{branch%% \\; *}"
-    second="${'$'}{branch#* \\; }"
-    eval "set -- ${'$'}first"
-    "${'$'}0" "${'$'}@"
-    if [ "${'$'}second" != "${'$'}branch" ]; then
-      eval "set -- ${'$'}second"
+    remaining="${'$'}branch"
+    while [ -n "${'$'}remaining" ]; do
+      command="${'$'}{remaining%% \\; *}"
+      eval "set -- ${'$'}command"
       "${'$'}0" "${'$'}@"
-    fi
+      [ "${'$'}command" = "${'$'}remaining" ] && break
+      remaining="${'$'}{remaining#* \\; }"
+    done
   fi
   exit 0
 fi
@@ -536,6 +537,26 @@ fi
       assert.match(log, /set-hook -a -t team:0 client-resized/);
       assert.doesNotMatch(log, /set-hook -u/);
       assert.doesNotMatch(log, /if-shell -t team:0/);
+    });
+  });
+
+  it('reuses a published Team generation and keeps a partial pair inert', async () => {
+    await withMockTmuxFixture('omx-team-hook-generations-', (logPath) => `#!/bin/sh
+state_dir="${logPath}.hooks"; mkdir -p "$state_dir"
+key() { printf '%s' "$1" | tr -c 'A-Za-z0-9_-' '_'; }
+if [ "$1" = set-option ]; then printf '%s\\n' "$5" > "$state_dir/option-$(key "$4")"; exit 0; fi
+if [ "$1" = show-options ]; then [ -f "$state_dir/option-$(key "$5")" ] && cat "$state_dir/option-$(key "$5")"; exit 0; fi
+if [ "$1" = set-hook ]; then [ "$5" = client-attached ] && [ -f "$state_dir/fail-attached" ] && exit 1; printf '%s\\n' "$6" >> "$state_dir/hook-$(key "$5")"; exit 0; fi
+if [ "$1" = show-hooks ]; then [ -f "$state_dir/hook-$(key "$4")" ] && cat "$state_dir/hook-$(key "$4")"; exit 0; fi
+if [ "$1" = if-shell ]; then set -- $6; while [ "$#" -gt 0 ]; do if [ "$1" = set-option ]; then printf '%s\\n' "$5" > "$state_dir/option-$(key "$4")"; shift 5; else shift; fi; done; exit 0; fi
+`, async ({ logPath }) => {
+      const generation = '11111111-1111-4111-8111-111111111111';
+      assert.equal(registerHudHooksTransactionally('my-session:0', 'resize', 'attached', '%1', generation, hookEvidence), true);
+      assert.equal(registerHudHooksTransactionally('my-session:0', 'resize', 'attached', '%1', generation, hookEvidence), true);
+      assert.equal((await readFile(`${logPath}.hooks/hook-client-resized`, 'utf8')).trim().split('\n').length, 1);
+      await writeFile(`${logPath}.hooks/fail-attached`, '1');
+      assert.equal(registerHudHooksTransactionally('other:0', 'resize', 'attached', '%1', '33333333-3333-4333-8333-333333333333', hookEvidence), false);
+      assert.equal((await readFile(`${logPath}.hooks/option-_omx_team_hook_active_33333333_3333_4333_8333_333333333333`, 'utf8')).trim(), '0');
     });
   });
 
@@ -4696,6 +4717,67 @@ esac
       else delete process.env.OMX_SESSION_ID;
       if (typeof prevWorkerCli === 'string') process.env.OMX_TEAM_WORKER_CLI = prevWorkerCli;
       else delete process.env.OMX_TEAM_WORKER_CLI;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+
+  it('fails closed before worker provisioning when exact Team HUD duplicates lack lifecycle receipts', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-duplicate-hud-'));
+    const previousTmux = process.env.TMUX;
+    const previousPane = process.env.TMUX_PANE;
+    try {
+      await withMockTmuxFixture(
+        'omx-team-duplicate-hud-',
+        (logPath) => `#!/bin/sh
+printf '%s\\n' "$*" >> "${logPath}"
+case "$1" in
+  display-message) printf 'shared:0 %%1\\n'; exit 0 ;;
+  list-panes)
+    printf "%%1\tnode\t'codex'\tpane-birth\tsession-birth\n"
+    printf "%%2\tnode\texec env OMX_SESSION_ID='owner-session' OMX_TMUX_HUD_OWNER='1' OMX_TMUX_HUD_LEADER_PANE='%%1' node /tmp/bin/omx.js hud --watch\tpane-birth\tsession-birth\n"
+    printf "%%3\tnode\texec env OMX_SESSION_ID='owner-session' OMX_TMUX_HUD_OWNER='1' OMX_TMUX_HUD_LEADER_PANE='%%1' node /tmp/bin/omx.js hud --watch\tpane-birth\tsession-birth\n"
+    exit 0
+    ;;
+  show-options) printf 'session-birth\\n'; exit 0 ;;
+  show-option)
+    case "$*" in
+      *"@omx_team_pane_owner_id"*) printf 'team:duplicate-hud\n' ;;
+      *) printf 'pane-birth\n' ;;
+    esac
+    exit 0
+    ;;
+  set-option) exit 0 ;;
+esac
+`,
+        async ({ logPath }) => {
+          process.env.TMUX = 'shared,stub,0';
+          process.env.TMUX_PANE = '%1';
+          assert.throws(
+            () => createTeamSession('Duplicate HUD', 1, cwd, [], [], {
+              ownerSessionId: 'owner-session',
+              hudExactCandidate: {
+                sessionId: 'owner-session',
+                sessionIds: ['owner-session'],
+                leaderPaneId: '%1',
+                tmuxSessionInstanceId: 'session-birth',
+                tmuxPaneInstanceId: 'pane-birth',
+                tmuxSessionName: 'shared',
+                tmuxWindowIndex: '0',
+              },
+            }),
+            /duplicate_exact_team_hud_without_receipts:%3/,
+          );
+          const log = await readFile(logPath, 'utf-8');
+          assert.doesNotMatch(log, /kill-pane/);
+          assert.doesNotMatch(log, /split-window/);
+        },
+      );
+    } finally {
+      if (typeof previousTmux === 'string') process.env.TMUX = previousTmux;
+      else delete process.env.TMUX;
+      if (typeof previousPane === 'string') process.env.TMUX_PANE = previousPane;
+      else delete process.env.TMUX_PANE;
       await rm(cwd, { recursive: true, force: true });
     }
   });

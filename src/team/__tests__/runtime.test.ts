@@ -29,6 +29,9 @@ import {
   createTeamLifecycleGeneration,
   finalizeTeamLifecycleGeneration,
   readTeamLifecycleGeneration,
+  probeTeamLifecycleGeneration,
+  setLifecycleCertificateReaderForTests,
+  resetLifecycleCertificateReaderForTests,
 } from '../state.js';
 import {
   monitorTeam,
@@ -626,6 +629,7 @@ beforeEach(() => {
 afterEach(() => {
   if (typeof ORIGINAL_OMX_TEAM_STATE_ROOT === 'string') process.env.OMX_TEAM_STATE_ROOT = ORIGINAL_OMX_TEAM_STATE_ROOT;
   else delete process.env.OMX_TEAM_STATE_ROOT;
+  resetLifecycleCertificateReaderForTests();
 });
 
 describe('runtime', () => {
@@ -658,6 +662,65 @@ describe('runtime', () => {
         tmux_session_birth: 'session-birth-2',
       }), false);
       assert.equal((await readTeamLifecycleGeneration(teamName, cwd))?.status, 'active');
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('distinguishes missing, malformed, permission, and transient lifecycle certificate probes', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-lifecycle-probe-'));
+    const teamName = 'team-lifecycle-probe';
+    try {
+      assert.deepEqual(await probeTeamLifecycleGeneration(teamName, cwd), { status: 'confirmed_missing' });
+
+      const certificatePath = join(cwd, '.omx', 'state', 'team', teamName, 'lifecycle-generation.json');
+      await mkdir(dirname(certificatePath), { recursive: true });
+      await writeFile(certificatePath, '{not-json', 'utf-8');
+      assert.deepEqual(await probeTeamLifecycleGeneration(teamName, cwd), { status: 'invalid' });
+
+      const permissionError = Object.assign(new Error('permission denied'), { code: 'EACCES' });
+      setLifecycleCertificateReaderForTests(async () => { throw permissionError; });
+      const permissionProbe = await probeTeamLifecycleGeneration(teamName, cwd);
+      assert.equal(permissionProbe.status, 'read_error');
+      if (permissionProbe.status === 'read_error') assert.equal(permissionProbe.error.code, 'EACCES');
+
+      const transientError = Object.assign(new Error('resource busy'), { code: 'EBUSY' });
+      setLifecycleCertificateReaderForTests(async () => { throw transientError; });
+      const transientProbe = await probeTeamLifecycleGeneration(teamName, cwd);
+      assert.equal(transientProbe.status, 'read_error');
+      if (transientProbe.status === 'read_error') assert.equal(transientProbe.error.code, 'EBUSY');
+    } finally {
+      resetLifecycleCertificateReaderForTests();
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('retains interactive metadata when its lifecycle certificate is missing or malformed', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-lifecycle-retention-'));
+    const teamName = 'team-lifecycle-retention';
+    try {
+      await initTeamState(teamName, 'retention test', 'executor', 1, cwd);
+      await assert.rejects(
+        () => shutdownTeam(teamName, cwd, { force: true }),
+        /shutdown_recovery_required:lifecycle_certificate_confirmed_missing/,
+      );
+      const teamRoot = join(cwd, '.omx', 'state', 'team', teamName);
+      assert.equal(existsSync(teamRoot), true);
+
+      await writeFile(join(teamRoot, 'lifecycle-generation.json'), '{not-json', 'utf-8');
+      await assert.rejects(
+        () => shutdownTeam(teamName, cwd, { force: true }),
+        /shutdown_recovery_required:lifecycle_certificate_invalid/,
+      );
+      assert.equal(existsSync(teamRoot), true);
+
+      const transientError = Object.assign(new Error('temporary read failure'), { code: 'EIO' });
+      setLifecycleCertificateReaderForTests(async () => { throw transientError; });
+      await assert.rejects(
+        () => shutdownTeam(teamName, cwd, { force: true }),
+        /shutdown_recovery_required:lifecycle_certificate_read_error/,
+      );
+      assert.equal(existsSync(teamRoot), true);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

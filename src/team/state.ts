@@ -136,6 +136,13 @@ export interface TeamLifecycleGenerationCertificate {
   resources: TeamLifecycleResource[];
 }
 
+/** Result of reading an immutable Team lifecycle certificate without collapsing uncertainty. */
+export type TeamLifecycleCertificateProbe =
+  | { status: 'confirmed_missing' }
+  | { status: 'valid'; certificate: TeamLifecycleGenerationCertificate }
+  | { status: 'invalid' }
+  | { status: 'read_error'; error: NodeJS.ErrnoException };
+
 export interface WorkerInfo {
   name: string; // "worker-1"
   index: number; // tmux window index (1-based)
@@ -682,6 +689,17 @@ function lifecycleGenerationPath(teamName: string, cwd: string): string {
   return join(teamDir(teamName, cwd), 'lifecycle-generation.json');
 }
 
+type LifecycleCertificateReader = (path: string) => Promise<string>;
+let lifecycleCertificateReader: LifecycleCertificateReader = async (path) => await readFile(path, 'utf-8');
+
+export function setLifecycleCertificateReaderForTests(reader: LifecycleCertificateReader): void {
+  lifecycleCertificateReader = reader;
+}
+
+export function resetLifecycleCertificateReaderForTests(): void {
+  lifecycleCertificateReader = async (path) => await readFile(path, 'utf-8');
+}
+
 function isLifecycleCertificate(value: unknown): value is TeamLifecycleGenerationCertificate {
   if (!value || typeof value !== 'object') return false;
   const certificate = value as Partial<TeamLifecycleGenerationCertificate>;
@@ -694,13 +712,31 @@ function isLifecycleCertificate(value: unknown): value is TeamLifecycleGeneratio
         && typeof certificate.tmux_context === 'string'));
 }
 
-export async function readTeamLifecycleGeneration(teamName: string, cwd: string): Promise<TeamLifecycleGenerationCertificate | null> {
+/**
+ * Probes the immutable lifecycle certificate while preserving the distinction
+ * between absence, malformed contents, and inability to read the file.
+ */
+export async function probeTeamLifecycleGeneration(
+  teamName: string,
+  cwd: string,
+): Promise<TeamLifecycleCertificateProbe> {
   try {
-    const parsed: unknown = JSON.parse(await readFile(lifecycleGenerationPath(teamName, cwd), 'utf-8'));
-    return isLifecycleCertificate(parsed) ? parsed : null;
-  } catch {
-    return null;
+    const parsed: unknown = JSON.parse(await lifecycleCertificateReader(lifecycleGenerationPath(teamName, cwd)));
+    return isLifecycleCertificate(parsed)
+      ? { status: 'valid', certificate: parsed }
+      : { status: 'invalid' };
+  } catch (error) {
+    const errno = error as NodeJS.ErrnoException;
+    if (errno?.code === 'ENOENT') return { status: 'confirmed_missing' };
+    if (error instanceof SyntaxError) return { status: 'invalid' };
+    return { status: 'read_error', error: errno };
   }
+}
+
+/** Legacy convenience reader. Cleanup paths must use probeTeamLifecycleGeneration. */
+export async function readTeamLifecycleGeneration(teamName: string, cwd: string): Promise<TeamLifecycleGenerationCertificate | null> {
+  const probe = await probeTeamLifecycleGeneration(teamName, cwd);
+  return probe.status === 'valid' ? probe.certificate : null;
 }
 
 /** Serializes lifecycle certificate creation, status updates, and receipt appends. */
@@ -713,8 +749,10 @@ async function withLifecycleGenerationLock<T>(teamName: string, cwd: string, fn:
 export async function createTeamLifecycleGeneration(certificate: TeamLifecycleGenerationCertificate, cwd: string): Promise<boolean> {
   if (!isLifecycleCertificate(certificate) || certificate.status !== 'preparing') return false;
   return await withLifecycleGenerationLock(certificate.team_name, cwd, async () => {
-    const existing = await readTeamLifecycleGeneration(certificate.team_name, cwd);
-    if (existing) return existing.token === certificate.token;
+    const existing = await probeTeamLifecycleGeneration(certificate.team_name, cwd);
+    if (existing.status !== 'confirmed_missing') {
+      return existing.status === 'valid' && existing.certificate.token === certificate.token;
+    }
     await writeAtomic(lifecycleGenerationPath(certificate.team_name, cwd), `${JSON.stringify(certificate, null, 2)}\n`);
     return true;
   });

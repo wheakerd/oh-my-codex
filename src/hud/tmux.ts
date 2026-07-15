@@ -741,6 +741,28 @@ function hudHookGenerationOption(leaderPaneId: string, leaderBirth: string): str
   return `@omx_hud_hook_generation_${key}`;
 }
 
+function hudHookReceiptOption(leaderPaneId: string, leaderBirth: string): string {
+  return `${hudHookGenerationOption(leaderPaneId, leaderBirth)}_receipt`;
+}
+
+function isHudHookGeneration(value: string): boolean {
+  return /^[0-9a-f-]{36}$/.test(value);
+}
+
+function hasVerifiedHudHookPair(
+  context: HudResizeHookContext,
+  generation: string,
+  execTmuxSync: TmuxExecSync,
+): boolean {
+  const marker = `omx-hud-owned:${generation}`;
+  for (const event of ['client-resized', 'window-layout-changed']) {
+    const hooks = execTmuxSync(['show-hooks', '-t', context.sessionId, event]);
+    if (!hooks.split('\n').some((line) => line.includes(marker))) return false;
+  }
+  return true;
+}
+
+/** Registers an inert pair, verifies its append receipts, then CAS-publishes it. */
 export function registerHudResizeHook(
   hudPaneId: string,
   leaderPaneId: string | undefined,
@@ -765,28 +787,51 @@ export function registerHudResizeHook(
     ]).trim().split('\t').map((value) => value.trim());
     const leaderBirth = execTmuxSync(['display-message', '-p', '-t', leaderPaneId, '#{@omx_pane_instance_id}']).trim();
     if (!hudBirth || !sessionBirth || !sessionName || !windowId || !currentCommand || !startCommand || !leaderBirth) return false;
+    const generationOption = hudHookGenerationOption(leaderPaneId, leaderBirth);
+    const priorGeneration = execTmuxSync(['show-option', '-qv', '-t', context.sessionId, generationOption]).trim();
+    if (priorGeneration && !isHudHookGeneration(priorGeneration)) return false;
+    if (priorGeneration) {
+      const priorActive = execTmuxSync(['show-option', '-qv', '-t', context.sessionId, `@omx_hud_hook_active_${priorGeneration.replace(/-/g, '_')}`]).trim();
+      if (priorActive === '1' && hasVerifiedHudHookPair(context, priorGeneration, execTmuxSync)) return true;
+    }
+
     const generation = randomUUID();
     activeOption = `@omx_hud_hook_active_${generation.replace(/-/g, '_')}`;
-    const generationOption = hudHookGenerationOption(leaderPaneId, leaderBirth);
+    const receiptOption = hudHookReceiptOption(leaderPaneId, leaderBirth);
+    const receipt = randomUUID();
     const condition = `#{&&:#{==:#{pane_id},${tmuxFormatLiteral(hudPaneId)}},#{==:#{pane_current_command},${tmuxFormatLiteral(currentCommand)}},#{==:#{pane_start_command},${tmuxFormatLiteral(startCommand)}},#{==:#{@omx_pane_instance_id},${tmuxFormatLiteral(hudBirth)}},#{==:#{@omx_instance_id},${tmuxFormatLiteral(sessionBirth)}},#{==:#{session_name},${tmuxFormatLiteral(sessionName)}},#{==:#{window_id},${tmuxFormatLiteral(windowId)}},#{==:#{${activeOption}},1}}`;
     const tmuxBin = resolveTmuxBinaryForPlatform() || 'tmux';
     const height = String(Math.max(1, Math.floor(heightLines)));
     const resize = buildHudResizeHookCommand(tmuxBin, hudPaneId, height, condition, options.env?.TMUX);
     const reconcile = buildHudLayoutReconcileHookCommand(tmuxBin, omxBin, leaderPaneId, options);
     const wrap = (command: string) => `if-shell -t ${hudPaneId} -F ${shellEscapeSingle(condition)} ${shellEscapeSingle(`run-shell -b ${command}`)} '' # omx-hud-owned:${generation}`;
-    execTmuxSync(['set-option', '-t', context.sessionId, activeOption, '1']);
-    execTmuxSync(['set-option', '-t', context.sessionId, generationOption, generation]);
-    // tmux serializes -a registration and assigns a fresh numeric slot. Existing
-    // foreign/older hooks are never observed as mutation authority or replaced.
+
+    // A partially appended pair remains inert forever unless both append receipts are observed.
+    execTmuxSync(['set-option', '-t', context.sessionId, activeOption, '0']);
     execTmuxSync(['set-hook', '-a', '-t', context.sessionId, 'client-resized', wrap(resize)]);
     execTmuxSync(['set-hook', '-a', '-t', context.sessionId, 'window-layout-changed', wrap(reconcile)]);
-    return true;
+    if (!hasVerifiedHudHookPair(context, generation, execTmuxSync)) return false;
+
+    const publishCondition = `#{==:#{${generationOption}},${tmuxFormatLiteral(priorGeneration)}}`;
+    const publish = [
+      `set-option -t ${context.sessionId} ${generationOption} ${generation}`,
+      `set-option -t ${context.sessionId} ${activeOption} 1`,
+      ...(priorGeneration ? [`set-option -t ${context.sessionId} @omx_hud_hook_active_${priorGeneration.replace(/-/g, '_')} 0`] : []),
+      `set-option -t ${context.sessionId} ${receiptOption} ${receipt}`,
+    ].join(' \\; ');
+    execTmuxSync(['if-shell', '-t', context.sessionId, '-F', publishCondition, publish, '']);
+    const applied = execTmuxSync(['show-option', '-qv', '-t', context.sessionId, receiptOption]).trim();
+    const published = execTmuxSync(['show-option', '-qv', '-t', context.sessionId, generationOption]).trim();
+    const active = execTmuxSync(['show-option', '-qv', '-t', context.sessionId, activeOption]).trim();
+    if (applied === receipt && published === generation && active === '1') return true;
+    execTmuxSync(['set-option', '-t', context.sessionId, activeOption, '0']);
+    return false;
   } catch {
     if (activeOption) {
       try {
         execTmuxSync(['set-option', '-t', context.sessionId, activeOption, '0']);
       } catch {
-        // A failed inert write remains recovery uncertainty.
+        // Failure to make an incomplete generation inert is retained as a failed registration.
       }
     }
     return false;
@@ -803,10 +848,15 @@ export function unregisterHudResizeHook(
   try {
     const leaderBirth = execTmuxSync(['display-message', '-p', '-t', leaderPaneId, '#{@omx_pane_instance_id}']).trim();
     if (!leaderBirth) return false;
-    const generation = execTmuxSync(['show-option', '-qv', '-t', context.sessionId, hudHookGenerationOption(leaderPaneId, leaderBirth)]).trim();
-    if (!/^[0-9a-f-]{36}$/.test(generation)) return false;
-    execTmuxSync(['set-option', '-t', context.sessionId, `@omx_hud_hook_active_${generation.replace(/-/g, '_')}`, '0']);
-    return true;
+    const generationOption = hudHookGenerationOption(leaderPaneId, leaderBirth);
+    const generation = execTmuxSync(['show-option', '-qv', '-t', context.sessionId, generationOption]).trim();
+    if (!isHudHookGeneration(generation)) return false;
+    const receiptOption = hudHookReceiptOption(leaderPaneId, leaderBirth);
+    const receipt = randomUUID();
+    const condition = `#{==:#{${generationOption}},${generation}}`;
+    const deactivate = `set-option -t ${context.sessionId} @omx_hud_hook_active_${generation.replace(/-/g, '_')} 0 \\; set-option -t ${context.sessionId} ${receiptOption} ${receipt}`;
+    execTmuxSync(['if-shell', '-t', context.sessionId, '-F', condition, deactivate, '']);
+    return execTmuxSync(['show-option', '-qv', '-t', context.sessionId, receiptOption]).trim() === receipt;
   } catch {
     return false;
   }

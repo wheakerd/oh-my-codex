@@ -50,6 +50,7 @@ import {
   appendTeamLifecycleResourceSync,
   createTeamLifecycleGeneration,
   finalizeTeamLifecycleGeneration,
+  probeTeamLifecycleGeneration,
   readTeamLifecycleGeneration,
   type TeamLifecycleGenerationCertificate,
 } from './state.js';
@@ -3926,6 +3927,14 @@ function resolveCommitHygieneArtifactTeamNames(config: TeamConfig, internalTeamN
   return names;
 }
 
+function hasInteractiveTmuxOwnershipEvidence(config: TeamConfig): boolean {
+  return config.worker_launch_mode === 'interactive'
+    || Boolean(config.hud_pane_id)
+    || Boolean(config.resize_hook_name)
+    || Boolean(config.resize_hook_target)
+    || config.workers.some((worker) => Boolean(worker.pane_id));
+}
+
 /**
  * Graceful shutdown: send shutdown inbox to all workers, wait, force kill, cleanup.
  */
@@ -3935,14 +3944,23 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
   let skipWorkerAcks = false;
   const sanitized = resolveTeamNameForCurrentContext(teamName, cwd);
   const config = await readTeamConfig(sanitized, cwd);
+  const lifecycleCertificateProbe = await probeTeamLifecycleGeneration(sanitized, cwd);
   if (!config) {
     // A missing mutable config is never authority to guess a session name or
-    // delete recovery state. Retain any immutable certificate for recovery.
-    const certificate = await readTeamLifecycleGeneration(sanitized, cwd);
-    if (certificate) throw new Error(`shutdown_recovery_required:missing_config:${certificate.token}`);
+    // delete recovery state. Invalid and unreadable certificates are also
+    // recovery state, not proof that no interactive generation exists.
+    if (lifecycleCertificateProbe.status === 'valid') {
+      throw new Error(`shutdown_recovery_required:missing_config:${lifecycleCertificateProbe.certificate.token}`);
+    }
+    if (lifecycleCertificateProbe.status !== 'confirmed_missing') {
+      throw new Error(`shutdown_recovery_required:unreadable_certificate:${lifecycleCertificateProbe.status}`);
+    }
     throw new Error(`Team ${sanitized} not found`);
   }
-  const lifecycleCertificate = await readTeamLifecycleGeneration(sanitized, cwd);
+  const lifecycleCertificate = lifecycleCertificateProbe.status === 'valid'
+    ? lifecycleCertificateProbe.certificate
+    : null;
+  const lifecycleCertificateUnavailable = hasInteractiveTmuxOwnershipEvidence(config) && !lifecycleCertificate;
   const manifest = await readTeamManifestV2(sanitized, cwd);
   const leaderSessionId = typeof manifest?.leader?.session_id === 'string'
     ? manifest.leader.session_id.trim()
@@ -4082,7 +4100,7 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
   // 3. Force kill remaining workers
   const leaderPaneId = config.leader_pane_id;
   const hudPaneId = config.hud_pane_id;
-  let retainHudLifecycleState = false;
+  let retainHudLifecycleState = lifecycleCertificateUnavailable;
   let retainHudContainer = false;
   const lifecycleAuthority = lifecycleCertificate?.status === 'active'
     && lifecycleCertificate.team_name === sanitized
@@ -4639,11 +4657,18 @@ async function detectAndCleanStaleTeam(
 
   // listTeamSessions has no error channel. An active/preparing immutable
   // generation therefore makes a missing session result uncertain, not stale.
-  const lifecycleCertificate = await readTeamLifecycleGeneration(teamName, leaderCwd);
-  if (lifecycleCertificate?.status === 'active' || lifecycleCertificate?.status === 'preparing') return;
+  const lifecycleCertificateProbe = await probeTeamLifecycleGeneration(teamName, leaderCwd);
+  if (lifecycleCertificateProbe.status === 'valid'
+    && (lifecycleCertificateProbe.certificate.status === 'active'
+      || lifecycleCertificateProbe.certificate.status === 'preparing')) return;
+  const retainedHudConfig = await readTeamConfig(teamName, leaderCwd);
+  // An interactive config can name panes, hooks, or a session acquired before
+  // its final receipt. Never delete that recovery metadata without a valid
+  // terminal certificate.
+  if (retainedHudConfig && hasInteractiveTmuxOwnershipEvidence(retainedHudConfig)
+    && lifecycleCertificateProbe.status !== 'valid') return;
   const sessions = new Set(listTeamSessions());
   if (sessions.has(`omx-team-${teamName}`)) return;
-  const retainedHudConfig = await readTeamConfig(teamName, leaderCwd);
   if (
     retainedHudConfig?.worker_launch_mode === 'interactive'
     && retainedHudConfig.hud_pane_id

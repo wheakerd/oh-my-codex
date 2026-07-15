@@ -3568,38 +3568,51 @@ async function resolvePreLaunchSessionPointerOptions(): Promise<{
   };
 }
 
-function tagTmuxSessionWithInstance(sessionName: string, sessionId: string): void {
-  const target = sessionName.trim();
-  const instanceId = sessionId.trim();
-  if (!target || !instanceId) return;
-  execFileSync("tmux", ["set-option", "-t", target, OMX_INSTANCE_OPTION, instanceId], {
-    stdio: ["ignore", "ignore", "ignore"],
-    timeout: 2000,
-  });
-}
-
-async function establishCurrentTmuxInstanceBinding(
+/**
+ * Establishes opaque tmux births exactly once. The logical Codex session id is
+ * deliberately not a tmux birth: it can be replayed after tmux has recycled a
+ * session or pane name.
+ */
+export async function establishCurrentTmuxInstanceBinding(
   sessionId: string,
   paneId: string | undefined = process.env.TMUX_PANE,
   expectedSessionName?: string,
 ): Promise<ActualTmuxInstanceEvidence | null> {
   const paneTarget = paneId?.trim() ?? '';
-  if (!paneTarget) return null;
+  if (!sessionId.trim() || !paneTarget) return null;
   try {
-    const sessionName = expectedSessionName?.trim() || execFileSync(
-      "tmux",
-      ["display-message", "-p", "-t", paneTarget, "#S"],
-      { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"], timeout: 2000 },
-    ).trim();
-    if (!sessionName) return null;
-    tagTmuxSessionWithInstance(sessionName, sessionId);
-    execFileSync("tmux", ["set-option", "-p", "-t", paneTarget, OMX_PANE_INSTANCE_OPTION, sessionId], {
-      stdio: ["ignore", "ignore", "ignore"],
-      timeout: 2000,
-    });
-    const evidence = await probeActualTmuxInstanceEvidence(paneTarget);
-    if (evidence.sessionName !== sessionName || !tmuxEvidenceBindsCandidate(evidence, sessionId)) return null;
-    return evidence;
+    const before = await probeActualTmuxInstanceEvidence(paneTarget);
+    const sessionName = expectedSessionName?.trim() || before.sessionName;
+    if (!sessionName || before.sessionName !== sessionName || !before.contextStable
+      || before.paneTarget !== paneTarget
+      || before.paneTagStatus === 'error' || before.sessionTagStatus === 'error') return null;
+
+    const sessionBirth = before.sessionInstanceId || randomUUID();
+    if (!before.sessionInstanceId) {
+      execFileSync('tmux', ['set-option', '-o', '-t', sessionName, OMX_INSTANCE_OPTION, sessionBirth], {
+        stdio: ['ignore', 'ignore', 'ignore'],
+        timeout: 2000,
+      });
+    }
+    const paneBirth = before.paneInstanceId || randomUUID();
+    if (!before.paneInstanceId) {
+      execFileSync('tmux', ['set-option', '-o', '-p', '-t', paneTarget, OMX_PANE_INSTANCE_OPTION, paneBirth], {
+        stdio: ['ignore', 'ignore', 'ignore'],
+        timeout: 2000,
+      });
+    }
+
+    const after = await probeActualTmuxInstanceEvidence(paneTarget);
+    if (!after.contextStable
+      || after.paneTarget !== paneTarget
+      || after.sessionName !== sessionName
+      || after.sessionId !== before.sessionId
+      || after.windowId !== before.windowId
+      || after.sessionInstanceId !== sessionBirth
+      || after.paneInstanceId !== paneBirth
+      || after.sessionTagStatus !== 'present'
+      || after.paneTagStatus !== 'present') return null;
+    return after;
   } catch {
     return null;
   }

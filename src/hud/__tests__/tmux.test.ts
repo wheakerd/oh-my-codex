@@ -157,10 +157,19 @@ describe('HUD resize hook helpers', () => {
         hooks.set(event, [...(hooks.get(event) ?? []), args[5]!]);
         return '';
       }
+      if (args[0] === 'if-shell' && args[1] === '-t' && args[3] === '-F') {
+        const expected = (args[4] ?? '').match(/#\{(@[^}]+)\},([^}]+)\}/);
+        if (expected && (options.get(expected[1]!) ?? '') !== expected[2]) return '';
+        for (const command of (args[5] ?? '').split(' \\; ')) {
+          const parts = command.split(' ');
+          if (parts[0] === 'set-option' && parts[1] === '-t' && parts[3] && parts[4]) options.set(parts[3], parts[4]);
+        }
+        return '';
+      }
       if (args[0] === 'show-hooks') return (hooks.get(args[3]!) ?? []).map((command, index) => `${args[3]}[${index}] ${command}`).join('\n');
       return '';
     };
-    return { hooks, calls, exec };
+    return { hooks, options, calls, exec };
   }
 
   it('appends a self-validating paired hook generation without touching existing hooks', () => {
@@ -182,16 +191,51 @@ describe('HUD resize hook helpers', () => {
     assert.equal(fixture.calls.some((args) => args[0] === 'set-hook' && args.includes('-u')), false);
   });
 
-  it('retains a partial pair and deactivates only its persisted generation on teardown', () => {
+  it('reuses a verified published generation across unchanged reconciliation', () => {
+    const fixture = appendOnlyHooks();
+    assert.equal(registerHudResizeHook('%9', '%1', 3, { cwd: '/repo', env: { TMUX: '/tmp/tmux' } }, fixture.exec), true);
+    assert.equal(registerHudResizeHook('%9', '%1', 3, { cwd: '/repo', env: { TMUX: '/tmp/tmux' } }, fixture.exec), true);
+    assert.equal(fixture.hooks.get('client-resized')?.length, 1);
+    assert.equal(fixture.hooks.get('window-layout-changed')?.length, 1);
+    assert.equal([...fixture.options.entries()].filter(([name, value]) => name.startsWith('@omx_hud_hook_active_') && value === '1').length, 1);
+  });
+
+  it('keeps a partial standalone pair inert when the second append fails', () => {
+    const fixture = appendOnlyHooks();
+    const exec = (args: string[]) => {
+      if (args[0] === 'set-hook' && args[4] === 'window-layout-changed') throw new Error('append failed');
+      return fixture.exec(args);
+    };
+    assert.equal(registerHudResizeHook('%9', '%1', 3, { cwd: '/repo', env: { TMUX: '/tmp/tmux' } }, exec), false);
+    assert.equal(fixture.hooks.get('client-resized')?.length, 1);
+    assert.equal(fixture.hooks.get('window-layout-changed')?.length ?? 0, 0);
+    assert.equal([...fixture.options.entries()].some(([name, value]) => name.startsWith('@omx_hud_hook_active_') && value === '1'), false);
+  });
+
+  it('retains the complete append-only pair and CAS-deactivates its persisted generation on teardown', () => {
     const fixture = appendOnlyHooks();
     assert.equal(registerHudResizeHook('%9', '%1', 3, { cwd: '/repo', env: { TMUX: '/tmp/tmux' } }, fixture.exec), true);
     assert.equal(unregisterHudResizeHook('%1', fixture.exec), true);
     const inactive = fixture.calls.filter((args) => args[0] === 'set-option' && args.at(-1) === '0');
     assert.equal(inactive.length, 1);
-    assert.equal(fixture.calls.some((args) => args[0] === 'show-hooks'), false);
+    assert.equal(fixture.calls.some((args) => args[0] === 'show-hooks'), true);
     assert.equal(fixture.calls.some((args) => args[0] === 'set-hook' && args.includes('-u')), false);
     assert.equal(fixture.hooks.get('client-resized')?.length, 1);
     assert.equal(fixture.hooks.get('window-layout-changed')?.length, 1);
+  });
+
+  it('does not deactivate a successor published after teardown read its predecessor', () => {
+    const fixture = appendOnlyHooks();
+    assert.equal(registerHudResizeHook('%9', '%1', 3, { cwd: '/repo', env: { TMUX: '/tmp/tmux' } }, fixture.exec), true);
+    const exec = (args: string[]) => {
+      if (args[0] === 'if-shell') {
+        fixture.options.set('@omx_hud_hook_generation_1_leader_birth', '44444444-4444-4444-8444-444444444444');
+        return '';
+      }
+      return fixture.exec(args);
+    };
+    assert.equal(unregisterHudResizeHook('%1', exec), false);
+    assert.equal(fixture.options.get('@omx_hud_hook_active_44444444_4444_4444_8444_444444444444'), undefined);
   });
 
   it('does not require or mutate a derived hook slot during foreign replacement races', () => {
@@ -199,7 +243,7 @@ describe('HUD resize hook helpers', () => {
     fixture.hooks.set('window-layout-changed', ['run-shell -b foreign replacement']);
     assert.equal(registerHudResizeHook('%9', '%1', 3, { cwd: '/repo', env: { TMUX: '/tmp/tmux' } }, fixture.exec), true);
     assert.equal(fixture.hooks.get('window-layout-changed')?.[0], 'run-shell -b foreign replacement');
-    assert.equal(fixture.calls.some((args) => args[0] === 'if-shell'), false);
+    assert.equal(fixture.calls.some((args) => args[0] === 'if-shell'), true);
   });
 });
 

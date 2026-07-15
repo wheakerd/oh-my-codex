@@ -92,15 +92,11 @@ function ensureHudResizeHook(
   desiredHeight: number,
   cwd: string,
   deps: ReconcileHudForPromptSubmitDeps,
-): void {
-  try {
-    (deps.registerHudResizeHook ?? registerHudResizeHook)(hudPaneId, leaderPaneId, desiredHeight, {
-      cwd,
-      env: deps.env ?? process.env,
-    });
-  } catch {
-    // Non-critical — hook registration failure does not break HUD lifecycle.
-  }
+): boolean {
+  return (deps.registerHudResizeHook ?? registerHudResizeHook)(hudPaneId, leaderPaneId, desiredHeight, {
+    cwd,
+    env: deps.env ?? process.env,
+  });
 }
 
 function hasCompleteGeometry(pane: TmuxPaneSnapshot): boolean {
@@ -478,9 +474,9 @@ export async function reconcileHudForPromptSubmit(
   if (singleHudPane && !needsHudTopologyRecreate(singleHudPane, leaderPane)) {
     const shouldResize = needsHudHeightResize(singleHudPane, desiredHeight);
     const resized = shouldResize ? resizePane(singleHudPane.paneId, desiredHeight) : true;
-    if (resized) ensureHudResizeHook(singleHudPane.paneId, currentPaneId, desiredHeight, cwd, deps);
+    const hooksRegistered = resized && ensureHudResizeHook(singleHudPane.paneId, currentPaneId, desiredHeight, cwd, deps);
     return {
-      status: resized ? (shouldResize ? 'resized' : 'unchanged') : 'failed',
+      status: resized && hooksRegistered ? (shouldResize ? 'resized' : 'unchanged') : 'failed',
       paneId: singleHudPane.paneId,
       desiredHeight,
       duplicateCount,
@@ -498,9 +494,9 @@ export async function reconcileHudForPromptSubmit(
         await killOwnedHudPane(paneId);
       }
       const resized = resizePane(keeperPane.paneId, desiredHeight);
-      if (resized) ensureHudResizeHook(keeperPane.paneId, currentPaneId, desiredHeight, cwd, deps);
+      const hooksRegistered = resized && ensureHudResizeHook(keeperPane.paneId, currentPaneId, desiredHeight, cwd, deps);
       return {
-        status: resized ? 'replaced_duplicates' : 'failed',
+        status: resized && hooksRegistered ? 'replaced_duplicates' : 'failed',
         paneId: keeperPane.paneId,
         desiredHeight,
         duplicateCount,
@@ -586,10 +582,10 @@ export async function reconcileHudForPromptSubmit(
       duplicateCount: postCreate.duplicatePaneIds.length,
     };
   }
-  ensureHudResizeHook(postCreate.paneId, currentPaneId, desiredHeight, cwd, deps);
+  const hooksRegistered = ensureHudResizeHook(postCreate.paneId, currentPaneId, desiredHeight, cwd, deps);
 
   return {
-    status: postCreate.duplicatePaneIds.length > 0 || hudPaneIds.length > 1 ? 'replaced_duplicates' : 'recreated',
+    status: hooksRegistered ? (postCreate.duplicatePaneIds.length > 0 || hudPaneIds.length > 1 ? 'replaced_duplicates' : 'recreated') : 'failed',
     paneId: postCreate.paneId,
     desiredHeight,
     duplicateCount: postCreate.duplicatePaneIds.length,

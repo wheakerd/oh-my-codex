@@ -59,6 +59,13 @@ export interface TeamLifecycleGenerationCertificate {
   resources: TeamLifecycleResource[];
 }
 
+/** Result of reading an immutable Team lifecycle certificate without collapsing uncertainty. */
+export type TeamLifecycleCertificateProbe =
+  | { status: 'confirmed_missing' }
+  | { status: 'valid'; certificate: TeamLifecycleGenerationCertificate }
+  | { status: 'invalid' }
+  | { status: 'read_error'; error: NodeJS.ErrnoException };
+
 export interface WorkerInfo {
   name: string;
   index: number;
