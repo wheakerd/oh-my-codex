@@ -348,6 +348,10 @@ async function main(): Promise<void> {
         process.stderr.write(`[runtime-cli] shutdownTeam error: ${err}\n`);
       }
     }
+    if (runtime && shutdownSummary?.complete !== true) {
+      finalStatus = 'failed';
+      process.stderr.write('[runtime-cli] shutdown incomplete; resources and recovery metadata were preserved\n');
+    }
 
     if (shutdownSummary?.commitHygieneArtifacts) {
       process.stderr.write(`[runtime-cli] commit_hygiene_context_json=${shutdownSummary.commitHygieneArtifacts.jsonPath}\n`);
@@ -360,7 +364,7 @@ async function main(): Promise<void> {
     process.stdout.write(JSON.stringify(output) + '\n');
 
     // 3. Exit
-    process.exit(status === 'completed' ? 0 : 1);
+    process.exit(finalStatus === 'completed' ? 0 : 1);
   }
 
   function exitWithoutShutdown(phase: TerminalPhaseResult): void {

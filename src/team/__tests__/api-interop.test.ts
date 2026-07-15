@@ -2109,23 +2109,19 @@ describe('executeTeamApiOperation: get-summary', () => {
 // ─── cleanup ──────────────────────────────────────────────────────────────
 
 describe('executeTeamApiOperation: cleanup', () => {
-  it('routes normal cleanup through shutdownTeam', async () => {
+  it('reports incomplete when normal cleanup lacks exact teardown authority', async () => {
     const { cwd, cleanup } = await setupTeam('cleanup-team');
     try {
       const result = await executeTeamApiOperation('cleanup', {
         team_name: 'cleanup-team',
       }, cwd);
-      assert.equal(result.ok, true);
-      if (result.ok) {
-        assert.equal(result.data.team_name, 'cleanup-team');
-        assert.equal(result.data.cleanup_mode, 'shutdown');
-      }
+      assert.equal(result.ok, false);
     } finally {
       await cleanup();
     }
   });
 
-  it('deactivates lingering team mode state after cleanup removes canonical team state', async () => {
+  it('does not rewrite independent mode state during canonical cleanup', async () => {
     const { cwd, cleanup } = await setupTeam('cleanup-mode-sync');
     try {
       const stateDir = join(cwd, '.omx', 'state');
@@ -2159,21 +2155,19 @@ describe('executeTeamApiOperation: cleanup', () => {
       const result = await executeTeamApiOperation('cleanup', {
         team_name: 'cleanup-mode-sync',
       }, cwd);
-      assert.equal(result.ok, true);
+      assert.equal(result.ok, false);
 
       const rootState = JSON.parse(
         await readFile(join(stateDir, 'team-state.json'), 'utf-8'),
       ) as Record<string, unknown>;
-      assert.equal(rootState.active, false);
-      assert.equal(rootState.current_phase, 'cancelled');
-      assert.ok(typeof rootState.completed_at === 'string' && rootState.completed_at.length > 0);
+      assert.equal(rootState.active, true);
+      assert.equal(rootState.current_phase, 'starting');
 
       const scopedState = JSON.parse(
         await readFile(join(stateDir, 'sessions', sessionId, 'team-state.json'), 'utf-8'),
       ) as Record<string, unknown>;
-      assert.equal(scopedState.active, false);
-      assert.equal(scopedState.current_phase, 'cancelled');
-      assert.ok(typeof scopedState.completed_at === 'string' && scopedState.completed_at.length > 0);
+      assert.equal(scopedState.active, true);
+      assert.equal(scopedState.current_phase, 'starting');
     } finally {
       await cleanup();
     }
@@ -2228,7 +2222,7 @@ describe('executeTeamApiOperation: cleanup', () => {
     }
   });
 
-  it('allows cleanup with confirm_issues when failed tasks remain', async () => {
+  it('still reports incomplete after issue confirmation when teardown authority is unavailable', async () => {
     const { cwd, cleanup } = await setupTeam('cleanup-confirm-issues');
     try {
       await createTask('cleanup-confirm-issues', {
@@ -2241,11 +2235,7 @@ describe('executeTeamApiOperation: cleanup', () => {
         team_name: 'cleanup-confirm-issues',
         confirm_issues: true,
       }, cwd);
-      assert.equal(result.ok, true);
-      if (result.ok) {
-        assert.equal(result.data.team_name, 'cleanup-confirm-issues');
-        assert.equal(result.data.cleanup_mode, 'shutdown');
-      }
+      assert.equal(result.ok, false);
     } finally {
       await cleanup();
     }

@@ -4116,6 +4116,12 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
     && lifecycleCertificate.tmux_session_name === sessionName.split(':')[0]
     && lifecycleCertificate.tmux_context === sessionName
     && Boolean(lifecycleCertificate.tmux_session_birth);
+  const lifecycleAlreadyClean = lifecycleCertificate?.status === 'cleanup_complete'
+    && lifecycleCertificate.team_name === sanitized
+    && lifecycleCertificate.team_pane_owner_id === config.tmux_pane_owner_id
+    && lifecycleCertificate.tmux_session_name === sessionName.split(':')[0]
+    && lifecycleCertificate.tmux_context === sessionName
+    && Boolean(lifecycleCertificate.tmux_session_birth);
   const lifecycleResources = lifecycleAuthority ? lifecycleCertificate.resources : [];
   const workerReceipts = Object.fromEntries(
     lifecycleResources.filter((resource) => resource.kind === 'worker' && resource.role === 'worker' && resource.pane_birth && resource.command)
@@ -4136,10 +4142,10 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
   const hasCreatedHudReceipt = lifecycleResources.some((resource) => resource.kind === 'hud' && resource.created === true);
   const hasCreatedHookReceipt = lifecycleResources.some((resource) => resource.kind === 'hook' && resource.created === true);
   let createdHudPaneReleased = !hasCreatedHudReceipt;
-  let createdRuntimeResourcesReleased = config.worker_launch_mode !== 'interactive';
+  let createdRuntimeResourcesReleased = config.worker_launch_mode !== 'interactive' || lifecycleAlreadyClean;
 
 
-  if (config.worker_launch_mode === 'interactive') {
+  if (config.worker_launch_mode === 'interactive' && !lifecycleAlreadyClean) {
     const sharedSessionTopology = sessionName.includes(':')
       ? resolveSharedSessionShutdownTopology(sessionName, leaderPaneId, sanitized)
       : null;
@@ -4297,7 +4303,7 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
       && lockedHudPaneId
       && tmuxPaneOwnerId
       && freshHudCandidate?.tmuxSessionInstanceId === lifecycleCertificate?.tmux_session_birth
-      && paneHasOmxInstanceTag(lockedHudPaneId, freshHudCandidate?.tmuxPaneInstanceId)
+      && paneHasOmxInstanceTag(lockedHudPaneId, hudReceipt?.pane_birth)
       && freshHudOwnerId === tmuxPaneOwnerId,
     );
 
@@ -4424,9 +4430,10 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
       retainHudContainer = true;
       console.warn(`[team shutdown] ${sanitized}: preserving lifecycle metadata because ${workerTeardown.kill.failed} worker pane teardown CAS operation(s) were uncertain`);
     }
-    const releasedEveryCreatedWorker = createdWorkerReceiptIds.every((paneId) => shutdownPaneIds.includes(paneId))
-      && workerTeardown.kill.failed === 0
-      && workerTeardown.kill.succeeded === shutdownPaneIds.length;
+    const livePaneIdsAtTeardown = listPaneIds(sessionName);
+    const releasedEveryCreatedWorker = createdWorkerReceiptIds.every((paneId) =>
+      !livePaneIdsAtTeardown.includes(paneId) || shutdownPaneIds.includes(paneId))
+      && workerTeardown.kill.failed === 0;
     const releasedCreatedHooks = !hasCreatedHookReceipt || hooksRemoved;
     createdRuntimeResourcesReleased = releasedEveryCreatedWorker && createdHudPaneReleased && releasedCreatedHooks;
     if (!createdRuntimeResourcesReleased) {
@@ -4604,14 +4611,9 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
     throw new Error(cleanupErrors.join(' | '));
   }
 
-  const hadCreatedRuntimeAuthority = Boolean(lifecycleCertificate)
-    || hasCreatedHudReceipt
-    || hasCreatedHookReceipt
-    || createdWorkerReceiptIds.length > 0
-    || provisionedWorktrees.length > 0;
   return {
     commitHygieneArtifacts,
-    complete: !hadCreatedRuntimeAuthority || (createdRuntimeResourcesReleased && teamStateCleaned),
+    complete: createdRuntimeResourcesReleased && teamStateCleaned,
   };
 }
 

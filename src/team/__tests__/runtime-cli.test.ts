@@ -191,7 +191,7 @@ describe('runtime-cli helpers', () => {
     }
   });
 
-  it('gracefully shuts down only when the leader explicitly requests shutdown', async () => {
+  it('preserves recovery state when forced fallback remains incomplete', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-cli-shutdown-'));
     const previousTeamStateRoot = process.env.OMX_TEAM_STATE_ROOT;
     delete process.env.OMX_TEAM_STATE_ROOT;
@@ -209,7 +209,7 @@ describe('runtime-cli helpers', () => {
       const runtimeCli = await loadRuntimeCliModule();
       await runtimeCli.shutdownWithForceFallback('shutdown-fallback', cwd);
 
-      assert.equal(existsSync(teamRoot), false);
+      assert.equal(existsSync(teamRoot), true);
     } finally {
       if (typeof previousTeamStateRoot === 'string') process.env.OMX_TEAM_STATE_ROOT = previousTeamStateRoot;
       else delete process.env.OMX_TEAM_STATE_ROOT;

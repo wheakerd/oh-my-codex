@@ -2347,10 +2347,10 @@ export function createTeamSession(
               windowIndex,
               hudPaneId,
             );
-            // Persist every append-only hook receipt before registration. The exact
-            // command and server-assigned slot are recovery diagnostics, never mutation authority.
-            options.journalResource?.({ kind: 'hook', id: hookName, created: true, command: options.hookGeneration, acquired_at: new Date().toISOString() });
-            options.journalResource?.({ kind: 'hook', id: clientAttachedHookName, created: true, command: options.hookGeneration, acquired_at: new Date().toISOString() });
+            // Persist inert intent as borrowed recovery metadata. Only a fully verified,
+            // activated generation is later journaled as created teardown authority.
+            options.journalResource?.({ kind: 'hook', id: hookName, created: false, command: options.hookGeneration, acquired_at: new Date().toISOString() });
+            options.journalResource?.({ kind: 'hook', id: clientAttachedHookName, created: false, command: options.hookGeneration, acquired_at: new Date().toISOString() });
             const hookSessionBirth = runTmux(['show-options', '-qv', '-t', sessionName, OMX_INSTANCE_OPTION]);
             const hookEvidence = createdHudPaneBirth && options.hookGeneration && hookSessionBirth.ok && hookSessionBirth.stdout.trim()
               ? {
@@ -2365,6 +2365,8 @@ export function createTeamSession(
                 }
               : null;
             if (hookEvidence && registerHudHooksTransactionally(hookTarget, hookName, clientAttachedHookName, hudPaneId, options.hookGeneration, hookEvidence)) {
+              options.journalResource?.({ kind: 'hook', id: hookName, created: true, command: options.hookGeneration, acquired_at: new Date().toISOString() });
+              options.journalResource?.({ kind: 'hook', id: clientAttachedHookName, created: true, command: options.hookGeneration, acquired_at: new Date().toISOString() });
               resizeHookTarget = hookTarget;
               resizeHookName = hookName;
               registeredResizeHook = { name: resizeHookName, target: resizeHookTarget };

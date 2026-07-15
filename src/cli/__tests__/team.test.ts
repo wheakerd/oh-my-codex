@@ -1431,7 +1431,7 @@ describe('teamCommand shutdown --force parsing', () => {
     assert.equal(force, true);
   });
 
-  it('persists cancelled team mode state on shutdown even when no team mode state existed beforehand', async () => {
+  it('does not publish cancelled mode state when shutdown remains incomplete', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-team-shutdown-mode-state-'));
     const previousCwd = process.cwd();
     const originalLog = console.log;
@@ -1457,18 +1457,11 @@ describe('teamCommand shutdown --force parsing', () => {
       console.log = (...args: unknown[]) => logs.push(args.map(String).join(' '));
       console.warn = (...args: unknown[]) => warns.push(args.map(String).join(' '));
 
-      await teamCommand(['shutdown', 'team-shutdown-mode-state', '--force']);
+      await assert.rejects(teamCommand(['shutdown', 'team-shutdown-mode-state', '--force']), /Team shutdown incomplete/);
 
       const state = await readModeState('team', wd);
-      assert.ok(state);
-      assert.equal(state?.active, false);
-      assert.equal(state?.current_phase, 'cancelled');
-      assert.equal(state?.team_name, 'team-shutdown-mode-state');
-      assert.ok(warns.every((line) => !line.includes('Team shutdown incomplete')));
-      assert.ok(
-        logs.some((line) =>
-          line.includes('Team shutdown complete: team-shutdown-mode-state')),
-      );
+      assert.equal(state, null);
+      assert.equal(logs.some((line) => line.includes('Team shutdown complete')), false);
     } finally {
       console.log = originalLog;
       console.warn = originalWarn;
@@ -1477,7 +1470,7 @@ describe('teamCommand shutdown --force parsing', () => {
     }
   });
 
-  it('persists cancelled session-scoped team mode state on shutdown', async () => {
+  it('preserves session-scoped team mode state on incomplete shutdown', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-team-shutdown-session-mode-state-'));
     const previousCwd = process.cwd();
     const teamName = 'team-shutdown-scoped';
@@ -1509,15 +1502,14 @@ describe('teamCommand shutdown --force parsing', () => {
         wd,
       );
 
-      await teamCommand(['shutdown', teamName, '--force']);
+      await assert.rejects(teamCommand(['shutdown', teamName, '--force']), /Team shutdown incomplete/);
 
       const scopedState = JSON.parse(
         await readFile(join(scopedStateDir, 'team-state.json'), 'utf-8'),
       ) as Record<string, unknown>;
-      assert.equal(scopedState.active, false);
-      assert.equal(scopedState.current_phase, 'cancelled');
+      assert.equal(scopedState.active, true);
+      assert.equal(scopedState.current_phase, 'team-exec');
       assert.equal(scopedState.team_name, teamName);
-      assert.ok(typeof scopedState.completed_at === 'string' && scopedState.completed_at.length > 0);
     } finally {
       process.chdir(previousCwd);
       await rm(wd, { recursive: true, force: true });
@@ -1556,14 +1548,14 @@ describe('teamCommand shutdown --force parsing', () => {
         wd,
       );
 
-      await teamCommand(['shutdown', teamName, '--force']);
+      await assert.rejects(teamCommand(['shutdown', teamName, '--force']), /Team shutdown incomplete/);
 
       assert.equal(existsSync(scopedStatePath), false);
       const rootState = JSON.parse(
         await readFile(join(stateDir, 'team-state.json'), 'utf-8'),
       ) as Record<string, unknown>;
-      assert.equal(rootState.active, false);
-      assert.equal(rootState.current_phase, 'cancelled');
+      assert.equal(rootState.active, true);
+      assert.equal(rootState.current_phase, 'team-exec');
       assert.equal(rootState.team_name, teamName);
     } finally {
       process.chdir(previousCwd);
@@ -1608,14 +1600,14 @@ describe('teamCommand shutdown --force parsing', () => {
         wd,
       );
 
-      await teamCommand(['shutdown', teamName, '--force']);
+      await assert.rejects(teamCommand(['shutdown', teamName, '--force']), /Team shutdown incomplete/);
 
       assert.equal(existsSync(scopedStatePath), false);
       const rootState = JSON.parse(
         await readFile(join(stateDir, 'team-state.json'), 'utf-8'),
       ) as Record<string, unknown>;
-      assert.equal(rootState.active, false);
-      assert.equal(rootState.current_phase, 'cancelled');
+      assert.equal(rootState.active, true);
+      assert.equal(rootState.current_phase, 'team-exec');
       assert.equal(rootState.team_name, teamName);
     } finally {
       process.chdir(previousCwd);
@@ -1629,7 +1621,7 @@ describe('teamCommand shutdown --force parsing', () => {
     assert.equal(confirmIssues, true);
   });
 
-  it('keeps the shutdown CLI alive while tearing down a shared leader tmux session', async () => {
+  it('fails closed while preserving an uncertain shared leader tmux session', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-team-shutdown-shared-cli-'));
     const binDir = join(wd, 'bin');
     const tmuxLogPath = join(wd, 'tmux.log');
@@ -1722,8 +1714,9 @@ esac
       });
 
       assert.equal(result.signal, null, `shutdown CLI received signal ${result.signal ?? 'none'}\n${result.stderr}`);
-      assert.equal(result.code, 0, `shutdown CLI exit=${result.code}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`);
-      assert.match(result.stdout, /Team shutdown complete: shared-shutdown-cli/);
+      assert.equal(result.code, 1, `shutdown CLI exit=${result.code}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`);
+      assert.doesNotMatch(result.stdout, /Team shutdown complete: shared-shutdown-cli/);
+      assert.match(result.stderr, /Team shutdown incomplete/);
       assert.equal(existsSync(join(wd, '.omx', 'state', 'team', 'shared-shutdown-cli')), true);
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
