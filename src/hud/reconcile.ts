@@ -269,8 +269,14 @@ function tmuxSnapshotMatchesClaimantBirth(
   pane: TmuxPaneSnapshot,
   domain: ResolvedHudControlPlaneDomain,
 ): boolean {
-  return pane.sessionInstanceId?.trim() === domain.claimant.tmuxSessionInstanceId?.trim()
-    && pane.paneInstanceId?.trim() === domain.claimant.tmuxPaneInstanceId?.trim();
+  const sessionBirthId = domain.claimant.tmuxSessionInstanceId?.trim() ?? '';
+  const paneBirthId = domain.claimant.tmuxPaneInstanceId?.trim() ?? '';
+  return Boolean(
+    sessionBirthId
+    && paneBirthId
+    && pane.sessionInstanceId?.trim() === sessionBirthId
+    && pane.paneInstanceId?.trim() === paneBirthId,
+  );
 }
 
 function hasVerifiedHudPaneInstanceIdentity(
@@ -318,6 +324,9 @@ function isVerifiedManagedHudOwner(
     ...(domain.session?.equivalentIds ?? []),
   ].map((sessionId) => sessionId?.trim() ?? '').filter(Boolean))];
   const acceptsSameAliasPair = equivalentSessionIds.length === 2
+    && evidence.contextStable
+    && evidence.paneTagStatus === 'present'
+    && evidence.sessionTagStatus === 'present'
     && evidence.paneInstanceId === evidence.sessionInstanceId
     && equivalentSessionIds.includes(evidence.paneInstanceId);
   return Boolean(
@@ -672,12 +681,12 @@ export async function teardownManagedHudPane(
     return { status: 'skipped_concurrent', removedPaneIds: [] };
   }
 
-  const lockedEvidence = await (deps.probeTmuxInstance ?? probeActualTmuxInstanceEvidence)(currentPaneId).catch(() => null);
-  if (!lockedEvidence || !isVerifiedManagedHudOwner(domain, currentPaneId, lockedEvidence)) {
-    return { status: 'skipped_not_omx_owned_tmux', removedPaneIds: [] };
-  }
-
   try {
+    const lockedEvidence = await (deps.probeTmuxInstance ?? probeActualTmuxInstanceEvidence)(currentPaneId).catch(() => null);
+    if (!lockedEvidence || !isVerifiedManagedHudOwner(domain, currentPaneId, lockedEvidence)) {
+      return { status: 'skipped_not_omx_owned_tmux', removedPaneIds: [] };
+    }
+
     const panes = (deps.listCurrentWindowPanes ?? ((paneId) => listCurrentWindowPanes(undefined, paneId)))(currentPaneId);
     const leader = panes.find((pane) => pane.paneId === currentPaneId && !isHudWatchPane(pane));
     const equivalentSessionIds = new Set(

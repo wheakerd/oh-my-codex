@@ -79,6 +79,46 @@ export interface ResolvedHudControlPlaneDomain {
   managed: boolean;
 }
 
+export interface HudTmuxBirthLineage {
+  sessionId: string;
+  tmuxSessionName: string;
+  tmuxSessionInstanceId: string;
+  tmuxPaneInstanceId: string;
+}
+
+const HUD_TMUX_BIRTH_LINEAGE_FILE = 'hud-tmux-birth-lineage.json';
+
+export async function writeHudTmuxBirthLineage(
+  domain: Pick<ResolvedHudControlPlaneDomain, 'baseStateDir'>,
+  lineage: HudTmuxBirthLineage,
+): Promise<void> {
+  const values = [lineage.sessionId, lineage.tmuxSessionName, lineage.tmuxSessionInstanceId, lineage.tmuxPaneInstanceId];
+  if (values.some((value) => typeof value !== 'string' || value.trim() === '')) {
+    throw new Error('HUD tmux birth lineage requires complete evidence');
+  }
+  const { mkdir, writeFile } = await import('fs/promises');
+  await mkdir(domain.baseStateDir, { recursive: true });
+  await writeFile(join(domain.baseStateDir, HUD_TMUX_BIRTH_LINEAGE_FILE), `${JSON.stringify(lineage)}\n`, { mode: 0o600 });
+}
+
+async function readHudTmuxBirthLineage(baseStateDir: string, sessionId: string | undefined): Promise<HudTmuxBirthLineage | null> {
+  if (!sessionId) return null;
+  try {
+    const value: unknown = JSON.parse(await readFile(join(baseStateDir, HUD_TMUX_BIRTH_LINEAGE_FILE), 'utf-8'));
+    if (!value || typeof value !== 'object') return null;
+    const candidate = value as Partial<HudTmuxBirthLineage>;
+    if (
+      candidate.sessionId !== sessionId
+      || typeof candidate.tmuxSessionName !== 'string' || candidate.tmuxSessionName.trim() === ''
+      || typeof candidate.tmuxSessionInstanceId !== 'string' || candidate.tmuxSessionInstanceId.trim() === ''
+      || typeof candidate.tmuxPaneInstanceId !== 'string' || candidate.tmuxPaneInstanceId.trim() === ''
+    ) return null;
+    return candidate as HudTmuxBirthLineage;
+  } catch {
+    return null;
+  }
+}
+
 export interface ResolveHudControlPlaneDomainOptions {
   cwd?: string;
   env?: NodeJS.ProcessEnv;
@@ -580,12 +620,13 @@ export async function resolveHudControlPlaneDomain(
   const equivalentIds = canonicalSessionId
     ? [...new Set([canonicalSessionId, ...(metadata?.nativeSessionAliases ?? []), metadata?.nativeSessionId, metadata?.ownerOmxSessionId, metadata?.ownerCodexSessionId].filter((id): id is string => typeof id === 'string' && normalizeSessionId(id) !== undefined))]
     : [];
+  const lineage = await readHudTmuxBirthLineage(baseStateDir, canonicalSessionId);
   const claimant = {
     sessionId: canonicalSessionId,
     leaderPaneId: options.claimant?.leaderPaneId ?? metadata?.leaderPaneId ?? env.TMUX_PANE,
-    tmuxSessionName: options.claimant?.tmuxSessionName ?? metadata?.tmuxSessionName ?? env.TMUX_SESSION,
-    tmuxSessionInstanceId: options.claimant?.tmuxSessionInstanceId ?? env.OMX_TMUX_SESSION_INSTANCE_ID,
-    tmuxPaneInstanceId: options.claimant?.tmuxPaneInstanceId ?? env.OMX_TMUX_PANE_INSTANCE_ID,
+    tmuxSessionName: options.claimant?.tmuxSessionName ?? lineage?.tmuxSessionName ?? metadata?.tmuxSessionName ?? env.TMUX_SESSION,
+    tmuxSessionInstanceId: options.claimant?.tmuxSessionInstanceId ?? lineage?.tmuxSessionInstanceId ?? env.OMX_TMUX_SESSION_INSTANCE_ID,
+    tmuxPaneInstanceId: options.claimant?.tmuxPaneInstanceId ?? lineage?.tmuxPaneInstanceId ?? env.OMX_TMUX_PANE_INSTANCE_ID,
   };
   const domainKey = `hud-control-plane:${createHash('sha256').update(baseStateDir).digest('hex')}`;
   return {

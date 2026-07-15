@@ -6,6 +6,7 @@ import { runProcess } from './process-runner.js';
 import { safeString } from './utils.js';
 import { sameFilePath } from '../../utils/paths.js';
 import type { ResolvedPromptTurnContext } from '../../hooks/prompt-session-provenance.js';
+import { resolveHudControlPlaneDomain } from '../../mcp/state-paths.js';
 
 
 const OMX_INSTANCE_OPTION = '@omx_instance_id';
@@ -336,9 +337,39 @@ export async function resolveManagedSessionContext(
         canonicalSessionId || invocationSessionId,
       );
     const evidence = await probeActualTmuxInstanceEvidence(paneTarget);
+    const birthDomain = await resolveHudControlPlaneDomain({
+      cwd: authoritativeSessionCwd,
+      requestedSessionId: canonicalSessionId || invocationSessionId,
+      env: { ...process.env, OMX_TMUX_SESSION_INSTANCE_ID: undefined, OMX_TMUX_PANE_INSTANCE_ID: undefined },
+    }).catch(() => null);
+    const birthEvidenceMatches = Boolean(
+      birthDomain
+      && evidence.contextStable
+      && evidence.paneTagStatus === 'present'
+      && evidence.sessionTagStatus === 'present'
+      && evidence.sessionName === birthDomain.claimant.tmuxSessionName
+      && evidence.paneInstanceId === birthDomain.claimant.tmuxPaneInstanceId
+      && evidence.sessionInstanceId === birthDomain.claimant.tmuxSessionInstanceId,
+    );
     const currentTmuxSessionName = evidence.sessionName || readCurrentTmuxSessionName();
     const currentTmuxPaneTarget = evidence.paneTarget;
     const currentTmuxPaneInstanceId = evidence.paneInstanceId;
+    if (birthEvidenceMatches) {
+      return {
+        managed: true,
+        reason: 'tmux_birth_lineage_match',
+        invocationSessionId,
+        canonicalSessionId,
+        nativeSessionId,
+        sessionState,
+        expectedTmuxSessionName,
+        currentTmuxSessionName,
+        currentTmuxPaneTarget,
+        currentTmuxPaneInstanceId,
+        currentTmuxInstanceId: evidence.sessionInstanceId,
+        taggedTmuxSessionName: currentTmuxSessionName,
+      };
+    }
     if (currentTmuxPaneInstanceId && currentTmuxPaneInstanceId !== invocationSessionId) {
       return {
         managed: false,
