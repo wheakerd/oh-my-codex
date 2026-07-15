@@ -2410,7 +2410,7 @@ exit 0
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
       assert.doesNotMatch(tmuxLog, /kill-pane -t %11/);
       assert.doesNotMatch(tmuxLog, /kill-pane -t %12/);
-      assert.match(tmuxLog, /kill-pane -t %13/);
+      assert.doesNotMatch(tmuxLog, /kill-pane -t %13/);
     } finally {
       if (typeof previousPath === 'string') process.env.PATH = previousPath;
       else delete process.env.PATH;

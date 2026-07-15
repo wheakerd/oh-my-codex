@@ -3385,6 +3385,7 @@ describe("tmux HUD pane helpers", () => {
         "#{window_height}",
         "#{@omx_pane_instance_id}",
         "#{@omx_instance_id}",
+        "#{session_name}",
         "#{pane_start_command}",
         "#{pane_current_path}",
       ].join("\x1f"),
@@ -5210,9 +5211,9 @@ exit 0
       (step) => step.name === "reconcile-hud-resize",
     );
 
-    assert.match(registerHook?.args[4] ?? "", />\/dev\/null 2>&1 \|\| true/);
+    assert.match((registerHook?.args ?? []).join(" "), />\/dev\/null 2>&1 \|\| true/);
     assert.match(
-      registerHook?.args[4] ?? "",
+      (registerHook?.args ?? []).join(" "),
       new RegExp(`-y ${HUD_TMUX_HEIGHT_LINES}\\b`),
     );
     assert.match(schedule?.args[2] ?? "", />\/dev\/null 2>&1 \|\| true/);
@@ -5280,7 +5281,7 @@ exit 0
     );
   });
 
-  it("buildDetachedSessionRollbackSteps unregisters hooks before killing session", () => {
+  it("buildDetachedSessionRollbackSteps makes retained hook generations inert before killing session", () => {
     const steps = buildDetachedSessionRollbackSteps(
       "omx-demo",
       "omx-demo:0",
@@ -5295,13 +5296,9 @@ exit 0
         "kill-session",
       ],
     );
-    assert.equal(steps[0]?.args[0], "set-hook");
-    assert.equal(steps[0]?.args[1], "-u");
-    assert.equal(steps[0]?.args[2], "-t");
-    assert.equal(steps[0]?.args[3], "omx-demo:0");
-    assert.match(steps[0]?.args[4] ?? "", /^client-attached\[\d+\]$/);
-    assert.match(steps[1]?.args[4] ?? "", /^client-resized\[\d+\]$/);
-    assert.doesNotMatch(steps[1]?.args.join(" ") ?? "", /window-resized/);
+    assert.equal(steps[0]?.args[0], "show-hooks");
+    assert.equal(steps[1]?.args[0], "show-hooks");
+    assert.doesNotMatch(steps.flatMap((step) => step.args).join(" "), /set-hook -u/);
     assert.deepEqual(steps[2]?.args, ["kill-session", "-t", "omx-demo"]);
   });
 

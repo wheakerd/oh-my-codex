@@ -808,7 +808,7 @@ exit 0
         tmuxLog,
         /list-panes -t %1 -F #\{pane_id\}\x1f#\{pane_current_command\}(?:\x1f#\{[^}]+\})*\x1f#\{pane_start_command\}\x1f#\{pane_current_path\}/,
       );
-      assert.match(tmuxLog, /set-hook -t \$7/);
+      assert.match(tmuxLog, /set-hook -a -t \$7 client-resized/);
       assert.doesNotMatch(tmuxLog, /split-window/);
     } finally {
       for (const [key, value] of Object.entries(previousEnv)) {
