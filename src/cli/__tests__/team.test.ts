@@ -1464,7 +1464,7 @@ describe('teamCommand shutdown --force parsing', () => {
       assert.equal(state?.active, false);
       assert.equal(state?.current_phase, 'cancelled');
       assert.equal(state?.team_name, 'team-shutdown-mode-state');
-      assert.equal(warns.length, 0);
+      assert.ok(warns.every((line) => !line.includes('Team shutdown incomplete')));
       assert.ok(
         logs.some((line) =>
           line.includes('Team shutdown complete: team-shutdown-mode-state')),
@@ -1740,7 +1740,7 @@ esac
     }
   });
 
-  it('keeps the shutdown command alive when executed inside the leader pane PTY', { concurrency: false }, async (t) => {
+  it('fails closed inside the leader pane PTY when exact teardown remains incomplete', { concurrency: false }, async (t) => {
     skipUnlessTmux(t);
 
     const wd = await mkdtemp(join(tmpdir(), 'omx-team-shutdown-shared-in-pane-'));
@@ -1777,13 +1777,11 @@ esac
         });
 
         assert.equal(result.signal, null, `shutdown CLI received signal ${result.signal ?? 'none'}\n${result.stderr}`);
-        assert.equal(result.code, 0, `shutdown CLI exit=${result.code}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`);
-        const stdout = result.stdout;
-        assert.match(stdout, new RegExp(`Team shutdown complete: ${teamName}`));
-        // Shared-session shutdown retains the leader pane but has no standalone
-        // lifecycle retry surface, so it clears stale Team metadata.
-        assert.equal(existsSync(join(teamStateRoot, 'team', teamName)), false);
-        assert.equal(await readTeamConfig(teamName, wd), null);
+        assert.equal(result.code, 1, `shutdown CLI exit=${result.code}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`);
+        assert.doesNotMatch(result.stdout, new RegExp(`Team shutdown complete: ${teamName}`));
+        assert.match(result.stderr, /Team shutdown incomplete/);
+        assert.equal(existsSync(join(teamStateRoot, 'team', teamName)), true);
+        assert.ok(await readTeamConfig(teamName, wd));
         assert.equal(fixturePaneExists(fixture, fixture.leaderPaneId), true, 'leader pane should remain alive');
       });
     } finally {

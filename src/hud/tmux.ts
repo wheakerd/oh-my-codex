@@ -674,7 +674,7 @@ export interface ExactHudPaneKillCandidate {
 }
 
 function tmuxFormatLiteral(value: string): string {
-  return value.replace(/([\\,}])/g, '\\$1');
+  return value.replace(/[#{},:]/g, (character) => `#${character}`);
 }
 
 /** Atomically kills a pane only while its complete managed-HUD identity still matches. */

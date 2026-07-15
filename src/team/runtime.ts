@@ -382,6 +382,7 @@ interface ShutdownOptions {
 
 export interface TeamShutdownSummary {
   commitHygieneArtifacts: TeamCommitHygieneArtifactPaths | null;
+  complete: boolean;
 }
 
 export function applyCreatedInteractiveSessionToConfig(
@@ -4603,7 +4604,15 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
     throw new Error(cleanupErrors.join(' | '));
   }
 
-  return { commitHygieneArtifacts }
+  const hadCreatedRuntimeAuthority = Boolean(lifecycleCertificate)
+    || hasCreatedHudReceipt
+    || hasCreatedHookReceipt
+    || createdWorkerReceiptIds.length > 0
+    || provisionedWorktrees.length > 0;
+  return {
+    commitHygieneArtifacts,
+    complete: !hadCreatedRuntimeAuthority || (createdRuntimeResourcesReleased && teamStateCleaned),
+  };
 }
 
 /**

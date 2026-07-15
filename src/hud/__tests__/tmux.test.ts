@@ -65,6 +65,25 @@ describe('exact HUD pane destruction', () => {
     ]]);
   });
 
+  it('escapes every tmux format delimiter in dynamic identity operands', () => {
+    const calls: string[][] = [];
+    const startCommand = `exec env OMX_SESSION_ID='session-a' OMX_TMUX_HUD_OWNER='1' ${OMX_TMUX_HUD_LEADER_PANE_ENV}='%1' node /repo/omx.js hud --watch`;
+    assert.equal(killExactHudPane({
+      paneId: '%2',
+      currentCommand: 'node#{},:',
+      startCommand,
+      owner: { sessionId: 'session-a', leaderPaneId: '%1' },
+      paneInstanceId: 'pane#{},:birth',
+      sessionInstanceId: 'session#{},:birth',
+      sessionName: 'managed#{},:',
+    }, (args) => { calls.push(args); return '__omx_hud_pane_kill_applied__\n'; }), true);
+    const condition = calls[0]?.[4] ?? '';
+    assert.match(condition, /node###\{#\}#,#:/);
+    assert.match(condition, /pane###\{#\}#,#:birth/);
+    assert.match(condition, /session###\{#\}#,#:birth/);
+    assert.match(condition, /managed###\{#\}#,#:/);
+  });
+
   it('rejects a reused pane before issuing the conditional mutation when its captured owner no longer matches', () => {
     const calls: string[][] = [];
     assert.equal(killExactHudPane({

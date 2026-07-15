@@ -213,14 +213,12 @@ export function findExactTeamHudPane(
   if (!hudPaneId || sessionName.trim() !== candidate.tmuxSessionName) return null;
   const pane = listPanes(sessionName).find((entry) => entry.paneId === hudPaneId);
   if (!pane || !isHudWatchPane(pane)) return null;
-  return hudPaneMatchesExactCandidate(pane, {
+  return hudPaneMatchesOwner(pane, {
     sessionId: candidate.sessionId,
     sessionIds: candidate.sessionIds,
     leaderPaneId: candidate.leaderPaneId,
-  }, {
-    tmuxSessionInstanceId: candidate.tmuxSessionInstanceId,
-    tmuxPaneInstanceId: candidate.tmuxPaneInstanceId,
-  }) ? hudPaneId : null;
+  }) && Boolean(pane.paneInstanceId?.trim())
+    && pane.sessionInstanceId === candidate.tmuxSessionInstanceId ? hudPaneId : null;
 }
 
 export interface RestoreStandaloneHudPaneOptions {
@@ -672,10 +670,10 @@ export function killExactTeamHudPane(
     || !receipt.pane_birth || !receipt.command || !teamOwnerId) return false;
   if (!findExactTeamHudPaneIds(target, candidate).includes(paneId)) return false;
   const sessionName = candidate.tmuxSessionName ?? target.split(':')[0] ?? '';
-  if (!sessionName || !candidate.tmuxSessionInstanceId || !candidate.tmuxPaneInstanceId) return false;
+  if (!sessionName || !candidate.tmuxSessionInstanceId) return false;
   const appliedReceipt = `__omx_hud_teardown_applied_${randomUUID()}__`;
   const rejectedReceipt = `__omx_hud_teardown_rejected_${randomUUID()}__`;
-  const condition = `#{&&:#{==:#{pane_id},${escapeTmuxFormatLiteral(paneId)}},#{==:#{pane_start_command},${escapeTmuxFormatLiteral(receipt.command)}},#{==:#{@omx_pane_instance_id},${escapeTmuxFormatLiteral(candidate.tmuxPaneInstanceId)}},#{==:#{@omx_instance_id},${escapeTmuxFormatLiteral(candidate.tmuxSessionInstanceId)}},#{==:#{session_name},${escapeTmuxFormatLiteral(sessionName)}},#{==:#{@omx_team_pane_owner_id},${escapeTmuxFormatLiteral(teamOwnerId)}},#{==:#{@omx_team_pane_birth},${escapeTmuxFormatLiteral(receipt.pane_birth)}},#{==:#{@omx_team_pane_role},${escapeTmuxFormatLiteral('hud')}}}`;
+  const condition = `#{&&:#{==:#{pane_id},${escapeTmuxFormatLiteral(paneId)}},#{==:#{pane_start_command},${escapeTmuxFormatLiteral(receipt.command)}},#{==:#{@omx_pane_instance_id},${escapeTmuxFormatLiteral(receipt.pane_birth)}},#{==:#{@omx_instance_id},${escapeTmuxFormatLiteral(candidate.tmuxSessionInstanceId)}},#{==:#{session_name},${escapeTmuxFormatLiteral(sessionName)}},#{==:#{@omx_team_pane_owner_id},${escapeTmuxFormatLiteral(teamOwnerId)}},#{==:#{@omx_team_pane_birth},${escapeTmuxFormatLiteral(receipt.pane_birth)}},#{==:#{@omx_team_pane_role},${escapeTmuxFormatLiteral('hud')}}}`;
   const result = runTmux([
     'if-shell', '-t', paneId, '-F', condition,
     `kill-pane -t ${paneId} \\; display-message -p ${appliedReceipt}`,
@@ -2309,7 +2307,7 @@ export function createTeamSession(
           }
           if (!retainedHudPaneId) {
             const paneBirth = randomUUID();
-            const paneInstanceBirth = randomUUID();
+            const paneInstanceBirth = paneBirth;
             if (!tagNewHudPaneOrRollback(id, paneInstanceBirth, teamPaneOwnerId)) {
               throw new Error(`failed to tag and verify HUD pane ${id}`);
             }

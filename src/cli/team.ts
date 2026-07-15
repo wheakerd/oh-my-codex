@@ -1703,6 +1703,9 @@ export async function teamCommand(args: string[], _options: TeamCliOptions = {})
     const resolvedName = resolveTeamNameForCurrentContext(name, cwd);
     const configBeforeShutdown = await readTeamConfig(resolvedName, cwd);
     const summary = await shutdownTeam(resolvedName, cwd, { force, confirmIssues });
+    if (!summary.complete) {
+      throw new Error(`Team shutdown incomplete: ${name}; resources and recovery metadata were preserved`);
+    }
     await persistTeamShutdownModeState(
       resolvedName,
       cwd,
