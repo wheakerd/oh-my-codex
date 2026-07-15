@@ -1514,6 +1514,11 @@ export function recordSubagentTurn(state: SubagentTrackingState, input: RecordSu
   normalized.sessions[sessionId] = {
     session_id: sessionId,
     ...(leaderThreadId ? { leader_thread_id: leaderThreadId } : {}),
+    // #3181: preserve the durable native leader attestation across ordinary turn writes.
+    // Dropping these would let a normal child SessionStart/bind erase authentication and
+    // silently downgrade later role-intent writes to the legacy (non-atomic) path.
+    ...(existingSession.leader_attested_at ? { leader_attested_at: existingSession.leader_attested_at } : {}),
+    ...(existingSession.leader_attest_source ? { leader_attest_source: existingSession.leader_attest_source } : {}),
     updated_at: timestamp,
     threads,
   };

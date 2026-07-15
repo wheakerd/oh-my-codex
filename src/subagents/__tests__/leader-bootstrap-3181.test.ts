@@ -193,4 +193,34 @@ describe('#3181 leader bootstrap tracker carrier', () => {
       assert.deepEqual((await readSubagentTrackingState(cwd)).pending_role_intents, []);
     });
   });
+
+  it('preserves the leader attestation across an ordinary child turn write (no legacy downgrade)', async () => {
+    await withCwd(async (cwd) => {
+      attestLeaderThread(cwd, { sessionId: 'sess-A', leaderThreadId: 'leader-L', source: 'native-sessionstart' });
+      const first = ensureLeaderAndRecordIntent(cwd, { role: 'architect', sessionId: 'sess-A', parentThreadId: 'leader-L', correlationToken: TOKEN });
+      assert.equal(first.ok, true);
+
+      // An ordinary child turn under the same session must NOT erase the attestation.
+      await recordSubagentTurnForSession(cwd, {
+        sessionId: 'sess-A',
+        threadId: 'child-thread',
+        kind: 'subagent',
+        leaderThreadId: 'leader-L',
+        timestamp: new Date().toISOString(),
+      });
+
+      const state = await readSubagentTrackingState(cwd);
+      assert.ok(state.sessions['sess-A']?.leader_attested_at, 'attestation must survive a child turn write');
+      assert.equal(state.sessions['sess-A']?.leader_attest_source, 'native-sessionstart');
+      assert.equal(state.sessions['sess-A']?.leader_thread_id, 'leader-L', 'a child turn must not replace the attested leader');
+
+      // The next role-intent write still uses the attested path (idempotent receipt reuse),
+      // proving no downgrade to the legacy non-atomic path.
+      const retry = ensureLeaderAndRecordIntent(cwd, { role: 'architect', sessionId: 'sess-A', parentThreadId: 'leader-L', correlationToken: TOKEN2 });
+      assert.equal(retry.ok, true);
+      if (!retry.ok || !first.ok) return;
+      assert.equal(retry.reused, true);
+      assert.equal(retry.intent.correlation_token, first.intent.correlation_token);
+    });
+  });
 });
