@@ -37,6 +37,7 @@ import {
   resolveSetupMcpModeArg,
   resolveSetupScopeArg,
   resolveSetupTeamModeArg,
+  resolveSetupAgentsMergePolicyArg,
   resolveLaunchConfigRepairOptions,
   readPersistedSetupPreferences,
   readPersistedSetupScope,
@@ -2110,6 +2111,30 @@ describe("resolveSetupTeamModeArg", () => {
     );
   });
 });
+describe("resolveSetupAgentsMergePolicyArg", () => {
+  it("accepts only the explicit bare set and clear selectors", () => {
+    assert.deepEqual(resolveSetupAgentsMergePolicyArg([]), undefined);
+    assert.deepEqual(resolveSetupAgentsMergePolicyArg(["--merge-agents"]), { kind: "set", value: true });
+    assert.deepEqual(resolveSetupAgentsMergePolicyArg(["--no-merge-agents"]), { kind: "set", value: false });
+    assert.deepEqual(resolveSetupAgentsMergePolicyArg(["--clear-merge-agents-policy"]), { kind: "clear" });
+    assert.deepEqual(resolveSetupAgentsMergePolicyArg(["--merge-agents", "--merge-agents"]), { kind: "set", value: true });
+    assert.deepEqual(resolveSetupAgentsMergePolicyArg(["--clear-merge-agents-policy", "--clear-merge-agents-policy"]), { kind: "clear" });
+  });
+
+  it("rejects values, equals spellings, and conflicting policy selectors", () => {
+    for (const argv of [
+      ["--merge-agents=true"],
+      ["--no-merge-agents=false"],
+      ["--clear-merge-agents-policy=true"],
+      ["--merge-agents", "true"],
+      ["--no-merge-agents", "false"],
+    ]) {
+      assert.throws(() => resolveSetupAgentsMergePolicyArg(argv), /merge.*policy|merge-agents/i);
+    }
+    assert.throws(() => resolveSetupAgentsMergePolicyArg(["--merge-agents", "--no-merge-agents"]), /Conflicting.*merge.*policy/i);
+    assert.throws(() => resolveSetupAgentsMergePolicyArg(["--clear-merge-agents-policy", "--merge-agents"]), /Conflicting.*merge.*policy/i);
+  });
+});
 
 describe("resolveSetupScopeArg", () => {
   it("returns undefined when scope is omitted", () => {
@@ -2961,6 +2986,123 @@ describe("project launch scope helpers", () => {
       assert.equal(resolveCodexHomeForLaunch(wd, {}), join(wd, ".codex"));
     } finally {
       await rm(wd, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("pointer launch aborts", () => {
+  it("does not launch, tag, or retain a runtime home when a pointer lock is held", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-pointer-lock-launch-"));
+    try {
+      const binDir = join(wd, "bin");
+      const codexLog = join(wd, "codex.log");
+      const tmuxLog = join(wd, "tmux.log");
+      const lockPath = join(wd, ".omx", "state", "session.json.lock");
+      const ownerPath = join(lockPath, "owner.json");
+      const ownerContents = "{malformed-held-lock\n";
+      await mkdir(binDir, { recursive: true });
+      await mkdir(lockPath, { recursive: true });
+      await writeFile(join(wd, ".omx", "setup-scope.json"), JSON.stringify({ scope: "project" }));
+      await writeFile(ownerPath, ownerContents);
+      await writeFile(
+        join(binDir, "codex"),
+        `#!/bin/sh\nprintf 'spawned\\n' >> ${JSON.stringify(codexLog)}\n`,
+      );
+      await writeFile(
+        join(binDir, "tmux"),
+        `#!/bin/sh\ncase "$1" in set-option|display-message) printf '%s\\n' "$*" >> ${JSON.stringify(tmuxLog)} ;; esac\n`,
+      );
+      await chmod(join(binDir, "codex"), 0o755);
+      await chmod(join(binDir, "tmux"), 0o755);
+
+      const { spawnSync } = await import("node:child_process");
+      const result = spawnSync(process.execPath, [join(repoRoot, "dist", "cli", "omx.js"), "launch", "--direct"], {
+        cwd: wd,
+        encoding: "utf-8",
+        env: {
+          ...process.env,
+          HOME: join(wd, "home"),
+          PATH: `${binDir}${delimiter}/usr/bin:/bin`,
+          CODEX_HOME: "",
+          OMX_ROOT: "",
+          OMX_STATE_ROOT: "",
+          OMX_TEAM_STATE_ROOT: "",
+          OMX_SESSION_ID: "",
+          OMX_MCP_WORKDIR_ROOTS: "",
+          OMX_AUTO_UPDATE: "0",
+          OMX_HOOK_DERIVED_SIGNALS: "0",
+          OMX_NOTIFY_FALLBACK: "0",
+          TMUX: "test-socket,1,1",
+          TMUX_PANE: "%1",
+        },
+      });
+
+      assert.equal(result.status, 1, result.stderr || result.stdout);
+      assert.match(result.stderr, /session_pointer_lock_recovery_required/);
+      assert.equal(existsSync(codexLog), false);
+      assert.equal(existsSync(tmuxLog), false);
+      assert.equal(await readFile(ownerPath, "utf-8"), ownerContents);
+      assert.equal(existsSync(join(wd, ".omx", "state", "sessions")), false);
+      const runtimeRoot = join(wd, ".omx", "runtime", "codex-home");
+      assert.deepEqual(existsSync(runtimeRoot) ? await fsReaddir(runtimeRoot) : [], []);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it("does not exec, tag, or retain a runtime home when pointer context root resolution is rejected", async () => {
+    const allowedRoot = await mkdtemp(join(tmpdir(), "omx-pointer-allowed-root-"));
+    const wd = await mkdtemp(join(tmpdir(), "omx-pointer-root-exec-"));
+    try {
+      const binDir = join(wd, "bin");
+      const codexLog = join(wd, "codex.log");
+      const tmuxLog = join(wd, "tmux.log");
+      await mkdir(binDir, { recursive: true });
+      await mkdir(join(wd, ".omx"), { recursive: true });
+      await writeFile(join(wd, ".omx", "setup-scope.json"), JSON.stringify({ scope: "project" }));
+      await writeFile(
+        join(binDir, "codex"),
+        `#!/bin/sh\nprintf 'spawned\\n' >> ${JSON.stringify(codexLog)}\n`,
+      );
+      await writeFile(
+        join(binDir, "tmux"),
+        `#!/bin/sh\ncase "$1" in set-option|display-message) printf '%s\\n' "$*" >> ${JSON.stringify(tmuxLog)} ;; esac\n`,
+      );
+      await chmod(join(binDir, "codex"), 0o755);
+      await chmod(join(binDir, "tmux"), 0o755);
+
+      const { spawnSync } = await import("node:child_process");
+      const result = spawnSync(process.execPath, [join(repoRoot, "dist", "cli", "omx.js"), "exec", "echo", "blocked"], {
+        cwd: wd,
+        encoding: "utf-8",
+        env: {
+          ...process.env,
+          HOME: join(wd, "home"),
+          PATH: `${binDir}${delimiter}/usr/bin:/bin`,
+          CODEX_HOME: "",
+          OMX_ROOT: "",
+          OMX_STATE_ROOT: "",
+          OMX_TEAM_STATE_ROOT: "",
+          OMX_SESSION_ID: "",
+          OMX_AUTO_UPDATE: "0",
+          OMX_HOOK_DERIVED_SIGNALS: "0",
+          OMX_NOTIFY_FALLBACK: "0",
+          OMX_MCP_WORKDIR_ROOTS: allowedRoot,
+          TMUX: "test-socket,1,1",
+          TMUX_PANE: "%1",
+        },
+      });
+
+      assert.equal(result.status, 1, result.stderr || result.stdout);
+      assert.match(result.stderr, /session_pointer_context_failure/);
+      assert.equal(existsSync(codexLog), false);
+      assert.equal(existsSync(tmuxLog), false);
+      assert.equal(existsSync(join(wd, ".omx", "state", "sessions")), false);
+      const runtimeRoot = join(wd, ".omx", "runtime", "codex-home");
+      assert.deepEqual(existsSync(runtimeRoot) ? await fsReaddir(runtimeRoot) : [], []);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+      await rm(allowedRoot, { recursive: true, force: true });
     }
   });
 });
