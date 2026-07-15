@@ -3356,6 +3356,25 @@ function hasSubagentThreadSpawnProvenance(payload: CodexHookPayload): boolean {
   return parentThreadId !== "";
 }
 
+// #3181: positive counter-evidence guard. A thread durably tracked as a subagent in ANY
+// session must never be attested as a leader, even if the current payload lacks typed-role
+// or thread_spawn provenance. This closes the source-less/untyped child escalation where a
+// child recorded at its SessionStart later self-promotes via a source-less PreToolUse.
+async function isThreadTrackedAsSubagent(cwd: string, threadId: string): Promise<boolean> {
+  const id = threadId.trim();
+  if (!id) return false;
+  try {
+    const state = await readSubagentTrackingState(cwd);
+    for (const session of Object.values(state.sessions)) {
+      if (session.threads?.[id]?.kind === "subagent") return true;
+    }
+    return false;
+  } catch {
+    // Fail closed for attestation: without readable tracker evidence, do not attest.
+    return true;
+  }
+}
+
 function buildNativeUnknownRolePreToolUseOutput(
   payload: CodexHookPayload,
 ): Record<string, unknown> | null {
@@ -10259,7 +10278,8 @@ export async function dispatchCodexNativeHook(
         // tracker leader before the turn-completion notify path would seed it. This is
         // the non-subagent SessionStart reconcile branch, so the leader thread id is the
         // reconciled native session id. Best-effort: never block SessionStart.
-        if (canonicalSessionId && resolvedNativeSessionId) {
+        if (canonicalSessionId && resolvedNativeSessionId
+          && !(await isThreadTrackedAsSubagent(cwd, resolvedNativeSessionId))) {
           try {
             attestLeaderThread(cwd, {
               sessionId: canonicalSessionId,
@@ -10583,7 +10603,11 @@ export async function dispatchCodexNativeHook(
       && !hasSubagentThreadSpawnProvenance(payload)
     ) {
       const preToolUseLeaderThreadId = readPayloadThreadId(payload);
-      if (preToolUseLeaderThreadId && preToolUseLeaderThreadId === nativeSessionId) {
+      if (
+        preToolUseLeaderThreadId
+        && preToolUseLeaderThreadId === nativeSessionId
+        && !(await isThreadTrackedAsSubagent(cwd, nativeSessionId))
+      ) {
         try {
           const ownerOmxSessionId = await resolveVerifiedOwnerOmxSessionId();
           const sessionState = await reconcileNativeSessionStart(cwd, nativeSessionId, {

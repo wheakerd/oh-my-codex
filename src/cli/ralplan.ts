@@ -83,18 +83,26 @@ export async function ralplanCommand(
   }
 
   // #3181: a durable native-hook leader attestation (leader_thread_id + leader_attested_at)
-  // authorizes the in-turn atomic self-heal path. Without it, fall back to the legacy
-  // active-leader path (native session id or a tracker leader recorded by real turns).
+  // authorizes the in-turn atomic self-heal path, but ONLY when a usable current session
+  // pointer maps to this session. resolveRuntimeStateScope will select an env-provided
+  // session id (OMX_SESSION_ID/CODEX_SESSION_ID/SESSION_ID) even with no usable pointer or
+  // a pointer owned by another session; in that case it omits metadata. Requiring metadata
+  // that maps to currentScope.sessionId prevents a stale/foreign process from selecting an
+  // attested session by environment alone and publishing/binding into it (shared state
+  // root). Without a usable pointer, fall back to the legacy native-session path only.
+  const hasUsableCurrentPointer = Boolean(
+    currentScope.metadata && currentScope.metadata.sessionId === currentScope.sessionId,
+  );
   const trackingState = await readSubagentTrackingState(currentScope.cwd);
   const attestedSession = trackingState.sessions[currentScope.sessionId];
-  const attestedLeaderThreadId = attestedSession?.leader_attested_at
+  const attestedLeaderThreadId = hasUsableCurrentPointer && attestedSession?.leader_attested_at
     ? attestedSession.leader_thread_id?.trim()
     : undefined;
   const useAttestedBootstrap = Boolean(attestedLeaderThreadId);
 
   if (!useAttestedBootstrap) {
     const activeLeaderThreadIds = new Set([
-      attestedSession?.leader_thread_id?.trim(),
+      hasUsableCurrentPointer ? attestedSession?.leader_thread_id?.trim() : undefined,
       currentScope.metadata?.nativeSessionId?.trim(),
     ].filter((threadId): threadId is string => Boolean(threadId)));
     if (!activeLeaderThreadIds.has(parsed.parentThreadId.trim())) {

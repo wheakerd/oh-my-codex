@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
 import { ralplanCommand } from '../../cli/ralplan.js';
-import { readSubagentTrackingState } from '../../subagents/tracker.js';
+import { readSubagentTrackingState, recordSubagentTurnForSession } from '../../subagents/tracker.js';
 import { dispatchCodexNativeHook } from '../codex-native-hook.js';
 
 async function invokeRoleIntent(cwd: string, args: string[]) {
@@ -101,6 +101,49 @@ describe('#3181 end-to-end fresh App turn bootstrap', () => {
       assert.equal(receipt.ok, true);
       assert.equal(receipt.intent.role, 'architect');
       assert.equal((await readSubagentTrackingState(cwd)).pending_role_intents.length, 1);
+    } finally {
+      if (priorEnv.OMX_SESSION_ID !== undefined) process.env.OMX_SESSION_ID = priorEnv.OMX_SESSION_ID;
+      if (priorEnv.CODEX_SESSION_ID !== undefined) process.env.CODEX_SESSION_ID = priorEnv.CODEX_SESSION_ID;
+      if (priorEnv.SESSION_ID !== undefined) process.env.SESSION_ID = priorEnv.SESSION_ID;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('never attests a thread durably tracked as a subagent, even via a source-less leader-shaped PreToolUse', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-3181-e2e-child-'));
+    const priorEnv = { OMX_SESSION_ID: process.env.OMX_SESSION_ID, CODEX_SESSION_ID: process.env.CODEX_SESSION_ID, SESSION_ID: process.env.SESSION_ID };
+    try {
+      delete process.env.OMX_SESSION_ID;
+      delete process.env.CODEX_SESSION_ID;
+      delete process.env.SESSION_ID;
+      const childThreadId = 'codex-native-child-thread';
+
+      // A child is durably recorded as a subagent (e.g. at its own SessionStart).
+      await recordSubagentTurnForSession(cwd, {
+        sessionId: 'leader-session',
+        threadId: childThreadId,
+        kind: 'subagent',
+        leaderThreadId: 'leader-session',
+        timestamp: new Date().toISOString(),
+      });
+
+      // The child then emits a source-less, untyped, leader-shaped PreToolUse
+      // (thread_id === session_id). It must NOT be promoted to leader.
+      await dispatchCodexNativeHook(
+        {
+          hook_event_name: 'PreToolUse',
+          cwd,
+          session_id: childThreadId,
+          thread_id: childThreadId,
+          tool_name: 'Bash',
+          tool_use_id: 'tool-child-selfpromote',
+          tool_input: { command: 'omx ralplan role-intent write --role architect --parent-thread "$CODEX_THREAD_ID" --json' },
+        },
+        { cwd, sessionOwnerPid: process.pid },
+      );
+
+      const state = await readSubagentTrackingState(cwd);
+      assert.equal(state.sessions[childThreadId]?.leader_attested_at, undefined, 'child thread must not be attested as leader');
     } finally {
       if (priorEnv.OMX_SESSION_ID !== undefined) process.env.OMX_SESSION_ID = priorEnv.OMX_SESSION_ID;
       if (priorEnv.CODEX_SESSION_ID !== undefined) process.env.CODEX_SESSION_ID = priorEnv.CODEX_SESSION_ID;

@@ -116,4 +116,35 @@ describe('#3181 ralplan CLI fresh-turn bootstrap', () => {
       assert.equal(state.sessions['sess-app']?.leader_thread_id, 'codex-leader-thread');
     });
   });
+
+  it('does not use a durable attestation for an env-selected session with no usable current pointer (stale/foreign guard)', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-ralplan-3181-env-'));
+    const prior = process.env.OMX_SESSION_ID;
+    try {
+      delete process.env.CODEX_SESSION_ID;
+      delete process.env.SESSION_ID;
+      // The usable pointer belongs to session B, but a stale process selects attested
+      // session A via the environment. A has an attestation in the shared tracker.
+      const stateDir = join(cwd, '.omx', 'state');
+      await mkdir(stateDir, { recursive: true });
+      await writeFile(join(stateDir, 'session.json'), JSON.stringify({
+        session_id: 'sess-real-B',
+        native_session_id: 'native-B',
+        started_at: '2026-07-14T00:00:00.000Z',
+        cwd,
+      }));
+      const attest = attestLeaderThread(cwd, { sessionId: 'sess-attested-A', leaderThreadId: 'attacker-known-leader', source: 'native-pretooluse' });
+      assert.equal(attest.ok, true);
+      process.env.OMX_SESSION_ID = 'sess-attested-A';
+
+      const res = await invoke(cwd, ['role-intent', 'write', '--role', 'architect', '--parent-thread', 'attacker-known-leader', '--json']);
+      assert.equal(res.exitCode, 1);
+      assert.deepEqual(JSON.parse(res.stdout.join('\n')), { ok: false, reason: 'parent_not_active_leader' });
+      assert.deepEqual((await readSubagentTrackingState(cwd)).pending_role_intents, []);
+    } finally {
+      if (prior === undefined) delete process.env.OMX_SESSION_ID;
+      else process.env.OMX_SESSION_ID = prior;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
 });

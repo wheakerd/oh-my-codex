@@ -1058,18 +1058,23 @@ export function ensureLeaderAndRecordIntent(
       return { ok: false, reason: 'native_anchor_mismatch' as const };
     }
 
-    // Idempotent reuse: a live own intent for this exact identity returns its original
-    // receipt instead of creating a second intent.
+    // Single-flight, role-agnostic (preserves recordPendingRoleIntent's invariant): a
+    // live/bound own intent for the same (session, parent) blocks a second live intent.
+    // Same-identity (same role) retries reuse the original receipt (idempotent); a
+    // different-role request for the same live parent returns single_flight_conflict
+    // rather than creating a second ambiguous intent.
     const all = state.pending_role_intents;
-    const existingIntent = all.find((intent) => (
+    const liveOwnIntent = all.find((intent) => (
       isOwn(intent)
-      && intent.role === role
       && intent.session_id === sessionId
       && intent.parent_thread_id === parentThreadId
       && (intent.binding_state === 'bound' || !isExpiredPendingRoleIntent(intent, nowMs))
     ));
-    if (existingIntent) {
-      return { ok: true, intent: existingIntent, reused: true };
+    if (liveOwnIntent) {
+      if (liveOwnIntent.role === role) {
+        return { ok: true, intent: liveOwnIntent, reused: true };
+      }
+      return { ok: false, reason: 'single_flight_conflict' };
     }
 
     // Self-heal the leader thread record so leader-anchor consumers see kind:"leader".

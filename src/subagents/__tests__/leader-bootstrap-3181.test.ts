@@ -116,4 +116,21 @@ describe('#3181 leader bootstrap tracker carrier', () => {
       assert.equal(state.pending_role_intents.length, 1);
     });
   });
+
+  it('preserves single-flight: a different-role second live intent returns single_flight_conflict', async () => {
+    await withCwd(async (cwd) => {
+      attestLeaderThread(cwd, { sessionId: 'sess-a', leaderThreadId: 'leader-thread-a', source: 'native-pretooluse' });
+      const architect = ensureLeaderAndRecordIntent(cwd, {
+        role: 'architect', sessionId: 'sess-a', parentThreadId: 'leader-thread-a', correlationToken: TOKEN,
+      });
+      const critic = ensureLeaderAndRecordIntent(cwd, {
+        role: 'critic', sessionId: 'sess-a', parentThreadId: 'leader-thread-a', correlationToken: TOKEN2,
+      });
+      assert.equal(architect.ok, true);
+      assert.deepEqual(critic, { ok: false, reason: 'single_flight_conflict' });
+      const state = await readSubagentTrackingState(cwd);
+      assert.equal(state.pending_role_intents.length, 1);
+      assert.equal(state.pending_role_intents[0]?.role, 'architect');
+    });
+  });
 });
