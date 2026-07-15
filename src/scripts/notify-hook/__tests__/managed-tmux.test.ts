@@ -1,0 +1,59 @@
+import assert from 'node:assert/strict';
+import { chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { describe, it } from 'node:test';
+import { resolveHudControlPlaneDomain, writeHudTmuxBirthLineage } from '../../../mcp/state-paths.js';
+import { isManagedOmxSession } from '../managed-tmux.js';
+
+describe('managed tmux opaque birth lineage', () => {
+  it('authorizes Team-established opaque UUID lineage through production resolution only with stable dual tags', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-managed-tmux-lineage-'));
+    const binDir = join(cwd, 'bin');
+    const previousPath = process.env.PATH;
+    const previousTmuxPane = process.env.TMUX_PANE;
+    const previousTmux = process.env.TMUX;
+    const sessionId = 'team-logical-session';
+    const sessionBirthId = '7d667f3f-4c4b-4e80-8ea5-050ba1dbfe1f';
+    const paneBirthId = '388b3d25-c797-4223-bb30-3eb3511e4101';
+    try {
+      await mkdir(join(cwd, '.omx', 'state'), { recursive: true });
+      await writeFile(join(cwd, '.omx', 'state', 'session.json'), JSON.stringify({
+        session_id: sessionId,
+        cwd,
+        pid: process.pid,
+        started_at: new Date().toISOString(),
+      }));
+      const domain = await resolveHudControlPlaneDomain({ cwd, requestedSessionId: sessionId });
+      await writeHudTmuxBirthLineage(domain, {
+        sessionId,
+        tmuxSessionName: 'team-session',
+        tmuxSessionInstanceId: sessionBirthId,
+        tmuxPaneInstanceId: paneBirthId,
+      });
+      await mkdir(binDir, { recursive: true });
+      await writeFile(join(binDir, 'tmux'), `#!/bin/sh
+case "$1" in
+display-message) printf 'team-session\t$1\t@1\t%%1\n' ;;
+show-option) printf '${paneBirthId}\n' ;;
+show-options) printf '${sessionBirthId}\n' ;;
+*) exit 1 ;;
+esac
+`);
+      await chmod(join(binDir, 'tmux'), 0o755);
+      process.env.PATH = `${binDir}:${previousPath ?? ''}`;
+      process.env.TMUX = 'fake,1,0';
+      process.env.TMUX_PANE = '%1';
+
+      assert.equal(await isManagedOmxSession(cwd, { session_id: sessionId }, { allowTeamWorker: false }), true);
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+      if (previousTmuxPane === undefined) delete process.env.TMUX_PANE;
+      else process.env.TMUX_PANE = previousTmuxPane;
+      if (previousTmux === undefined) delete process.env.TMUX;
+      else process.env.TMUX = previousTmux;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
