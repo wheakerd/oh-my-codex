@@ -1179,6 +1179,101 @@ export function ensureLeaderAndRecordIntent(
   });
 }
 
+export type NativeLeaderIntentFailureReason = LeaderBootstrapFailureReason | 'parent_not_active_leader';
+
+/**
+ * #3181 legacy/native fallback, made atomic. When no durable attestation exists, an
+ * in-turn role intent may still be authorized against a native-session leader anchor
+ * (the reconciled session pointer's native_session_id and/or the tracker
+ * leader_thread_id from real turns). This is the strict tracker-locked equivalent of the
+ * former CLI "activeLeaderThreadIds + recordPendingRoleIntent" fallback: it validates the
+ * native-session binding AND rejects any all-session subagent counter-evidence under the
+ * same lock as the intent write, so a subagent record that lands after a pre-check (or a
+ * PreToolUse attestation that lost its race) can never be downgraded into an
+ * unvalidated legacy authorization. Fail-closed: unreadable/corrupt tracker →
+ * native_anchor_unavailable; parent not a native leader anchor → parent_not_active_leader;
+ * parent tracked as a subagent anywhere → native_anchor_mismatch.
+ */
+export function recordNativeLeaderIntent(
+  cwd: string,
+  input: {
+    role: string;
+    sessionId: string;
+    parentThreadId: string;
+    nativeSessionId?: string;
+    allowTrackerLeader: boolean;
+    correlationToken: string;
+    ttlMs?: number;
+    nowMs?: number;
+  },
+): { ok: true; intent: PendingRoleIntent; reused: boolean } | { ok: false; reason: NativeLeaderIntentFailureReason } {
+  const role = resolveInstalledRoleName(input.role);
+  if (!role) return { ok: false, reason: 'unknown_role' };
+  const correlationToken = input.correlationToken;
+  if (!isCanonicalCorrelationToken(correlationToken)) {
+    return { ok: false, reason: 'invalid_correlation_token' };
+  }
+  const nowMs = normalizeNowMs(input.nowMs);
+  const sessionId = input.sessionId.trim();
+  const parentThreadId = input.parentThreadId.trim();
+  const nativeSessionId = input.nativeSessionId?.trim();
+  const canonicalOrigin = canonicalizeOriginCwd(cwd);
+  if (canonicalOrigin === null) return { ok: false, reason: 'invalid_origin' };
+  const { isOwn, shouldPruneExpired } = pendingRoleIntentPredicates(cwd, canonicalOrigin, nowMs);
+  return withCrossProcessFileLockSync(subagentTrackingPath(cwd), (context) => {
+    const read = readSubagentTrackingStateSyncStrict(cwd);
+    if (!read.ok) return { ok: false, reason: 'native_anchor_unavailable' as const };
+    const state = read.state;
+
+    // Native leader anchors, recomputed under the lock.
+    const acceptable = new Set<string>();
+    if (nativeSessionId) acceptable.add(nativeSessionId);
+    if (input.allowTrackerLeader) {
+      const trackerLeader = state.sessions[sessionId]?.leader_thread_id?.trim();
+      if (trackerLeader) acceptable.add(trackerLeader);
+    }
+    if (!parentThreadId || !acceptable.has(parentThreadId)) {
+      return { ok: false, reason: 'parent_not_active_leader' as const };
+    }
+    // Atomic all-session subagent exclusion: a parent thread recorded as a subagent in ANY
+    // session is never a valid leader, even if it matches a native anchor.
+    if (threadIsTrackedAsSubagent(state, parentThreadId)) {
+      return { ok: false, reason: 'native_anchor_mismatch' as const };
+    }
+
+    // Role-agnostic single-flight (same contract as recordPendingRoleIntent).
+    const all = state.pending_role_intents;
+    const liveOwnIntent = all.find((intent) => (
+      isOwn(intent)
+      && intent.session_id === sessionId
+      && intent.parent_thread_id === parentThreadId
+      && (intent.binding_state === 'bound' || !isExpiredPendingRoleIntent(intent, nowMs))
+    ));
+    if (liveOwnIntent) {
+      if (liveOwnIntent.role === role) {
+        return { ok: true, intent: liveOwnIntent, reused: true };
+      }
+      return { ok: false, reason: 'single_flight_conflict' };
+    }
+
+    const nowIso = new Date(nowMs).toISOString();
+    const ttlMs = typeof input.ttlMs === 'number' && Number.isFinite(input.ttlMs) ? input.ttlMs : 10 * 60_000;
+    const intent: PendingRoleIntent = {
+      role,
+      session_id: sessionId,
+      parent_thread_id: parentThreadId,
+      correlation_token: correlationToken,
+      created_at: nowIso,
+      expires_at: new Date(nowMs + ttlMs).toISOString(),
+      ...(canonicalOrigin ? { origin_cwd: canonicalOrigin } : {}),
+    };
+    state.pending_role_intents = [...all.filter((candidate) => !shouldPruneExpired(candidate)), intent];
+    context.assertOwnership();
+    writeSubagentTrackingStateSync(cwd, state, context.publish);
+    return { ok: true, intent, reused: false };
+  });
+}
+
 export function bindPendingRoleIntentUnderLock(
   cwd: string,
   input: { sessionId: string; parentThreadId: string; correlationToken?: string; nowMs?: number },

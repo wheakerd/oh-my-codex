@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 
 import { resolveRuntimeStateScope } from '../mcp/state-paths.js';
-import { ensureLeaderAndRecordIntent, type PendingRoleIntent, readSubagentTrackingStateStrict, recordPendingRoleIntent } from '../subagents/tracker.js';
+import { ensureLeaderAndRecordIntent, type PendingRoleIntent, readSubagentTrackingStateStrict, recordNativeLeaderIntent } from '../subagents/tracker.js';
 import {
   ROLE_INTENT_CORRELATION_TOKEN_PATTERN,
   buildRoleIntentSpawnTaskName,
@@ -42,7 +42,7 @@ export interface RalplanCommandDependencies {
   stdout?: (line: string) => void;
   stderr?: (line: string) => void;
   resolveSessionScope?: typeof resolveRuntimeStateScope;
-  recordPendingIntent?: typeof recordPendingRoleIntent;
+  recordNativeLeaderIntent?: typeof recordNativeLeaderIntent;
   ensureLeaderAndRecordIntent?: typeof ensureLeaderAndRecordIntent;
   generateCorrelationToken?: () => string;
 }
@@ -108,16 +108,9 @@ export async function ralplanCommand(
     : undefined;
   const useAttestedBootstrap = Boolean(attestedLeaderThreadId);
 
-  if (!useAttestedBootstrap) {
-    const activeLeaderThreadIds = new Set([
-      hasUsableCurrentPointer ? attestedSession?.leader_thread_id?.trim() : undefined,
-      currentScope.metadata?.nativeSessionId?.trim(),
-    ].filter((threadId): threadId is string => Boolean(threadId)));
-    if (!activeLeaderThreadIds.has(parsed.parentThreadId.trim())) {
-      emitRoleIntentFailure('parent_not_active_leader', parsed.json, stdout, stderr);
-      return;
-    }
-  }
+  // Note: the non-attested legacy path's native-anchor validation + all-session subagent
+  // exclusion is performed atomically inside recordNativeLeaderIntent under the tracker
+  // lock (below), not as a separate pre-check, so a subagent record cannot race in between.
 
   const correlationToken = (deps.generateCorrelationToken ?? (() => randomUUID().replace(/-/g, '')))();
   if (!isSupportedCorrelationToken(correlationToken)) {
@@ -136,14 +129,19 @@ export async function ralplanCommand(
     });
     result = bootstrap.ok ? { ok: true, intent: bootstrap.intent } : { ok: false, reason: bootstrap.reason };
   } else {
-    const recordPendingIntent = deps.recordPendingIntent ?? recordPendingRoleIntent;
-    result = recordPendingIntent(currentScope.cwd, {
+    const recordNativeIntent = deps.recordNativeLeaderIntent ?? recordNativeLeaderIntent;
+    const nativeResult = recordNativeIntent(currentScope.cwd, {
       role: parsed.role,
       sessionId: currentScope.sessionId,
       parentThreadId: parsed.parentThreadId,
+      ...(hasUsableCurrentPointer && currentScope.metadata?.nativeSessionId
+        ? { nativeSessionId: currentScope.metadata.nativeSessionId }
+        : {}),
+      allowTrackerLeader: hasUsableCurrentPointer,
       correlationToken,
       ...(parsed.ttlMs === undefined ? {} : { ttlMs: parsed.ttlMs }),
     });
+    result = nativeResult.ok ? { ok: true, intent: nativeResult.intent } : { ok: false, reason: nativeResult.reason };
   }
   if (!result.ok) {
     emitRoleIntentFailure(result.reason, parsed.json, stdout, stderr);

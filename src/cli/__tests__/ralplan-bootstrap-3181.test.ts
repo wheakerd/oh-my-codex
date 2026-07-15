@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
-import { attestLeaderThread, readSubagentTrackingState } from '../../subagents/tracker.js';
+import { attestLeaderThread, readSubagentTrackingState, recordSubagentTurnForSession } from '../../subagents/tracker.js';
 import { parseRoleIntentCorrelationToken } from '../../leader/contract.js';
 import { ralplanCommand, type RalplanCommandDependencies } from '../ralplan.js';
 
@@ -146,5 +146,41 @@ describe('#3181 ralplan CLI fresh-turn bootstrap', () => {
       else process.env.OMX_SESSION_ID = prior;
       await rm(cwd, { recursive: true, force: true });
     }
+  });
+
+  it('legacy native-session path: authenticates the native leader when it is not a subagent', async () => {
+    await withCwd(async (cwd) => {
+      // A reconciled pointer with a native session id, but NO attestation (legacy path).
+      const stateDir = join(cwd, '.omx', 'state');
+      await mkdir(stateDir, { recursive: true });
+      await writeFile(join(stateDir, 'session.json'), JSON.stringify({
+        session_id: 'sess-legacy', native_session_id: 'native-legacy', started_at: '2026-07-14T00:00:00.000Z', cwd,
+      }));
+      const res = await invoke(cwd, ['role-intent', 'write', '--role', 'architect', '--parent-thread', 'native-legacy', '--json']);
+      assert.equal(res.exitCode, undefined);
+      const receipt = JSON.parse(res.stdout.join('\n')) as { ok: boolean; intent: { role: string; parent_thread_id: string } };
+      assert.equal(receipt.ok, true);
+      assert.equal(receipt.intent.parent_thread_id, 'native-legacy');
+      assert.equal((await readSubagentTrackingState(cwd)).pending_role_intents.length, 1);
+    });
+  });
+
+  it('legacy native-session path: refuses a native leader that is also tracked as a subagent (atomic, no downgrade)', async () => {
+    await withCwd(async (cwd) => {
+      const stateDir = join(cwd, '.omx', 'state');
+      await mkdir(stateDir, { recursive: true });
+      await writeFile(join(stateDir, 'session.json'), JSON.stringify({
+        session_id: 'sess-legacy', native_session_id: 'native-legacy', started_at: '2026-07-14T00:00:00.000Z', cwd,
+      }));
+      // The native-session thread is also recorded as a subagent in another session (the
+      // PreToolUse-attestation-lost-the-race outcome). The legacy path must NOT authorize it.
+      await recordSubagentTurnForSession(cwd, {
+        sessionId: 'other-session', threadId: 'native-legacy', kind: 'subagent', leaderThreadId: 'other-session', timestamp: new Date().toISOString(),
+      });
+      const res = await invoke(cwd, ['role-intent', 'write', '--role', 'architect', '--parent-thread', 'native-legacy', '--json']);
+      assert.equal(res.exitCode, 1);
+      assert.deepEqual(JSON.parse(res.stdout.join('\n')), { ok: false, reason: 'native_anchor_mismatch' });
+      assert.deepEqual((await readSubagentTrackingState(cwd)).pending_role_intents, []);
+    });
   });
 });
