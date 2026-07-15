@@ -248,6 +248,31 @@ function tmuxSnapshotBindsCandidate(
       && candidateIds.includes(paneInstanceId));
 }
 
+function tmuxEvidenceMatchesClaimantBirth(
+  evidence: ActualTmuxInstanceEvidence,
+  domain: ResolvedHudControlPlaneDomain,
+): boolean {
+  const sessionBirthId = domain.claimant.tmuxSessionInstanceId?.trim() ?? '';
+  const paneBirthId = domain.claimant.tmuxPaneInstanceId?.trim() ?? '';
+  return Boolean(
+    sessionBirthId
+    && paneBirthId
+    && evidence.contextStable
+    && evidence.paneTagStatus === 'present'
+    && evidence.sessionTagStatus === 'present'
+    && evidence.sessionInstanceId === sessionBirthId
+    && evidence.paneInstanceId === paneBirthId,
+  );
+}
+
+function tmuxSnapshotMatchesClaimantBirth(
+  pane: TmuxPaneSnapshot,
+  domain: ResolvedHudControlPlaneDomain,
+): boolean {
+  return pane.sessionInstanceId?.trim() === domain.claimant.tmuxSessionInstanceId?.trim()
+    && pane.paneInstanceId?.trim() === domain.claimant.tmuxPaneInstanceId?.trim();
+}
+
 function hasVerifiedHudPaneInstanceIdentity(
   pane: TmuxPaneSnapshot,
   equivalentSessionIds: ReadonlySet<string>,
@@ -261,11 +286,12 @@ function planOwnedHudPaneDedupe(
   owner: HudPaneOwner,
   preferredPaneId: string,
   equivalentSessionIds: ReadonlySet<string>,
+  domain: ResolvedHudControlPlaneDomain,
 ): { paneId: string; duplicatePaneIds: string[]; unsafeCandidate: boolean } {
   const ownedPanes = panes
     .filter((pane) => pane.paneId !== currentPaneId)
     .filter((pane) => hudPaneMatchesOwner(pane, owner));
-  if (ownedPanes.some((pane) => !hasVerifiedHudPaneInstanceIdentity(pane, equivalentSessionIds))) {
+  if (ownedPanes.some((pane) => !hasVerifiedHudPaneInstanceIdentity(pane, equivalentSessionIds) && !tmuxSnapshotMatchesClaimantBirth(pane, domain))) {
     return { paneId: preferredPaneId, duplicatePaneIds: [], unsafeCandidate: true };
   }
   const ownedPaneIds = ownedPanes.map((pane) => pane.paneId);
@@ -298,7 +324,7 @@ function isVerifiedManagedHudOwner(
     domain.managed
     && currentPaneId
     && evidence.paneTarget === currentPaneId
-    && (tmuxEvidenceBindsCandidate(evidence, equivalentSessionIds) || acceptsSameAliasPair)
+    && (tmuxEvidenceBindsCandidate(evidence, equivalentSessionIds) || acceptsSameAliasPair || tmuxEvidenceMatchesClaimantBirth(evidence, domain))
     && domain.claimant.leaderPaneId === currentPaneId
     && domain.claimant.tmuxSessionName
     && domain.claimant.tmuxSessionName === evidence.sessionName,
@@ -412,6 +438,13 @@ export async function reconcileHudForPromptSubmit(
   const equivalentSessionIds = domain.session?.equivalentIds ?? [];
   try {
 
+  const lockedEvidence = currentPaneId
+    ? await (deps.probeTmuxInstance ?? probeActualTmuxInstanceEvidence)(currentPaneId).catch(() => null)
+    : null;
+  if (!lockedEvidence || !isVerifiedManagedHudOwner(domain, currentPaneId, lockedEvidence)) {
+    return { status: 'unchanged', paneId: null, desiredHeight: null, duplicateCount: 0 };
+  }
+
   let panes = listPanes(currentPaneId);
 
   // Reclaim orphaned HUD panes left behind by a destroyed leader before deciding
@@ -455,7 +488,7 @@ export async function reconcileHudForPromptSubmit(
   const ownedHudPanes = panes
     .filter((pane) => pane.paneId !== currentPaneId)
     .filter((pane) => hudPaneMatchesOwner(pane, owner));
-  if (ownedHudPanes.some((pane) => !hasVerifiedHudPaneInstanceIdentity(pane, equivalentSessionIdSet))) {
+  if (ownedHudPanes.some((pane) => !hasVerifiedHudPaneInstanceIdentity(pane, equivalentSessionIdSet) && !tmuxSnapshotMatchesClaimantBirth(pane, domain))) {
     return { status: 'unchanged', paneId: null, desiredHeight: null, duplicateCount: 0 };
   }
   const hudPaneIds = ownedHudPanes.map((pane) => pane.paneId);
@@ -570,6 +603,7 @@ export async function reconcileHudForPromptSubmit(
     owner,
     paneId,
     equivalentSessionIdSet,
+    domain,
   );
   if (postCreate.unsafeCandidate) {
     return { status: 'recreated', paneId, desiredHeight, duplicateCount: 0 };
@@ -638,6 +672,11 @@ export async function teardownManagedHudPane(
     return { status: 'skipped_concurrent', removedPaneIds: [] };
   }
 
+  const lockedEvidence = await (deps.probeTmuxInstance ?? probeActualTmuxInstanceEvidence)(currentPaneId).catch(() => null);
+  if (!lockedEvidence || !isVerifiedManagedHudOwner(domain, currentPaneId, lockedEvidence)) {
+    return { status: 'skipped_not_omx_owned_tmux', removedPaneIds: [] };
+  }
+
   try {
     const panes = (deps.listCurrentWindowPanes ?? ((paneId) => listCurrentWindowPanes(undefined, paneId)))(currentPaneId);
     const leader = panes.find((pane) => pane.paneId === currentPaneId && !isHudWatchPane(pane));
@@ -646,7 +685,7 @@ export async function teardownManagedHudPane(
         .map((value) => value?.trim() ?? '')
         .filter(Boolean),
     );
-    if (!leader || !tmuxSnapshotBindsCandidate(leader, [...equivalentSessionIds])) {
+    if (!leader || (!tmuxSnapshotBindsCandidate(leader, [...equivalentSessionIds]) && !tmuxSnapshotMatchesClaimantBirth(leader, domain))) {
       return { status: 'skipped_not_omx_owned_tmux', removedPaneIds: [] };
     }
 
@@ -656,7 +695,7 @@ export async function teardownManagedHudPane(
     };
     const exactHudPaneIds = panes
       .filter((pane) => pane.paneId !== currentPaneId && isHudWatchPane(pane))
-      .filter((pane) => tmuxSnapshotBindsCandidate(pane, [...equivalentSessionIds]))
+      .filter((pane) => tmuxSnapshotBindsCandidate(pane, [...equivalentSessionIds]) || tmuxSnapshotMatchesClaimantBirth(pane, domain))
       .filter((pane) => [...equivalentSessionIds].some((sessionId) => hudPaneMatchesExactCandidate(
         pane,
         { sessionId, leaderPaneId: currentPaneId },

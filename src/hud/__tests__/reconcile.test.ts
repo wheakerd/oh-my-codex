@@ -2230,6 +2230,63 @@ describe('reconcileHudForPromptSubmit verified lifecycle ownership', () => {
     assert.equal(result.paneId, '%created');
     assert.deepEqual(killed, []);
   });
+  it('accepts resolver-carried opaque birth evidence without widening logical aliases', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-hud-opaque-claimant-'));
+    try {
+      const domain = await testReconcileDomain(cwd, { sessionId: 'logical-session', env: { TMUX_PANE: '%1' } });
+      const opaqueDomain = {
+        ...domain,
+        claimant: {
+          ...domain.claimant,
+          tmuxSessionInstanceId: '7d667f3f-4c4b-4e80-8ea5-050ba1dbfe1f',
+          tmuxPaneInstanceId: '388b3d25-c797-4223-bb30-3eb3511e4101',
+        },
+      };
+      const result = await reconcileHudForPromptSubmit(cwd, {
+        env: { TMUX: '1', TMUX_PANE: '%1', OMX_SESSION_ID: 'logical-session', [OMX_TMUX_HUD_OWNER_ENV]: '1' },
+        sessionId: 'logical-session',
+        resolveDomain: async () => opaqueDomain,
+        probeTmuxInstance: async () => ({
+          paneTarget: '%1', sessionName: 'managed', paneInstanceId: '388b3d25-c797-4223-bb30-3eb3511e4101', sessionInstanceId: '7d667f3f-4c4b-4e80-8ea5-050ba1dbfe1f',
+          instanceId: '388b3d25-c797-4223-bb30-3eb3511e4101', source: 'pane', paneTagStatus: 'present', sessionTagStatus: 'present', sessionId: '$1', windowId: '@1', contextStable: true,
+        }),
+        listCurrentWindowPanes: () => [
+          { paneId: '%1', currentCommand: 'codex', startCommand: 'codex', paneInstanceId: '388b3d25-c797-4223-bb30-3eb3511e4101', sessionInstanceId: '7d667f3f-4c4b-4e80-8ea5-050ba1dbfe1f' },
+          { paneId: '%2', currentCommand: 'node', startCommand: "exec env OMX_SESSION_ID='logical-session' OMX_TMUX_HUD_OWNER='1' OMX_TMUX_HUD_LEADER_PANE='%1' node omx.js hud --watch", paneInstanceId: '388b3d25-c797-4223-bb30-3eb3511e4101', sessionInstanceId: '7d667f3f-4c4b-4e80-8ea5-050ba1dbfe1f' },
+        ],
+        resizeTmuxPane: () => true,
+        resolveOmxCliEntryPath: () => '/repo/dist/cli/omx.js',
+      });
+      assert.equal(result.status, 'resized');
+      assert.equal(result.paneId, '%2');
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('does not mutate after the leader birth identity drifts under the lifecycle lock', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-hud-under-lock-drift-'));
+    let probes = 0;
+    let mutated = false;
+    try {
+      const result = await reconcileHudForPromptSubmit(cwd, {
+        env: { TMUX: '1', TMUX_PANE: '%1', OMX_SESSION_ID: 'session-a', [OMX_TMUX_HUD_OWNER_ENV]: '1' },
+        sessionId: 'session-a',
+        probeTmuxInstance: async () => ({
+          paneTarget: '%1', sessionName: 'managed', paneInstanceId: probes++ === 0 ? 'session-a' : 'replacement', sessionInstanceId: 'session-a',
+          instanceId: 'session-a', source: 'pane', paneTagStatus: 'present', sessionTagStatus: 'present', sessionId: '$1', windowId: '@1', contextStable: true,
+        }),
+        listCurrentWindowPanes: () => { mutated = true; return []; },
+        killTmuxPane: () => { mutated = true; return true; },
+        resolveOmxCliEntryPath: () => '/repo/dist/cli/omx.js',
+      });
+      assert.equal(result.status, 'unchanged');
+      assert.equal(mutated, false);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
 });
 
 describe('teardownManagedHudPane', () => {
@@ -2318,4 +2375,27 @@ describe('teardownManagedHudPane', () => {
       await rm(cwd, { recursive: true, force: true });
     }
   });
+  it('tears down an opaque birth claimant carried by the resolver', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-hud-teardown-opaque-'));
+    const killed: string[] = [];
+    try {
+      const domain = await testReconcileDomain(cwd, { sessionId: 'logical-session', env: { TMUX_PANE: '%1' } });
+      const opaqueDomain = { ...domain, claimant: { ...domain.claimant, tmuxSessionInstanceId: 'session-birth', tmuxPaneInstanceId: 'pane-birth' } };
+      const result = await teardownManagedHudPane(cwd, {
+        env: { TMUX: '1', TMUX_PANE: '%1', OMX_SESSION_ID: 'logical-session', [OMX_TMUX_HUD_OWNER_ENV]: '1' },
+        sessionId: 'logical-session', resolveDomain: async () => opaqueDomain,
+        probeTmuxInstance: async () => ({ paneTarget: '%1', sessionName: 'managed', paneInstanceId: 'pane-birth', sessionInstanceId: 'session-birth', instanceId: 'pane-birth', source: 'pane', paneTagStatus: 'present', sessionTagStatus: 'present', sessionId: '$1', windowId: '@1', contextStable: true }),
+        listCurrentWindowPanes: () => [
+          { paneId: '%1', currentCommand: 'codex', startCommand: 'codex', paneInstanceId: 'pane-birth', sessionInstanceId: 'session-birth' },
+          { paneId: '%2', currentCommand: 'node', startCommand: "exec env OMX_SESSION_ID='logical-session' OMX_TMUX_HUD_OWNER='1' OMX_TMUX_HUD_LEADER_PANE='%1' node omx.js hud --watch", paneInstanceId: 'pane-birth', sessionInstanceId: 'session-birth' },
+        ],
+        killTmuxPane: (paneId) => { killed.push(paneId); return true; }, unregisterHudResizeHook: noOpUnregisterHudResizeHook,
+      });
+      assert.equal(result.status, 'removed');
+      assert.deepEqual(killed, ['%2']);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
 });

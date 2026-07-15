@@ -424,13 +424,15 @@ describe('HUD resize hook command builders', () => {
     const attachedName = 'omx_attached_team_session_0_1';
     const resizeSlot = buildRegisterResizeHookArgs('team:0', resizeName, '%1')[3] as string;
     const attachedSlot = buildRegisterClientAttachedReconcileArgs('team:0', attachedName, '%1')[3] as string;
+    const resizeCommand = buildRegisterResizeHookArgs('team:0', resizeName, '%1')[4] as string;
+    const attachedCommand = buildRegisterClientAttachedReconcileArgs('team:0', attachedName, '%1')[4] as string;
     await withMockTmuxFixture('omx-tmux-hook-client-failure-', (logPath) => `#!/bin/sh
 printf '%s\\n' "$*" >> "${logPath}"
 case "$1" in
   show-hooks)
     case "$4" in
-      "${resizeSlot}") echo "${resizeSlot} run-shell resize" ;;
-      "${attachedSlot}") echo "${attachedSlot} run-shell attached" ;;
+      "${resizeSlot}") echo "${resizeSlot} ${resizeCommand}" ;;
+      "${attachedSlot}") echo "${attachedSlot} ${attachedCommand}" ;;
     esac
     ;;
   set-hook)
@@ -438,7 +440,7 @@ case "$1" in
     ;;
 esac
 `, async ({ logPath }) => {
-      assert.equal(unregisterHudHooksTransactionally('team:0', resizeName, attachedName), false);
+      assert.equal(unregisterHudHooksTransactionally('team:0', resizeName, attachedName, '%1'), false);
       const log = await readFile(logPath, 'utf-8');
       assert.match(log, new RegExp(`set-hook -u -t team:0 ${escapeRegExp(attachedSlot)}`));
       assert.doesNotMatch(log, new RegExp(`set-hook -u -t team:0 ${escapeRegExp(resizeSlot)}`));
@@ -450,14 +452,16 @@ esac
     const attachedName = 'omx_attached_team_session_0_2';
     const resizeSlot = buildRegisterResizeHookArgs('team:0', resizeName, '%1')[3] as string;
     const attachedSlot = buildRegisterClientAttachedReconcileArgs('team:0', attachedName, '%1')[3] as string;
+    const resizeCommand = buildRegisterResizeHookArgs('team:0', resizeName, '%1')[4] as string;
+    const attachedCommand = buildRegisterClientAttachedReconcileArgs('team:0', attachedName, '%1')[4] as string;
     await withMockTmuxFixture('omx-tmux-hook-resize-failure-', (logPath) => `#!/bin/sh
 printf '%s\\n' "$*" >> "${logPath}"
 state="${logPath}.attached-removed"
 case "$1" in
   show-hooks)
     case "$4" in
-      "${resizeSlot}") echo "${resizeSlot} run-shell resize" ;;
-      "${attachedSlot}") [ ! -f "$state" ] && echo "${attachedSlot} run-shell attached" ;;
+      "${resizeSlot}") echo "${resizeSlot} ${resizeCommand}" ;;
+      "${attachedSlot}") [ ! -f "$state" ] && echo "${attachedSlot} ${attachedCommand}" ;;
     esac
     true
     ;;
@@ -469,11 +473,32 @@ case "$1" in
 esac
 `,
  async ({ logPath }) => {
-      assert.equal(unregisterHudHooksTransactionally('team:0', resizeName, attachedName), false);
+      assert.equal(unregisterHudHooksTransactionally('team:0', resizeName, attachedName, '%1'), false);
       const log = await readFile(logPath, 'utf-8');
       assert.match(log, new RegExp(`set-hook -u -t team:0 ${escapeRegExp(attachedSlot)}`));
       assert.match(log, new RegExp(`set-hook -u -t team:0 ${escapeRegExp(resizeSlot)}`));
-      assert.match(log, new RegExp(`set-hook -t team:0 ${escapeRegExp(attachedSlot)} run-shell attached`));
+      assert.match(log, new RegExp(`set-hook -t team:0 ${escapeRegExp(attachedSlot)} ${escapeRegExp(attachedCommand)}`));
+    });
+  });
+  it('preserves a foreign hook command occupying an OMX hook slot', async () => {
+    const resizeName = 'omx_resize_team_session_0_3';
+    const attachedName = 'omx_attached_team_session_0_3';
+    const resizeSlot = buildRegisterResizeHookArgs('team:0', resizeName, '%1')[3] as string;
+    const attachedSlot = buildRegisterClientAttachedReconcileArgs('team:0', attachedName, '%1')[3] as string;
+    await withMockTmuxFixture('omx-tmux-hook-foreign-slot-', (logPath) => `#!/bin/sh
+printf '%s\\n' "$*" >> "${logPath}"
+case "$1" in
+  show-hooks)
+    case "$4" in
+      "${resizeSlot}") echo "${resizeSlot} run-shell -b 'foreign command'" ;;
+      "${attachedSlot}") echo "${attachedSlot} run-shell -b 'foreign command'" ;;
+    esac
+    ;;
+esac
+`, async ({ logPath }) => {
+      assert.equal(unregisterHudHooksTransactionally('team:0', resizeName, attachedName, '%1'), false);
+      const log = await readFile(logPath, 'utf-8');
+      assert.doesNotMatch(log, /set-hook -u/);
     });
   });
 
