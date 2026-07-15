@@ -1388,7 +1388,7 @@ function runPackedTransportRegressions(hookScript: string, smokeCwd: string): vo
   const g2aCwd = join(smokeCwd, 'g2a');
   mkdirSync(g2aCwd, { recursive: true });
   const g2aEnv = buildPackedRegressionEnvironment({ name: 'g2a' });
-  const g2aPayload = { hook_event_name: 'UserPromptSubmit', cwd: g2aCwd, session_id: 'g2a', thread_id: 'g2a-thread', turn_id: 'g2a-turn', prompt: '> quoted context\nProse\n$ralplan implement this' };
+  const g2aPayload = { hook_event_name: 'UserPromptSubmit', cwd: g2aCwd, session_id: 'g2a', thread_id: 'g2a-thread', turn_id: 'g2a-turn', prompt: 'use $ralplan is the consensus-planning command' };
   validateHookStdout('UserPromptSubmit', String(invoke(g2aCwd, g2aEnv, g2aPayload).stdout || ''));
   if (existsSync(join(g2aCwd, '.omx', 'state', 'sessions', 'g2a', 'skill-active-state.json'))) throw new Error('packed G2a stale predecessor created workflow state');
   if (stopDecision(g2aCwd, g2aEnv, g2aPayload) === 'block') throw new Error('packed G2a stale predecessor blocked Stop');
@@ -1398,7 +1398,7 @@ function runPackedTransportRegressions(hookScript: string, smokeCwd: string): vo
   const g2bFiles = seedTerminal(g2bCwd, 'g2b-old', 'g2b');
   const g2bBefore = g2bFiles.map((file) => readFileSync(file));
   const g2bEnv = buildPackedRegressionEnvironment({ name: 'g2b' });
-  const g2bPayload = { hook_event_name: 'UserPromptSubmit', cwd: g2bCwd, session_id: 'g2b-new', thread_id: 'g2b-thread', turn_id: 'g2b-turn', prompt: 'Do not use $team $autopilot restart — café' };
+  const g2bPayload = { hook_event_name: 'UserPromptSubmit', cwd: g2bCwd, session_id: 'g2b-old', thread_id: 'g2b-thread', turn_id: 'g2b-turn-new', prompt: 'do not start $autopilot — café' };
   validateHookStdout('UserPromptSubmit', String(invoke(g2bCwd, g2bEnv, g2bPayload).stdout || ''));
   for (const [index, file] of g2bFiles.entries()) if (Buffer.compare(readFileSync(file), g2bBefore[index]!) !== 0) throw new Error(`packed G2b mutated terminal state ${file}`);
   if (stopDecision(g2bCwd, g2bEnv, g2bPayload) === 'block') throw new Error('packed G2b negated prompt blocked Stop');
