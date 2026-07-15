@@ -22,7 +22,7 @@ async function invokeRoleIntent(cwd: string, args: string[]) {
 }
 
 describe('#3181 end-to-end fresh App turn bootstrap', () => {
-  it('SessionStart attests the leader so a fresh in-turn role-intent write succeeds instead of missing_session', async () => {
+  it('SessionStart establishes the canonical pointer (without attesting) so a fresh in-turn role-intent write succeeds via native-session auth', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-3181-e2e-'));
     const priorEnv = { OMX_SESSION_ID: process.env.OMX_SESSION_ID, CODEX_SESSION_ID: process.env.CODEX_SESSION_ID, SESSION_ID: process.env.SESSION_ID };
     try {
@@ -37,15 +37,14 @@ describe('#3181 end-to-end fresh App turn bootstrap', () => {
         { cwd, sessionOwnerPid: process.pid },
       );
 
-      // 2. The leader is now durably attested by the native hook (Phase 1).
+      // 2. SessionStart reconciles the canonical pointer but does NOT attest a leader
+      //    (a null transcript cannot positively classify a root vs a malformed child).
       const afterStart = await readSubagentTrackingState(cwd);
-      const attested = afterStart.sessions[nativeSessionId];
-      assert.equal(attested?.leader_thread_id, nativeSessionId);
-      assert.equal(attested?.leader_attest_source, 'native-sessionstart');
-      assert.ok(attested?.leader_attested_at);
+      assert.equal(afterStart.sessions[nativeSessionId]?.leader_attested_at, undefined, 'SessionStart must not attest a leader');
 
-      // 3. The first in-turn command (before any child spawn) now succeeds via self-heal
-      //    (Phase 2), reproducing the exact #3181 repro command shape.
+      // 3. The first in-turn command still succeeds: session.json's native_session_id
+      //    authenticates the leader via the legacy native-session path (no more
+      //    missing_session), reproducing the exact #3181 repro command shape.
       const res = await invokeRoleIntent(cwd, ['role-intent', 'write', '--role', 'architect', '--parent-thread', nativeSessionId, '--json']);
       assert.equal(res.exitCode, undefined);
       const receipt = JSON.parse(res.stdout.join('\n')) as { ok: boolean; intent: { role: string; parent_thread_id: string; correlation_token: string }; spawn_task_name: string };
@@ -57,7 +56,6 @@ describe('#3181 end-to-end fresh App turn bootstrap', () => {
       const finalState = await readSubagentTrackingState(cwd);
       assert.equal(finalState.pending_role_intents.length, 1);
       assert.equal(finalState.pending_role_intents[0]?.role, 'architect');
-      assert.equal(finalState.sessions[nativeSessionId]?.threads[nativeSessionId]?.kind, 'leader');
     } finally {
       if (priorEnv.OMX_SESSION_ID !== undefined) process.env.OMX_SESSION_ID = priorEnv.OMX_SESSION_ID;
       if (priorEnv.CODEX_SESSION_ID !== undefined) process.env.CODEX_SESSION_ID = priorEnv.CODEX_SESSION_ID;

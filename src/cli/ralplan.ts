@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 
 import { resolveRuntimeStateScope } from '../mcp/state-paths.js';
-import { ensureLeaderAndRecordIntent, type PendingRoleIntent, readSubagentTrackingState, recordPendingRoleIntent } from '../subagents/tracker.js';
+import { ensureLeaderAndRecordIntent, type PendingRoleIntent, readSubagentTrackingStateStrict, recordPendingRoleIntent } from '../subagents/tracker.js';
 import {
   ROLE_INTENT_CORRELATION_TOKEN_PATTERN,
   buildRoleIntentSpawnTaskName,
@@ -93,7 +93,15 @@ export async function ralplanCommand(
   const hasUsableCurrentPointer = Boolean(
     currentScope.metadata && currentScope.metadata.sessionId === currentScope.sessionId,
   );
-  const trackingState = await readSubagentTrackingState(currentScope.cwd);
+  // Strict read: an existing but unreadable/corrupt tracker must fail closed rather than
+  // being read as empty and then overwritten by the legacy recordPendingRoleIntent path,
+  // which would erase leader_attested_* and all subagent counter-evidence.
+  const trackingRead = await readSubagentTrackingStateStrict(currentScope.cwd);
+  if (!trackingRead.ok) {
+    emitRoleIntentFailure('native_anchor_unavailable', parsed.json, stdout, stderr);
+    return;
+  }
+  const trackingState = trackingRead.state;
   const attestedSession = trackingState.sessions[currentScope.sessionId];
   const attestedLeaderThreadId = hasUsableCurrentPointer && attestedSession?.leader_attested_at
     ? attestedSession.leader_thread_id?.trim()

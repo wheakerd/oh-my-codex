@@ -10270,25 +10270,13 @@ export async function dispatchCodexNativeHook(
         resolvedNativeSessionId = safeString(sessionState.native_session_id).trim() || nativeSessionId;
         allowImplicitSessionSideEffects = true;
         stopAuthorizationFailure = null;
-        // #3181: durably attest the authenticated leader thread for this canonical
-        // session so a fresh in-turn `omx ralplan role-intent write` can bootstrap the
-        // tracker leader before the turn-completion notify path would seed it. This is
-        // the non-subagent SessionStart reconcile branch, so the leader thread id is the
-        // reconciled native session id. Best-effort: never block SessionStart.
-        if (canonicalSessionId && resolvedNativeSessionId
-          && readPayloadAgentRole(payload) === ""
-          && !hasSubagentThreadSpawnProvenance(payload)
-          && !(await isThreadTrackedAsSubagent(cwd, resolvedNativeSessionId))) {
-          try {
-            attestLeaderThread(cwd, {
-              sessionId: canonicalSessionId,
-              leaderThreadId: resolvedNativeSessionId,
-              source: 'native-sessionstart',
-            });
-          } catch {
-            // Attestation is a non-critical accelerator; tolerate any failure.
-          }
-        }
+        // #3181: leader attestation is intentionally NOT performed here. This branch is
+        // reached whenever readNativeSubagentSessionStartMetadata() returns null, which
+        // conflates a genuine root start with an unreadable/malformed child transcript, so
+        // it cannot positively classify a leader (a legitimate leader may also carry no
+        // transcript). Leader attestation is performed only on the strictly-gated fresh
+        // leader PreToolUse path below, which fires before the first in-turn role-intent
+        // write. Fail closed here rather than risk a false-leader adoption.
       } catch (error) {
         if (!isSessionPointerLaunchAbort(error)) throw error;
         canonicalSessionId = "";

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
@@ -51,10 +51,12 @@ async function withFreshEnv(fn: () => Promise<void>): Promise<void> {
   }
 }
 
-// Both plugin and legacy delivery drive the same native hook + CLI + tracker recovery path;
-// the meaningful axis is the authenticated in-turn entry point that seeded the leader.
+// Both plugin and legacy delivery drive the same native hook + CLI + tracker recovery path.
+// Leader attestation is established only on the strictly-gated fresh leader PreToolUse
+// entry point (the role-intent command's own PreToolUse fires before it executes); both
+// deliveries route through it, so durable recovery is proven identically for each.
 const DELIVERIES: Array<{ label: string; event: 'SessionStart' | 'PreToolUse' }> = [
-  { label: 'plugin (SessionStart-seeded)', event: 'SessionStart' },
+  { label: 'plugin (PreToolUse-seeded)', event: 'PreToolUse' },
   { label: 'legacy (PreToolUse-seeded)', event: 'PreToolUse' },
 ];
 
@@ -121,7 +123,7 @@ describe('#3181 durable bootstrap-order recovery', () => {
     await withFreshEnv(async () => {
       try {
         const sessionId = 'codex-native-retry';
-        await seedAuthenticatedLeader(cwd, sessionId, 'SessionStart');
+        await seedAuthenticatedLeader(cwd, sessionId, 'PreToolUse');
         const receipts: string[] = [];
         for (let i = 0; i < 3; i += 1) {
           const r = (await invoke(cwd, roleIntentArgs('architect', sessionId))).json as Receipt;
@@ -143,7 +145,7 @@ describe('#3181 durable bootstrap-order recovery', () => {
       delete process.env.SESSION_ID;
       // Real leader session A is authenticated and has a durable intent.
       await withFreshEnv(async () => {
-        await seedAuthenticatedLeader(cwd, 'codex-native-A', 'SessionStart');
+        await seedAuthenticatedLeader(cwd, 'codex-native-A', 'PreToolUse');
         const r = (await invoke(cwd, roleIntentArgs('architect', 'codex-native-A'))).json as Receipt;
         assert.equal(r.ok, true);
       });
@@ -161,37 +163,28 @@ describe('#3181 durable bootstrap-order recovery', () => {
     }
   });
 
-  it('malformed durable tracker on resume: FR-20 fail-closed boundary (spoof rejected; legacy fallback only under an independently authenticated native leader)', async () => {
+  it('malformed/corrupt durable tracker on resume fails closed (native_anchor_unavailable) and never overwrites the evidence', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-3181-recover-malformed-'));
     await withFreshEnv(async () => {
       try {
         const sessionId = 'codex-native-malformed';
-        await seedAuthenticatedLeader(cwd, sessionId, 'SessionStart');
+        await seedAuthenticatedLeader(cwd, sessionId, 'PreToolUse');
         (await invoke(cwd, roleIntentArgs('architect', sessionId))).json as Receipt;
-        // Corrupt the durable tracker so the attestation evidence is unreadable. Per the
-        // FR-20 contract the malformed attestation must NOT be trusted: the attested
-        // self-heal path becomes unavailable (readSubagentTrackingStateStrict denies it),
-        // so no receipt is recovered from the corrupt record and no partial adoption occurs.
+        // Corrupt the durable tracker. Per FR-20 the malformed evidence must not be trusted:
+        // the CLI strict-reads it and fails closed rather than reading it as empty and
+        // overwriting it via the legacy path (which would erase leader/subagent evidence).
+        const corrupt = '{ corrupt tracker not valid json';
         await mkdir(join(cwd, '.omx', 'state'), { recursive: true });
-        await writeFile(subagentTrackingPath(cwd), '{ corrupt tracker not valid json');
+        await writeFile(subagentTrackingPath(cwd), corrupt);
 
-        // Negative boundary: a spoofed --parent-thread is rejected outright; the corrupt
-        // attestation cannot authorize a foreign/unauthenticated leader thread. No write
-        // occurs, so corruption persists for the positive-boundary check below.
+        // A spoofed parent AND the real native leader both fail closed on a corrupt tracker.
         const spoofed = (await invoke(cwd, roleIntentArgs('architect', 'attacker-thread'))).json as { ok: boolean; reason?: string };
-        assert.equal(spoofed.ok, false, 'a spoofed leader thread must never be adopted');
-        assert.equal(spoofed.reason, 'parent_not_active_leader');
+        assert.deepEqual(spoofed, { ok: false, reason: 'native_anchor_unavailable' }, 'spoof on a corrupt tracker fails closed');
+        const nativeLeader = (await invoke(cwd, roleIntentArgs('architect', sessionId))).json as { ok: boolean; reason?: string };
+        assert.deepEqual(nativeLeader, { ok: false, reason: 'native_anchor_unavailable' }, 'even the native leader fails closed on a corrupt tracker');
 
-        // Positive boundary: legacy fallback is permitted ONLY under an independently
-        // authenticated native leader. session.json's native_session_id authenticates the
-        // leader independent of the (corrupt) tracker, so re-recording under the real native
-        // leader thread is safe even though the corrupt attestation itself is untrusted. The
-        // exact prior receipt is unrecoverable (inherent to corruption), but recovery is safe
-        // and never adopts a foreign leader.
-        const authenticated = (await invoke(cwd, roleIntentArgs('architect', sessionId))).json as Receipt;
-        assert.equal(authenticated.ok, true, 'legacy fallback under an authenticated native leader is permitted');
-        assert.equal(authenticated.intent.role, 'architect');
-        assert.equal(authenticated.intent.parent_thread_id, sessionId);
+        // The corrupt tracker is never overwritten (evidence preserved, not silently reset).
+        assert.equal(await readFile(subagentTrackingPath(cwd), 'utf-8'), corrupt, 'corrupt tracker must not be overwritten');
       } finally {
         await rm(cwd, { recursive: true, force: true });
       }
