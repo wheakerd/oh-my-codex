@@ -14,7 +14,7 @@
  * - Session metadata
  */
 
-import { readFile, writeFile, mkdir, rm } from "fs/promises";
+import { chmod, readFile, writeFile, mkdir, rm } from "fs/promises";
 import { dirname, join } from "path";
 import { existsSync } from "fs";
 import {
@@ -655,7 +655,8 @@ export async function writeSessionModelInstructionsFile(
   overlay: string,
 ): Promise<string> {
   const sessionPath = sessionModelInstructionsPath(cwd, sessionId);
-  await mkdir(dirname(sessionPath), { recursive: true });
+  await mkdir(dirname(sessionPath), { recursive: true, mode: 0o700 });
+  await chmod(dirname(sessionPath), 0o700);
 
   const baseParts: string[] = [];
   const userAgentsPath = join(codexHome(), "AGENTS.md");

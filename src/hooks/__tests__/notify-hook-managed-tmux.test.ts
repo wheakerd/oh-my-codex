@@ -14,6 +14,7 @@ import {
   verifyManagedPaneTarget,
 } from '../../scripts/notify-hook/managed-tmux.js';
 import { writeSessionStart } from '../session.js';
+import { clearTeamTestAuthority, hardenTestAuthorityTreeSync, installTeamTestAuthority } from '../../team/__tests__/authority-fixture.js';
 
 function readLinuxStartTicks(pid: number): number | null {
   try {
@@ -49,6 +50,7 @@ describe('notify-hook managed tmux windows fallback', () => {
     await writeFile(fakeTmuxPath, script);
     await chmod(fakeTmuxPath, 0o755);
     process.env.PATH = `${fakeBinDir}:${previousPath || ''}`;
+    await installManagedTmuxFixtureAuthority(cwd);
     try {
       await run();
     } finally {
@@ -57,12 +59,25 @@ describe('notify-hook managed tmux windows fallback', () => {
     }
   }
 
+async function installManagedTmuxFixtureAuthority(cwd: string): Promise<void> {
+  try {
+    const session = JSON.parse(await readFile(join(cwd, '.omx', 'state', 'session.json'), 'utf-8')) as { session_id?: unknown };
+    if (typeof session.session_id !== 'string' || session.session_id.length === 0) return;
+    await installTeamTestAuthority(cwd, session.session_id);
+    hardenTestAuthorityTreeSync(cwd);
+  } catch {
+    // Tests without persisted session state do not exercise authority-gated paths.
+  }
+}
+
   const originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
   const originalTmux = process.env.TMUX;
   const originalTmuxPane = process.env.TMUX_PANE;
   const originalTeamWorker = process.env.OMX_TEAM_WORKER;
+  clearTeamTestAuthority();
 
   afterEach(() => {
+    clearTeamTestAuthority();
     if (originalPlatform) Object.defineProperty(process, 'platform', originalPlatform);
     if (originalTmux !== undefined) process.env.TMUX = originalTmux;
     else delete process.env.TMUX;
@@ -219,16 +234,9 @@ exit 1
   it('does not rely on ps ancestry checks on native Windows', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-managed-tmux-win32-'));
     try {
-      const stateDir = join(cwd, '.omx', 'state');
       const sessionId = 'omx-test-session';
-      await mkdir(stateDir, { recursive: true });
-      await writeFile(join(stateDir, 'session.json'), JSON.stringify({
-        session_id: sessionId,
-        started_at: new Date().toISOString(),
-        cwd,
-        pid: 999999,
-        platform: 'win32',
-      }, null, 2));
+      await installTeamTestAuthority(cwd, sessionId);
+      await writeSessionStart(cwd, sessionId, { pid: 999999, platform: 'win32' });
 
       Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
       delete process.env.TMUX;
@@ -237,7 +245,7 @@ exit 1
 
       const result = await resolveManagedSessionContext(cwd, { session_id: sessionId }, { allowTeamWorker: false });
       assert.equal(result.managed, false);
-      assert.equal(result.reason, 'stale_session');
+      assert.equal(result.reason, 'session_check_failed');
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -248,6 +256,7 @@ exit 1
     try {
       const stateDir = join(cwd, '.omx', 'state');
       await mkdir(stateDir, { recursive: true });
+      await installTeamTestAuthority(cwd, 'omx-canonical-session');
       await writeSessionStart(cwd, 'omx-canonical-session');
       const current = JSON.parse(await readFile(join(stateDir, 'session.json'), 'utf-8'));
       await writeFile(join(stateDir, 'session.json'), JSON.stringify({
@@ -274,6 +283,7 @@ exit 1
     const cwd = await mkdtemp(join(tmpdir(), 'omx-managed-tmux-authoritative-'));
     try {
       const sessionId = 'omx-authoritative-session';
+      await installTeamTestAuthority(cwd, sessionId);
       const tmuxSessionName = 'omx-authoritative-without-git';
       await writeSessionStart(cwd, sessionId, { tmuxSessionName });
 
@@ -303,6 +313,7 @@ exit 1
     const cwd = await mkdtemp(join(tmpdir(), 'omx-managed-tmux-authoritative-mismatch-'));
     try {
       const sessionId = 'omx-authoritative-session';
+      await installTeamTestAuthority(cwd, sessionId);
       await writeSessionStart(cwd, sessionId, { tmuxSessionName: 'omx-expected-session' });
 
       await withFakeTmux(cwd, `#!/usr/bin/env bash
@@ -332,6 +343,7 @@ exit 1
     const aliasCwd = `${cwd}-alias`;
     try {
       await symlink(cwd, aliasCwd, process.platform === 'win32' ? 'junction' : 'dir');
+      await installTeamTestAuthority(cwd, 'omx-alias-session');
       await writeSessionStart(cwd, 'omx-alias-session');
 
       delete process.env.TMUX;
@@ -355,6 +367,7 @@ exit 1
     const sessionId = 'omx-alias-session';
     try {
       await symlink(cwd, aliasCwd, process.platform === 'win32' ? 'junction' : 'dir');
+      await installTeamTestAuthority(cwd, sessionId);
       await writeSessionStart(cwd, sessionId);
 
       delete process.env.TMUX;
@@ -400,6 +413,7 @@ exit 1
     const cwd = await mkdtemp(join(tmpdir(), 'omx-managed-tmux-pane-instance-'));
     try {
       const sessionId = 'omx-pane-instance-owner';
+      await installTeamTestAuthority(cwd, sessionId);
       const sharedTmuxSession = 'shared-omx-session';
       await writeSessionStart(cwd, sessionId, { tmuxSessionName: sharedTmuxSession });
 
@@ -549,6 +563,8 @@ exit 1
       delete process.env.TMUX_PANE;
       process.env.OMX_TEAM_WORKER = '';
 
+      await installTeamTestAuthority(cwd, sessionId);
+      await writeSessionStart(cwd, sessionId);
       const paneId = await resolveManagedPaneFromAnchor('%42', cwd, { session_id: sessionId }, { allowTeamWorker: false });
       assert.equal(paneId, '%42');
     } finally {
@@ -640,6 +656,8 @@ exit 1
       delete process.env.TMUX_PANE;
       process.env.OMX_TEAM_WORKER = '';
 
+      await installTeamTestAuthority(cwd, sessionId);
+      await writeSessionStart(cwd, sessionId);
       const paneId = await resolveManagedPaneFromAnchor('%42', cwd, { session_id: sessionId }, { allowTeamWorker: false });
       assert.equal(paneId, '%55');
     } finally {
@@ -810,6 +828,8 @@ exit 1
       delete process.env.TMUX_PANE;
       process.env.OMX_TEAM_WORKER = '';
 
+      await installTeamTestAuthority(cwd, sessionId);
+      await writeSessionStart(cwd, sessionId);
       const paneId = await resolveManagedPaneFromAnchor('%42', cwd, { session_id: sessionId }, { allowTeamWorker: false });
       assert.equal(paneId, '%42');
     } finally {
@@ -992,6 +1012,8 @@ exit 1
       delete process.env.TMUX_PANE;
       process.env.OMX_TEAM_WORKER = '';
 
+      await installTeamTestAuthority(cwd, sessionId);
+      await writeSessionStart(cwd, sessionId);
       const paneId = await resolveManagedPaneFromAnchor('%42', cwd, { session_id: sessionId }, { allowTeamWorker: false });
       assert.equal(paneId, '%55');
     } finally {
@@ -1083,6 +1105,8 @@ exit 1
       delete process.env.TMUX_PANE;
       process.env.OMX_TEAM_WORKER = '';
 
+      await installTeamTestAuthority(cwd, sessionId);
+      await writeSessionStart(cwd, sessionId);
       const paneId = await resolveManagedPaneFromAnchor('%42', cwd, { session_id: sessionId }, { allowTeamWorker: false });
       assert.equal(paneId, '%55');
     } finally {
@@ -1185,6 +1209,8 @@ exit 1
       delete process.env.TMUX_PANE;
       process.env.OMX_TEAM_WORKER = '';
 
+      await installTeamTestAuthority(cwd, sessionId);
+      await writeSessionStart(cwd, sessionId);
       const paneId = await resolveManagedPaneFromAnchor('%42', cwd, { session_id: sessionId }, { allowTeamWorker: false });
       assert.equal(paneId, '%55');
     } finally {
@@ -1363,6 +1389,8 @@ exit 1
       delete process.env.TMUX_PANE;
       process.env.OMX_TEAM_WORKER = '';
 
+      await installTeamTestAuthority(cwd, sessionId);
+      await writeSessionStart(cwd, sessionId);
       const paneId = await resolveManagedPaneFromAnchor('%42', cwd, { session_id: sessionId }, { allowTeamWorker: false });
       assert.equal(paneId, '%42');
     } finally {

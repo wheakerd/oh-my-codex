@@ -9,6 +9,7 @@ import {
   writeSubagentTrackingState,
 } from '../../subagents/tracker.js';
 import { writeSessionStart } from '../../hooks/session.js';
+import { clearTeamTestAuthority, hardenTestAuthorityTreeSync, installTeamTestAuthority } from '../../team/__tests__/authority-fixture.js';
 import type { SessionMapping } from '../session-registry.js';
 import {
   STATUS_DATA_UNAVAILABLE_MESSAGE,
@@ -219,6 +220,7 @@ describe('session-status helper', () => {
   it('filters root skill-active fallback to entries visible to the requested session', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-session-status-foreign-root-'));
     try {
+      await installTeamTestAuthority(wd, 'sess-main');
       await writeJson(join(wd, '.omx', 'state', 'skill-active-state.json'), {
         active: true,
         skill: 'team',
@@ -240,6 +242,7 @@ describe('session-status helper', () => {
           },
         ],
       });
+      hardenTestAuthorityTreeSync(wd);
 
       const status = await buildDiscordSessionStatusReply(createMapping(wd, 'sess-main'), {
         now: '2026-03-20T00:05:00.000Z',
@@ -248,6 +251,7 @@ describe('session-status helper', () => {
       assert.match(status, /State: team\/running/);
       assert.doesNotMatch(status, /ralph\/executing/);
     } finally {
+      clearTeamTestAuthority();
       await rm(wd, { recursive: true, force: true });
     }
   });
@@ -255,6 +259,7 @@ describe('session-status helper', () => {
   it('ignores root skill-active fallback when all active entries belong to another session', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-session-status-root-only-foreign-'));
     try {
+      await installTeamTestAuthority(wd, 'sess-main');
       await writeJson(join(wd, '.omx', 'state', 'skill-active-state.json'), {
         active: true,
         skill: 'ralph',
@@ -268,6 +273,7 @@ describe('session-status helper', () => {
           updated_at: '2026-03-20T00:04:30.000Z',
         }],
       });
+      hardenTestAuthorityTreeSync(wd);
 
       const status = await buildDiscordSessionStatusReply(createMapping(wd, 'sess-main'), {
         now: '2026-03-20T00:05:00.000Z',
@@ -275,6 +281,7 @@ describe('session-status helper', () => {
 
       assert.equal(status, STATUS_DATA_UNAVAILABLE_MESSAGE);
     } finally {
+      clearTeamTestAuthority();
       await rm(wd, { recursive: true, force: true });
     }
   });

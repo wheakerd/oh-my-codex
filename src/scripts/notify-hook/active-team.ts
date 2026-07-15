@@ -1,7 +1,6 @@
 import { existsSync } from 'fs';
-import { readdir } from 'fs/promises';
+import { readFile, readdir } from 'fs/promises';
 import { join } from 'path';
-import { readTeamManifestV2, readTeamPhase } from '../../team/state.js';
 import { resolveCanonicalTeamStateRoot } from '../../team/state-root.js';
 import { TEAM_NAME_SAFE_PATTERN } from '../../team/contracts.js';
 import { isTerminalPhase, safeString } from './utils.js';
@@ -17,11 +16,13 @@ export interface NotifyCanonicalActiveTeam {
 export async function listNotifyCanonicalActiveTeams(
   cwd: string,
   currentSessionId: string,
+  stateRoot?: string,
 ): Promise<NotifyCanonicalActiveTeam[]> {
   const sessionId = safeString(currentSessionId).trim();
   if (!sessionId) return [];
 
-  const teamsRoot = join(resolveCanonicalTeamStateRoot(cwd), 'team');
+  const canonicalRoot = safeString(stateRoot).trim() || resolveCanonicalTeamStateRoot(cwd);
+  const teamsRoot = join(canonicalRoot, 'team');
   if (!existsSync(teamsRoot)) return [];
 
   const entries = await readdir(teamsRoot, { withFileTypes: true }).catch(() => []);
@@ -31,9 +32,10 @@ export async function listNotifyCanonicalActiveTeams(
     const teamName = entry.name.trim();
     if (!teamName || !TEAM_NAME_SAFE_PATTERN.test(teamName)) continue;
 
+    const teamDir = join(teamsRoot, teamName);
     const [manifest, phaseState] = await Promise.all([
-      readTeamManifestV2(teamName, cwd),
-      readTeamPhase(teamName, cwd),
+      readFile(join(teamDir, 'manifest.v2.json'), 'utf-8').then((raw) => JSON.parse(raw)).catch(() => null),
+      readFile(join(teamDir, 'phase.json'), 'utf-8').then((raw) => JSON.parse(raw)).catch(() => null),
     ]);
     if (!manifest || !phaseState) continue;
 

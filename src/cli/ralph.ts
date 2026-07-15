@@ -314,6 +314,8 @@ export async function ralphCommand(args: string[]): Promise<void> {
   const staffingPlan = buildFollowupStaffingPlan('ralph', task, availableAgentTypes, {
     codexHomeOverride,
   });
+  const cli = await import('./index.js');
+  await cli.establishAlternateSurfaceAuthority(cwd);
   await startMode('ralph', task, 50);
   const sessionFiles = await writeRalphSessionFiles(cwd, task, { noDeslop, approvedHint });
   await updateModeState('ralph', {
@@ -345,7 +347,6 @@ export async function ralphCommand(args: string[]): Promise<void> {
   console.log('[ralph] Ralph persistence mode active. Launching Codex...');
   console.log(`[ralph] available_agent_types: ${staffingPlan.rosterSummary}`);
   console.log(`[ralph] staffing_plan: ${staffingPlan.staffingSummary}`);
-  const { launchWithHud } = await import('./index.js');
   const codexArgsBase = filterRalphCodexArgs(normalizedArgs);
   const codexArgs = explicitTask === 'ralph-cli-launch' && approvedHint?.task
     ? [...codexArgsBase, approvedHint.task]
@@ -354,7 +355,7 @@ export async function ralphCommand(args: string[]): Promise<void> {
   const previousAppendixEnv = process.env[RALPH_APPEND_ENV];
   process.env[RALPH_APPEND_ENV] = appendixPath;
   try {
-    await launchWithHud(codexArgs);
+    await cli.launchWithHud(codexArgs);
   } finally {
     if (typeof previousAppendixEnv === 'string') process.env[RALPH_APPEND_ENV] = previousAppendixEnv;
     else delete process.env[RALPH_APPEND_ENV];

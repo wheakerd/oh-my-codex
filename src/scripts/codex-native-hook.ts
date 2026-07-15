@@ -17,7 +17,6 @@ import {
   type SkillActiveEntry,
 } from "../state/skill-active.js";
 import {
-  bindPendingRoleIntentUnderLock,
   isTrustedSubagentThread,
   OMX_ADAPTED_PROVENANCE,
   readSubagentSessionSummary,
@@ -27,6 +26,11 @@ import {
   recordSubagentTurnForSession,
   resolveInstalledRoleName,
 } from "../subagents/tracker.js";
+import {
+  bindAndPublishAdaptedRole,
+  NATIVE_SUBAGENT_ROLE_ROUTING_MARKER_TTL_MS,
+  recoverAdaptedRoleBindings,
+} from "../subagents/adapted-role-binding.js";
 import { readRoleRoutingMarker, writeRoleRoutingMarker } from "../subagents/role-routing-marker.js";
 import { resolveWorkerNotifyTeamStateRootPath } from "../team/state-root.js";
 import { inferTerminalLifecycleOutcome } from "../runtime/run-outcome.js";
@@ -112,9 +116,9 @@ import {
   isNativeSubagentSpawnToolName,
   isRoleRoutingUnavailableEvidence,
   isUnsupportedNativeSubagentEvidence,
+  parseRoleIntentCorrelationToken,
   resolveNativeSubagentSupportStatus,
   type NativeSubagentUnsupportedReason,
-  type RoleRoutingUnavailableMarker,
 } from "../leader/contract.js";
 import { evaluateRalphCompletionAuditEvidence, isRalphCompletePhase } from "../ralph/completion-audit.js";
 import {
@@ -345,7 +349,6 @@ const LEADER_CONDUCTOR_GOLDEN_RULE = "Main-root Conductor golden rule: delegate 
 const NATIVE_STOP_STATE_FILE = "native-stop-state.json";
 const NATIVE_SUBAGENT_CAPACITY_BLOCKER_FILE = "native-subagent-capacity-blocker.json";
 const NATIVE_SUBAGENT_CAPACITY_BLOCKER_TTL_MS = 30 * 60_000;
-const NATIVE_SUBAGENT_ROLE_ROUTING_MARKER_TTL_MS = 60 * 60_000;
 const ORDINARY_STOP_NO_PROGRESS_DEFAULT_MAX_REPEATS = 8;
 const RALPH_ORPHANED_STARTING_STALE_MS = 15 * 60_000;
 const ORDINARY_STOP_NO_PROGRESS_DEFAULT_IDLE_MS = 10 * 60_000;
@@ -548,12 +551,17 @@ function readBoundedFirstLineSync(path: string): string {
   }
 }
 
-function readRoleIntentCorrelationToken(...carrierValues: unknown[]): string | undefined {
-  for (const carrierValue of carrierValues) {
-    const match = safeString(carrierValue).trim().match(/^omx-role-intent:(\S+)$/);
-    if (match) return match[1];
+function selectAuthoritativeTaskName(
+  threadSpawn: unknown,
+  subagent: unknown,
+  payload: unknown,
+): { present: boolean; value: unknown } {
+  for (const obj of [threadSpawn, subagent, payload]) {
+    if (obj && typeof obj === "object" && "task_name" in obj) {
+      return { present: true, value: (obj as Record<string, unknown>).task_name };
+    }
   }
-  return undefined;
+  return { present: false, value: undefined };
 }
 
 
@@ -580,12 +588,10 @@ function readNativeSubagentSessionStartMetadata(transcriptPath: string): NativeS
       payload.agent_nickname ?? payload.agentNickname,
     ];
     const agentNickname = safeString(agentNicknameCarrierValues[0]).trim();
-    const correlationToken = readRoleIntentCorrelationToken(
-      threadSpawn.task_name ?? threadSpawn.taskName,
-      subagent.task_name ?? subagent.taskName,
-      payload.task_name ?? payload.taskName,
-      ...agentNicknameCarrierValues,
-    );
+    const authoritativeTaskName = selectAuthoritativeTaskName(threadSpawn, subagent, payload);
+    const correlationToken = authoritativeTaskName.present
+      ? parseRoleIntentCorrelationToken(authoritativeTaskName.value)
+      : undefined;
     const agentRole = safeString(
       threadSpawn.agent_role
         ?? threadSpawn.agentRole
@@ -610,7 +616,7 @@ function readNativeSubagentSessionStartMetadata(transcriptPath: string): NativeS
 
 function reportRoleRoutingBindingFailure(error: unknown): void {
   console.error(
-    `[omx] SECURITY: native adapted role binding was not durably persisted; pending role intent remains unconsumed: ${error instanceof Error ? error.message : String(error)}`,
+    `[omx] SECURITY: native adapted role binding did not complete; retained binding will be recovered: ${error instanceof Error ? error.message : String(error)}`,
   );
 }
 
@@ -637,10 +643,11 @@ async function recordNativeSubagentSessionStart(
 
   if (!metadata.agentRole && correlationSessionId && parentThreadId) {
     try {
-      adaptedRoleIntent = bindPendingRoleIntentUnderLock(
+      const bound = bindAndPublishAdaptedRole(
         cwd,
+        stateDir,
         {
-          sessionId: correlationSessionId,
+          correlationSessionId,
           parentThreadId,
           correlationToken: metadata.correlationToken,
         },
@@ -667,19 +674,12 @@ async function recordNativeSubagentSessionStart(
           return next;
         },
       );
+      adaptedRoleIntent = bound ? { role: bound.role, provenanceKind: OMX_ADAPTED_PROVENANCE } : null;
     } catch (error) {
       reportRoleRoutingBindingFailure(error);
       throw error;
     }
-    if (adaptedRoleIntent) {
-      recordNativeSubagentRoleRoutingMarker(
-        cwd,
-        stateDir,
-        correlationSessionId,
-        parentThreadId,
-      );
 
-    }
   }
 
   if (!adaptedRoleIntent) {
@@ -3622,24 +3622,6 @@ async function recordNativeSubagentSupportBlocker(
   }, null, 2));
 }
 
-function recordNativeSubagentRoleRoutingMarker(
-  cwd: string,
-  stateDir: string,
-  sessionId: string,
-  parentThreadId: string,
-): void {
-  const nowMs = Date.now();
-  const marker: RoleRoutingUnavailableMarker = {
-    schema_version: 1,
-    cwd,
-    session_id: sessionId,
-    parent_thread_id: parentThreadId,
-    observed_at: new Date(nowMs).toISOString(),
-    expires_at: new Date(nowMs + NATIVE_SUBAGENT_ROLE_ROUTING_MARKER_TTL_MS).toISOString(),
-    evidence: "validated OMX adapted role intent correlated to an untyped native child",
-  };
-  writeRoleRoutingMarker(stateDir, marker);
-}
 
 function refreshNativeSubagentRoleRoutingMarker(
   cwd: string,
@@ -3915,14 +3897,6 @@ const RALPLAN_EXECUTION_HANDOFF_SKILLS = new Set([
   "ultraqa",
 ]);
 
-function isActiveDeepInterviewPhase(state: Record<string, unknown> | null): boolean {
-  if (!state || state.active !== true) return false;
-  const mode = safeString(state.mode).trim();
-  if (mode && mode !== "deep-interview") return false;
-  const phase = safeString(state.current_phase ?? state.currentPhase).trim().toLowerCase();
-  if (phase && (TERMINAL_MODE_PHASES.has(phase) || phase === "completing")) return false;
-  return true;
-}
 
 function isInactiveCompletedDeepInterviewPhase(state: Record<string, unknown> | null): boolean {
   if (!state || state.active !== false) return false;
@@ -7286,6 +7260,128 @@ function isCompleteRalplanTerminalWritePayload(
   return true;
 }
 
+function hasUnquotedShellControlOrRedirection(command: string): boolean {
+  let quote: "'" | '"' | null = null;
+  for (let index = 0; index < command.length; index += 1) {
+    const char = command[index] ?? "";
+    if (char === "\\" && quote !== "'") {
+      index += 1;
+      continue;
+    }
+    if (char === "'" || char === '"') {
+      quote = quote === char ? null : quote ?? char;
+      continue;
+    }
+    if (!quote && ";&|()<>\n\r".includes(char)) return true;
+  }
+  return false;
+}
+
+function suppliedSessionAliasesMatch(payload: Record<string, unknown>, sessionId: string): boolean {
+  return [
+    payload.session_id,
+    payload.owner_omx_session_id,
+    payload.codex_session_id,
+    payload.owner_codex_session_id,
+  ].filter((value) => value !== undefined)
+    .every((value) => safeString(value).trim() === sessionId);
+}
+
+function hasOnlyFinishedExplicitOutcomes(payload: Record<string, unknown>): boolean {
+  const values = [
+    payload.lifecycle_outcome,
+    payload.lifecycleOutcome,
+    payload.terminal_outcome,
+    payload.terminalOutcome,
+    payload.run_outcome,
+    payload.runOutcome,
+  ].filter((value) => value !== undefined);
+  return values.every((value) => inferTerminalLifecycleOutcome(
+    { lifecycle_outcome: value },
+    { includeQuestionEnforcement: false },
+  ) === "finished");
+}
+
+function isCompleteDeepInterviewTerminalWritePayload(
+  payload: Record<string, unknown>,
+  activeState: Record<string, unknown>,
+  sessionId: string,
+): boolean {
+  if (!sessionId) return false;
+  const activeMode = safeString(activeState.mode).trim().toLowerCase();
+  if (activeMode && activeMode !== "deep-interview") return false;
+  const activeSessionId = safeString(
+    activeState.session_id
+      ?? activeState.owner_omx_session_id
+      ?? activeState.codex_session_id
+      ?? activeState.owner_codex_session_id,
+  ).trim();
+  if (activeSessionId && activeSessionId !== sessionId) return false;
+
+  const mode = safeString(payload.mode).trim().toLowerCase();
+  const phase = safeString(payload.current_phase ?? payload.currentPhase).trim().toLowerCase();
+  const payloadSessionId = safeString(payload.session_id).trim();
+  if (!hasOnlyFinishedExplicitOutcomes(payload)) return false;
+  return mode === "deep-interview"
+    && payload.active === false
+    && phase === "complete"
+    && payloadSessionId === sessionId
+    && inferTerminalLifecycleOutcome(payload, { includeQuestionEnforcement: false }) === "finished";
+}
+
+function isAllowedDeepInterviewTerminalStateWriteCommand(
+  cwd: string,
+  command: string,
+  activeState: Record<string, unknown>,
+  sessionId: string,
+): boolean {
+  const rawWords = tokenizeShellWords(normalizeShellLineContinuations(command).trim());
+  if (rawWords[0] !== "omx") return false;
+  const canonicalCommand = canonicalizeOmxStateTransportCommand(command);
+  if (hasUnquotedShellControlOrRedirection(command)) return false;
+  if (hasUnsafeUnquotedHeredocExpansion(canonicalCommand)) return false;
+  if (hasUnquotedShellSubstitution(canonicalCommand)) return false;
+  if (splitStateScanSegments(canonicalCommand).length !== 1) return false;
+  if (sourcesFileWrittenEarlierInSameCommand(cwd, canonicalCommand)) return false;
+  if (findUnquotedOmxStateCommandIndexes(canonicalCommand, "clear").length > 0) return false;
+  if (hasDynamicNestedShellExecution(canonicalCommand)) return false;
+  if (extractDeepInterviewCommandWriteTargets(command).length > 0) return false;
+
+  const operations = collectOmxStateCommandOperations(command, "write");
+  if (operations.length !== 1) return false;
+  const operation = operations[0];
+  if (!operation || operation.nested || operation.commandPrefix.trim() || hasPriorExecutableCommand(operation.prefix)) return false;
+  const inlineInputCount = operation.args.filter((arg) => arg === "--input" || arg.startsWith("--input=")).length;
+  if (inlineInputCount !== 1 || operation.args.some((arg) => arg === "--input-file" || arg.startsWith("--input-file="))) return false;
+  const inlineInput = readStateWriteFlagValue(operation.args, "--input");
+  let rawPayload: Record<string, unknown> | null = null;
+  try {
+    rawPayload = inlineInput ? safeObject(JSON.parse(inlineInput)) : null;
+  } catch {
+    rawPayload = null;
+  }
+  const nestedState = safeObject(rawPayload?.state);
+  if (
+    !rawPayload
+    || "workingDirectory" in rawPayload
+    || !suppliedSessionAliasesMatch(rawPayload, sessionId)
+    || !hasOnlyFinishedExplicitOutcomes(rawPayload)
+    || (nestedState && (
+      "mode" in nestedState
+      || "session_id" in nestedState
+      || "workingDirectory" in nestedState
+      || "active" in nestedState
+      || "current_phase" in nestedState
+      || "currentPhase" in nestedState
+      || !suppliedSessionAliasesMatch(nestedState, sessionId)
+      || !hasOnlyFinishedExplicitOutcomes(nestedState)
+    ))
+  ) return false;
+
+  const payload = readStateWriteInputPayload(cwd, canonicalCommand, command);
+  return payload ? isCompleteDeepInterviewTerminalWritePayload(payload, activeState, sessionId) : false;
+}
+
 function isAllowedRalplanTerminalStateWriteCommand(
   cwd: string,
   command: string,
@@ -7324,10 +7420,56 @@ function commandEndsPlanningPhase(cwd: string, command: string): boolean {
   return payload ? isPlanningPhaseDeactivationPayload(payload) : true;
 }
 
-function isAllowedDeepInterviewBashWrite(cwd: string, command: string): boolean {
+function isAllowedDeepInterviewBashWrite(
+  cwd: string,
+  command: string,
+  activeState?: Record<string, unknown>,
+  sessionId = "",
+): boolean {
+  const stateWriteOperations = collectOmxStateCommandOperations(command, "write");
+  const hasUnsafeRuntimeStateWrite = (words: string[]): boolean => {
+    const stateWordIndex = words.indexOf("state");
+    const writeWordIndex = stateWordIndex >= 0 ? words.indexOf("write", stateWordIndex + 1) : -1;
+    if (writeWordIndex <= stateWordIndex) return false;
+    const hasRuntimeBeforeState = words.slice(0, stateWordIndex).some((word) => {
+      const base = shellWordBaseName(word);
+      return isNodeInterpreterCommandWord(base) || base === "bun" || base === "tsx";
+    });
+    if (!hasRuntimeBeforeState) return false;
+
+    const inlineInput = readStateWriteFlagValue(words, "--input");
+    let payload: Record<string, unknown> | null = null;
+    try {
+      const parsed = inlineInput ? safeObject(JSON.parse(inlineInput)) : null;
+      const modeOverride = readStateWriteFlagValue(words, "--mode");
+      payload = parsed
+        ? normalizeStateWriteClassificationPayload(modeOverride ? { ...parsed, mode: modeOverride } : parsed)
+        : null;
+    } catch {
+      payload = null;
+    }
+    return (!payload && stateWriteOperations.length === 0)
+      || Boolean(payload && (
+        safeString(payload.mode).trim().toLowerCase() !== "deep-interview"
+        || isPlanningPhaseDeactivationPayload(payload)
+      ));
+  };
+  const rawCommand = normalizeShellLineContinuations(command).trim();
+  if ([rawCommand, canonicalizeOmxStateTransportCommand(rawCommand)]
+    .some((candidate) => hasUnsafeRuntimeStateWrite(tokenizeShellWords(candidate)))) return false;
+  if (stateWriteOperations.some((operation) => operation.nested)) return false;
   if (isAllowedDeepInterviewRalplanHandoffCommand(cwd, command)) return true;
   if (hasDeepInterviewRalplanHandoffStateMutation(cwd, command)) return false;
-  if (commandEndsPlanningPhase(cwd, command)) return false;
+  if (commandEndsPlanningPhase(cwd, command)) {
+    return activeState
+      ? isAllowedDeepInterviewTerminalStateWriteCommand(cwd, command, activeState, sessionId)
+      : false;
+  }
+  if (stateWriteOperations.length > 0) {
+    const canonicalCommand = canonicalizeOmxStateTransportCommand(command);
+    const payload = readStateWriteInputPayload(cwd, canonicalCommand, command);
+    if (!payload || safeString(payload.mode).trim().toLowerCase() !== "deep-interview") return false;
+  }
   if (commandHasUntargetedPlanningForbiddenIntent(command)) return false;
   if (firstPlanningTmpScriptExecutionTarget(cwd, command)) return false;
   if (!commandHasDeepInterviewWriteIntent(command)) return true;
@@ -7352,13 +7494,11 @@ async function readActiveDeepInterviewStateForPreToolUse(
   const modeState = sessionId
     ? await readStopSessionPinnedState("deep-interview-state.json", cwd, sessionId, stateDir)
     : await readJsonIfExists(join(stateDir, "deep-interview-state.json"));
-  if (isActiveDeepInterviewPhase(modeState) && modeState && modeStateMatchesSkillStopContext(modeState, cwd, sessionId)) {
-    const hasActiveDeepInterviewSkill = listActiveSkills(canonicalState).some((entry) => (
-      entry.skill === "deep-interview"
-      && matchesSkillStopContext(entry, canonicalState, sessionId, threadId)
-    ));
-    if (hasActiveDeepInterviewSkill) return modeState;
-  }
+  const hasActiveDeepInterviewSkill = listActiveSkills(canonicalState).some((entry) => (
+    entry.skill === "deep-interview"
+    && matchesSkillStopContext(entry, canonicalState, sessionId, threadId)
+  ));
+  if (hasActiveDeepInterviewSkill && modeState?.active === true) return modeState;
   if (isInactiveCompletedDeepInterviewPhase(modeState)) return null;
 
   const autopilotState = sessionId
@@ -7599,7 +7739,7 @@ async function buildDeepInterviewPreToolUseBoundaryOutput(
   let blockedDetail = "implementation/write tools are blocked until an explicit handoff workflow is activated";
 
   if (toolName === "Bash") {
-    blocked = !isAllowedDeepInterviewBashWrite(cwd, command);
+    blocked = !isAllowedDeepInterviewBashWrite(cwd, command, activeState, sessionId);
     if (blocked) {
       blockedDetail = buildDeepInterviewBashBlockedDetail(cwd, command);
     }
@@ -10217,6 +10357,14 @@ export async function dispatchCodexNativeHook(
       };
     }
   }
+  if (hookEventName === "SessionStart" && !authority) {
+    return {
+      hookEventName,
+      omxEventName: mapCodexHookEventToOmxEvent(hookEventName),
+      skillState: null,
+      outputJson: buildAuthorityHookDenial(hookEventName, "no committed active authority"),
+    };
+  }
   if (hookEventName === "Stop" && !authority && !hasNativeStopRuntimeSurface(cwd)) {
     return {
       hookEventName,
@@ -10230,6 +10378,13 @@ export async function dispatchCodexNativeHook(
   const workspaceCwd = authority?.workspace_identity.canonical_path
     ?? resolveWorkspaceIdentity(cwd).canonical_path;
   const stateDir = authority?.canonical_state_root ?? canonicalHookStateDirectory(workspaceCwd);
+  if (authority) {
+    try {
+      recoverAdaptedRoleBindings(workspaceCwd, stateDir);
+    } catch {
+      // Recovery is best-effort for unrelated hook events.
+    }
+  }
 
   const omxEventName = mapCodexHookEventToOmxEvent(hookEventName);
   let skillState: SkillActiveState | null = null;

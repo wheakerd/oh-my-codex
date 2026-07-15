@@ -1,7 +1,7 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { chmod, mkdir, mkdtemp, rm, readFile, writeFile } from 'fs/promises';
-import { join } from 'path';
+import { dirname, join } from 'path';
 import { tmpdir } from 'os';
 import { existsSync } from 'fs';
 import { readModeState } from '../../modes/base.js';
@@ -81,6 +81,12 @@ const TEST_AUTHORITY_ENV_KEYS = [
   'OMX_STATE_AUTHORITY_CAPABILITY',
 ] as const;
 
+const PIPELINE_TEST_SESSION_ID = 'pipeline-test-session';
+
+function pipelineStatePath(cwd: string, filename = 'autopilot-state.json'): string {
+  return join(cwd, '.omx', 'state', 'sessions', PIPELINE_TEST_SESSION_ID, filename);
+}
+
 let tempDir: string;
 let savedOmxEnv: Map<string, string | undefined>;
 
@@ -101,7 +107,7 @@ async function installPipelineTestAuthority(cwd: string): Promise<void> {
   await chmod(join(cwd, '.omx'), 0o700);
   await chmod(join(cwd, '.omx', 'state'), 0o700);
 
-  const sessionId = 'pipeline-test-session';
+  const sessionId = PIPELINE_TEST_SESSION_ID;
   const authority = await initializeStateAuthority({
     startup_cwd: cwd,
     observed_cwd: cwd,
@@ -594,19 +600,19 @@ describe('Pipeline Orchestrator', () => {
 
     it('materializes ralplan consensus handoff artifacts when ralplan is skipped', async () => {
       const plansDir = join(tempDir, '.omx', 'plans');
-      const stateDir = join(tempDir, '.omx', 'state');
+      const statePath = pipelineStatePath(tempDir, 'ralplan-state.json');
       await mkdir(plansDir, { recursive: true });
-      await mkdir(stateDir, { recursive: true });
+      await mkdir(dirname(statePath), { recursive: true, mode: 0o700 });
       await writeFile(join(plansDir, 'prd-skip.md'), '# Plan\n');
       await writeFile(join(plansDir, 'test-spec-skip.md'), '# Test Spec\n');
-      await writeFile(join(stateDir, 'ralplan-state.json'), JSON.stringify({
+      await writeFile(statePath, JSON.stringify({
         mode: 'ralplan',
         current_phase: 'complete',
         planning_complete: true,
         ralplan_consensus_gate: {
           complete: true,
-          ralplan_architect_review: { agent_role: 'architect', verdict: 'approve', sequence_index: 1, summary: 'architect ok' },
-          ralplan_critic_review: { agent_role: 'critic', verdict: 'approve', sequence_index: 2, summary: 'critic ok' },
+          ralplan_architect_review: { agent_role: 'architect', verdict: 'approve', summary: 'architect ok' },
+          ralplan_critic_review: { agent_role: 'critic', verdict: 'approve', summary: 'critic ok' },
         },
       }));
 
@@ -615,6 +621,7 @@ describe('Pipeline Orchestrator', () => {
         task: 'skip with durable evidence',
         stages: [createRalplanStage(), makeStage('after')],
         cwd: tempDir,
+        sessionId: PIPELINE_TEST_SESSION_ID,
       });
 
       assert.equal(result.status, 'completed');
@@ -626,9 +633,9 @@ describe('Pipeline Orchestrator', () => {
       assert.deepEqual(handoffs.ralplan_consensus_gate, {
         complete: true,
         sequence: ['architect-review', 'critic-review'],
-        ralplan_architect_review: { agent_role: 'architect', verdict: 'approve', sequence_index: 1, summary: 'architect ok' },
-        ralplan_critic_review: { agent_role: 'critic', verdict: 'approve', sequence_index: 2, summary: 'critic ok' },
-        source: join(tempDir, '.omx', 'state', 'ralplan-state.json'),
+        ralplan_architect_review: { agent_role: 'architect', verdict: 'approve', summary: 'architect ok' },
+        ralplan_critic_review: { agent_role: 'critic', verdict: 'approve', summary: 'critic ok' },
+        source: pipelineStatePath(tempDir, 'ralplan-state.json'),
         blockedReason: null,
       });
     });
@@ -717,7 +724,7 @@ describe('Pipeline Orchestrator', () => {
         cwd: tempDir,
       });
 
-      const statePath = join(tempDir, '.omx', 'state', 'autopilot-state.json');
+      const statePath = pipelineStatePath(tempDir);
       assert.ok(existsSync(statePath), 'pipeline state file should exist');
 
       const raw = await readFile(statePath, 'utf-8');
@@ -735,7 +742,7 @@ describe('Pipeline Orchestrator', () => {
         cwd: tempDir,
       });
 
-      const statePath = join(tempDir, '.omx', 'state', 'autopilot-state.json');
+      const statePath = pipelineStatePath(tempDir);
       const raw = await readFile(statePath, 'utf-8');
       const state = JSON.parse(raw);
       assert.equal(state.active, false);
@@ -832,11 +839,11 @@ describe('Pipeline Orchestrator', () => {
 
     it('returns true when pipeline state is active and in-progress', async () => {
       // Manually write an in-progress pipeline state
-      const { mkdir: mkdirFs, writeFile: writeFileFs } = await import('fs/promises');
-      const stateDir = join(tempDir, '.omx', 'state');
-      await mkdirFs(stateDir, { recursive: true });
+      const { writeFile: writeFileFs } = await import('fs/promises');
+      const statePath = pipelineStatePath(tempDir);
+      await mkdir(dirname(statePath), { recursive: true, mode: 0o700 });
       await writeFileFs(
-        join(stateDir, 'autopilot-state.json'),
+        statePath,
         JSON.stringify({
           active: true,
           mode: 'autopilot',

@@ -8,6 +8,7 @@ import { tmpdir } from 'node:os';
 import { initTeamState, createTask, claimTask, readTask, writeAtomic } from '../state.js';
 import { monitorTeam } from '../runtime.js';
 import { planWorktreeTarget, ensureWorktree } from '../worktree.js';
+import { clearTeamTestAuthority, installTeamTestAuthority } from './authority-fixture.js';
 
 async function initRepo(): Promise<string> {
   const cwd = await mkdtemp(join(tmpdir(), 'omx-team-hardening-e2e-repo-'));
@@ -29,12 +30,14 @@ beforeEach(() => {
 afterEach(() => {
   if (typeof ORIGINAL_OMX_TEAM_STATE_ROOT === 'string') process.env.OMX_TEAM_STATE_ROOT = ORIGINAL_OMX_TEAM_STATE_ROOT;
   else delete process.env.OMX_TEAM_STATE_ROOT;
+  clearTeamTestAuthority();
 });
 
 describe('team hardening e2e', () => {
   it('reopens an expired in-progress task and allows the next worker to complete the flow', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-team-hardening-e2e-'));
     try {
+      await installTeamTestAuthority(cwd);
       await initTeamState('team-hardening-e2e', 'recover stuck work', 'executor', 2, cwd);
       const task = await createTask('team-hardening-e2e', { subject: 'recover me', description: 'd', status: 'pending' }, cwd);
       const firstClaim = await claimTask('team-hardening-e2e', task.id, 'worker-1', task.version ?? 1, cwd);
@@ -84,11 +87,11 @@ describe('team hardening e2e', () => {
     }
   });
 
-  it('tolerates malformed worker status from an external team state root', async () => {
+  it('tolerates malformed worker status from the committed team state root', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-team-hardening-worker-state-'));
-    const sharedRoot = join(cwd, 'shared-state');
+    const sharedRoot = join(cwd, '.omx', 'state');
     try {
-      process.env.OMX_TEAM_STATE_ROOT = sharedRoot;
+      await installTeamTestAuthority(cwd);
       await initTeamState('team-hardening-worker-state', 'worker status corruption smoke', 'executor', 1, cwd);
 
       const statusPath = join(

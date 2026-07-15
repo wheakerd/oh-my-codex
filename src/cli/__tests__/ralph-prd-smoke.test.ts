@@ -2,7 +2,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -205,7 +205,9 @@ describe('omx ralph --prd smoke gate', () => {
       assert.equal(launches.length, 1, `expected exactly one Codex launch, got ${launches.length}`);
       assert.match(launches[0], /ship release checklist/);
 
-      const ralphState = JSON.parse(await readFile(join(cwd, '.omx', 'state', 'ralph-state.json'), 'utf-8')) as Record<string, unknown>;
+      const sessionIds = await readdir(join(cwd, '.omx', 'state', 'sessions'));
+      assert.equal(sessionIds.length, 1, `expected one authoritative Ralph session, got ${sessionIds.length}`);
+      const ralphState = JSON.parse(await readFile(join(cwd, '.omx', 'state', 'sessions', sessionIds[0]!, 'ralph-state.json'), 'utf-8')) as Record<string, unknown>;
       assert.equal(ralphState.goal_mode_integration, 'codex-goal-tools');
       assert.match(String(ralphState.goal_mode_policy ?? ''), /get_goal/);
       assert.match(String(ralphState.goal_mode_policy ?? ''), /update_goal/);

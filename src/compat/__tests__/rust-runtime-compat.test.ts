@@ -5,6 +5,8 @@ import { spawnSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
+import { initializeStateAuthority, mintStateAuthorityTransportCapability } from '../../state/authority.js';
+import { buildStateAuthorityTransportEnv } from '../../state/transport-env.js';
 import { enqueueDispatchRequest, initTeamState, listDispatchRequests, listMailboxMessages, sendDirectMessage } from '../../team/state.js';
 import { readTeamState } from '../../hud/state.js';
 
@@ -30,17 +32,51 @@ function shouldSkipForSpawnPermissions(err?: string): boolean {
   return typeof err === 'string' && /(EPERM|EACCES)/i.test(err);
 }
 
+const TEST_AUTHORITY_ENV_KEYS = [
+  'OMX_ROOT',
+  'OMX_STATE_ROOT',
+  'OMX_TEAM_STATE_ROOT',
+  'OMX_SESSION_ID',
+  'OMX_STARTUP_CWD',
+  'OMX_STATE_AUTHORITY_PATH',
+  'OMX_STATE_AUTHORITY_ID',
+  'OMX_STATE_AUTHORITY_GENERATION_ID',
+  'OMX_STATE_AUTHORITY_WORKSPACE_DIGEST',
+  'OMX_STATE_AUTHORITY_CAPABILITY',
+] as const;
+
 async function withTempTeamStateRoot<T>(
   teamStateRoot: string,
   fn: () => Promise<T>,
 ): Promise<T> {
-  const previousRoot = process.env.OMX_TEAM_STATE_ROOT;
-  process.env.OMX_TEAM_STATE_ROOT = teamStateRoot;
+  const previousEnv = new Map(TEST_AUTHORITY_ENV_KEYS.map((key) => [key, process.env[key]]));
+  for (const key of TEST_AUTHORITY_ENV_KEYS) delete process.env[key];
+
+  const cwd = dirname(dirname(teamStateRoot));
+  const sessionId = `rust-compat-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  await mkdir(teamStateRoot, { recursive: true, mode: 0o700 });
+  await chmod(join(cwd, '.omx'), 0o700);
+  await chmod(teamStateRoot, 0o700);
+  const authority = await initializeStateAuthority({
+    startup_cwd: cwd,
+    observed_cwd: cwd,
+    launch_id: `${sessionId}-launch`,
+    session_binding: { canonical_session_id: sessionId },
+  });
+  await mintStateAuthorityTransportCapability(authority);
+  Object.assign(process.env, buildStateAuthorityTransportEnv(authority, {
+    OMX_TEAM_STATE_ROOT: teamStateRoot,
+    OMX_SESSION_ID: sessionId,
+  }));
+
   try {
     return await fn();
   } finally {
-    if (previousRoot === undefined) delete process.env.OMX_TEAM_STATE_ROOT;
-    else process.env.OMX_TEAM_STATE_ROOT = previousRoot;
+    for (const key of TEST_AUTHORITY_ENV_KEYS) {
+      const value = previousEnv.get(key);
+      if (typeof value === 'string') process.env[key] = value;
+      else delete process.env[key];
+    }
   }
 }
 
@@ -187,13 +223,21 @@ describe('rust runtime legacy-reader compatibility', () => {
 
   it('keeps HUD team state on the session-scoped compatibility file', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-rust-compat-hud-'));
+    const previousEnv = new Map(TEST_AUTHORITY_ENV_KEYS.map((key) => [key, process.env[key]]));
+    for (const key of TEST_AUTHORITY_ENV_KEYS) delete process.env[key];
     try {
       const stateRoot = join(wd, '.omx', 'state');
       const sessionId = 'hud-rust-compat';
       const sessionStateDir = join(stateRoot, 'sessions', sessionId);
-      await mkdir(sessionStateDir, { recursive: true });
-
-      await writeFile(join(stateRoot, 'session.json'), JSON.stringify({ session_id: sessionId }, null, 2));
+      await mkdir(sessionStateDir, { recursive: true, mode: 0o700 });
+      await chmod(join(wd, '.omx'), 0o700);
+      await chmod(stateRoot, 0o700);
+      await initializeStateAuthority({
+        startup_cwd: wd,
+        observed_cwd: wd,
+        launch_id: `${sessionId}-launch`,
+        session_binding: { canonical_session_id: sessionId },
+      });
       await writeFile(
         join(stateRoot, 'team-state.json'),
         JSON.stringify({
@@ -219,6 +263,11 @@ describe('rust runtime legacy-reader compatibility', () => {
       assert.equal(state?.current_phase, 'executing');
       assert.equal(state?.agent_count, 3);
     } finally {
+      for (const key of TEST_AUTHORITY_ENV_KEYS) {
+        const value = previousEnv.get(key);
+        if (typeof value === 'string') process.env[key] = value;
+        else delete process.env[key];
+      }
       await rm(wd, { recursive: true, force: true });
     }
   });

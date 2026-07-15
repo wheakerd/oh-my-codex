@@ -815,7 +815,7 @@ async function resolveStandaloneCommittedAuthority(
   }
 }
 
-async function establishAlternateSurfaceAuthority(
+export async function establishAlternateSurfaceAuthority(
   cwd: string = process.cwd(),
 ): Promise<ImmutableResolvedStateAuthorityContext> {
   const inherited = await resolveInheritedStateAuthorityForLaunch(cwd);

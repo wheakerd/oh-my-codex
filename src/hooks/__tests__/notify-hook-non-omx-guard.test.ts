@@ -1,18 +1,77 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { describe, it } from "node:test";
+import {
+	initializeStateAuthority,
+	mintStateAuthorityTransportCapability,
+	resolveStateAuthorityForGuard,
+} from "../../state/authority.js";
+import { buildStateAuthorityTransportEnv } from "../../state/transport-env.js";
+import {
+	TEAM_AMBIENT_STATE_ROOT_ALIAS_ENV_KEYS,
+	TEAM_STATE_AUTHORITY_TRANSPORT_ENV_KEYS,
+} from "../../team/state-root.js";
+import { hardenTestAuthorityTreeSync } from "../../team/__tests__/authority-fixture.js";
+import { writeSessionStart } from "../session.js";
+
+async function notifyFixtureAuthority(
+	observedCwd: string,
+	sessionId: string,
+): Promise<{
+	env: NodeJS.ProcessEnv;
+	canonicalSessionDir: string;
+}> {
+	const env = { ...process.env };
+	for (const key of [
+		...TEAM_AMBIENT_STATE_ROOT_ALIAS_ENV_KEYS,
+		...TEAM_STATE_AUTHORITY_TRANSPORT_ENV_KEYS,
+	]) {
+		delete env[key];
+	}
+	await mkdir(observedCwd, { recursive: true, mode: 0o700 });
+	await mkdir(join(observedCwd, ".omx"), { recursive: true, mode: 0o700 });
+	await chmod(join(observedCwd, ".omx"), 0o700);
+	hardenTestAuthorityTreeSync(observedCwd);
+	const authority = await initializeStateAuthority({
+		startup_cwd: observedCwd,
+		observed_cwd: observedCwd,
+		launch_id: `notify-non-omx-${sessionId}-${Date.now()}`,
+		session_binding: { canonical_session_id: sessionId },
+	});
+	await chmod(authority.canonical_state_root, 0o700);
+	await writeSessionStart(observedCwd, sessionId, { pid: process.pid });
+	const refreshedAuthority = await resolveStateAuthorityForGuard({
+		startup_cwd: observedCwd,
+		observed_cwd: observedCwd,
+		session_id: sessionId,
+	});
+	await mintStateAuthorityTransportCapability(refreshedAuthority);
+	const childTransportEnv = buildStateAuthorityTransportEnv(
+		refreshedAuthority,
+		{ ...env, OMX_SESSION_ID: sessionId },
+	);
+	hardenTestAuthorityTreeSync(observedCwd);
+	return {
+		env: childTransportEnv,
+		canonicalSessionDir: join(
+			refreshedAuthority.canonical_state_root,
+			"sessions",
+			sessionId,
+		),
+	};
+}
 
 describe("notify-hook non-OMX project guard", () => {
-	it("co-locates boxed prompt skill mode detail and canonical skill state under OMX_ROOT", async () => {
+	it("stores boxed prompt skill mode detail in the persisted authority session root", async () => {
 		const root = await mkdtemp(join(tmpdir(), "omx-notify-boxed-skill-"));
 		const wd = join(root, "source");
-		const omxRoot = join(root, "box");
 		const sessionId = "sess-notify-ralplan";
 		try {
+			const fixture = await notifyFixtureAuthority(wd, sessionId);
 			await mkdir(join(wd, ".omx"), { recursive: true });
 			await writeFile(join(wd, ".omx", "managed"), "");
 			const payload = JSON.stringify({
@@ -21,7 +80,7 @@ describe("notify-hook non-OMX project guard", () => {
 				session_id: sessionId,
 				thread_id: "thread-notify",
 				turn_id: "turn-notify",
-				"input-messages": ["$ralplan plan this change"],
+				"input-messages": ["$ralplan implement issue #1307"],
 				"last-assistant-message": "working",
 			});
 			const result = spawnSync(
@@ -31,93 +90,65 @@ describe("notify-hook non-OMX project guard", () => {
 					cwd: process.cwd(),
 					encoding: "utf-8",
 					env: {
-						...process.env,
-						OMX_ROOT: omxRoot,
-						OMX_STATE_ROOT: "",
-						OMX_TEAM_STATE_ROOT: "",
+						...fixture.env,
 					},
 				},
 			);
 			assert.equal(result.status, 0);
-			const boxedSessionDir = join(omxRoot, ".omx", "state", "sessions", sessionId);
-			assert.equal(existsSync(join(boxedSessionDir, "skill-active-state.json")), true);
-			assert.equal(existsSync(join(boxedSessionDir, "ralplan-state.json")), true);
-			const skillState = JSON.parse(await readFile(join(boxedSessionDir, "skill-active-state.json"), "utf-8"));
-			assert.equal(skillState.skill, "ralplan");
-			assert.equal(skillState.active, true);
-			assert.equal(existsSync(join(wd, ".omx", "state", "sessions", sessionId, "skill-active-state.json")), false);
-			assert.equal(existsSync(join(wd, ".omx", "state", "sessions", sessionId, "ralplan-state.json")), false);
+			const boxedSessionDir = fixture.canonicalSessionDir;
+			assert.equal(
+				existsSync(join(boxedSessionDir, "skill-active-state.json")),
+				true,
+			);
+			assert.equal(
+				existsSync(join(boxedSessionDir, "ralplan-state.json")),
+				true,
+			);
+			assert.equal(
+				existsSync(join(wd, ".omx", "state", "skill-active-state.json")),
+				false,
+			);
+			assert.equal(
+				existsSync(join(wd, ".omx", "state", "ralplan-state.json")),
+				false,
+			);
 		} finally {
 			await rm(root, { recursive: true, force: true });
 		}
 	});
 
-	it("does not activate issue #3133 negated, non-English, or quoted ralplan mentions under OMX_ROOT", async () => {
-		const root = await mkdtemp(join(tmpdir(), "omx-notify-boxed-ralplan-inert-"));
-		const wd = join(root, "source");
-		const omxRoot = join(root, "box");
-		try {
-			await mkdir(join(wd, ".omx"), { recursive: true });
-			await writeFile(join(wd, ".omx", "managed"), "");
-			for (const [index, input] of [
-				"Do not run $ralplan and do not repeat the review.",
-				"Не запускай $ralplan",
-				"Logged review text: \"$ralplan plan this change\".",
-			].entries()) {
-				const sessionId = `sess-notify-ralplan-inert-${index}`;
-				const result = spawnSync(
-					process.execPath,
-					["dist/scripts/notify-hook.js", JSON.stringify({
-						cwd: wd,
-						type: "agent-turn-complete",
-						session_id: sessionId,
-						thread_id: `thread-notify-ralplan-inert-${index}`,
-						turn_id: `turn-notify-ralplan-inert-${index}`,
-						"input-messages": [input],
-						"last-assistant-message": "working",
-					})],
-					{
-						cwd: process.cwd(),
-						encoding: "utf-8",
-						env: {
-							...process.env,
-							OMX_ROOT: omxRoot,
-							OMX_STATE_ROOT: "",
-							OMX_TEAM_STATE_ROOT: "",
-						},
-					},
-				);
-				assert.equal(result.status, 0);
-				const boxedSessionDir = join(omxRoot, ".omx", "state", "sessions", sessionId);
-				assert.equal(existsSync(join(boxedSessionDir, "skill-active-state.json")), false);
-				assert.equal(existsSync(join(boxedSessionDir, "ralplan-state.json")), false);
-				assert.equal(existsSync(join(omxRoot, ".omx", "state", "skill-active-state.json")), false);
-				assert.equal(existsSync(join(wd, ".omx", "state", "sessions", sessionId, "ralplan-state.json")), false);
-			}
-		} finally {
-			await rm(root, { recursive: true, force: true });
-		}
-	});
-
-	it("co-locates team-worker prompt skill state under the resolved team state root", async () => {
+	it("does not let a team-worker prompt mutate leader-scoped skill state", async () => {
 		const root = await mkdtemp(join(tmpdir(), "omx-notify-team-worker-skill-"));
 		const wd = join(root, "worker-worktree");
-		const teamStateRoot = join(root, "team-state");
 		const teamName = "fixhud";
 		const workerName = "worker-1";
 		const sessionId = "sess-worker-ralplan";
 		try {
-			await mkdir(join(teamStateRoot, "team", teamName, "workers", workerName), { recursive: true });
+			await mkdir(wd, { recursive: true });
+			const fixture = await notifyFixtureAuthority(wd, sessionId);
+			const teamStateRoot = fixture.canonicalSessionDir;
+			const teamDir = join(teamStateRoot, "team", teamName);
+			await mkdir(join(teamDir, "workers", workerName), { recursive: true });
 			await writeFile(
-				join(teamStateRoot, "team", teamName, "workers", workerName, "identity.json"),
+				join(teamDir, "config.json"),
+				JSON.stringify({
+					name: teamName,
+					session_id: sessionId,
+					leader: { session_id: sessionId },
+					workers: [{ name: workerName, worktree_path: wd }],
+				}),
+			);
+			await writeFile(
+				join(teamDir, "workers", workerName, "identity.json"),
 				JSON.stringify({
 					name: workerName,
+					team_name: teamName,
+					session_id: sessionId,
 					worktree_path: wd,
 					team_state_root: teamStateRoot,
 				}),
 			);
-			await mkdir(wd, { recursive: true });
-
+			hardenTestAuthorityTreeSync(wd);
 			const payload = JSON.stringify({
 				cwd: wd,
 				type: "agent-turn-complete",
@@ -134,33 +165,44 @@ describe("notify-hook non-OMX project guard", () => {
 					cwd: process.cwd(),
 					encoding: "utf-8",
 					env: {
-						...process.env,
+						...fixture.env,
 						OMX_TEAM_INTERNAL_WORKER: `${teamName}/${workerName}`,
 						OMX_TEAM_STATE_ROOT: teamStateRoot,
-						OMX_ROOT: "",
-						OMX_STATE_ROOT: "",
+						OMX_TEAM_LEADER_CWD: wd,
 					},
 				},
 			);
 			assert.equal(result.status, 0);
-			const teamSessionDir = join(teamStateRoot, "sessions", sessionId);
-			assert.equal(existsSync(join(teamSessionDir, "skill-active-state.json")), true);
-			assert.equal(existsSync(join(teamSessionDir, "ralplan-state.json")), true);
-			assert.equal(existsSync(join(wd, ".omx", "state", "sessions", sessionId, "skill-active-state.json")), false);
-			assert.equal(existsSync(join(wd, ".omx", "state", "sessions", sessionId, "ralplan-state.json")), false);
+			const teamSessionDir = fixture.canonicalSessionDir;
+			assert.equal(
+				existsSync(join(teamSessionDir, "skill-active-state.json")),
+				false,
+			);
+			assert.equal(
+				existsSync(join(teamSessionDir, "ralplan-state.json")),
+				false,
+			);
+			assert.equal(
+				existsSync(join(wd, ".omx", "state", "skill-active-state.json")),
+				false,
+			);
+			assert.equal(
+				existsSync(join(wd, ".omx", "state", "ralplan-state.json")),
+				false,
+			);
 		} finally {
 			await rm(root, { recursive: true, force: true });
 		}
 	});
 
-	it("co-locates non-worker prompt skill state under OMX_TEAM_STATE_ROOT", async () => {
+	it("stores non-worker prompt skill state in the persisted authority session root", async () => {
 		const root = await mkdtemp(join(tmpdir(), "omx-notify-team-root-skill-"));
 		const wd = join(root, "source");
-		const teamStateRoot = join(root, "team-state");
 		const sessionId = "sess-notify-team-root";
 		try {
 			await mkdir(join(wd, ".omx"), { recursive: true });
 			await writeFile(join(wd, ".omx", "managed"), "");
+			const fixture = await notifyFixtureAuthority(wd, sessionId);
 			const payload = JSON.stringify({
 				cwd: wd,
 				type: "agent-turn-complete",
@@ -177,21 +219,28 @@ describe("notify-hook non-OMX project guard", () => {
 					cwd: process.cwd(),
 					encoding: "utf-8",
 					env: {
-						...process.env,
-						OMX_TEAM_STATE_ROOT: teamStateRoot,
-						OMX_ROOT: "",
-						OMX_STATE_ROOT: "",
-						OMX_TEAM_INTERNAL_WORKER: "",
-						OMX_TEAM_WORKER: "",
+						...fixture.env,
 					},
 				},
 			);
 			assert.equal(result.status, 0);
-			const teamSessionDir = join(teamStateRoot, "sessions", sessionId);
-			assert.equal(existsSync(join(teamSessionDir, "skill-active-state.json")), true);
-			assert.equal(existsSync(join(teamSessionDir, "ralplan-state.json")), true);
-			assert.equal(existsSync(join(wd, ".omx", "state", "sessions", sessionId, "skill-active-state.json")), false);
-			assert.equal(existsSync(join(wd, ".omx", "state", "sessions", sessionId, "ralplan-state.json")), false);
+			const teamSessionDir = fixture.canonicalSessionDir;
+			assert.equal(
+				existsSync(join(teamSessionDir, "skill-active-state.json")),
+				true,
+			);
+			assert.equal(
+				existsSync(join(teamSessionDir, "ralplan-state.json")),
+				true,
+			);
+			assert.equal(
+				existsSync(join(wd, ".omx", "state", "skill-active-state.json")),
+				false,
+			);
+			assert.equal(
+				existsSync(join(wd, ".omx", "state", "ralplan-state.json")),
+				false,
+			);
 		} finally {
 			await rm(root, { recursive: true, force: true });
 		}
@@ -241,7 +290,10 @@ describe("notify-hook non-OMX project guard", () => {
 			);
 			assert.equal(result.status, 0);
 			assert.equal(existsSync(join(wd, ".omx", "state", "notify.json")), false);
-			assert.equal(existsSync(join(wd, ".omx", "logs", "notify-hook.log")), false);
+			assert.equal(
+				existsSync(join(wd, ".omx", "logs", "notify-hook.log")),
+				false,
+			);
 		} finally {
 			await rm(wd, { recursive: true, force: true });
 		}

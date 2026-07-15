@@ -8,6 +8,7 @@ import { spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import { initializeStateAuthority, mintStateAuthorityTransportCapability } from '../../state/authority.js';
 import { buildStateAuthorityTransportEnv } from '../../state/transport-env.js';
+import { hardenTestAuthorityTreeSync } from '../../team/__tests__/authority-fixture.js';
 
 
 const testDir = dirname(fileURLToPath(import.meta.url));
@@ -56,6 +57,7 @@ function unauthenticatedEnv(overrides: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
 }
 
 function runOmxWithEnv(cwd: string, env: NodeJS.ProcessEnv, ...args: string[]) {
+  hardenTestAuthorityTreeSync(cwd);
   const childEnv = { ...process.env, ...env };
   for (const [key, value] of Object.entries(env)) {
     if (value === undefined) delete childEnv[key];
@@ -346,7 +348,7 @@ describe('CLI session-scoped state parity', () => {
     }
   });
 
-  it('reports stale current-autopilot in status when no authoritative active modes exist', async () => {
+  it('ignores stale current-autopilot when no authoritative active modes exist', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-cli-status-stale-current-autopilot-'));
     try {
       const authorityTransport = await establishCommittedAuthority(wd, 'sess-stale-autopilot');
@@ -365,21 +367,21 @@ describe('CLI session-scoped state parity', () => {
 
       const statusResult = runOmxWithEnv(wd, authorityTransport, 'status');
       assert.equal(statusResult.status, 0, statusResult.stderr || statusResult.stdout);
-      assert.match(statusResult.stdout, /autopilot: STALE \(phase: complete\)/);
-      assert.doesNotMatch(statusResult.stdout, /No active modes\./);
+      assert.match(statusResult.stdout, /No active modes\./);
+      assert.doesNotMatch(statusResult.stdout, /STALE/);
 
       const listResult = runOmxWithEnv(wd, authorityTransport, 'state', 'list-active', '--json');
 
       assert.equal(listResult.status, 0, listResult.stderr || listResult.stdout);
       assert.deepEqual(JSON.parse(listResult.stdout), { active_modes: [] });
       assert.deepEqual(JSON.parse(await readFile(currentAutopilotPath, 'utf-8')), currentAutopilot);
-      assert.equal(statusResult.stdout.trim(), 'autopilot: STALE (phase: complete)');
+      assert.equal(statusResult.stdout.trim(), 'No active modes.');
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
   });
 
-  it('reports stale current-autopilot alongside inactive authoritative modes only', async () => {
+  it('ignores stale current-autopilot alongside inactive authoritative modes', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-cli-status-stale-current-autopilot-with-inactive-'));
     try {
       const stateDir = join(wd, '.omx', 'state');
@@ -406,7 +408,7 @@ describe('CLI session-scoped state parity', () => {
 
       assert.equal(statusResult.status, 0, statusResult.stderr || statusResult.stdout);
       assert.match(statusResult.stdout, /deep-interview: inactive \(phase: cleared\)/);
-      assert.match(statusResult.stdout, /autopilot: STALE \(phase: complete\)/);
+      assert.doesNotMatch(statusResult.stdout, /STALE/);
       assert.doesNotMatch(statusResult.stdout, /No active modes\./);
       assert.deepEqual(JSON.parse(await readFile(currentAutopilotPath, 'utf-8')), currentAutopilot);
     } finally {
@@ -466,7 +468,7 @@ describe('CLI session-scoped state parity', () => {
     }
   });
 
-  it('reports durable failed Ultragoal artifacts without advertising a cancellable active mode', async () => {
+  it('does not project non-authoritative failed Ultragoal artifacts as mode state', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-cli-status-failed-ultragoal-'));
     try {
       const authorityTransport = await establishCommittedAuthority(wd, 'sess-failed-ultragoal');
@@ -488,8 +490,8 @@ describe('CLI session-scoped state parity', () => {
 
       const statusResult = runOmxWithEnv(wd, authorityTransport, 'status');
       assert.equal(statusResult.status, 0, statusResult.stderr || statusResult.stdout);
-      assert.match(statusResult.stdout, /ultragoal: FAILED \(phase: failed\)/);
-      assert.doesNotMatch(statusResult.stdout, /ultragoal: ACTIVE \(phase: failed\)/);
+      assert.match(statusResult.stdout, /No active modes\./);
+      assert.doesNotMatch(statusResult.stdout, /ultragoal: (?:FAILED|ACTIVE)/);
 
       const cancelResult = runOmxWithEnv(wd, authorityTransport, 'cancel');
 

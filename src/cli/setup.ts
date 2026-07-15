@@ -4522,10 +4522,14 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 
 	// Step 6: Generate AGENTS.md
 	console.log("[6/8] Generating AGENTS.md...");
-	const activeSession =
-		resolvedScope.scope === "project"
-			? await readSessionState(projectRoot)
-			: null;
+	let activeSession = null;
+	if (resolvedScope.scope === "project") {
+		try {
+			activeSession = await readSessionState(projectRoot);
+		} catch (error) {
+			if ((error as { code?: unknown })?.code !== "authority_anchor_missing") throw error;
+		}
+	}
 	const sessionIsActive = activeSession && !isSessionStale(activeSession);
 	if (isPluginInstallMode) {
 		const agentsMdSrc = join(pkgRoot, "templates", "AGENTS.md");

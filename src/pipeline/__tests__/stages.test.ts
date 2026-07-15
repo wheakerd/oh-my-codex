@@ -1,7 +1,7 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdtemp, rm, mkdir, readFile, writeFile } from 'fs/promises';
+import { chmod, mkdtemp, rm, mkdir, readFile, writeFile } from 'fs/promises';
 import { basename, dirname, join, relative } from 'path';
 import { tmpdir } from 'os';
 import { existsSync } from 'fs';
@@ -17,12 +17,66 @@ import { buildFollowupStaffingPlan } from '../../team/followup-planner.js';
 import { packageRoot } from '../../utils/paths.js';
 import { subagentTrackingPath } from '../../subagents/tracker.js';
 import { LEADER_CONDUCTOR_BLOCK, buildUnsupportedNativeSubagentGuidance } from '../../leader/contract.js';
+import {
+  initializeStateAuthority,
+  mintStateAuthorityTransportCapability,
+} from '../../state/authority.js';
+import { buildStateAuthorityTransportEnv } from '../../state/transport-env.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
 let tempDir: string;
+const TEST_AUTHORITY_ENV_KEYS = [
+  'OMX_ROOT',
+  'OMX_STATE_ROOT',
+  'OMX_TEAM_STATE_ROOT',
+  'OMX_SESSION_ID',
+  'OMX_STARTUP_CWD',
+  'OMX_STATE_AUTHORITY_PATH',
+  'OMX_STATE_AUTHORITY_ID',
+  'OMX_STATE_AUTHORITY_GENERATION_ID',
+  'OMX_STATE_AUTHORITY_WORKSPACE_DIGEST',
+  'OMX_STATE_AUTHORITY_CAPABILITY',
+] as const;
+
+const PIPELINE_STAGES_TEST_SESSION_ID = 'pipeline-stages-test-session';
+
+let savedOmxEnv: Map<string, string | undefined>;
+
+function clearAmbientOmxEnv(): void {
+  savedOmxEnv = new Map(TEST_AUTHORITY_ENV_KEYS.map((key) => [key, process.env[key]]));
+  for (const key of TEST_AUTHORITY_ENV_KEYS) delete process.env[key];
+}
+
+function restoreAmbientOmxEnv(): void {
+  for (const [key, value] of savedOmxEnv) {
+    if (typeof value === 'string') process.env[key] = value;
+    else delete process.env[key];
+  }
+}
+
+function pipelineStageStatePath(cwd: string, filename: string): string {
+  return join(cwd, '.omx', 'state', 'sessions', PIPELINE_STAGES_TEST_SESSION_ID, filename);
+}
+
+async function installPipelineStageTestAuthority(cwd: string): Promise<void> {
+  await mkdir(join(cwd, '.omx', 'state'), { recursive: true, mode: 0o700 });
+  await chmod(join(cwd, '.omx'), 0o700);
+  await chmod(join(cwd, '.omx', 'state'), 0o700);
+
+  const authority = await initializeStateAuthority({
+    startup_cwd: cwd,
+    observed_cwd: cwd,
+    launch_id: `${PIPELINE_STAGES_TEST_SESSION_ID}-launch`,
+    session_binding: { canonical_session_id: PIPELINE_STAGES_TEST_SESSION_ID },
+  });
+  await mintStateAuthorityTransportCapability(authority);
+  Object.assign(process.env, buildStateAuthorityTransportEnv(authority, {
+    OMX_SESSION_ID: PIPELINE_STAGES_TEST_SESSION_ID,
+  }));
+}
 
 function encodeApprovedExecutionTask(task: string, quote: 'single' | 'double'): string {
   return quote === 'single'
@@ -137,8 +191,15 @@ function escapeRegExp(value: string): string {
 // ---------------------------------------------------------------------------
 
 describe('RALPLAN Stage', () => {
-  beforeEach(async () => { await setup(); });
-  afterEach(async () => { await cleanup(); });
+  beforeEach(async () => {
+    clearAmbientOmxEnv();
+    await setup();
+    await installPipelineStageTestAuthority(tempDir);
+  });
+  afterEach(async () => {
+    await cleanup();
+    restoreAmbientOmxEnv();
+  });
 
   it('creates a stage with the correct name', () => {
     const stage = createRalplanStage();
@@ -343,23 +404,14 @@ describe('RALPLAN Stage', () => {
     })), true);
   });
 
-  it('canSkip honors explicit session-scoped consensus state before root state', async () => {
+  it('canSkip reads consensus from the committed canonical session scope', async () => {
     const plansDir = join(tempDir, '.omx', 'plans');
-    const stateDir = join(tempDir, '.omx', 'state');
-    const sessionDir = join(stateDir, 'sessions', 'sess-explicit');
+    const statePath = pipelineStageStatePath(tempDir, 'autopilot-state.json');
     await mkdir(plansDir, { recursive: true });
-    await mkdir(sessionDir, { recursive: true });
+    await mkdir(dirname(statePath), { recursive: true, mode: 0o700 });
     await writeFile(join(plansDir, 'prd-my-feature.md'), '# Plan\n');
     await writeFile(join(plansDir, 'test-spec-my-feature.md'), '# Test Spec\n');
-    await writeFile(join(stateDir, 'autopilot-state.json'), JSON.stringify({
-      state: {
-        handoff_artifacts: {
-          ralplan_architect_review: { agent_role: 'architect', verdict: 'reject', approved: true },
-          ralplan_critic_review: { agent_role: 'critic', verdict: 'approve' },
-        },
-      },
-    }));
-    await writeFile(join(sessionDir, 'autopilot-state.json'), JSON.stringify({
+    await writeFile(statePath, JSON.stringify({
       state: {
         handoff_artifacts: {
           ralplan_architect_review: { agent_role: 'architect', verdict: 'approve', sequence_index: 1 },
@@ -369,44 +421,24 @@ describe('RALPLAN Stage', () => {
     }));
 
     const stage = createRalplanStage();
-    assert.equal(stage.canSkip!(makeCtx({ sessionId: 'sess-explicit' })), true);
+    assert.equal(stage.canSkip!(makeCtx({ sessionId: PIPELINE_STAGES_TEST_SESSION_ID })), true);
   });
 
-  it('canSkip fails closed when explicit session state is missing despite root consensus', async () => {
+  it('canSkip fails closed when the committed session has no consensus', async () => {
     const plansDir = join(tempDir, '.omx', 'plans');
-    const stateDir = join(tempDir, '.omx', 'state');
     await mkdir(plansDir, { recursive: true });
-    await mkdir(stateDir, { recursive: true });
     await writeFile(join(plansDir, 'prd-my-feature.md'), '# Plan\n');
     await writeFile(join(plansDir, 'test-spec-my-feature.md'), '# Test Spec\n');
-    await writeFile(join(stateDir, 'autopilot-state.json'), JSON.stringify({
-      state: {
-        handoff_artifacts: {
-          ralplan_architect_review: { agent_role: 'architect', verdict: 'approve' },
-          ralplan_critic_review: { agent_role: 'critic', verdict: 'approve' },
-        },
-      },
-    }));
 
     const stage = createRalplanStage();
-    assert.equal(stage.canSkip!(makeCtx({ sessionId: 'sess-missing' })), false);
+    assert.equal(stage.canSkip!(makeCtx({ sessionId: PIPELINE_STAGES_TEST_SESSION_ID })), false);
   });
 
-  it('canSkip fails closed for malformed explicit session ids instead of falling back to root consensus', async () => {
+  it('canSkip fails closed for malformed explicit session ids', async () => {
     const plansDir = join(tempDir, '.omx', 'plans');
-    const stateDir = join(tempDir, '.omx', 'state');
     await mkdir(plansDir, { recursive: true });
-    await mkdir(stateDir, { recursive: true });
     await writeFile(join(plansDir, 'prd-my-feature.md'), '# Plan\n');
     await writeFile(join(plansDir, 'test-spec-my-feature.md'), '# Test Spec\n');
-    await writeFile(join(stateDir, 'ralplan-state.json'), JSON.stringify({
-      ralplanConsensusGate: {
-        complete: true,
-        sequence: ['architect-review', 'critic-review'],
-        ralplan_architect_review: { agent_role: 'architect', verdict: 'approve' },
-        ralplan_critic_review: { agent_role: 'critic', verdict: 'approve' },
-      },
-    }));
 
     const stage = createRalplanStage();
     for (const sessionId of ['../bad', 'a'.repeat(65), '']) {
@@ -609,14 +641,14 @@ describe('RALPLAN Stage', () => {
     })), false);
   });
 
-  it('canSkip returns false when local state only has latest verdict fields', async () => {
+  it('canSkip returns false when canonical session state only has latest verdict fields', async () => {
     const plansDir = join(tempDir, '.omx', 'plans');
-    const stateDir = join(tempDir, '.omx', 'state');
+    const statePath = pipelineStageStatePath(tempDir, 'ralplan-state.json');
     await mkdir(plansDir, { recursive: true });
-    await mkdir(stateDir, { recursive: true });
+    await mkdir(dirname(statePath), { recursive: true, mode: 0o700 });
     await writeFile(join(plansDir, 'prd-my-feature.md'), '# Plan\n');
     await writeFile(join(plansDir, 'test-spec-my-feature.md'), '# Test Spec\n');
-    await writeFile(join(stateDir, 'ralplan-state.json'), JSON.stringify({
+    await writeFile(statePath, JSON.stringify({
       current_phase: 'complete',
       planning_complete: true,
       latest_architect_verdict: 'approve',

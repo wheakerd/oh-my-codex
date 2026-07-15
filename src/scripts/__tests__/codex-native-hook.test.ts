@@ -2985,7 +2985,7 @@ PY`,
     }
   });
 
-  it("writes SessionStart state against the long-lived session owner pid and injects environment context", async () => {
+  it("rejects unauthenticated SessionStart without creating workspace state", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-session-start-"));
     try {
       const result = await dispatchCodexNativeHook(
@@ -3001,19 +3001,8 @@ PY`,
       );
 
       assert.equal(result.omxEventName, "session-start");
-      const additionalContext = String(
-        (result.outputJson as { hookSpecificOutput?: { additionalContext?: string } })?.hookSpecificOutput?.additionalContext ?? "",
-      );
-      assert.match(additionalContext, /\[Execution environment\]/);
-      assert.match(additionalContext, /native-hook \/ Codex App outside tmux/);
-      assert.match(additionalContext, /omx team, omx hud, and omx quest(?:ion) need an attached tmux OMX CLI shell|omx team and omx hud need an attached tmux OMX CLI shell/);
-      assert.match(additionalContext, /not available from this outside-tmux surface/);
-      const sessionState = JSON.parse(
-        await readFile(join(cwd, ".omx", "state", "session.json"), "utf-8"),
-      ) as { session_id?: string; native_session_id?: string; pid?: number };
-      assert.equal(sessionState.session_id, "sess-start-1");
-      assert.equal(sessionState.native_session_id, "sess-start-1");
-      assert.equal(sessionState.pid, 43210);
+      assert.match(JSON.stringify(result.outputJson), /no committed active authority/);
+      assert.equal(existsSync(join(cwd, ".omx")), false);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

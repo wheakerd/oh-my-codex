@@ -1,4 +1,4 @@
-import { after, before, describe, it } from "node:test";
+import { after, afterEach, before, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, lstatSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import {
@@ -48,6 +48,40 @@ import {
 const packageRoot = process.cwd();
 let previousPathForFakeCodex: string | undefined;
 let fakeCodexBinDir: string | null = null;
+let savedAuthorityEnv: Map<string, string | undefined>;
+
+const TEST_AUTHORITY_ENV_KEYS = [
+	"OMX_ROOT",
+	"OMX_STATE_ROOT",
+	"OMX_TEAM_STATE_ROOT",
+	"OMX_SESSION_ID",
+	"OMX_STARTUP_CWD",
+	"OMX_STATE_AUTHORITY_PATH",
+	"OMX_STATE_AUTHORITY_ID",
+	"OMX_STATE_AUTHORITY_GENERATION_ID",
+	"OMX_STATE_AUTHORITY_WORKSPACE_DIGEST",
+	"OMX_STATE_AUTHORITY_CAPABILITY",
+] as const;
+
+function clearInheritedAuthorityTransport(): void {
+	savedAuthorityEnv = new Map(TEST_AUTHORITY_ENV_KEYS.map((key) => [key, process.env[key]]));
+	for (const key of TEST_AUTHORITY_ENV_KEYS) delete process.env[key];
+}
+
+function restoreInheritedAuthorityTransport(): void {
+	for (const [key, value] of savedAuthorityEnv) {
+		if (typeof value === "string") process.env[key] = value;
+		else delete process.env[key];
+	}
+}
+
+beforeEach(() => {
+	clearInheritedAuthorityTransport();
+});
+
+afterEach(() => {
+	restoreInheritedAuthorityTransport();
+});
 
 before(async () => {
 	previousPathForFakeCodex = process.env.PATH;

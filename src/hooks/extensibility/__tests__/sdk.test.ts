@@ -1,11 +1,53 @@
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
+import { createHash } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { describe, it } from 'node:test';
 import { createHookPluginSdk, clearHookPluginState } from '../sdk.js';
 import type { HookEventEnvelope } from '../types.js';
+import { initializeStateAuthority, mintStateAuthorityTransportCapability } from '../../../state/authority.js';
+import { buildStateAuthorityTransportEnv } from '../../../state/transport-env.js';
+
+const AUTHORITY_ENV_KEYS = [
+  'OMX_ROOT',
+  'OMX_STATE_ROOT',
+  'OMX_TEAM_STATE_ROOT',
+  'OMX_STARTUP_CWD',
+  'OMX_SESSION_ID',
+  'OMX_STATE_AUTHORITY_PATH',
+  'OMX_STATE_AUTHORITY_ID',
+  'OMX_STATE_AUTHORITY_GENERATION_ID',
+  'OMX_STATE_AUTHORITY_WORKSPACE_DIGEST',
+  'OMX_STATE_AUTHORITY_CAPABILITY',
+] as const;
+
+async function withTestAuthority<T>(cwd: string, sessionId: string, run: () => Promise<T>): Promise<T> {
+  const savedEnvironment = new Map(AUTHORITY_ENV_KEYS.map((key) => [key, process.env[key]]));
+  try {
+    for (const key of AUTHORITY_ENV_KEYS) delete process.env[key];
+    await mkdir(join(cwd, '.omx', 'state'), { recursive: true, mode: 0o700 });
+    await chmod(cwd, 0o700);
+    await chmod(join(cwd, '.omx'), 0o700);
+    await chmod(join(cwd, '.omx', 'state'), 0o700);
+    const authority = await initializeStateAuthority({
+      startup_cwd: cwd,
+      observed_cwd: cwd,
+      launch_id: `${sessionId}-${createHash('sha256').update(cwd).digest('hex').slice(0, 16)}`,
+      session_binding: { canonical_session_id: sessionId },
+    });
+    await mintStateAuthorityTransportCapability(authority);
+    Object.assign(process.env, buildStateAuthorityTransportEnv(authority, { OMX_SESSION_ID: sessionId }));
+    return await run();
+  } finally {
+    for (const [key, value] of savedEnvironment) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+}
+
 
 function makeEvent(event = 'session-start'): HookEventEnvelope {
   return {
@@ -51,10 +93,12 @@ describe('createHookPluginSdk', () => {
     it('writes and reads state', async () => {
       const cwd = await mkdtemp(join(tmpdir(), 'omx-sdk-'));
       try {
+        await withTestAuthority(cwd, 'sdk-state-write', async () => {
         const sdk = createHookPluginSdk({ cwd, pluginName: 'test', event: makeEvent() });
         await sdk.state.write('counter', 5);
         const val = await sdk.state.read('counter');
         assert.equal(val, 5);
+        });
       } finally {
         await rm(cwd, { recursive: true, force: true });
       }
@@ -63,11 +107,13 @@ describe('createHookPluginSdk', () => {
     it('deletes state key', async () => {
       const cwd = await mkdtemp(join(tmpdir(), 'omx-sdk-'));
       try {
+        await withTestAuthority(cwd, 'sdk-state-delete', async () => {
         const sdk = createHookPluginSdk({ cwd, pluginName: 'test', event: makeEvent() });
         await sdk.state.write('key', 'value');
         await sdk.state.delete('key');
         const val = await sdk.state.read('key');
         assert.equal(val, undefined);
+        });
       } finally {
         await rm(cwd, { recursive: true, force: true });
       }
@@ -76,11 +122,13 @@ describe('createHookPluginSdk', () => {
     it('delete is a no-op for nonexistent key', async () => {
       const cwd = await mkdtemp(join(tmpdir(), 'omx-sdk-'));
       try {
+        await withTestAuthority(cwd, 'sdk-state-delete-missing', async () => {
         const sdk = createHookPluginSdk({ cwd, pluginName: 'test', event: makeEvent() });
         await sdk.state.write('keep', 'yes');
         await sdk.state.delete('nonexistent');
         const val = await sdk.state.read('keep');
         assert.equal(val, 'yes');
+        });
       } finally {
         await rm(cwd, { recursive: true, force: true });
       }
@@ -89,11 +137,13 @@ describe('createHookPluginSdk', () => {
     it('reads all state', async () => {
       const cwd = await mkdtemp(join(tmpdir(), 'omx-sdk-'));
       try {
+        await withTestAuthority(cwd, 'sdk-state-all', async () => {
         const sdk = createHookPluginSdk({ cwd, pluginName: 'test', event: makeEvent() });
         await sdk.state.write('a', 1);
         await sdk.state.write('b', 'two');
         const all = await sdk.state.all();
         assert.deepEqual(all, { a: 1, b: 'two' });
+        });
       } finally {
         await rm(cwd, { recursive: true, force: true });
       }
@@ -326,6 +376,7 @@ exit 1
     it('reads session state from .omx/state/session.json', async () => {
       const cwd = await mkdtemp(join(tmpdir(), 'omx-sdk-'));
       try {
+        await withTestAuthority(cwd, 'session-123', async () => {
         await writeOmxStateFile(cwd, 'session.json', {
           session_id: 'session-123',
           cwd,
@@ -339,6 +390,7 @@ exit 1
           cwd,
           started_at: '2026-01-01T00:00:00.000Z',
         });
+        });
       } finally {
         await rm(cwd, { recursive: true, force: true });
       }
@@ -347,21 +399,29 @@ exit 1
     it('returns null for invalid session state without session_id', async () => {
       const cwd = await mkdtemp(join(tmpdir(), 'omx-sdk-'));
       try {
+        await withTestAuthority(cwd, 'sdk-invalid-session', async () => {
         await writeOmxStateFile(cwd, 'session.json', {
           started_at: '2026-01-01T00:00:00.000Z',
         });
 
         const sdk = createHookPluginSdk({ cwd, pluginName: 'test', event: makeEvent() });
         assert.equal(await sdk.omx.session.read(), null);
+        });
       } finally {
         await rm(cwd, { recursive: true, force: true });
       }
     });
 
-    it('reads hud, notifyFallback, and updateCheck state from root-scoped omx files', async () => {
+    it('reads HUD state from the canonical session scope and root-scoped notifyFallback and updateCheck state', async () => {
       const cwd = await mkdtemp(join(tmpdir(), 'omx-sdk-'));
       try {
-        await writeOmxStateFile(cwd, 'hud-state.json', {
+        await withTestAuthority(cwd, 'sdk-reader-session', async () => {
+        await writeOmxStateFile(cwd, 'session.json', {
+          session_id: 'sdk-reader-session',
+          cwd,
+          started_at: '2026-01-01T00:00:00.000Z',
+        });
+        await writeOmxStateFile(cwd, join('sessions', 'sdk-reader-session', 'hud-state.json'), {
           last_turn_at: '2026-01-01T00:00:00.000Z',
           turn_count: 3,
         });
@@ -389,6 +449,7 @@ exit 1
           last_checked_at: '2026-01-01T00:00:00.000Z',
           last_seen_latest: '0.11.0',
         });
+        });
       } finally {
         await rm(cwd, { recursive: true, force: true });
       }
@@ -397,6 +458,7 @@ exit 1
     it('reads hud state from the current session scope instead of stale root fallback', async () => {
       const cwd = await mkdtemp(join(tmpdir(), 'omx-sdk-hud-session-'));
       try {
+        await withTestAuthority(cwd, 'sess-current', async () => {
         await writeOmxStateFile(cwd, 'session.json', {
           session_id: 'sess-current',
           cwd,
@@ -418,6 +480,7 @@ exit 1
           last_turn_at: '2026-01-01T00:00:00.000Z',
           turn_count: 3,
           last_agent_output: 'Current session output',
+        });
         });
       } finally {
         await rm(cwd, { recursive: true, force: true });
@@ -442,6 +505,7 @@ exit 1
     it('sanitizes special characters in plugin name', async () => {
       const cwd = await mkdtemp(join(tmpdir(), 'omx-sdk-'));
       try {
+        await withTestAuthority(cwd, 'sdk-plugin-sanitization', async () => {
         const sdk = createHookPluginSdk({
           cwd,
           pluginName: 'my plugin!@#',
@@ -450,6 +514,7 @@ exit 1
         await sdk.state.write('test', 'value');
         const val = await sdk.state.read('test');
         assert.equal(val, 'value');
+        });
       } finally {
         await rm(cwd, { recursive: true, force: true });
       }
@@ -461,6 +526,7 @@ describe('clearHookPluginState', () => {
   it('removes data.json and tmux.json for plugin', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-clear-'));
     try {
+      await withTestAuthority(cwd, 'sdk-plugin-clear', async () => {
       const pluginDir = join(cwd, '.omx', 'state', 'hooks', 'plugins', 'my-plugin');
       await mkdir(pluginDir, { recursive: true });
       await writeFile(join(pluginDir, 'data.json'), '{}');
@@ -470,6 +536,7 @@ describe('clearHookPluginState', () => {
 
       assert.equal(existsSync(join(pluginDir, 'data.json')), false);
       assert.equal(existsSync(join(pluginDir, 'tmux.json')), false);
+      });
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -478,7 +545,9 @@ describe('clearHookPluginState', () => {
   it('does not throw when files do not exist', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-clear-'));
     try {
+      await withTestAuthority(cwd, 'sdk-plugin-clear-missing', async () => {
       await clearHookPluginState(cwd, 'nonexistent');
+      });
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

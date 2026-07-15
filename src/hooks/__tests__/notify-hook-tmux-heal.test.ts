@@ -2,18 +2,41 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { chmod, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
-import { readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildTmuxSessionName } from '../../cli/index.js';
 import { handleTmuxInjection, resolvePaneTarget } from '../../scripts/notify-hook/tmux-injection.js';
+import { initializeStateAuthority, mintStateAuthorityTransportCapability } from '../../state/authority.js';
+import { buildStateAuthorityTransportEnv } from '../../state/transport-env.js';
+import { hardenTestAuthorityTreeSync } from '../../team/__tests__/authority-fixture.js';
+import { writeSessionStart } from '../session.js';
+
+async function initializeHealFixtureAuthority(cwd: string, sessionId: string): Promise<NodeJS.ProcessEnv> {
+  hardenTestAuthorityTreeSync(cwd);
+  const authority = await initializeStateAuthority({
+    startup_cwd: cwd,
+    observed_cwd: cwd,
+    launch_id: `notify-tmux-heal-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    session_binding: { canonical_session_id: sessionId },
+  });
+  await mintStateAuthorityTransportCapability(authority);
+  await chmod(authority.canonical_state_root, 0o700);
+  return buildStateAuthorityTransportEnv(authority, { OMX_SESSION_ID: sessionId });
+}
 
 const NOTIFY_HOOK_SCRIPT = new URL('../../../dist/scripts/notify-hook.js', import.meta.url);
 
 const STATE_ENV_KEYS = [
   'OMX_ROOT',
   'OMX_STATE_ROOT',
+  'OMX_TEAM_STATE_ROOT',
+  'OMX_STARTUP_CWD',
   'OMX_SESSION_ID',
+  'OMX_STATE_AUTHORITY_PATH',
+  'OMX_STATE_AUTHORITY_ID',
+  'OMX_STATE_AUTHORITY_GENERATION_ID',
+  'OMX_STATE_AUTHORITY_WORKSPACE_DIGEST',
+  'OMX_STATE_AUTHORITY_CAPABILITY',
   'CODEX_SESSION_ID',
   'SESSION_ID',
 ] as const;
@@ -76,42 +99,10 @@ function withPatchedEnv<T>(patch: Record<string, string>, run: () => Promise<T>)
   });
 }
 
-
-function readLinuxStartTicks(pid: number): number | null {
-  try {
-    const stat = readFileSync(`/proc/${pid}/stat`, 'utf-8');
-    const commandEnd = stat.lastIndexOf(')');
-    if (commandEnd === -1) return null;
-    const remainder = stat.slice(commandEnd + 1).trim();
-    const fields = remainder.split(/\s+/);
-    if (fields.length <= 19) return null;
-    const startTicks = Number(fields[19]);
-    return Number.isFinite(startTicks) ? startTicks : null;
-  } catch {
-    return null;
-  }
-}
-
-function readLinuxCmdline(pid: number): string | null {
-  try {
-    const raw = readFileSync(`/proc/${pid}/cmdline`);
-    const text = raw.toString('utf-8').replace(/\0+/g, ' ').trim();
-    return text.length > 0 ? text : null;
-  } catch {
-    return null;
-  }
-}
-
-async function writeManagedSessionState(stateDir: string, cwd: string, sessionId: string): Promise<void> {
-  await writeJson(join(stateDir, 'session.json'), {
-    session_id: sessionId,
-    started_at: new Date().toISOString(),
-    cwd,
-    pid: process.pid,
-    platform: process.platform,
-    pid_start_ticks: readLinuxStartTicks(process.pid),
-    pid_cmdline: readLinuxCmdline(process.pid),
-  });
+async function writeManagedSessionState(_stateDir: string, cwd: string, sessionId: string): Promise<void> {
+  Object.assign(process.env, await initializeHealFixtureAuthority(cwd, sessionId));
+  await writeSessionStart(cwd, sessionId, { pid: process.pid });
+  hardenTestAuthorityTreeSync(cwd);
 }
 
 describe('notify-hook tmux target healing', () => {

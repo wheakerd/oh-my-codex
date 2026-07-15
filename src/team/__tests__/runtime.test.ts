@@ -2038,6 +2038,7 @@ sleep 5
   it('shutdownTeam with path-like display input cannot remove state outside the team directory', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-shutdown-unsafe-'));
     try {
+      await installTestAuthorityTransport(cwd);
       const victim = join(cwd, '.omx', 'state', 'victim');
       await mkdir(victim, { recursive: true });
       await writeFile(join(victim, 'keep.txt'), 'keep');

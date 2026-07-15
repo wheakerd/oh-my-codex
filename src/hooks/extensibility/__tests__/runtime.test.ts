@@ -1,11 +1,53 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
+import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 import { dispatchHookEventRuntime } from '../runtime.js';
 import { buildHookEvent } from '../events.js';
 import { initTeamState, readTeamLeaderAttention, readTeamManifestV2, writeTeamLeaderAttention, writeTeamManifestV2 } from '../../../team/state.js';
+import { initializeStateAuthority, mintStateAuthorityTransportCapability } from '../../../state/authority.js';
+import { buildStateAuthorityTransportEnv } from '../../../state/transport-env.js';
+
+const AUTHORITY_ENV_KEYS = [
+  'OMX_ROOT',
+  'OMX_STATE_ROOT',
+  'OMX_TEAM_STATE_ROOT',
+  'OMX_STARTUP_CWD',
+  'OMX_SESSION_ID',
+  'OMX_STATE_AUTHORITY_PATH',
+  'OMX_STATE_AUTHORITY_ID',
+  'OMX_STATE_AUTHORITY_GENERATION_ID',
+  'OMX_STATE_AUTHORITY_WORKSPACE_DIGEST',
+  'OMX_STATE_AUTHORITY_CAPABILITY',
+] as const;
+
+async function withTestAuthority<T>(cwd: string, sessionId: string, run: () => Promise<T>): Promise<T> {
+  const savedEnvironment = new Map(AUTHORITY_ENV_KEYS.map((key) => [key, process.env[key]]));
+  try {
+    for (const key of AUTHORITY_ENV_KEYS) delete process.env[key];
+    await mkdir(join(cwd, '.omx', 'state'), { recursive: true, mode: 0o700 });
+    await chmod(cwd, 0o700);
+    await chmod(join(cwd, '.omx'), 0o700);
+    await chmod(join(cwd, '.omx', 'state'), 0o700);
+    const authority = await initializeStateAuthority({
+      startup_cwd: cwd,
+      observed_cwd: cwd,
+      launch_id: `${sessionId}-${createHash('sha256').update(cwd).digest('hex').slice(0, 16)}`,
+      session_binding: { canonical_session_id: sessionId },
+    });
+    await mintStateAuthorityTransportCapability(authority);
+    Object.assign(process.env, buildStateAuthorityTransportEnv(authority, { OMX_SESSION_ID: sessionId }));
+    return await run();
+  } finally {
+    for (const [key, value] of savedEnvironment) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+}
+
 
 describe('dispatchHookEventRuntime', () => {
   it('dispatches native events even when plugins env var is not set', async () => {
@@ -123,6 +165,7 @@ describe('dispatchHookEventRuntime', () => {
   it('marks active leader-owned teams when a native stop event is dispatched without inventing leader attention', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-stop-team-'));
     try {
+      await withTestAuthority(cwd, 'leader-session-stop', async () => {
       await initTeamState('stop-owned-team', 'stop test', 'executor', 1, cwd);
       const manifest = await readTeamManifestV2('stop-owned-team', cwd);
       assert.ok(manifest);
@@ -165,6 +208,7 @@ describe('dispatchHookEventRuntime', () => {
       assert.equal(attention?.work_remaining, false);
       assert.equal(attention?.leader_attention_reason, null);
       assert.deepEqual(attention?.attention_reasons, []);
+      });
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -173,6 +217,7 @@ describe('dispatchHookEventRuntime', () => {
   it('routes native stop leader attention by canonical OMX session id while preserving native metadata in context', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-stop-team-native-meta-'));
     try {
+      await withTestAuthority(cwd, 'omx-canonical-session', async () => {
       await initTeamState('stop-owned-team-meta', 'stop test', 'executor', 1, cwd);
       const manifest = await readTeamManifestV2('stop-owned-team-meta', cwd);
       assert.ok(manifest);
@@ -198,6 +243,7 @@ describe('dispatchHookEventRuntime', () => {
       assert.equal(attention?.source, 'native_stop');
       assert.equal(attention?.leader_session_id, 'omx-canonical-session');
       assert.equal(attention?.leader_session_active, false);
+      });
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

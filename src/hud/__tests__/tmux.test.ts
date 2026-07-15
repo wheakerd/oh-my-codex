@@ -616,8 +616,6 @@ describe('HUD pane ownership helpers', () => {
       '-c',
       '/repo/$(literal)',
       '-e',
-      `OMX_ROOT=${hostileRoot}`,
-      '-e',
       `OMX_SESSION_ID=${hostileSession}`,
       '-P',
       '-F',

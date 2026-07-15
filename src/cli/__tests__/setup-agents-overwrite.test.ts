@@ -13,6 +13,8 @@ import {
   OMX_USER_POLICY_START_MARKER,
 } from '../../utils/agents-md.js';
 import { resolveAgentsModelTableContext, upsertAgentsModelTable } from '../../utils/agents-model-table.js';
+import { writeSessionStart } from '../../hooks/session.js';
+import { clearTeamTestAuthority, installTeamTestAuthority } from '../../team/__tests__/authority-fixture.js';
 
 function setMockTty(value: boolean): () => void {
   Object.defineProperty(process.stdin, 'isTTY', {
@@ -74,18 +76,9 @@ async function runSetupWithCapturedLogs(
   }
 }
 
-async function readCurrentLinuxStartTicks(): Promise<number | undefined> {
-  if (process.platform !== 'linux') return undefined;
-  try {
-    const stat = await readFile('/proc/self/stat', 'utf-8');
-    const commandEnd = stat.lastIndexOf(')');
-    if (commandEnd === -1) return undefined;
-    const fields = stat.slice(commandEnd + 1).trim().split(/\s+/);
-    const ticks = Number(fields[19]);
-    return Number.isFinite(ticks) ? ticks : undefined;
-  } catch {
-    return undefined;
-  }
+async function installActiveSessionFixture(cwd: string): Promise<void> {
+  await installTeamTestAuthority(cwd, 'sess-test');
+  await writeSessionStart(cwd, 'sess-test', { pid: process.pid });
 }
 
 describe('omx setup AGENTS refresh behavior', () => {
@@ -823,19 +816,8 @@ describe('omx setup AGENTS refresh behavior', () => {
     const restoreHome = setMockHome(home);
     const existing = '# active session file\n';
     try {
-      const pidStartTicks = await readCurrentLinuxStartTicks();
-      await mkdir(join(wd, '.omx', 'state'), { recursive: true });
+      await installActiveSessionFixture(wd);
       await writeFile(join(wd, 'AGENTS.md'), existing);
-      await writeFile(
-        join(wd, '.omx', 'state', 'session.json'),
-        JSON.stringify({
-          session_id: 'sess-test',
-          started_at: new Date().toISOString(),
-          cwd: wd,
-          pid: process.pid,
-          pid_start_ticks: pidStartTicks,
-        }, null, 2)
-      );
 
       const output = await runSetupWithCapturedLogs(wd, {
         scope: 'project',
@@ -852,6 +834,7 @@ describe('omx setup AGENTS refresh behavior', () => {
         { scope: 'project', mcpMode: 'none', mergeAgents: true },
       );
     } finally {
+      clearTeamTestAuthority();
       restoreHome();
       restoreTty();
       await rm(wd, { recursive: true, force: true });
@@ -865,19 +848,8 @@ describe('omx setup AGENTS refresh behavior', () => {
     const restoreHome = setMockHome(home);
     const existing = '# active session file\n';
     try {
-      const pidStartTicks = await readCurrentLinuxStartTicks();
-      await mkdir(join(wd, '.omx', 'state'), { recursive: true });
+      await installActiveSessionFixture(wd);
       await writeFile(join(wd, 'AGENTS.md'), existing);
-      await writeFile(
-        join(wd, '.omx', 'state', 'session.json'),
-        JSON.stringify({
-          session_id: 'sess-test',
-          started_at: new Date().toISOString(),
-          cwd: wd,
-          pid: process.pid,
-          pid_start_ticks: pidStartTicks,
-        }, null, 2)
-      );
       const statePath = join(wd, '.omx', 'setup-scope.json');
 
       for (const [mergeAgentsPolicy, expected] of [
@@ -895,6 +867,7 @@ describe('omx setup AGENTS refresh behavior', () => {
         assert.equal(Object.hasOwn(persisted, 'mergeAgents'), expected !== undefined);
       }
     } finally {
+      clearTeamTestAuthority();
       restoreHome();
       restoreTty();
       await rm(wd, { recursive: true, force: true });
@@ -908,19 +881,8 @@ describe('omx setup AGENTS refresh behavior', () => {
     const restoreHome = setMockHome(home);
     const existing = '# active plugin project file\n';
     try {
-      const pidStartTicks = await readCurrentLinuxStartTicks();
-      await mkdir(join(wd, '.omx', 'state'), { recursive: true });
+      await installActiveSessionFixture(wd);
       await writeFile(join(wd, 'AGENTS.md'), existing);
-      await writeFile(
-        join(wd, '.omx', 'state', 'session.json'),
-        JSON.stringify({
-          session_id: 'sess-test',
-          started_at: new Date().toISOString(),
-          cwd: wd,
-          pid: process.pid,
-          pid_start_ticks: pidStartTicks,
-        }, null, 2)
-      );
 
       const output = await runSetupWithCapturedLogs(wd, {
         scope: 'project',
@@ -938,6 +900,7 @@ describe('omx setup AGENTS refresh behavior', () => {
         { scope: 'project', installMode: 'plugin', mcpMode: 'none', mergeAgents: true },
       );
     } finally {
+      clearTeamTestAuthority();
       restoreHome();
       restoreTty();
       await rm(wd, { recursive: true, force: true });
@@ -951,19 +914,8 @@ describe('omx setup AGENTS refresh behavior', () => {
     const restoreHome = setMockHome(home);
     const existing = '# active plugin project file\n';
     try {
-      const pidStartTicks = await readCurrentLinuxStartTicks();
-      await mkdir(join(wd, '.omx', 'state'), { recursive: true });
+      await installActiveSessionFixture(wd);
       await writeFile(join(wd, 'AGENTS.md'), existing);
-      await writeFile(
-        join(wd, '.omx', 'state', 'session.json'),
-        JSON.stringify({
-          session_id: 'sess-test',
-          started_at: new Date().toISOString(),
-          cwd: wd,
-          pid: process.pid,
-          pid_start_ticks: pidStartTicks,
-        }, null, 2)
-      );
 
       const output = await runSetupWithCapturedLogs(wd, {
         scope: 'project',
@@ -978,6 +930,7 @@ describe('omx setup AGENTS refresh behavior', () => {
       assert.match(output, /agents_md: updated=0, unchanged=0, backed_up=0, skipped=1, removed=0/);
       assert.equal(await readFile(join(wd, 'AGENTS.md'), 'utf-8'), existing);
     } finally {
+      clearTeamTestAuthority();
       restoreHome();
       restoreTty();
       await rm(wd, { recursive: true, force: true });
@@ -1017,19 +970,8 @@ describe('omx setup AGENTS refresh behavior', () => {
     const restoreHome = setMockHome(home);
     const existing = '# active session file\n';
     try {
-      const pidStartTicks = await readCurrentLinuxStartTicks();
-      await mkdir(join(wd, '.omx', 'state'), { recursive: true });
+      await installActiveSessionFixture(wd);
       await writeFile(join(wd, 'AGENTS.md'), existing);
-      await writeFile(
-        join(wd, '.omx', 'state', 'session.json'),
-        JSON.stringify({
-          session_id: 'sess-test',
-          started_at: new Date().toISOString(),
-          cwd: wd,
-          pid: process.pid,
-          pid_start_ticks: pidStartTicks,
-        }, null, 2)
-      );
 
       const output = await runSetupWithCapturedLogs(wd, {
         scope: 'project',
@@ -1042,6 +984,7 @@ describe('omx setup AGENTS refresh behavior', () => {
       assert.equal(await readFile(join(wd, 'AGENTS.md'), 'utf-8'), existing);
       assert.equal(existsSync(join(wd, '.omx', 'backups', 'setup')), false);
     } finally {
+      clearTeamTestAuthority();
       restoreHome();
       restoreTty();
       await rm(wd, { recursive: true, force: true });

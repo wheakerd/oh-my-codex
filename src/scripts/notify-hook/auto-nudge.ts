@@ -36,6 +36,7 @@ import {
   verifyManagedPaneTarget,
 } from './managed-tmux.js';
 import type { PromptMutationAuthorization, ResolvedPromptTurnContext } from '../../hooks/prompt-session-provenance.js';
+import type { RootFilesystemIdentity } from '../../state/authority.js';
 
 export const SKILL_ACTIVE_STATE_FILE = 'skill-active-state.json';
 export const DEEP_INTERVIEW_BLOCKED_APPROVAL_INPUTS = ['yes', 'y', 'proceed', 'continue', 'ok', 'sure', 'go ahead', 'next i should'];
@@ -216,7 +217,7 @@ function cloneSkillActiveState(state) {
   };
 }
 
-export async function syncSkillStateFromTurn(stateDir, payload, invocationSessionIdOverride = '', authorization: PromptMutationAuthorization | null = null) {
+export async function syncSkillStateFromTurn(stateDir, payload, invocationSessionIdOverride = '', authorization: PromptMutationAuthorization | null = null, expectedRootIdentity: RootFilesystemIdentity | undefined = undefined) {
   const lastMessage = safeString(payload['last-assistant-message'] || payload.last_assistant_message || '');
   const latestUserInput = latestUserInputFromPayload(payload);
   const invocationSessionId = invocationSessionIdOverride || resolveInvocationSessionId(payload);
@@ -279,6 +280,7 @@ export async function syncSkillStateFromTurn(stateDir, payload, invocationSessio
       sessionId: invocationSessionId,
       threadId: safeString(payload?.['thread-id'] || payload?.thread_id || ''),
       turnId: safeString(payload?.['turn-id'] || payload?.turn_id || ''),
+      expectedRootIdentity,
     });
   }
 

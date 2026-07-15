@@ -19,6 +19,24 @@ import { initializeStateAuthority, mintStateAuthorityTransportCapability } from 
 import { buildStateAuthorityTransportEnv } from '../../state/transport-env.js';
 import { hardenTestAuthorityTreeSync } from '../../team/__tests__/authority-fixture.js';
 
+const fixtureAuthorityEnv = new Map<string, string | undefined>();
+
+function installFixtureAuthorityEnv(env: NodeJS.ProcessEnv): void {
+  for (const [key, value] of Object.entries(env)) {
+    if (!fixtureAuthorityEnv.has(key)) fixtureAuthorityEnv.set(key, process.env[key]);
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+}
+
+function restoreFixtureAuthorityEnv(): void {
+  for (const [key, value] of fixtureAuthorityEnv) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+  fixtureAuthorityEnv.clear();
+}
+
 function buildFakeTmux(tmuxLogPath: string): string {
   return `#!/usr/bin/env bash
 set -eu
@@ -61,6 +79,10 @@ if [[ "$cmd" == "display-message" ]]; then
     esac
     shift || true
   done
+  if [[ "$fmt" == "#{@omx_instance_id}" ]]; then
+    echo "notify-hook-team-dispatch"
+    exit 0
+  fi
   if [[ "$fmt" == "#{pane_in_mode}" ]]; then
     echo "0"
     exit 0
@@ -279,6 +301,8 @@ async function initTeamState(
   workerCount: number,
   cwd: string,
 ) {
+  await mkdir(join(cwd, '.omx'), { recursive: true, mode: 0o700 });
+  await chmod(join(cwd, '.omx'), 0o700);
   const sessionId = 'notify-hook-team-dispatch';
   const authority = await initializeStateAuthority({
     startup_cwd: cwd,
@@ -292,7 +316,7 @@ async function initTeamState(
     ...process.env,
     OMX_SESSION_ID: sessionId,
   });
-  Object.assign(process.env, transport);
+  installFixtureAuthorityEnv(transport);
   const config = await initTeamStateDirect(
     teamName,
     task,
@@ -341,6 +365,7 @@ describe('notify-hook team dispatch consumer', () => {
     } else {
       process.env.OMX_TEAM_STATE_ROOT = originalTeamStateRoot;
     }
+    restoreFixtureAuthorityEnv();
   });
 
   it('marks pending request as notified and preserves mailbox notified_at semantics', async () => {

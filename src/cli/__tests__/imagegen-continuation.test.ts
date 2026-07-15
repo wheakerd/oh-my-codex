@@ -123,7 +123,7 @@ describe("omx imagegen continuation", () => {
     }
   });
 
-  it("queues continuation metadata even when no exec session is accepting input", async () => {
+  it("fails closed when continuation has no committed session authority", async () => {
     const wd = await mkdtemp(join(tmpdir(), "omx-imagegen-no-active-exec-"));
     try {
       const result = runOmx(wd, [
@@ -137,19 +137,10 @@ describe("omx imagegen continuation", () => {
         "--json",
       ]);
 
-      assert.equal(result.status, 0, result.stderr);
-      const output = JSON.parse(result.stdout) as {
-        ok?: boolean;
-        queue_path?: string;
-        record?: { session_id?: string };
-      };
-      assert.equal(output.ok, true);
-      assert.equal(output.record?.session_id, "plain-app-session");
-      assert.match(output.queue_path ?? "", /plain-app-session.*exec-followups\.json/);
-
+      assert.equal(result.status, 1);
+      assert.match(result.stderr, /no committed active authority|authority_anchor_missing/i);
       const followups = await readPendingExecFollowups(wd, "plain-app-session");
-      assert.equal(followups.pending.length, 1);
-      assert.equal(followups.pending[0]?.prompt, "Resume imagegen recovery for eyes-sheet.png.");
+      assert.equal(followups.pending.length, 0);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }

@@ -96,10 +96,10 @@ describe('nested help routing', () => {
           };
           const rejectedWrite = runOmx(cwd, writeArgs, env);
           assert.equal(rejectedWrite.status, 1, rejectedWrite.stderr || rejectedWrite.stdout);
-          assert.match(rejectedWrite.stderr, /conflicts with committed authority root/);
+          assert.match(rejectedWrite.stderr, /conflicts with .*authenticated.*authority/);
           const rejectedClear = runOmx(cwd, clearArgs, env);
           assert.equal(rejectedClear.status, 1, rejectedClear.stderr || rejectedClear.stdout);
-          assert.match(rejectedClear.stderr, /conflicts with committed authority root/);
+          assert.match(rejectedClear.stderr, /conflicts with .*authenticated.*authority/);
         } finally {
           await rm(ambientRoot, { recursive: true, force: true });
         }

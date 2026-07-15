@@ -1,25 +1,54 @@
-import { describe, it } from 'node:test';
+import { afterEach, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { initializeStateAuthority } from '../../state/authority.js';
 
-const stateServerRalphAuthorityInitByWorkspace = new Map<string, Promise<void>>();
+const stateServerRalphAuthorityInitByWorkspace = new Map<string, Promise<string>>();
+const TEST_AUTHORITY_ENV_KEYS = [
+  'OMX_ROOT',
+  'OMX_STATE_ROOT',
+  'OMX_TEAM_STATE_ROOT',
+  'OMX_SESSION_ID',
+  'OMX_STARTUP_CWD',
+  'OMX_STATE_AUTHORITY_PATH',
+  'OMX_STATE_AUTHORITY_ID',
+  'OMX_STATE_AUTHORITY_GENERATION_ID',
+  'OMX_STATE_AUTHORITY_WORKSPACE_DIGEST',
+  'OMX_STATE_AUTHORITY_CAPABILITY',
+] as const;
 
-async function ensureTestStateServerRalphAuthority(workingDirectory: string): Promise<void> {
+let savedAuthorityEnv: Map<string, string | undefined>;
+
+beforeEach(() => {
+  savedAuthorityEnv = new Map(TEST_AUTHORITY_ENV_KEYS.map((key) => [key, process.env[key]]));
+  for (const key of TEST_AUTHORITY_ENV_KEYS) delete process.env[key];
+});
+
+afterEach(() => {
+  for (const [key, value] of savedAuthorityEnv) {
+    if (typeof value === 'string') process.env[key] = value;
+    else delete process.env[key];
+  }
+});
+
+async function ensureTestStateServerRalphAuthority(workingDirectory: string): Promise<string> {
   const existing = stateServerRalphAuthorityInitByWorkspace.get(workingDirectory);
   if (existing) return existing;
+  const sessionId = `state-server-ralph-phase-session-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  await mkdir(join(workingDirectory, '.omx', 'state'), { recursive: true, mode: 0o700 });
+  await chmod(join(workingDirectory, '.omx'), 0o700);
+  await chmod(join(workingDirectory, '.omx', 'state'), 0o700);
   const initializing = initializeStateAuthority({
     startup_cwd: workingDirectory,
+    observed_cwd: workingDirectory,
     launch_id: `state-server-ralph-phase-test-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-    session_binding: {
-      canonical_session_id: `state-server-ralph-phase-session-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-    },
-  }).then(() => undefined);
+    session_binding: { canonical_session_id: sessionId },
+  }).then(() => sessionId);
   stateServerRalphAuthorityInitByWorkspace.set(workingDirectory, initializing);
   try {
-    await initializing;
+    return await initializing;
   } catch (error) {
     stateServerRalphAuthorityInitByWorkspace.delete(workingDirectory);
     throw error;
@@ -46,6 +75,7 @@ describe('state-server Ralph phase contract', () => {
     const handleStateToolCall = await getTestStateToolCall();
 
     const wd = await mkdtemp(join(tmpdir(), 'omx-state-ralph-phase-'));
+    const sessionId = await ensureTestStateServerRalphAuthority(wd);
     try {
       const response = await handleStateToolCall({
         params: {
@@ -61,7 +91,7 @@ describe('state-server Ralph phase contract', () => {
       });
       assert.equal(response.isError, undefined);
 
-      const file = join(wd, '.omx', 'state', 'ralph-state.json');
+      const file = join(wd, '.omx', 'state', 'sessions', sessionId, 'ralph-state.json');
       const state = JSON.parse(await readFile(file, 'utf-8'));
       assert.equal(state.current_phase, 'executing');
       assert.equal(state.ralph_phase_normalized_from, 'execution');

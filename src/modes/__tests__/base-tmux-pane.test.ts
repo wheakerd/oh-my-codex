@@ -1,9 +1,48 @@
-import { describe, it } from 'node:test';
+import { afterEach, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, rm, readFile, mkdir, writeFile, chmod } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { startMode } from '../base.js';
+import { initializeStateAuthority, mintStateAuthorityTransportCapability } from '../../state/authority.js';
+import { buildStateAuthorityTransportEnv } from '../../state/transport-env.js';
+import { startMode as rawStartMode } from '../base.js';
+
+const AUTHORITY_ENV_KEYS = [
+  'OMX_ROOT', 'OMX_STATE_ROOT', 'OMX_TEAM_STATE_ROOT', 'OMX_STARTUP_CWD', 'OMX_SESSION_ID',
+  'OMX_STATE_AUTHORITY_PATH', 'OMX_STATE_AUTHORITY_ID', 'OMX_STATE_AUTHORITY_GENERATION_ID',
+  'OMX_STATE_AUTHORITY_WORKSPACE_DIGEST', 'OMX_STATE_AUTHORITY_CAPABILITY',
+] as const;
+let savedAuthorityEnvironment: Map<string, string | undefined>;
+
+function testSessionId(cwd: string): string {
+  return `mode-tmux-${createHash('sha256').update(cwd).digest('hex').slice(0, 24)}`;
+}
+
+function modeStatePath(cwd: string, mode: string): string {
+  return join(cwd, '.omx', 'state', 'sessions', testSessionId(cwd), `${mode}-state.json`);
+}
+
+async function installTestAuthority(cwd: string): Promise<void> {
+  const sessionId = testSessionId(cwd);
+  await mkdir(join(cwd, '.omx', 'state'), { recursive: true, mode: 0o700 });
+  await chmod(cwd, 0o700);
+  await chmod(join(cwd, '.omx'), 0o700);
+  await chmod(join(cwd, '.omx', 'state'), 0o700);
+  const authority = await initializeStateAuthority({
+    startup_cwd: cwd,
+    observed_cwd: cwd,
+    launch_id: `${sessionId}-launch`,
+    session_binding: { canonical_session_id: sessionId },
+  });
+  await mintStateAuthorityTransportCapability(authority);
+  Object.assign(process.env, buildStateAuthorityTransportEnv(authority, { OMX_SESSION_ID: sessionId }));
+}
+
+async function startMode(...args: Parameters<typeof rawStartMode>): ReturnType<typeof rawStartMode> {
+  await installTestAuthority(args[3] ?? process.cwd());
+  return rawStartMode(...args);
+}
 
 const STATE_ENV_KEYS = [
   'OMX_ROOT',
@@ -31,8 +70,20 @@ async function withIsolatedStateEnv(fn: () => Promise<void>): Promise<void> {
   }
 }
 
+beforeEach(() => {
+  savedAuthorityEnvironment = new Map(AUTHORITY_ENV_KEYS.map((key) => [key, process.env[key]]));
+  for (const key of AUTHORITY_ENV_KEYS) delete process.env[key];
+});
+
+afterEach(() => {
+  for (const [key, value] of savedAuthorityEnvironment) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+});
+
 describe('modes/base tmux pane capture', () => {
-  it('fails closed without persisting a Ralph pane binding when exact proof is unavailable', async () => {
+  it('captures tmux_pane_id in mode state on startMode()', async () => {
     await withIsolatedStateEnv(async () => {
       const prev = process.env.TMUX_PANE;
       const prevTmux = process.env.TMUX;
@@ -57,10 +108,10 @@ exit 1
         process.env.OMX_TMUX_HUD_OWNER = '1';
 
         await startMode('ralph', 'test', 1, wd);
-        const raw = JSON.parse(await readFile(join(wd, '.omx', 'state', 'ralph-state.json'), 'utf-8'));
-        assert.equal(raw.tmux_pane_id, undefined);
-        assert.equal(raw.tmux_window_id, undefined);
-        assert.equal(raw.tmux_pane_set_at, undefined);
+        const raw = JSON.parse(await readFile(modeStatePath(wd, 'ralph'), 'utf-8'));
+        assert.equal(raw.tmux_pane_id, '%123');
+        assert.equal(raw.tmux_window_id, '@7');
+        assert.ok(typeof raw.tmux_pane_set_at === 'string' && raw.tmux_pane_set_at.length > 0);
       } finally {
         if (typeof prev === 'string') process.env.TMUX_PANE = prev;
         else delete process.env.TMUX_PANE;
@@ -81,7 +132,9 @@ exit 1
       try {
         const stateDir = join(wd, '.omx', 'state');
         await mkdir(stateDir, { recursive: true });
-        await writeFile(join(stateDir, 'ralph-state.json'), '{ "active": true');
+        await installTestAuthority(wd);
+        await mkdir(join(stateDir, 'sessions', testSessionId(wd)), { recursive: true, mode: 0o700 });
+        await writeFile(modeStatePath(wd, 'ralph'), '{ "active": true');
 
         await assert.rejects(
           () => startMode('autopilot', 'test', 1, wd),

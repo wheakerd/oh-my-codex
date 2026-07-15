@@ -21,7 +21,6 @@
 import { writeFile, appendFile, mkdir, readFile } from 'fs/promises';
 import { existsSync } from 'fs';
 import { dirname, join, resolve } from 'path';
-import { fileURLToPath } from 'url';
 import {
   appendPromptSessionProvenanceRejection,
   isSessionStateUsable,
@@ -36,7 +35,7 @@ import {
   preflightSelectedTargetOwner,
   type ResolvedPromptTurnContext,
 } from '../hooks/prompt-session-provenance.js';
-import { readTeamModeConfig } from '../config/team-mode.js';
+import { resolveStateAuthorityForGuard } from '../state/authority.js';
 
 import { safeString, asNumber } from './notify-hook/utils.js';
 import {
@@ -91,13 +90,6 @@ import {
   extractRawJsonStringField,
   utf8ByteLength,
 } from './hook-payload-guard.js';
-import {
-  classifyKeywordInput,
-  recordSkillActivation,
-  type KeywordInputClassification,
-  type RecordSkillActivationInput,
-  type SkillActiveState,
-} from '../hooks/keyword-detector.js';
 
 const RALPH_ACTIVE_PROGRESS_PHASES = new Set([
   'start',
@@ -114,8 +106,6 @@ const RALPH_ACTIVE_PROGRESS_PHASES = new Set([
 ]);
 
 const IDLE_NOTIFICATION_SUMMARY_MAX_LENGTH = 240;
-const NOTIFY_SKILL_ACTIVATION_ERROR_MAX_LENGTH = 512;
-const NOTIFY_SKILL_ACTIVATION_CONTEXT_MAX_LENGTH = 200;
 
 async function readJsonFileIfObject(path: string): Promise<Record<string, unknown> | null> {
   try {
@@ -290,6 +280,13 @@ function classifyIdleNotificationPhase(message: unknown): 'idle' | 'progress' | 
 }
 
 
+function isExplicitAutopilotActivationText(text: string): boolean {
+  return /(?:^|[^\w])\$autopilot\b/i.test(text)
+    || /^\s*\/autopilot\b/i.test(text)
+    || /^\s*(?:please\s+)?autopilot(?:\s+(?:this|mode|workflow|skill|loop|now))?\s*[.!]?\s*$/i.test(text)
+    || /\b(?:use|run|start|enable|launch|invoke|activate|resume|continue)\s+(?:the\s+)?autopilot(?:\s+(?:mode|workflow|skill|loop|now))?\s*[.!]?\s*$/i.test(text)
+    || /\bautopilot\s+(?:mode|workflow|skill|loop)\b/i.test(text);
+}
 
 function looksLikeAutopilotTerminalHandoff(text: string): boolean {
   return /\bAutopilot complete\b/i.test(text)
@@ -352,106 +349,6 @@ async function shouldSuppressAutopilotTerminalReplayActivation(
   if (!looksLikeAutopilotTerminalHandoff(lastAssistantMessage) && !isNotifyFallbackTaskCompletePayload(payload)) return false;
 
   return hasTerminalAutopilotStateForNotifyTurn(stateDir, sessionId, payload);
-}
-
-export interface NotifySkillActivationInput {
-  readonly stateDir: string;
-  readonly sourceCwd: string;
-  readonly text: string;
-  readonly sessionId?: string;
-  readonly threadId?: string;
-  readonly turnId?: string;
-  readonly payload: Record<string, unknown>;
-  readonly nowIso?: string;
-}
-
-export interface NotifySkillActivationDependencies {
-  readonly classifyKeywordInput?: (text: string) => KeywordInputClassification;
-  readonly recordSkillActivation?: (input: RecordSkillActivationInput) => Promise<SkillActiveState | null>;
-}
-
-function boundedNotifySkillActivationContext(value: unknown): string | null {
-  try {
-    const context = safeString(value).trim().slice(0, NOTIFY_SKILL_ACTIVATION_CONTEXT_MAX_LENGTH);
-    return context || null;
-  } catch {
-    return null;
-  }
-}
-
-function boundedNotifySkillActivationError(error: unknown): string {
-  try {
-    const message = error instanceof Error ? error.message : String(error);
-    return message.slice(0, NOTIFY_SKILL_ACTIVATION_ERROR_MAX_LENGTH);
-  } catch {
-    return 'unknown_error';
-  }
-}
-
-async function logNotifySkillActivationFailure(
-  logsDir: string,
-  input: NotifySkillActivationInput,
-  error: unknown,
-): Promise<void> {
-  await logNotifyHookEvent(logsDir, {
-    timestamp: new Date().toISOString(),
-    level: 'warn',
-    type: 'notify_skill_activation_failure',
-    error: boundedNotifySkillActivationError(error),
-    session_id: boundedNotifySkillActivationContext(input.sessionId),
-    thread_id: boundedNotifySkillActivationContext(input.threadId),
-    turn_id: boundedNotifySkillActivationContext(input.turnId),
-  }).catch(() => {});
-}
-
-/**
- * Records prompt skill activation using one shared input classification for the
- * terminal-replay check and the state writer.
- */
-export async function recordNotifySkillActivation(
-  input: NotifySkillActivationInput,
-  dependencies: NotifySkillActivationDependencies = {},
-): Promise<SkillActiveState | null> {
-  const classification = (dependencies.classifyKeywordInput ?? classifyKeywordInput)(input.text);
-  const teamEnabled = readTeamModeConfig(input.sourceCwd).enabled;
-  const runtimeMatches = teamEnabled
-    ? classification.matches
-    : classification.matches.filter((match) => match.skill !== 'team');
-  const terminalAutopilotReplay = await shouldSuppressAutopilotTerminalReplayActivation(
-    input.stateDir,
-    input.payload,
-    runtimeMatches.some((match) => match.skill === 'autopilot'),
-    input.sessionId || '',
-  );
-  if (terminalAutopilotReplay && runtimeMatches[0]?.skill === 'autopilot') return null;
-
-  return (dependencies.recordSkillActivation ?? recordSkillActivation)({
-    stateDir: input.stateDir,
-    sourceCwd: input.sourceCwd,
-    text: input.text,
-    sessionId: input.sessionId,
-    threadId: input.threadId,
-    turnId: input.turnId,
-    nowIso: input.nowIso,
-    classification,
-    allowSecondaryAutopilot: !terminalAutopilotReplay,
-  });
-}
-
-/**
- * Non-fatal notify-hook boundary for shared classification and state writes.
- */
-export async function recordNotifySkillActivationNonFatal(
-  input: NotifySkillActivationInput,
-  logsDir: string,
-  dependencies: NotifySkillActivationDependencies = {},
-): Promise<SkillActiveState | null> {
-  try {
-    return await recordNotifySkillActivation(input, dependencies);
-  } catch (error) {
-    await logNotifySkillActivationFailure(logsDir, input, error);
-    return null;
-  }
 }
 
 function buildIdleNotificationFingerprint(payload: Record<string, unknown>): string {
@@ -644,6 +541,10 @@ async function main() {
         }
         dedupeState.recent_turns[key] = now;
         dedupeState.last_event_at = new Date().toISOString();
+        if (scope) {
+          (dedupeState as any).session_id = scope.targetSessionId;
+          (dedupeState as any).owner_codex_session_id = scope.ownerCodexSessionId;
+        }
         await mkdir(dirname(dedupeStatePath), { recursive: true }).catch(() => {});
         await writeFile(dedupeStatePath, JSON.stringify(dedupeState, null, 2)).catch(() => {});
       }
@@ -659,6 +560,9 @@ async function main() {
       const turnId = safeString(payload['turn-id'] || payload.turn_id || '');
       if (getEffectiveSessionId() && threadId) {
         const { recordSubagentTurnForSession } = await import('../subagents/tracker.js');
+        const trackerStateDir = leaderWriteDecision?.scope
+          ? dirname(await getScopedStatePathAtScope(stateDir, 'subagent-tracking.json', leaderWriteDecision.scope))
+          : undefined;
         await recordSubagentTurnForSession(cwd, {
           sessionId: getEffectiveSessionId(),
           threadId,
@@ -671,7 +575,7 @@ async function main() {
                 completionSource: 'notify-fallback-watcher',
               }
             : {}),
-        });
+        }, trackerStateDir);
       }
     } catch {
       // Non-critical: tracking must never block the hook
@@ -905,6 +809,8 @@ async function main() {
       hudState.turn_count = (hudState.turn_count || 0) + 1;
       (hudState as any).last_agent_output = (payload['last-assistant-message'] || payload.last_assistant_message || '')
         .slice(0, 100);
+      (hudState as any).session_id = scope.targetSessionId;
+      (hudState as any).owner_codex_session_id = scope.ownerCodexSessionId;
       await mkdir(dirname(hudStatePath), { recursive: true }).catch(() => {});
       await writeFile(hudStatePath, JSON.stringify(hudState, null, 2));
     } catch {
@@ -928,34 +834,58 @@ async function main() {
 
   // 4.45. Skill activation tracking: update skill-active-state.json before any nudge logic.
   if (isTeamWorker || canWriteLeaderScopedState) {
-    if (latestUserInput) {
-      await recordNotifySkillActivationNonFatal({
-        stateDir,
-        sourceCwd: cwd,
-        text: latestUserInput,
-        sessionId: getEffectiveSessionId(),
-        threadId: payloadThreadId,
-        turnId: safeString(payload['turn-id'] || payload.turn_id || ''),
-        payload,
-      }, logsDir, {
-        recordSkillActivation: async (input) => recordSkillActivation({
-          ...input,
-          ...(!isTeamWorker && leaderWriteDecision ? {
-            resolvedPromptTurnContext: leaderWriteDecision.context,
-            onProvenanceRejected: async (diagnostic: import('../hooks/prompt-session-provenance.js').PromptDiagnosticDescriptor) => {
-              await appendPromptSessionProvenanceRejection(leaderWriteDecision.pointerContext, diagnostic).catch(() => {});
-            },
-          } : {}),
-        }),
-      });
+    try {
+      const { detectKeywords, recordSkillActivation } = await import('../hooks/keyword-detector.js');
+      if (latestUserInput) {
+        const activationSessionId = getEffectiveSessionId();
+        const keywordAuthority = await resolveStateAuthorityForGuard({
+          startup_cwd: cwd,
+          observed_cwd: cwd,
+          session_id: activationSessionId || undefined,
+        });
+        const isAutopilotActivation = detectKeywords(latestUserInput)
+          .some((match) => match.skill === 'autopilot')
+          || isExplicitAutopilotActivationText(latestUserInput);
+        const suppressTerminalReplay = await shouldSuppressAutopilotTerminalReplayActivation(
+          stateDir,
+          payload,
+          isAutopilotActivation,
+          activationSessionId,
+        );
+        if (!suppressTerminalReplay) {
+          await recordSkillActivation({
+            stateDir,
+            sourceCwd: cwd,
+            text: latestUserInput,
+            sessionId: activationSessionId,
+            threadId: payloadThreadId,
+            expectedRootIdentity: keywordAuthority.generation.root_identity,
+            turnId: safeString(payload['turn-id'] || payload.turn_id || ''),
+            ...(!isTeamWorker && leaderWriteDecision ? {
+              resolvedPromptTurnContext: leaderWriteDecision.context,
+              onProvenanceRejected: async (diagnostic: import('../hooks/prompt-session-provenance.js').PromptDiagnosticDescriptor) => {
+                await appendPromptSessionProvenanceRejection(leaderWriteDecision.pointerContext, diagnostic).catch(() => {});
+              },
+            } : {}),
+          });
+        }
+      }
+    } catch {
+      // Non-fatal: keyword detector module may not be built yet
     }
 
     try {
+      const lifecycleAuthority = await resolveStateAuthorityForGuard({
+        startup_cwd: cwd,
+        observed_cwd: cwd,
+        session_id: getEffectiveSessionId() || undefined,
+      });
       skillSyncResult = await syncSkillStateFromTurn(
         stateDir,
         payload,
         !isTeamWorker && leaderAuthorization ? leaderAuthorization.targetSessionId : '',
         !isTeamWorker ? leaderAuthorization : null,
+        lifecycleAuthority.generation.root_identity,
       );
     } catch {
       // Non-fatal: lifecycle sync should not block the hook
@@ -1204,7 +1134,6 @@ async function main() {
             const csText = `${csResult.message} ${DEFAULT_MARKER}`;
             const sendResult = await sendPaneInput({
               paneTarget: csPaneId,
-              exactPaneId: csPaneId,
               prompt: csText,
               submitKeyPresses: 2,
               submitDelayMs: 100,
@@ -1255,11 +1184,9 @@ async function logFatalNotifyHookError(err: unknown): Promise<void> {
   }) + '\n').catch(() => {});
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  main().catch((err) => {
-    // Notify hooks are auxiliary background work. Avoid printing stack traces into
-    // Codex TUI/PowerShell foreground panes; record diagnostics in .omx/logs.
-    process.exitCode = 0;
-    void logFatalNotifyHookError(err);
-  });
-}
+main().catch((err) => {
+  // Notify hooks are auxiliary background work. Avoid printing stack traces into
+  // Codex TUI/PowerShell foreground panes; record diagnostics in .omx/logs.
+  process.exitCode = 0;
+  void logFatalNotifyHookError(err);
+});

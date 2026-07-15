@@ -1,4 +1,4 @@
-import { describe, it } from 'node:test';
+import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'fs/promises';
 import { existsSync } from 'fs';
@@ -7,6 +7,8 @@ import { dirname, join } from 'path';
 import { tmpdir } from 'os';
 import { fileURLToPath } from 'url';
 import { reconcileRalphSessionResume } from '../../scripts/notify-hook/ralph-session-resume.js';
+import { writeSessionEnd, writeSessionStart } from '../session.js';
+import { clearTeamTestAuthority, hardenTestAuthorityTreeSync, installTeamTestAuthority } from '../../team/__tests__/authority-fixture.js';
 
 function notifyHookRepoRoot(): string {
   const testDir = dirname(fileURLToPath(import.meta.url));
@@ -143,6 +145,7 @@ function authorizedRalphScope(
 }
 
 describe('notify-hook Ralph session resume', () => {
+  afterEach(() => clearTeamTestAuthority());
   it('does not mark normal native turn-complete notifications as subagent completion', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-notify-subagent-normal-turn-'));
     try {
@@ -268,10 +271,8 @@ describe('notify-hook Ralph session resume', () => {
       const currentSessionDir = join(stateDir, 'sessions', currentOmxSessionId);
       const priorSessionDir = join(stateDir, 'sessions', priorOmxSessionId);
       const currentPaneId = '%77';
-      await writeJson(join(stateDir, 'session.json'), {
-        session_id: currentOmxSessionId,
-        owner_codex_session_id: 'codex-session-1',
-      });
+      await installTeamTestAuthority(wd, currentOmxSessionId);
+      await writeSessionStart(wd, currentOmxSessionId, { nativeSessionId: 'codex-session-1' });
       await writeJson(join(currentSessionDir, 'ralph-state.json'), {
         active: true,
         iteration: 4,
@@ -290,6 +291,7 @@ describe('notify-hook Ralph session resume', () => {
         tmux_pane_id: '%42',
       });
 
+      hardenTestAuthorityTreeSync(wd);
       const result = runNotifyHook(
         buildPayload(wd, {
           session_id: 'codex-session-1',
@@ -323,7 +325,8 @@ describe('notify-hook Ralph session resume', () => {
       const currentOmxSessionId = 'sess-current';
       const currentSessionDir = join(stateDir, 'sessions', currentOmxSessionId);
       const currentPaneId = '%79';
-      await writeJson(join(stateDir, 'session.json'), { session_id: currentOmxSessionId });
+      await installTeamTestAuthority(wd, currentOmxSessionId);
+      await writeSessionStart(wd, currentOmxSessionId);
       await writeJson(join(currentSessionDir, 'ralph-state.json'), {
         active: true,
         iteration: 4,
@@ -335,6 +338,7 @@ describe('notify-hook Ralph session resume', () => {
         tmux_pane_id: '%42',
       });
 
+      hardenTestAuthorityTreeSync(wd);
       const result = runNotifyHook(
         buildPayload(wd, {
           thread_id: 'thread-current-legacy-1',
@@ -355,7 +359,7 @@ describe('notify-hook Ralph session resume', () => {
     }
   });
 
-  it('adopts a same-thread Ralph across OMX session turnover even when Codex session id is absent', async () => {
+  it('rejects same-thread Ralph takeover across an unproven OMX session turnover', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-notify-ralph-thread-turnover-'));
     try {
       const stateDir = join(wd, '.omx', 'state');
@@ -363,8 +367,9 @@ describe('notify-hook Ralph session resume', () => {
       const currentOmxSessionId = 'sess-current';
       const priorSessionDir = join(stateDir, 'sessions', priorOmxSessionId);
       const currentSessionDir = join(stateDir, 'sessions', currentOmxSessionId);
+      await installTeamTestAuthority(wd, priorOmxSessionId);
 
-      await writeJson(join(stateDir, 'session.json'), { session_id: priorOmxSessionId });
+      await writeSessionStart(wd, priorOmxSessionId);
       await writeJson(join(priorSessionDir, 'ralph-state.json'), {
         active: true,
         iteration: 4,
@@ -375,6 +380,7 @@ describe('notify-hook Ralph session resume', () => {
         tmux_pane_id: '%42',
       });
 
+      hardenTestAuthorityTreeSync(wd);
       const firstResult = runNotifyHook(
         buildPayload(wd, {
           thread_id: 'thread-turnover-1',
@@ -393,24 +399,21 @@ describe('notify-hook Ralph session resume', () => {
       assert.equal(updatedPriorState.owner_codex_thread_id, undefined);
       assert.equal(updatedPriorState.tmux_pane_id, '%81');
 
-      await writeJson(join(stateDir, 'session.json'), { session_id: currentOmxSessionId });
-
-      const secondResult = runNotifyHook(
-        buildPayload(wd, {
-          thread_id: 'thread-turnover-1',
-          turn_id: 'turn-thread-turnover-current-1',
-        }),
-        await setupTmuxFixture(wd, '%82'),
+      await writeSessionEnd(wd, priorOmxSessionId);
+      clearTeamTestAuthority();
+      await assert.rejects(
+        () => installTeamTestAuthority(wd, currentOmxSessionId),
+        (error: unknown) => (
+          error instanceof Error
+          && 'code' in error
+          && error.code === 'authority_session_binding_conflict'
+        ),
       );
-      assert.equal(secondResult.status, 0, secondResult.stderr || secondResult.stdout);
-
       assert.equal(existsSync(join(currentSessionDir, 'ralph-state.json')), false);
-
       const priorState = JSON.parse(
         await readFile(join(priorSessionDir, 'ralph-state.json'), 'utf-8'),
       ) as Record<string, unknown>;
       assert.equal(priorState.active, true);
-      assert.equal(priorState.current_phase, 'executing');
       assert.equal(priorState.owner_omx_session_id, priorOmxSessionId);
     } finally {
       await rm(wd, { recursive: true, force: true });

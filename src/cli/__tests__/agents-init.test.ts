@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { agentsInit } from '../agents-init.js';
+import { clearTeamTestAuthority, installTeamTestAuthority } from '../../team/__tests__/authority-fixture.js';
 
 function runOmx(
   cwd: string,
@@ -172,6 +173,7 @@ describe('omx agents-init', () => {
           pid_start_ticks: pidStartTicks,
         }, null, 2),
       );
+      await installTeamTestAuthority(wd, 'session-1');
 
       await withCwd(wd, async () => {
         await agentsInit({ force: true });
@@ -180,6 +182,7 @@ describe('omx agents-init', () => {
       assert.equal(await readFile(join(wd, 'AGENTS.md'), 'utf-8'), '# unmanaged\n');
       assert.equal(existsSync(join(wd, 'src', 'AGENTS.md')), true);
     } finally {
+      clearTeamTestAuthority();
       await rm(wd, { recursive: true, force: true });
     }
   });

@@ -11,6 +11,7 @@ function runCompiledRunner(root: string, envOverrides: Record<string, string> = 
     encoding: 'utf-8',
     env: {
       ...process.env,
+      OMX_NODE_TEST_FORCE_EXIT: undefined,
       ...envOverrides,
     },
     timeout: timeoutMs,

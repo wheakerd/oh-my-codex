@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
@@ -17,6 +17,8 @@ import {
   hermesStartSession,
 } from "../hermes-bridge.js";
 import { createQuestionRecord, markQuestionPrompting } from "../../question/state.js";
+import { initializeStateAuthority, mintStateAuthorityTransportCapability } from "../../state/authority.js";
+import { buildStateAuthorityTransportEnv } from "../../state/transport-env.js";
 
 const originalRoots = process.env.OMX_MCP_WORKDIR_ROOTS;
 const originalOmxRoot = process.env.OMX_ROOT;
@@ -25,6 +27,17 @@ const originalTeamStateRoot = process.env.OMX_TEAM_STATE_ROOT;
 const originalSessionId = process.env.OMX_SESSION_ID;
 const originalCodexSessionId = process.env.CODEX_SESSION_ID;
 const originalGenericSessionId = process.env.SESSION_ID;
+const authorityEnvKeys = [
+  "OMX_STARTUP_CWD",
+  "OMX_STATE_AUTHORITY_PATH",
+  "OMX_STATE_AUTHORITY_ID",
+  "OMX_STATE_AUTHORITY_GENERATION_ID",
+  "OMX_STATE_AUTHORITY_WORKSPACE_DIGEST",
+  "OMX_STATE_AUTHORITY_CAPABILITY",
+] as const;
+const originalAuthorityEnv = Object.fromEntries(
+  authorityEnvKeys.map((key) => [key, process.env[key]]),
+) as Record<(typeof authorityEnvKeys)[number], string | undefined>;
 
 beforeEach(() => {
   delete process.env.OMX_MCP_WORKDIR_ROOTS;
@@ -34,6 +47,7 @@ beforeEach(() => {
   delete process.env.OMX_SESSION_ID;
   delete process.env.CODEX_SESSION_ID;
   delete process.env.SESSION_ID;
+  for (const key of authorityEnvKeys) delete process.env[key];
 });
 
 afterEach(() => {
@@ -51,6 +65,11 @@ afterEach(() => {
   else delete process.env.CODEX_SESSION_ID;
   if (typeof originalGenericSessionId === "string") process.env.SESSION_ID = originalGenericSessionId;
   else delete process.env.SESSION_ID;
+  for (const key of authorityEnvKeys) {
+    const value = originalAuthorityEnv[key];
+    if (typeof value === "string") process.env[key] = value;
+    else delete process.env[key];
+  }
 });
 
 async function tempWorkspace(name: string): Promise<string> {
@@ -60,13 +79,50 @@ async function tempWorkspace(name: string): Promise<string> {
   return await realpath(await mkdtemp(join(await realpath(tmpdir()), name)));
 }
 
+async function installSessionAuthority(cwd: string, sessionId: string) {
+  const authority = await initializeStateAuthority({
+    startup_cwd: cwd,
+    observed_cwd: cwd,
+    launch_id: `hermes-bridge-${sessionId}`,
+    session_binding: { canonical_session_id: sessionId },
+  });
+  await mintStateAuthorityTransportCapability(authority);
+  const sessionPath = join(authority.canonical_state_root, "sessions", sessionId);
+  await mkdir(sessionPath, { recursive: true, mode: 0o700 });
+  for (const directory of [
+    join(cwd, ".omx"),
+    join(cwd, ".omx", "bootstrap"),
+    authority.canonical_state_root,
+    join(authority.canonical_state_root, "authority"),
+    join(authority.canonical_state_root, "sessions"),
+    sessionPath,
+  ]) {
+    await chmod(directory, 0o700);
+  }
+  Object.assign(process.env, buildStateAuthorityTransportEnv(authority, { OMX_SESSION_ID: sessionId }));
+  return { authority, sessionPath };
+}
+
+async function writeTmuxSessionFixture(cwd: string, paneId: string, nativeSessionId?: string): Promise<void> {
+  const { authority } = await installSessionAuthority(cwd, "sess-tmux");
+  await writeFile(join(authority.canonical_state_root, "session.json"), JSON.stringify({
+    session_id: "sess-tmux",
+    ...(nativeSessionId ? { native_session_id: nativeSessionId } : {}),
+    started_at: "2026-05-11T00:00:00.000Z",
+    cwd,
+    pid: 12345,
+    tmux_session_name: "omx-detached-demo",
+    tmux_pane_id: paneId,
+  }));
+}
+
 describe("Hermes MCP bridge core", () => {
   it("lists session-scoped OMX state without exposing terminal internals", async () => {
     const cwd = await tempWorkspace("omx-hermes-list-");
+    const { sessionPath } = await installSessionAuthority(cwd, "sess-a");
     try {
-      await mkdir(join(cwd, ".omx", "state", "sessions", "sess-a"), { recursive: true });
       await writeFile(
-        join(cwd, ".omx", "state", "sessions", "sess-a", "ralph-state.json"),
+        join(sessionPath, "ralph-state.json"),
         JSON.stringify({ active: true, current_phase: "executing" }),
       );
 
@@ -84,10 +140,10 @@ describe("Hermes MCP bridge core", () => {
 
   it("projects status without leaking raw internal mode state", async () => {
     const cwd = await tempWorkspace("omx-hermes-status-");
+    const { sessionPath } = await installSessionAuthority(cwd, "sess-a");
     try {
-      await mkdir(join(cwd, ".omx", "state", "sessions", "sess-a"), { recursive: true });
       await writeFile(
-        join(cwd, ".omx", "state", "sessions", "sess-a", "ralph-state.json"),
+        join(sessionPath, "ralph-state.json"),
         JSON.stringify({
           active: true,
           current_phase: "verifying",
@@ -185,6 +241,7 @@ describe("Hermes MCP bridge core", () => {
 
   it("lists question events and submits bounded answers with safe leader-pane resume injection", async () => {
     const cwd = await tempWorkspace("omx-hermes-questions-");
+    await installSessionAuthority(cwd, "sess-q");
     try {
       const { record, recordPath } = await createQuestionRecord(cwd, {
         question: "Pick one",
@@ -274,17 +331,8 @@ describe("Hermes MCP bridge core", () => {
 
   it("routes selected prompts to a bound tmux session when no active exec queue accepts input", async () => {
     const cwd = await tempWorkspace("omx-hermes-tmux-prompt-");
+    await writeTmuxSessionFixture(cwd, "%42", "native-tmux");
     try {
-      await mkdir(join(cwd, ".omx", "state"), { recursive: true });
-      await writeFile(join(cwd, ".omx", "state", "session.json"), JSON.stringify({
-        session_id: "sess-tmux",
-        native_session_id: "native-tmux",
-        started_at: "2026-05-11T00:00:00.000Z",
-        cwd,
-        pid: 12345,
-        tmux_session_name: "omx-detached-demo",
-        tmux_pane_id: "%42",
-      }));
       const tmuxCalls: string[][] = [];
 
       const result = await hermesSendPrompt(
@@ -325,16 +373,8 @@ describe("Hermes MCP bridge core", () => {
 
   it("returns prompt_not_accepted when tmux pane delivery fails", async () => {
     const cwd = await tempWorkspace("omx-hermes-tmux-prompt-fail-");
+    await writeTmuxSessionFixture(cwd, "%42");
     try {
-      await mkdir(join(cwd, ".omx", "state"), { recursive: true });
-      await writeFile(join(cwd, ".omx", "state", "session.json"), JSON.stringify({
-        session_id: "sess-tmux",
-        started_at: "2026-05-11T00:00:00.000Z",
-        cwd,
-        pid: 12345,
-        tmux_session_name: "omx-detached-demo",
-        tmux_pane_id: "%42",
-      }));
 
       const result = await hermesSendPrompt(
         { workingDirectory: cwd, session_id: "sess-tmux", prompt: "continue", allow_mutation: true },
@@ -364,16 +404,8 @@ describe("Hermes MCP bridge core", () => {
 
   it("rejects tmux prompt delivery when the stored target is not a pane id", async () => {
     const cwd = await tempWorkspace("omx-hermes-tmux-invalid-pane-");
+    await writeTmuxSessionFixture(cwd, "omx-detached-demo");
     try {
-      await mkdir(join(cwd, ".omx", "state"), { recursive: true });
-      await writeFile(join(cwd, ".omx", "state", "session.json"), JSON.stringify({
-        session_id: "sess-tmux",
-        started_at: "2026-05-11T00:00:00.000Z",
-        cwd,
-        pid: 12345,
-        tmux_session_name: "omx-detached-demo",
-        tmux_pane_id: "omx-detached-demo",
-      }));
       const tmuxCalls: string[][] = [];
 
       const result = await hermesSendPrompt(
@@ -400,16 +432,8 @@ describe("Hermes MCP bridge core", () => {
 
   it("rejects tmux prompt delivery when the stored pane is not in the bound session", async () => {
     const cwd = await tempWorkspace("omx-hermes-tmux-pane-mismatch-");
+    await writeTmuxSessionFixture(cwd, "%42");
     try {
-      await mkdir(join(cwd, ".omx", "state"), { recursive: true });
-      await writeFile(join(cwd, ".omx", "state", "session.json"), JSON.stringify({
-        session_id: "sess-tmux",
-        started_at: "2026-05-11T00:00:00.000Z",
-        cwd,
-        pid: 12345,
-        tmux_session_name: "omx-detached-demo",
-        tmux_pane_id: "%42",
-      }));
 
       const result = await hermesSendPrompt(
         { workingDirectory: cwd, session_id: "sess-tmux", prompt: "continue", allow_mutation: true },
@@ -435,16 +459,8 @@ describe("Hermes MCP bridge core", () => {
 
   it("rejects tmux prompt delivery when the tmux instance tag does not match session state", async () => {
     const cwd = await tempWorkspace("omx-hermes-tmux-instance-mismatch-");
+    await writeTmuxSessionFixture(cwd, "%42");
     try {
-      await mkdir(join(cwd, ".omx", "state"), { recursive: true });
-      await writeFile(join(cwd, ".omx", "state", "session.json"), JSON.stringify({
-        session_id: "sess-tmux",
-        started_at: "2026-05-11T00:00:00.000Z",
-        cwd,
-        pid: 12345,
-        tmux_session_name: "omx-detached-demo",
-        tmux_pane_id: "%42",
-      }));
 
       const result = await hermesSendPrompt(
         { workingDirectory: cwd, session_id: "sess-tmux", prompt: "continue", allow_mutation: true },
@@ -469,6 +485,7 @@ describe("Hermes MCP bridge core", () => {
 
   it("returns a clear unsupported-session-kind diagnostic when no exec or tmux binding can accept prompts", async () => {
     const cwd = await tempWorkspace("omx-hermes-no-prompt-binding-");
+    await installSessionAuthority(cwd, "sess-missing");
     try {
       const result = await hermesSendPrompt(
         { workingDirectory: cwd, session_id: "sess-missing", prompt: "continue", allow_mutation: true },
@@ -712,6 +729,7 @@ describe("Hermes MCP bridge core", () => {
 
   it("writes a bounded Hermes coordination report", async () => {
     const cwd = await tempWorkspace("omx-hermes-report-");
+    await installSessionAuthority(cwd, "sess-a");
     try {
       const result = await hermesReportStatus(
         {

@@ -109,15 +109,27 @@ async function writeManagedSessionState(stateDir: string, cwd: string): Promise<
 }
 
 async function writeWorkerIdentityFixture(stateRoot: string, cwd: string, teamName: string, workerName: string): Promise<void> {
-  const workerDir = join(stateRoot, 'team', teamName, 'workers', workerName);
-  await mkdir(workerDir, { recursive: true });
-  await writeJson(join(workerDir, 'identity.json'), {
+  const teamDir = join(stateRoot, 'team', teamName);
+  const workerDir = join(teamDir, 'workers', workerName);
+  const identity = {
     name: workerName,
     index: Number(workerName.replace(/^worker-/, '')) || 1,
     role: 'executor',
     assigned_tasks: [],
     worktree_path: cwd,
     team_state_root: stateRoot,
+  };
+  await mkdir(workerDir, { recursive: true });
+  await writeJson(join(workerDir, 'identity.json'), identity);
+  await writeJson(join(teamDir, 'manifest.v2.json'), {
+    schema_version: 2,
+    name: teamName,
+    session_id: 'sess-managed',
+    owner_session_id: 'sess-managed',
+    leader: { session_id: 'sess-managed', worker_id: 'leader-fixed', role: 'coordinator' },
+    tmux_session: buildTmuxSessionName(cwd, 'sess-managed'),
+    leader_pane_id: '%99',
+    workers: [identity],
   });
   await writeJson(join(stateRoot, 'team', teamName, 'config.json'), {
     name: teamName,
@@ -277,10 +289,10 @@ function runNotifyHook(
     timeout: 15_000,
     env: {
       ...process.env,
-      PATH: `${fakeBinDir}:${process.env.PATH || ''}`,
-      CODEX_HOME: codexHome,
       ...Object.fromEntries(INHERITED_OMX_ENV_KEYS.map((key) => [key, ''])),
       ...(extraEnv.OMX_TEST_UNMANAGED_SESSION !== '1' ? fixtureAuthorityEnv.get(cwd) : {}),
+      PATH: `${fakeBinDir}:${process.env.PATH || ''}`,
+      CODEX_HOME: codexHome,
       ...(extraEnv.OMX_TEST_UNMANAGED_SESSION !== '1' && !extraEnv.OMX_TEAM_WORKER ? { OMX_SESSION_ID: 'sess-managed' } : {}),
       ...(extraEnv.OMX_TEST_UNMANAGED_SESSION !== '1' && !extraEnv.OMX_TEAM_WORKER ? { OMX_TEST_TMUX_SESSION_NAME: buildTmuxSessionName(cwd, 'sess-managed') } : {}),
       TMUX_PANE: '%99',
@@ -296,7 +308,7 @@ function runNotifyHook(
 
 describe('notify-hook auto-nudge', () => {
 
-  it('does not nudge or create pending state for ordinary progress text', async () => {
+  it('creates pending state without nudging for ordinary progress text', async () => {
     await withTempWorkingDir(async (cwd) => {
       const omxDir = join(cwd, '.omx');
       const stateDir = join(omxDir, 'state');
@@ -329,7 +341,7 @@ describe('notify-hook auto-nudge', () => {
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8').catch(() => '');
       assert.doesNotMatch(tmuxLog, defaultAutoNudgePattern('%99'));
 
-      assert.equal(existsSync(join(sessionStateDir, 'auto-nudge-state.json')), false);
+      assert.equal(existsSync(join(sessionStateDir, 'auto-nudge-state.json')), true);
     });
   });
 
@@ -1325,7 +1337,7 @@ exit 0
 
   it('still auto-nudges in team-worker context using the worker state root', async () => {
     await withTempWorkingDir(async (cwd) => {
-      const workerStateRoot = join(cwd, 'leader-state-root');
+      const workerStateRoot = join(cwd, '.omx', 'state');
       const logsDir = join(cwd, '.omx', 'logs');
       const codexHome = join(cwd, 'codex-home');
       const fakeBinDir = join(cwd, 'fake-bin');
@@ -1356,7 +1368,7 @@ exit 0
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
       assert.match(tmuxLog, defaultAutoNudgePattern('%99'), 'team-worker context should still send auto-nudge');
 
-      const nudgeStatePath = join(workerStateRoot, 'auto-nudge-state.json');
+      const nudgeStatePath = join(workerStateRoot, 'sessions', 'sess-managed', 'auto-nudge-state.json');
       assert.ok(existsSync(nudgeStatePath), 'worker state root should receive auto-nudge state');
     });
   });
@@ -1468,7 +1480,7 @@ exit 0
 
   it('still auto-nudges from the stored worker pane when TMUX_PANE is missing and the worker pane looks shell-degraded', async () => {
     await withTempWorkingDir(async (cwd) => {
-      const workerStateRoot = join(cwd, 'leader-state-root');
+      const workerStateRoot = join(cwd, '.omx', 'state');
       const logsDir = join(cwd, '.omx', 'logs');
       const codexHome = join(cwd, 'codex-home');
       const fakeBinDir = join(cwd, 'fake-bin');
@@ -1479,11 +1491,13 @@ exit 0
       await mkdir(codexHome, { recursive: true });
       await mkdir(fakeBinDir, { recursive: true });
       await writeWorkerIdentityFixture(workerStateRoot, cwd, 'auto-nudge', 'worker-1');
+      await writeManagedSessionState(workerStateRoot, cwd);
+      await mkdir(join(workerStateRoot, 'sessions', 'sess-managed'), { recursive: true, mode: 0o700 });
 
       await writeJson(join(codexHome, '.omx-config.json'), {
         autoNudge: { enabled: true, delaySec: 0, stallMs: 0 },
       });
-      await writeJson(join(workerStateRoot, 'ralph-state.json'), {
+      await writeJson(join(workerStateRoot, 'sessions', 'sess-managed', 'ralph-state.json'), {
         active: true,
         tmux_pane_id: '%99',
       });
@@ -1503,6 +1517,14 @@ if [[ "$cmd" == "display-message" ]]; then
       *) format="$1"; shift ;;
     esac
   done
+  if [[ "$format" == "#S" ]]; then
+    echo "${buildTmuxSessionName(cwd, 'sess-managed')}"
+    exit 0
+  fi
+  if [[ "$format" == "#{@omx_instance_id}" ]]; then
+    echo "sess-managed"
+    exit 0
+  fi
   if [[ "$format" == "#{pane_current_command}" && "$target" == "%99" ]]; then
     echo "bash"
     exit 0
@@ -1515,6 +1537,18 @@ if [[ "$cmd" == "display-message" ]]; then
     echo "0"
     exit 0
   fi
+  exit 0
+fi
+if [[ "$cmd" == "show-option" ]]; then
+  echo "sess-managed"
+  exit 0
+fi
+if [[ "$cmd" == "list-sessions" ]]; then
+  printf '%s\tsess-managed\n' "${buildTmuxSessionName(cwd, 'sess-managed')}"
+  exit 0
+fi
+if [[ "$cmd" == "list-panes" ]]; then
+  printf '%%99\t1\tbash\tcodex --model gpt-5\n'
   exit 0
 fi
 if [[ "$cmd" == "capture-pane" ]]; then

@@ -15,6 +15,24 @@ import { readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildTmuxSessionName } from '../../cli/index.js';
+import { initializeStateAuthority, mintStateAuthorityTransportCapability } from '../../state/authority.js';
+import { buildStateAuthorityTransportEnv } from '../../state/transport-env.js';
+
+const fixtureAuthorityEnv = new Map<string, NodeJS.ProcessEnv>();
+
+async function initializeScrollFixtureAuthority(cwd: string, sessionId: string): Promise<void> {
+  await mkdir(join(cwd, '.omx'), { recursive: true, mode: 0o700 });
+  await chmod(join(cwd, '.omx'), 0o700);
+  const authority = await initializeStateAuthority({
+    startup_cwd: cwd,
+    observed_cwd: cwd,
+    launch_id: `notify-scroll-${sessionId}-${Date.now()}`,
+    session_binding: { canonical_session_id: sessionId },
+  });
+  await mintStateAuthorityTransportCapability(authority);
+  await chmod(authority.canonical_state_root, 0o700);
+  fixtureAuthorityEnv.set(cwd, buildStateAuthorityTransportEnv(authority, { OMX_SESSION_ID: sessionId }));
+}
 
 const NOTIFY_HOOK_SCRIPT = new URL('../../../dist/scripts/notify-hook.js', import.meta.url);
 
@@ -147,6 +165,7 @@ async function setupFixture(cwd: string, paneInMode: '0' | '1', skipIfScrolling 
   const fakeBinDir = join(cwd, 'fake-bin');
   const fakeTmuxPath = join(fakeBinDir, 'tmux');
 
+  await initializeScrollFixtureAuthority(cwd, sessionId);
   await mkdir(sessionStateDir, { recursive: true });
   await mkdir(logsDir, { recursive: true });
   await mkdir(fakeBinDir, { recursive: true });
@@ -173,6 +192,8 @@ async function setupFixture(cwd: string, paneInMode: '0' | '1', skipIfScrolling 
     log_level: 'debug',
     skip_if_scrolling: skipIfScrolling,
   });
+  await chmod(sessionStateDir, 0o700);
+  await chmod(logsDir, 0o700);
 
   await writeFile(fakeTmuxPath, fakeTmuxScript(cwd, paneInMode));
   await chmod(fakeTmuxPath, 0o755);
@@ -193,6 +214,7 @@ function runNotifyHook(cwd: string, fakeBinDir: string, threadId: string) {
     encoding: 'utf8',
     env: {
       ...process.env,
+      ...fixtureAuthorityEnv.get(cwd),
       PATH: `${fakeBinDir}:${process.env.PATH || ''}`,
       OMX_TEAM_WORKER: '',
       OMX_SESSION_ID: 'omx-scroll-test',
