@@ -9,6 +9,9 @@ import { buildTmuxSessionName } from '../../cli/index.js';
 import { classifyKeywordInput, recordSkillActivation } from '../keyword-detector.js';
 import { recordNotifySkillActivation, recordNotifySkillActivationNonFatal } from '../../scripts/notify-hook.js';
 import { normalizeSkillActiveState } from '../../scripts/notify-hook/auto-nudge.js';
+import { initializeStateAuthority, mintStateAuthorityTransportCapability } from '../../state/authority.js';
+import { buildStateAuthorityTransportEnv } from '../../state/transport-env.js';
+import { hardenTestAuthorityTreeSync } from '../../team/__tests__/authority-fixture.js';
 
 const NOTIFY_HOOK_SCRIPT = new URL('../../../dist/scripts/notify-hook.js', import.meta.url);
 const DEEP_INTERVIEW_BLOCKED_APPROVAL_INPUTS = ['yes', 'y', 'proceed', 'continue', 'ok', 'sure', 'go ahead', 'next i should'];
@@ -22,6 +25,22 @@ const INHERITED_OMX_ENV_KEYS = [
   'OMX_STARTUP_CWD',
   'OMX_ENTRY_PATH',
 ] as const;
+
+const fixtureAuthorityEnv = new Map<string, NodeJS.ProcessEnv>();
+
+async function initializeNotifyFixtureAuthority(cwd: string, sessionId = 'sess-managed'): Promise<void> {
+  await mkdir(join(cwd, '.omx'), { recursive: true, mode: 0o700 });
+  await chmod(join(cwd, '.omx'), 0o700);
+  const authority = await initializeStateAuthority({
+    startup_cwd: cwd,
+    observed_cwd: cwd,
+    launch_id: `notify-auto-nudge-${sessionId}-${Date.now()}`,
+    session_binding: { canonical_session_id: sessionId },
+  });
+  await mintStateAuthorityTransportCapability(authority);
+  await chmod(authority.canonical_state_root, 0o700);
+  fixtureAuthorityEnv.set(cwd, buildStateAuthorityTransportEnv(authority, { ...process.env, OMX_SESSION_ID: sessionId }));
+}
 
 describe('notify lifecycle owner normalization', () => {
   it('preserves the stored Codex owner for lifecycle authorization checks', () => {
@@ -38,8 +57,10 @@ describe('notify lifecycle owner normalization', () => {
 async function withTempWorkingDir(run: (cwd: string) => Promise<void>): Promise<void> {
   const cwd = await mkdtemp(join(tmpdir(), 'omx-auto-nudge-'));
   try {
+    await initializeNotifyFixtureAuthority(cwd);
     await run(cwd);
   } finally {
+    fixtureAuthorityEnv.delete(cwd);
     await rm(cwd, { recursive: true, force: true });
   }
 }
@@ -82,6 +103,8 @@ async function writeManagedSessionState(stateDir: string, cwd: string): Promise<
     platform: process.platform,
     pid_start_ticks: readLinuxStartTicks(process.pid),
     pid_cmdline: readLinuxCmdline(process.pid),
+    tmux_session_name: buildTmuxSessionName(cwd, 'sess-managed'),
+    tmux_pane_id: '%99',
   });
 }
 
@@ -175,6 +198,10 @@ if [[ "\$cmd" == "display-message" ]]; then
       *) format="\$1"; shift ;;
     esac
   done
+  if [[ "\$format" == "#{@omx_instance_id}" ]]; then
+    echo "sess-managed"
+    exit 0
+  fi
   if [[ "\$format" == "#{pane_in_mode}" ]]; then
     echo "${paneInMode}"
     exit 0
@@ -244,6 +271,7 @@ function runNotifyHook(
     ...payloadOverrides,
   };
 
+  hardenTestAuthorityTreeSync(cwd);
   return spawnSync(process.execPath, [NOTIFY_HOOK_SCRIPT.pathname, JSON.stringify(payload)], {
     encoding: 'utf8',
     timeout: 15_000,
@@ -252,6 +280,7 @@ function runNotifyHook(
       PATH: `${fakeBinDir}:${process.env.PATH || ''}`,
       CODEX_HOME: codexHome,
       ...Object.fromEntries(INHERITED_OMX_ENV_KEYS.map((key) => [key, ''])),
+      ...(extraEnv.OMX_TEST_UNMANAGED_SESSION !== '1' ? fixtureAuthorityEnv.get(cwd) : {}),
       ...(extraEnv.OMX_TEST_UNMANAGED_SESSION !== '1' && !extraEnv.OMX_TEAM_WORKER ? { OMX_SESSION_ID: 'sess-managed' } : {}),
       ...(extraEnv.OMX_TEST_UNMANAGED_SESSION !== '1' && !extraEnv.OMX_TEAM_WORKER ? { OMX_TEST_TMUX_SESSION_NAME: buildTmuxSessionName(cwd, 'sess-managed') } : {}),
       TMUX_PANE: '%99',
@@ -267,7 +296,7 @@ function runNotifyHook(
 
 describe('notify-hook auto-nudge', () => {
 
-  it('does not nudge immediately by default before a real stall window elapses', async () => {
+  it('does not nudge or create pending state for ordinary progress text', async () => {
     await withTempWorkingDir(async (cwd) => {
       const omxDir = join(cwd, '.omx');
       const stateDir = join(omxDir, 'state');
@@ -300,10 +329,7 @@ describe('notify-hook auto-nudge', () => {
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8').catch(() => '');
       assert.doesNotMatch(tmuxLog, defaultAutoNudgePattern('%99'));
 
-      const nudgeState = JSON.parse(await readFile(join(sessionStateDir, 'auto-nudge-state.json'), 'utf-8'));
-      assert.equal(nudgeState.nudgeCount, 0);
-      assert.ok(nudgeState.pendingSignature);
-      assert.ok(nudgeState.pendingSince);
+      assert.equal(existsSync(join(sessionStateDir, 'auto-nudge-state.json')), false);
     });
   });
 

@@ -1,11 +1,82 @@
-import { describe, it } from 'node:test';
+import { afterEach, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { assertModeStartAllowed, readModeState, startMode, updateModeState } from '../base.js';
+import {
+  assertModeStartAllowed as rawAssertModeStartAllowed,
+  readModeState,
+  startMode as rawStartMode,
+  updateModeState as rawUpdateModeState,
+} from '../base.js';
 
+import { createHash } from 'node:crypto';
+import { initializeStateAuthority, mintStateAuthorityTransportCapability } from '../../state/authority.js';
+import { buildStateAuthorityTransportEnv } from '../../state/transport-env.js';
+
+const AUTHORITY_ENV_KEYS = [
+  'OMX_ROOT', 'OMX_STATE_ROOT', 'OMX_TEAM_STATE_ROOT', 'OMX_STARTUP_CWD', 'OMX_SESSION_ID',
+  'OMX_STATE_AUTHORITY_PATH', 'OMX_STATE_AUTHORITY_ID', 'OMX_STATE_AUTHORITY_GENERATION_ID',
+  'OMX_STATE_AUTHORITY_WORKSPACE_DIGEST', 'OMX_STATE_AUTHORITY_CAPABILITY',
+] as const;
+let savedAuthorityEnvironment: Map<string, string | undefined>;
+
+async function installTestAuthority(cwd: string): Promise<void> {
+  const sessionFile = join(cwd, '.omx', 'state', 'session.json');
+  const canonicalSessionId = await readFile(sessionFile, 'utf-8')
+    .then((raw) => (JSON.parse(raw) as { session_id?: string }).session_id?.trim())
+    .catch(() => undefined)
+    ?? `mode-session-${createHash('sha256').update(cwd).digest('hex').slice(0, 24)}`;
+  const requestedSessionId = process.env.OMX_SESSION_ID?.trim() || canonicalSessionId;
+  await mkdir(join(cwd, '.omx', 'state'), { recursive: true, mode: 0o700 });
+  await chmod(cwd, 0o700);
+  await chmod(join(cwd, '.omx'), 0o700);
+  await chmod(join(cwd, '.omx', 'state'), 0o700);
+  const authority = await initializeStateAuthority({
+    startup_cwd: cwd,
+    observed_cwd: cwd,
+    launch_id: `${canonicalSessionId}-launch`,
+    session_binding: {
+      canonical_session_id: canonicalSessionId,
+      ...(requestedSessionId === canonicalSessionId ? {} : {
+        aliases: { current_session_aliases: [requestedSessionId] },
+      }),
+    },
+  });
+  await mintStateAuthorityTransportCapability(authority);
+  Object.assign(process.env, buildStateAuthorityTransportEnv(authority, { OMX_SESSION_ID: requestedSessionId }));
+}
+
+async function startMode(...args: Parameters<typeof rawStartMode>): ReturnType<typeof rawStartMode> {
+  await installTestAuthority(args[3] ?? process.cwd());
+  return rawStartMode(...args);
+}
+
+async function updateModeState(...args: Parameters<typeof rawUpdateModeState>): ReturnType<typeof rawUpdateModeState> {
+  await installTestAuthority(args[2] ?? process.cwd());
+  return rawUpdateModeState(...args);
+}
+
+async function assertModeStartAllowed(...args: Parameters<typeof rawAssertModeStartAllowed>): ReturnType<typeof rawAssertModeStartAllowed> {
+  await installTestAuthority(args[1] ?? process.cwd());
+  return rawAssertModeStartAllowed(...args);
+}
+
+function restoreAuthorityEnvironment(): void {
+  for (const [key, value] of savedAuthorityEnvironment) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+}
+
+
+beforeEach(() => {
+  savedAuthorityEnvironment = new Map(AUTHORITY_ENV_KEYS.map((key) => [key, process.env[key]]));
+  for (const key of AUTHORITY_ENV_KEYS) delete process.env[key];
+});
+
+afterEach(() => restoreAuthorityEnvironment());
 
 describe('modes/base session-scoped persistence', () => {
   it('writes mode state into the current session scope when session.json exists', async () => {
@@ -81,6 +152,7 @@ describe('modes/base session-scoped persistence', () => {
       await writeFile(join(stateDir, 'session.json'), JSON.stringify({ session_id: sessionId }));
       await writeFile(join(stateDir, 'ralplan-state.json'), JSON.stringify({ active: true, current_phase: 'root-only', iteration: 9 }));
       await writeFile(join(sessionDir, 'ralplan-state.json'), JSON.stringify({ active: true, current_phase: 'draft', iteration: 1 }));
+      await installTestAuthority(wd);
 
       const state = await readModeState('ralplan', wd);
       assert.equal(state?.current_phase, 'draft');
@@ -167,10 +239,11 @@ describe('modes/base session-scoped persistence', () => {
       const stateDir = join(wd, '.omx', 'state');
       await mkdir(stateDir, { recursive: true });
       await writeFile(join(stateDir, 'session.json'), JSON.stringify({ session_id: 'sess-canonical', cwd: wd }));
+      await installTestAuthority(wd);
       process.env.OMX_SESSION_ID = 'sess-unmatched';
 
-      await assert.rejects(() => assertModeStartAllowed('ralplan', wd), /OMX_SESSION_ID is not bound to session\.json/);
-      await assert.rejects(() => startMode('ralplan', 'must not write', 5, wd), /OMX_SESSION_ID is not bound to session\.json/);
+      await assert.rejects(() => rawAssertModeStartAllowed('ralplan', wd), /requested session does not match the active authority binding/);
+      await assert.rejects(() => rawStartMode('ralplan', 'must not write', 5, wd), /requested session does not match the active authority binding/);
       assert.equal(existsSync(join(stateDir, 'sessions', 'sess-unmatched')), false);
       assert.equal(existsSync(join(stateDir, 'ralplan-state.json')), false);
     } finally {
@@ -196,9 +269,10 @@ describe('modes/base session-scoped persistence', () => {
         max_iterations: 5,
         current_phase: 'starting',
       }));
+      await installTestAuthority(wd);
       process.env.OMX_SESSION_ID = 'sess-unmatched';
 
-      await updateModeState('ralplan', { current_phase: 'planning', iteration: 1 }, wd, forkSessionId);
+      await rawUpdateModeState('ralplan', { current_phase: 'planning', iteration: 1 }, wd, forkSessionId);
 
       const updated = JSON.parse(await readFile(forkStatePath, 'utf-8')) as Record<string, unknown>;
       assert.equal(updated.current_phase, 'planning');

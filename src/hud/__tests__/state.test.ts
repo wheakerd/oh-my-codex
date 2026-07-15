@@ -2,7 +2,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { mkdtemp, mkdir, realpath, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, mkdir, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, relative } from 'node:path';
 import { renderHud } from '../render.js';
@@ -122,7 +122,8 @@ async function createAlternateAuthority(
   });
   await mintStateAuthorityTransportCapability(initial);
   const initialTransport = authorityTransport(initial);
-  await mkdir(dirname(dirname(alternateStateRoot)), { recursive: true });
+  await mkdir(dirname(dirname(alternateStateRoot)), { recursive: true, mode: 0o700 });
+  await chmod(dirname(dirname(alternateStateRoot)), 0o700);
   const active = await rolloverStateAuthorityToAlternateRoot({
     context: initial,
     proposed_state_root: alternateStateRoot,
@@ -1010,16 +1011,21 @@ describe('readAllState canonical skill precedence', () => {
 
   it('surfaces real keyword-activated ultragoal phase in state and HUD before goals exist', async () => {
     await withTempRepo('omx-hud-keyword-ultragoal-', async (cwd) => {
-      const rootStateDir = join(cwd, '.omx', 'state');
       const sessionId = 'sess-ultragoal-keyword';
-      await mkdir(join(rootStateDir, 'sessions', sessionId), { recursive: true });
-      await writeFile(join(rootStateDir, 'session.json'), JSON.stringify({ session_id: sessionId }));
+      const authority = await initializeStateAuthority({
+        startup_cwd: cwd,
+        launch_id: 'hud-keyword-ultragoal',
+        session_binding: { canonical_session_id: sessionId },
+      });
+      const rootStateDir = authority.canonical_state_root;
+      await mkdir(join(rootStateDir, 'sessions', sessionId), { recursive: true, mode: 0o700 });
 
       await recordSkillActivation({
         stateDir: rootStateDir,
         sourceCwd: cwd,
         text: '$ultragoal create goals for HUD',
         sessionId,
+        expectedRootIdentity: authority.generation.root_identity,
         nowIso: '2026-06-01T00:00:00.000Z',
       });
 
@@ -1037,16 +1043,21 @@ describe('readAllState canonical skill precedence', () => {
 
   it('surfaces real keyword-activated code-review phase in state and HUD', async () => {
     await withTempRepo('omx-hud-keyword-code-review-', async (cwd) => {
-      const rootStateDir = join(cwd, '.omx', 'state');
       const sessionId = 'sess-code-review-keyword';
-      await mkdir(join(rootStateDir, 'sessions', sessionId), { recursive: true });
-      await writeFile(join(rootStateDir, 'session.json'), JSON.stringify({ session_id: sessionId }));
+      const authority = await initializeStateAuthority({
+        startup_cwd: cwd,
+        launch_id: 'hud-keyword-code-review',
+        session_binding: { canonical_session_id: sessionId },
+      });
+      const rootStateDir = authority.canonical_state_root;
+      await mkdir(join(rootStateDir, 'sessions', sessionId), { recursive: true, mode: 0o700 });
 
       await recordSkillActivation({
         stateDir: rootStateDir,
         sourceCwd: cwd,
         text: '$code-review inspect HUD',
         sessionId,
+        expectedRootIdentity: authority.generation.root_identity,
         nowIso: '2026-06-01T00:00:00.000Z',
       });
 

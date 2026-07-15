@@ -4804,6 +4804,63 @@ async function readActiveGeneration(
   return { generation, authorityPath: expectedAuthorityPath, binding };
 }
 
+/**
+ * A fence counter can legitimately advance beyond the anchor when a process
+ * crashes after reserving a lock but before publishing its next anchor.  A
+ * committed successor journal is different: it is durable evidence that this
+ * generation was retired.  Never allow a rolled-back anchor to reactivate it.
+ */
+async function assertAnchorHasNoCommittedSuccessor(
+  workspace: WorkspaceIdentity,
+  anchor: WorkspaceAuthorityAnchor,
+): Promise<void> {
+  const counter = await readWorkspaceAuthorityLockFenceCounter(
+    stateAuthorityPaths(workspace).lock_fence_path,
+  );
+  if (!counter || counter.record.last_fencing_token <= anchor.fencing_token
+    || !anchor.active_generation_id || !anchor.active_generation_locator) {
+    return;
+  }
+
+  const generation = await readAuthorityJson(
+    anchor.active_generation_locator,
+    AUTHORITY_DIAGNOSTIC_CODES.authorityMalformed,
+  ) as StateAuthorityGeneration;
+  validateStateAuthorityGeneration(generation);
+  if (generation.generation_id !== anchor.active_generation_id) {
+    authorityError(AUTHORITY_DIAGNOSTIC_CODES.authorityMalformed, 'active generation does not match the workspace anchor');
+  }
+  const expectedAuthorityPath = authorityGenerationPaths(
+    generation.canonical_state_root,
+    generation.generation_id,
+  ).authority_path;
+  await assertAuthorityLocator(
+    generation.canonical_state_root,
+    anchor.active_generation_locator,
+    expectedAuthorityPath,
+    'active authority locator',
+  );
+
+  const journalDirectory = authorityGenerationPaths(
+    generation.canonical_state_root,
+    generation.generation_id,
+  ).journal_directory;
+  await assertPathHasNoSymlinkComponents(journalDirectory, 'active generation journal directory');
+  const entries = await readdir(journalDirectory, { withFileTypes: true });
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
+    const journal = await readStateAuthorityJournal(join(journalDirectory, entry.name));
+    if (journal.status === 'committed'
+      && (journal.kind === 'generation_establish' || journal.kind === 'alternate_root_rollover')
+      && journal.generation_id !== generation.generation_id) {
+      authorityError(
+        AUTHORITY_DIAGNOSTIC_CODES.anchorRevisionConflict,
+        'workspace authority anchor attempts to reactivate a generation retired by a committed successor journal',
+      );
+    }
+  }
+}
+
 function transportCapabilityMatchesActiveAuthority(
   metadata: StateAuthorityTransportCapabilityMetadata,
   anchor: WorkspaceAuthorityAnchor,
@@ -5018,6 +5075,9 @@ export async function initializeStateAuthority(
     && await recoverUnanchoredPristinePreparation(workspace, now);
 
   await recoverPendingAlternateRootRollover(workspace, now);
+  const recoveredAnchor = await readWorkspaceAuthorityAnchor(workspace);
+  if (recoveredAnchor) await assertAnchorHasNoCommittedSuccessor(workspace, recoveredAnchor);
+
   for (let attempt = 0; attempt < 200; attempt += 1) {
     const { lock } = await acquireCurrentWorkspaceAuthorityLock(workspace, now);
     let prepared: {
@@ -5420,6 +5480,7 @@ export async function resolveStateAuthority(
   try {
     await recoverPendingAlternateRootRollover(workspace);
     anchor = await readWorkspaceAuthorityAnchor(workspace);
+    if (anchor) await assertAnchorHasNoCommittedSuccessor(workspace, anchor);
   } catch (error) {
     if (error instanceof StateAuthorityError) {
       return { diagnostics: [...diagnostics, diagnostic(error.code, error.message)], can_mutate: false };

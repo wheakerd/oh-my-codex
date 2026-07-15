@@ -222,6 +222,7 @@ export interface HookRuntimeDispatchInput {
   cwd: string;
   event: HookEventEnvelope;
   allowTeamWorkerSideEffects?: boolean;
+  skipNativeStopTeamLeaderAttention?: boolean;
   sideEffectsEnabled?: boolean;
 }
 

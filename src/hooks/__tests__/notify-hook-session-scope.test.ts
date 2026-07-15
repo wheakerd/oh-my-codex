@@ -1,21 +1,76 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'fs/promises';
-import { existsSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync } from 'fs';
 import { dirname, join } from 'path';
 import { tmpdir } from 'os';
 import { spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import { VISUAL_NEXT_ACTIONS_LIMIT } from '../../visual/constants.js';
+import { initializeStateAuthority, mintStateAuthorityTransportCapability } from '../../state/authority.js';
+import { buildStateAuthorityTransportEnv } from '../../state/transport-env.js';
+import { hardenTestAuthorityTreeSync } from '../../team/__tests__/authority-fixture.js';
+
+const fixtureAuthorityEnv = new Map<string, NodeJS.ProcessEnv>();
+
+async function initializeNotifyFixtureAuthority(cwd: string, sessionId: string): Promise<void> {
+  await mkdir(join(cwd, '.omx'), { recursive: true, mode: 0o700 });
+  await chmod(join(cwd, '.omx'), 0o700);
+  const authority = await initializeStateAuthority({
+    startup_cwd: cwd,
+    observed_cwd: cwd,
+    launch_id: `notify-session-scope-${sessionId}-${Date.now()}`,
+    session_binding: { canonical_session_id: sessionId },
+  });
+  await mintStateAuthorityTransportCapability(authority);
+  await chmod(authority.canonical_state_root, 0o700);
+  fixtureAuthorityEnv.set(cwd, buildStateAuthorityTransportEnv(authority, { ...process.env, OMX_SESSION_ID: sessionId }));
+}
+function currentLinuxIdentity(): { startTicks?: number; cmdline?: string } {
+  if (process.platform !== 'linux') return {};
+  try {
+    const stat = readFileSync(`/proc/${process.pid}/stat`, 'utf8');
+    const commandEnd = stat.lastIndexOf(')');
+    const fields = stat.slice(commandEnd + 1).trim().split(/\s+/);
+    const startTicks = Number(fields[19]);
+    const cmdline = readFileSync(`/proc/${process.pid}/cmdline`).toString('utf8').replace(/\0+/g, ' ').trim();
+    return {
+      ...(Number.isFinite(startTicks) ? { startTicks } : {}),
+      ...(cmdline ? { cmdline } : {}),
+    };
+  } catch {
+    return {};
+  }
+}
+
 
 function runNotifyHook(payload: Record<string, unknown>, env: NodeJS.ProcessEnv = {}) {
   const testDir = dirname(fileURLToPath(import.meta.url));
   const repoRoot = join(testDir, '..', '..', '..');
+  hardenTestAuthorityTreeSync(String(payload.cwd));
+  const sessionPath = join(String(payload.cwd), '.omx', 'state', 'session.json');
+  if (existsSync(sessionPath)) {
+    const session = JSON.parse(readFileSync(sessionPath, 'utf8')) as Record<string, unknown>;
+    const threadId = String(payload.thread_id ?? payload['thread-id'] ?? '');
+    if (threadId) {
+      session.codex_session_id = threadId;
+      session.native_session_id = threadId;
+      const linuxIdentity = currentLinuxIdentity();
+      session.started_at = new Date().toISOString();
+      session.cwd = String(payload.cwd);
+      session.pid = process.pid;
+      session.platform = process.platform;
+      session.pid_start_ticks = linuxIdentity.startTicks;
+      session.pid_cmdline = linuxIdentity.cmdline;
+      writeFileSync(sessionPath, JSON.stringify(session, null, 2));
+    }
+  }
   return spawnSync(process.execPath, ['dist/scripts/notify-hook.js', JSON.stringify(payload)], {
     cwd: repoRoot,
     encoding: 'utf-8',
     env: {
       ...process.env,
+      ...fixtureAuthorityEnv.get(String(payload.cwd)),
       OMX_TEAM_WORKER: '',
       TMUX: '',
       TMUX_PANE: '',
@@ -30,6 +85,7 @@ describe('notify-hook session-scoped iteration updates', () => {
     try {
       const stateDir = join(wd, '.omx', 'state');
       const sessionId = 'sess-current';
+      await initializeNotifyFixtureAuthority(wd, sessionId);
       await mkdir(stateDir, { recursive: true });
 
       await writeFile(join(stateDir, 'session.json'), JSON.stringify({ session_id: sessionId }));
@@ -64,18 +120,23 @@ describe('notify-hook session-scoped iteration updates', () => {
     try {
       const stateDir = join(wd, '.omx', 'state');
       const sessionId = 'sess1';
+      await initializeNotifyFixtureAuthority(wd, sessionId);
       const sessionScopedDir = join(stateDir, 'sessions', sessionId);
       await mkdir(sessionScopedDir, { recursive: true });
 
       await writeFile(join(stateDir, 'session.json'), JSON.stringify({ session_id: sessionId }));
-      await writeFile(join(sessionScopedDir, 'team-state.json'), JSON.stringify({ active: true, iteration: 0 }));
+      await writeFile(join(sessionScopedDir, 'team-state.json'), JSON.stringify({
+        active: true,
+        iteration: 0,
+        owner_codex_session_id: 'th',
+      }));
 
       const result = runNotifyHook({
         cwd: wd,
         type: 'agent-turn-complete',
         thread_id: 'th',
         turn_id: 'tu',
-        input_messages: [],
+        input_messages: ['continue'],
         last_assistant_message: 'ok',
       });
       assert.equal(result.status, 0, result.stderr || result.stdout);
@@ -93,6 +154,7 @@ describe('notify-hook session-scoped iteration updates', () => {
     try {
       const stateDir = join(wd, '.omx', 'state');
       const sessionId = 'sess1';
+      await initializeNotifyFixtureAuthority(wd, sessionId);
       const sessionScopedDir = join(stateDir, 'sessions', sessionId);
       await mkdir(sessionScopedDir, { recursive: true });
 
@@ -134,6 +196,7 @@ describe('notify-hook session-scoped iteration updates', () => {
     try {
       const stateDir = join(wd, '.omx', 'state');
       const sessionId = 'sess1';
+      await initializeNotifyFixtureAuthority(wd, sessionId);
       const sessionScopedDir = join(stateDir, 'sessions', sessionId);
       await mkdir(sessionScopedDir, { recursive: true });
 
@@ -171,6 +234,7 @@ describe('notify-hook session-scoped iteration updates', () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-notify-hud-progress-'));
     try {
       const stateDir = join(wd, '.omx', 'state');
+      await initializeNotifyFixtureAuthority(wd, 'codex-progress');
       await mkdir(stateDir, { recursive: true });
       await writeFile(join(wd, '.omx', 'managed'), 'test fixture managed workspace');
 
@@ -199,6 +263,7 @@ describe('notify-hook session-scoped iteration updates', () => {
     try {
       const stateDir = join(wd, '.omx', 'state');
       const canonicalSessionId = 'omx-canonical-session';
+      await initializeNotifyFixtureAuthority(wd, canonicalSessionId);
       const nativeSessionId = 'codex-native-session';
       const canonicalDir = join(stateDir, 'sessions', canonicalSessionId);
       await mkdir(canonicalDir, { recursive: true });

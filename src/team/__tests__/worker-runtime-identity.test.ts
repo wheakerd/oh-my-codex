@@ -1,8 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
 import { mkdtemp, realpath, rm, writeFile, readFile, mkdir, readdir } from 'fs/promises';
-import { delimiter, join, resolve } from 'path';
+import { delimiter, join } from 'path';
 import { tmpdir } from 'os';
 import { existsSync } from 'fs';
 import {
@@ -20,51 +19,18 @@ import {
 import { scaleUp } from '../scaling.js';
 import { createTeamSession } from '../tmux-session.js';
 
-import {
-  initializeStateAuthority,
-  mintStateAuthorityTransportCapability,
-} from '../../state/authority.js';
 import { resolveTeamLowComplexityDefaultModel } from '../model-contract.js';
 import { buildStateAuthorityTransportEnv } from '../../state/transport-env.js';
-
-function testAuthoritySessionId(cwd: string): string {
-  return `team-start-${createHash('sha256').update(resolve(cwd)).digest('hex').slice(0, 24)}`;
-}
+import {
+  clearTeamTestAuthority,
+  hardenTeamTestAuthority,
+  installTeamTestAuthority,
+} from './authority-fixture.js';
 
 async function startTeam(
   ...args: Parameters<typeof rawStartTeam>
 ): ReturnType<typeof rawStartTeam> {
-  const cwd = args[5];
-  const canonicalSessionId = testAuthoritySessionId(cwd);
-  const requestedSessionId = process.env.OMX_SESSION_ID?.trim() || canonicalSessionId;
-  const authority = await initializeStateAuthority({
-    startup_cwd: cwd,
-    observed_cwd: cwd,
-    launch_id: `${canonicalSessionId}-launch`,
-    session_binding: {
-      canonical_session_id: canonicalSessionId,
-      ...(requestedSessionId === canonicalSessionId
-        ? {}
-        : { aliases: { current_session_aliases: [requestedSessionId] } }),
-    },
-  });
-  await mintStateAuthorityTransportCapability(authority);
-  const transport = buildStateAuthorityTransportEnv(authority, {
-    OMX_SESSION_ID: requestedSessionId,
-  });
-  const previous = new Map(
-    Object.keys(transport).map((key) => [key, process.env[key]]),
-  );
-
-  Object.assign(process.env, transport);
-  try {
-    return await rawStartTeam(...args);
-  } finally {
-    for (const [key, value] of previous) {
-      if (typeof value === 'string') process.env[key] = value;
-      else delete process.env[key];
-    }
-  }
+  return rawStartTeam(...args);
 }
 
 function expectedLowComplexityModel(codexHomeOverride?: string): string {
@@ -236,6 +202,7 @@ process.on('SIGTERM', () => process.exit(0));
 
     let runtime: TeamRuntime | null = null;
     try {
+      await installTeamTestAuthority(cwd);
       runtime = await withMockPromptModeCodexAllowed(() =>
         withoutTeamWorkerEnv(() =>
           startTeam(
@@ -365,6 +332,7 @@ process.on('SIGTERM', () => process.exit(0));
       if (typeof prevLaunchArgs === 'string')
         process.env.OMX_TEAM_WORKER_LAUNCH_ARGS = prevLaunchArgs;
       else delete process.env.OMX_TEAM_WORKER_LAUNCH_ARGS;
+      clearTeamTestAuthority();
       await rm(cwd, { recursive: true, force: true });
     }
   });
@@ -379,6 +347,7 @@ process.on('SIGTERM', () => process.exit(0));
     const previousPath = process.env[pathKey];
 
     try {
+      await installTeamTestAuthority(cwd);
       await writeNodeCommandStub(
         fakeBinDir,
         'tmux',
@@ -419,6 +388,7 @@ switch (args[0] || '') {
         '# Base worker instructions\n',
       );
 
+      await hardenTeamTestAuthority(cwd);
       await initTeamState(
         'low-role-scale',
         'task',
@@ -526,6 +496,7 @@ switch (args[0] || '') {
     } finally {
       if (typeof previousPath === 'string') process.env[pathKey] = previousPath;
       else delete process.env[pathKey];
+      clearTeamTestAuthority();
       await rm(cwd, { recursive: true, force: true });
       await rm(fakeBinDir, { recursive: true, force: true });
     }
@@ -543,6 +514,7 @@ switch (args[0] || '') {
     const previousPath = process.env[pathKey];
 
     try {
+      await installTeamTestAuthority(cwd);
       await writeNodeCommandStub(
         fakeBinDir,
         'tmux',
@@ -575,6 +547,7 @@ switch (args[0] || '') {
         '# Base worker instructions\n',
       );
 
+      await hardenTeamTestAuthority(cwd);
       await initTeamState('exact-role-cli', 'task', 'executor', 1, cwd);
       await createTask(
         'exact-role-cli',
@@ -678,6 +651,7 @@ switch (args[0] || '') {
     } finally {
       if (typeof previousPath === 'string') process.env[pathKey] = previousPath;
       else delete process.env[pathKey];
+      clearTeamTestAuthority();
       await rm(cwd, { recursive: true, force: true });
       await rm(fakeBinDir, { recursive: true, force: true });
     }
@@ -885,16 +859,13 @@ fs.writeFileSync(${JSON.stringify(capabilityMarkerPath)}, 'received');`,
       process.env.CODEX_HOME = codexHome;
       process.env[providerEnvKey] = providerValue;
 
-      const authority = await initializeStateAuthority({
-        startup_cwd: cwd,
-        observed_cwd: cwd,
-        launch_id: 'worker-runtime-preexisting-tmux-authority',
-        session_binding: {
-          canonical_session_id:
-            'worker-runtime-preexisting-tmux-authority-session',
-        },
+      const sessionId = 'worker-runtime-preexisting-tmux-authority-session';
+      const authority = await installTeamTestAuthority(cwd, sessionId);
+      const authorityTransport = buildStateAuthorityTransportEnv(authority, {
+        OMX_SESSION_ID: sessionId,
       });
-      const minted = await mintStateAuthorityTransportCapability(authority);
+      const authorityCapability = authorityTransport.OMX_STATE_AUTHORITY_CAPABILITY;
+      assert.ok(authorityCapability);
       const workerAuthorityTransport = {
         OMX_STARTUP_CWD: authority.workspace_identity.canonical_path,
         OMX_STATE_AUTHORITY_PATH: authority.authority_path,
@@ -902,7 +873,7 @@ fs.writeFileSync(${JSON.stringify(capabilityMarkerPath)}, 'received');`,
         OMX_STATE_AUTHORITY_GENERATION_ID: authority.generation.generation_id,
         OMX_STATE_AUTHORITY_WORKSPACE_DIGEST:
           authority.workspace_identity.digest,
-        OMX_STATE_AUTHORITY_CAPABILITY: minted.capability,
+        OMX_STATE_AUTHORITY_CAPABILITY: authorityCapability,
       };
       const workerTransport = {
         ...workerAuthorityTransport,
@@ -918,10 +889,9 @@ fs.writeFileSync(${JSON.stringify(capabilityMarkerPath)}, 'received');`,
           ]),
         ),
       );
-      process.env.OMX_SESSION_ID =
-        'worker-runtime-preexisting-tmux-authority-session';
+      process.env.OMX_SESSION_ID = sessionId;
 
-      // Bypass the fixture wrapper to exercise the manually assembled transport.
+      // Exercise a manually assembled child transport against the persisted authority.
       runtime = await withoutTeamWorkerEnv(() =>
         rawStartTeam(
           'pre-existing-tmux-authority',
@@ -965,7 +935,7 @@ fs.writeFileSync(${JSON.stringify(capabilityMarkerPath)}, 'received');`,
       assert.equal(workerSplitArgv.includes('-e'), false);
       for (const argv of tmuxArgv) {
         assert.equal(
-          argv.some((value) => value.includes(minted.capability)),
+          argv.some((value) => value.includes(authorityCapability)),
           false,
         );
         assert.equal(
@@ -995,7 +965,7 @@ fs.writeFileSync(${JSON.stringify(capabilityMarkerPath)}, 'received');`,
       const startupScript = await readFile(startupScriptPath, 'utf8');
       const persistedWorkerFiles = await readRegularFilesRecursively(teamRoot);
       for (const value of persistedWorkerFiles) {
-        assert.equal(value.includes(minted.capability), false);
+        assert.equal(value.includes(authorityCapability), false);
         assert.equal(value.includes(providerValue), false);
       }
       for (const key of [
@@ -1057,7 +1027,7 @@ fs.writeFileSync(${JSON.stringify(capabilityMarkerPath)}, 'received');`,
         directTmuxArgv.some((args) =>
           args.some(
             (value) =>
-              value.includes(minted.capability) ||
+              value.includes(authorityCapability) ||
               value.includes(providerValue),
           ),
         ),
@@ -1086,7 +1056,7 @@ fs.writeFileSync(${JSON.stringify(capabilityMarkerPath)}, 'received');`,
 
       const unsafeTransport = {
         ...workerAuthorityTransport,
-        OMX_STATE_AUTHORITY_CAPABILITY: `${minted.capability}\nunsafe`,
+        OMX_STATE_AUTHORITY_CAPABILITY: `${authorityCapability}\nunsafe`,
       };
       assert.throws(
         () =>
@@ -1105,6 +1075,7 @@ fs.writeFileSync(${JSON.stringify(capabilityMarkerPath)}, 'received');`,
         await shutdownTeam(runtime.teamName, cwd, { force: true }).catch(
           () => {},
         );
+      clearTeamTestAuthority();
       if (typeof previousPath === 'string') process.env[pathKey] = previousPath;
       else delete process.env[pathKey];
       for (const [key, value] of previousEnv) {

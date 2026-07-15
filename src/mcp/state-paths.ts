@@ -4,6 +4,7 @@ import { readFile, readdir } from 'fs/promises';
 import {
   AUTHORITY_DIAGNOSTIC_CODES,
   StateAuthorityError,
+  canonicalizeExistingAuthorityPath,
   canonicalizeTrustedAuthorityDarwinDirectoryAliasComponentsSync,
   canonicalizeTrustedAuthorityWindowsDirectoryAliasComponentsSync,
   resolveStateAuthorityForGuard,
@@ -43,6 +44,33 @@ function observedAmbientRootSources(): StateRootSource[] {
   if (process.env[OMX_ROOT_ENV]?.trim()) sources.push('omx-root-env');
   if (process.env[OMX_STATE_ROOT_ENV]?.trim()) sources.push('omx-state-root-env');
   return sources;
+}
+
+/**
+ * Ambient root aliases are never authority selectors. Mutation callers use this
+ * guard to reject an invocation whose diagnostic aliases name another root.
+ */
+export function assertAmbientStateRootAliasesMatchAuthority(
+  authority: ResolvedStateAuthorityContext,
+  env: NodeJS.ProcessEnv = process.env,
+): void {
+  const aliases: Array<[string, string]> = [];
+  const teamStateRoot = env[OMX_TEAM_STATE_ROOT_ENV]?.trim();
+  if (teamStateRoot) aliases.push([OMX_TEAM_STATE_ROOT_ENV, teamStateRoot]);
+  const omxRoot = env[OMX_ROOT_ENV]?.trim();
+  if (omxRoot) aliases.push([OMX_ROOT_ENV, join(omxRoot, '.omx', 'state')]);
+  const omxStateRoot = env[OMX_STATE_ROOT_ENV]?.trim();
+  if (omxStateRoot) aliases.push([OMX_STATE_ROOT_ENV, join(omxStateRoot, '.omx', 'state')]);
+
+  for (const [name, candidate] of aliases) {
+    const canonicalCandidate = canonicalizeExistingAuthorityPath(candidate, `${name} state root`);
+    if (canonicalCandidate !== authority.canonical_state_root) {
+      throw new StateAuthorityError(
+        AUTHORITY_DIAGNOSTIC_CODES.workspaceMismatch,
+        `${name} state root "${canonicalCandidate}" conflicts with committed authority root "${authority.canonical_state_root}"`,
+      );
+    }
+  }
 }
 export type SessionScopeSource = 'explicit' | 'env' | 'session-json' | 'native-alias' | 'authority-binding' | 'root';
 
@@ -622,9 +650,12 @@ function buildRuntimeStateScope(
 export async function resolveRuntimeStateScope(
   workingDirectory?: string,
   explicitSessionId?: string,
+  options: { ambientRootAliases?: boolean } = {},
 ): Promise<ResolvedRuntimeStateScope> {
   const cwd = resolveWorkingDirectoryForState(workingDirectory);
-  const { baseStateDir, rootSource } = getBaseStateDirWithSource(cwd);
+  const { baseStateDir, rootSource } = options.ambientRootAliases === false
+    ? { baseStateDir: join(cwd, '.omx', 'state'), rootSource: 'cwd-default' as const }
+    : getBaseStateDirWithSource(cwd);
   const metadata = await readSessionMetadataFromBaseStateDir(cwd, baseStateDir);
   return buildRuntimeStateScope(cwd, baseStateDir, rootSource, metadata, explicitSessionId);
 }

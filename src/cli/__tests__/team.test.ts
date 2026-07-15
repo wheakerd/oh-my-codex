@@ -34,14 +34,13 @@ import {
 } from '../../team/approved-execution.js';
 import { writePersistedTeamUltragoalContext } from '../../team/ultragoal-context.js';
 import { isRealTmuxAvailable, withTempTmuxSession, type TempTmuxSessionFixture } from '../../team/__tests__/tmux-test-fixture.js';
+import { clearTeamTestAuthority, installTeamTestAuthority } from '../../team/__tests__/authority-fixture.js';
 
 const OMX_CLI_PATH = fileURLToPath(new URL('../omx.js', import.meta.url));
-const ORIGINAL_OMX_TEAM_WORKER = process.env.OMX_TEAM_WORKER;
 
 function it(name: string, fn: (t: TestContext) => void | Promise<void>): void {
   nodeIt(name, { concurrency: false }, fn);
 }
-const ORIGINAL_OMX_TEAM_STATE_ROOT = process.env.OMX_TEAM_STATE_ROOT;
 
 function pathEnvironmentKey(): 'PATH' | 'Path' {
   return Object.hasOwn(process.env, 'Path') ? 'Path' : 'PATH';
@@ -134,16 +133,17 @@ async function writeReadyContextPack(
 }
 
 beforeEach(() => {
+  clearTeamTestAuthority();
   delete process.env.OMX_TEAM_WORKER;
   delete process.env.OMX_TEAM_STATE_ROOT;
 });
 
 afterEach(() => {
-  if (typeof ORIGINAL_OMX_TEAM_WORKER === 'string') process.env.OMX_TEAM_WORKER = ORIGINAL_OMX_TEAM_WORKER;
-  else delete process.env.OMX_TEAM_WORKER;
-
-  if (typeof ORIGINAL_OMX_TEAM_STATE_ROOT === 'string') process.env.OMX_TEAM_STATE_ROOT = ORIGINAL_OMX_TEAM_STATE_ROOT;
-  else delete process.env.OMX_TEAM_STATE_ROOT;
+  clearTeamTestAuthority();
+  for (const [key, value] of ORIGINAL_AUTHENTICATED_TEAM_COMMAND_ENV) {
+    if (typeof value === 'string') process.env[key] = value;
+    else delete process.env[key];
+  }
 });
 
 function withoutTeamTestWorkerEnv<T>(fn: () => T): T {
@@ -207,10 +207,22 @@ const AUTHENTICATED_TEAM_COMMAND_ENV_KEYS = [
   'OMX_TEAM_WORKER',
 ] as const;
 
+const ORIGINAL_AUTHENTICATED_TEAM_COMMAND_ENV = new Map(
+  AUTHENTICATED_TEAM_COMMAND_ENV_KEYS.map((key) => [key, process.env[key]]),
+);
+
 async function buildAuthenticatedTeamCommandTransport(
   cwd: string,
   sessionId: string,
 ): Promise<NodeJS.ProcessEnv> {
+  if (
+    process.env.OMX_SESSION_ID === sessionId
+    && process.env.OMX_STARTUP_CWD === cwd
+    && process.env.OMX_STATE_AUTHORITY_PATH
+    && process.env.OMX_STATE_AUTHORITY_CAPABILITY
+  ) {
+    return { ...process.env };
+  }
   const stateRoot = join(cwd, '.omx', 'state');
   await mkdir(stateRoot, { recursive: true });
   await chmod(join(cwd, '.omx'), 0o700);
@@ -1793,11 +1805,8 @@ esac
     }
 
     try {
+      await installTeamTestAuthority(wd, 'shared-shutdown-cli');
       await withAuthenticatedTeamCommandAuthority(wd, 'shared-shutdown-cli', async () => initTeamState('shared-shutdown-cli', 'shared shutdown cli test', 'executor', 2, wd));
-      const authorityTransport = await buildAuthenticatedTeamCommandTransport(
-        wd,
-        'shared-shutdown-cli',
-      );
       const config = await readTeamConfig('shared-shutdown-cli', wd);
       assert.ok(config);
       if (!config) return;
@@ -1812,7 +1821,6 @@ esac
         cwd: wd,
         env: {
           ...process.env,
-          ...authorityTransport,
           [pathKey]: prependPath(binDir, previousPath),
         },
       });
@@ -1836,6 +1844,7 @@ esac
     skipUnlessTmux(t);
 
     const wd = await realpath(await mkdtemp(join(tmpdir(), 'omx-team-shutdown-shared-in-pane-')));
+    await installTeamTestAuthority(wd, 'shared-shutdown-in-pane');
     try {
       await withTempTmuxSession(async (fixture) => {
         const teamName = 'shared-shutdown-in-pane';
@@ -1845,10 +1854,6 @@ esac
         const workerPaneTwo = runFixtureTmux(fixture, ['split-window', '-d', '-P', '-F', '#{pane_id}', '-t', fixture.windowTarget, 'sleep 300']);
 
         await withAuthenticatedTeamCommandAuthority(wd, 'shared-shutdown-in-pane', async () => initTeamState(teamName, 'shared shutdown in-pane test', 'executor', 2, wd));
-        const authorityTransport = await buildAuthenticatedTeamCommandTransport(
-          wd,
-          'shared-shutdown-in-pane',
-        );
         const config = await readTeamConfig(teamName, wd);
         assert.ok(config);
         if (!config) return;
@@ -1863,7 +1868,6 @@ esac
           cwd: wd,
           env: {
             ...process.env,
-            ...authorityTransport,
             OMX_AUTO_UPDATE: '0',
             TMUX: fixture.env.TMUX,
             TMUX_PANE: fixture.leaderPaneId,
@@ -2019,6 +2023,7 @@ describe('teamCommand api', () => {
     const originalLog = console.log;
     try {
       process.chdir(wd);
+      await installTeamTestAuthority(wd, 'api-read-events');
       await withAuthenticatedTeamCommandAuthority(wd, 'api-read-events', async () => initTeamState('api-read-events', 'api event test', 'executor', 1, wd));
       await appendTeamEvent('api-read-events', {
         type: 'worker_idle',
@@ -2073,6 +2078,7 @@ describe('teamCommand api', () => {
     const originalLog = console.log;
     try {
       process.chdir(wd);
+      await installTeamTestAuthority(wd, 'api-read-idle');
       await withAuthenticatedTeamCommandAuthority(wd, 'api-read-idle', async () => initTeamState('api-read-idle', 'api idle state test', 'executor', 2, wd));
       await writeMonitorSnapshot('api-read-idle', {
         taskStatusById: {},
@@ -2136,6 +2142,7 @@ describe('teamCommand api', () => {
     try {
       delete process.env.OMX_TEAM_STATE_ROOT;
       process.chdir(wd);
+      await installTeamTestAuthority(wd, 'api-read-stall');
       await withAuthenticatedTeamCommandAuthority(wd, 'api-read-stall', async () => initTeamState('api-read-stall', 'api stall state test', 'executor', 2, wd));
       const task = await createTask('api-read-stall', {
         subject: 'Pending work',
@@ -2445,6 +2452,7 @@ describe('teamCommand status', () => {
     const originalLog = console.log;
     try {
       process.chdir(wd);
+      await installTeamTestAuthority(wd, 'pane-team');
       const config = await withAuthenticatedTeamCommandAuthority(wd, 'pane-team', async () => withoutTeamTestWorkerEnv(() => initTeamState('pane-team', 'inspect worker panes', 'executor', 2, wd)));
       config.worker_launch_mode = 'prompt';
       await withoutTeamTestWorkerEnv(() => createTask('pane-team', {
@@ -2659,6 +2667,7 @@ describe('teamCommand status', () => {
     try {
       delete process.env.OMX_TEAM_STATE_ROOT;
       process.chdir(wd);
+      await installTeamTestAuthority(wd, 'pane-json-team');
       const config = await withAuthenticatedTeamCommandAuthority(wd, 'pane-json-team', async () => withoutTeamTestWorkerEnv(() => initTeamState('pane-json-team', 'inspect worker panes', 'executor', 1, wd)));
       config.worker_launch_mode = 'prompt';
       await withoutTeamTestWorkerEnv(() => createTask('pane-json-team', {

@@ -1,16 +1,22 @@
-import { describe, it } from 'node:test';
+import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, rm } from 'node:fs/promises';
-import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { initTeamState, appendTeamEvent } from '../state.js';
 import { readTeamEvents, waitForTeamEvent } from '../state/events.js';
+import { clearTeamTestAuthority, installTeamTestAuthority } from './authority-fixture.js';
 
 async function setupTeam(name: string): Promise<{ cwd: string; cleanup: () => Promise<void> }> {
   const cwd = await mkdtemp(join(tmpdir(), `omx-team-events-${name}-`));
+  await installTeamTestAuthority(cwd);
   await initTeamState(name, 'event test', 'executor', 2, cwd);
   return { cwd, cleanup: () => rm(cwd, { recursive: true, force: true }) };
 }
+
+afterEach(() => {
+  clearTeamTestAuthority();
+});
 
 describe('team/state/events', () => {
   it('reads canonical filtered events', async () => {

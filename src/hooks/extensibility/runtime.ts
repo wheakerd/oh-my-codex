@@ -29,7 +29,7 @@ export async function dispatchHookEventRuntime(input: HookRuntimeDispatchInput):
     };
   }
 
-  await handleNativeStopTeamLeaderAttention(input);
+  if (!input.skipNativeStopTeamLeaderAttention) await handleNativeStopTeamLeaderAttention(input);
 
   const result = await dispatchHookEvent(input.event, {
     cwd: input.cwd,

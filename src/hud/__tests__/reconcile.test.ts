@@ -383,7 +383,7 @@ describe('reconcileHudForPromptSubmit', () => {
         resolveOmxCliEntryPath: () => '/repo/dist/cli/omx.js',
       });
 
-      assert.equal(result.status, 'skipped_concurrent');
+      assert.equal(result.status, 'skipped_custody_conflict');
       assert.equal(listed, false);
       assert.deepEqual(await readLockOwner(lockPath), concurrentOwner);
       const reapedLock = (await readdir(dirname(lockPath)))

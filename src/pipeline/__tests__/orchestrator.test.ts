@@ -1,6 +1,6 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, rm, readFile, writeFile } from 'fs/promises';
+import { chmod, mkdir, mkdtemp, rm, readFile, writeFile } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { existsSync } from 'fs';
@@ -15,6 +15,11 @@ import {
 } from '../orchestrator.js';
 import { createRalplanStage } from '../stages/ralplan.js';
 import type { PipelineConfig, PipelineStage, StageContext, StageResult } from '../types.js';
+import {
+  initializeStateAuthority,
+  mintStateAuthorityTransportCapability,
+} from '../../state/authority.js';
+import { buildStateAuthorityTransportEnv } from '../../state/transport-env.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -63,28 +68,50 @@ function makeThrowingStage(name: string, message: string): PipelineStage {
   };
 }
 
+const TEST_AUTHORITY_ENV_KEYS = [
+  'OMX_ROOT',
+  'OMX_STATE_ROOT',
+  'OMX_TEAM_STATE_ROOT',
+  'OMX_SESSION_ID',
+  'OMX_STARTUP_CWD',
+  'OMX_STATE_AUTHORITY_PATH',
+  'OMX_STATE_AUTHORITY_ID',
+  'OMX_STATE_AUTHORITY_GENERATION_ID',
+  'OMX_STATE_AUTHORITY_WORKSPACE_DIGEST',
+  'OMX_STATE_AUTHORITY_CAPABILITY',
+] as const;
+
 let tempDir: string;
-let savedOmxEnv: Pick<NodeJS.ProcessEnv, 'OMX_ROOT' | 'OMX_STATE_ROOT' | 'OMX_TEAM_STATE_ROOT' | 'OMX_SESSION_ID'>;
+let savedOmxEnv: Map<string, string | undefined>;
 
 function clearAmbientOmxEnv(): void {
-  savedOmxEnv = {
-    OMX_ROOT: process.env.OMX_ROOT,
-    OMX_STATE_ROOT: process.env.OMX_STATE_ROOT,
-    OMX_TEAM_STATE_ROOT: process.env.OMX_TEAM_STATE_ROOT,
-    OMX_SESSION_ID: process.env.OMX_SESSION_ID,
-  };
-  delete process.env.OMX_ROOT;
-  delete process.env.OMX_STATE_ROOT;
-  delete process.env.OMX_TEAM_STATE_ROOT;
-  delete process.env.OMX_SESSION_ID;
+  savedOmxEnv = new Map(TEST_AUTHORITY_ENV_KEYS.map((key) => [key, process.env[key]]));
+  for (const key of TEST_AUTHORITY_ENV_KEYS) delete process.env[key];
 }
 
 function restoreAmbientOmxEnv(): void {
-  for (const key of ['OMX_ROOT', 'OMX_STATE_ROOT', 'OMX_TEAM_STATE_ROOT', 'OMX_SESSION_ID'] as const) {
-    const value = savedOmxEnv[key];
-    if (value === undefined) delete process.env[key];
-    else process.env[key] = value;
+  for (const [key, value] of savedOmxEnv) {
+    if (typeof value === 'string') process.env[key] = value;
+    else delete process.env[key];
   }
+}
+
+async function installPipelineTestAuthority(cwd: string): Promise<void> {
+  await mkdir(join(cwd, '.omx', 'state'), { recursive: true, mode: 0o700 });
+  await chmod(join(cwd, '.omx'), 0o700);
+  await chmod(join(cwd, '.omx', 'state'), 0o700);
+
+  const sessionId = 'pipeline-test-session';
+  const authority = await initializeStateAuthority({
+    startup_cwd: cwd,
+    observed_cwd: cwd,
+    launch_id: `${sessionId}-launch`,
+    session_binding: { canonical_session_id: sessionId },
+  });
+  await mintStateAuthorityTransportCapability(authority);
+  Object.assign(process.env, buildStateAuthorityTransportEnv(authority, {
+    OMX_SESSION_ID: sessionId,
+  }));
 }
 
 async function setup(): Promise<string> {
@@ -106,6 +133,7 @@ describe('Pipeline Orchestrator', () => {
   beforeEach(async () => {
     clearAmbientOmxEnv();
     await setup();
+    await installPipelineTestAuthority(tempDir);
   });
 
   afterEach(async () => {

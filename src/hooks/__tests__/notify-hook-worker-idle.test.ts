@@ -5,21 +5,63 @@ import { chmod, mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { initializeStateAuthority, mintStateAuthorityTransportCapability } from '../../state/authority.js';
+import { buildStateAuthorityTransportEnv } from '../../state/transport-env.js';
+import { hardenTestAuthorityTreeSync } from '../../team/__tests__/authority-fixture.js';
+
+const fixtureAuthorityEnv = new Map<string, NodeJS.ProcessEnv>();
+
+async function initializeNotifyFixtureAuthority(cwd: string): Promise<void> {
+  await mkdir(join(cwd, '.omx'), { recursive: true, mode: 0o700 });
+  await chmod(join(cwd, '.omx'), 0o700);
+  const authority = await initializeStateAuthority({
+    startup_cwd: cwd,
+    observed_cwd: cwd,
+    launch_id: `notify-worker-idle-${Date.now()}`,
+    session_binding: { canonical_session_id: 'notify-worker-idle' },
+  });
+  await mintStateAuthorityTransportCapability(authority);
+  await chmod(authority.canonical_state_root, 0o700);
+  fixtureAuthorityEnv.set(cwd, buildStateAuthorityTransportEnv(authority, { ...process.env, OMX_SESSION_ID: 'notify-worker-idle' }));
+}
+
 
 const NOTIFY_HOOK_SCRIPT = new URL('../../../dist/scripts/notify-hook.js', import.meta.url);
 
 async function withTempWorkingDir(run: (cwd: string) => Promise<void>): Promise<void> {
   const cwd = await mkdtemp(join(tmpdir(), 'omx-notify-worker-idle-'));
   try {
+    await initializeNotifyFixtureAuthority(cwd);
     await run(cwd);
   } finally {
+    fixtureAuthorityEnv.delete(cwd);
     await rm(cwd, { recursive: true, force: true });
   }
 }
 
 async function writeJson(path: string, value: unknown): Promise<void> {
+  const persisted = /(?:config|manifest\.v2)\.json$/.test(path) && value && typeof value === 'object'
+    ? {
+        session_id: 'notify-worker-idle',
+        owner_session_id: 'notify-worker-idle',
+        ...value as Record<string, unknown>,
+      }
+    : value;
   await mkdir(join(path, '..'), { recursive: true });
-  await writeFile(path, JSON.stringify(value, null, 2));
+  await writeFile(path, JSON.stringify(persisted, null, 2));
+  if (path.endsWith('config.json') && persisted && typeof persisted === 'object') {
+    const config = persisted as { workers?: unknown[]; tmux_session?: unknown; leader_pane_id?: unknown };
+    await writeFile(join(path, '..', 'manifest.v2.json'), JSON.stringify({
+      leader: {
+        session_id: 'notify-worker-idle',
+        worker_id: 'leader-fixed',
+        role: 'coordinator',
+      },
+      tmux_session: config.tmux_session ?? null,
+      leader_pane_id: config.leader_pane_id ?? null,
+      workers: config.workers ?? [],
+    }, null, 2));
+  }
 }
 
 function buildFakeTmux(tmuxLogPath: string): string {
@@ -104,6 +146,21 @@ function writeWorkerIdentityFixture(cwd: string, workerEnv: string): string {
       team_state_root: stateRoot,
     }, null, 2));
   }
+  const manifestPath = join(stateRoot, 'team', teamName, 'manifest.v2.json');
+  if (existsSync(manifestPath)) {
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as { workers?: Array<Record<string, unknown>> };
+    const workerIdentity = JSON.parse(readFileSync(identityPath, 'utf8')) as Record<string, unknown>;
+    manifest.workers = [
+      ...(manifest.workers ?? []).filter((candidate) => candidate.name !== workerName),
+      {
+        name: workerName,
+        index: workerIdentity.index,
+        role: workerIdentity.role,
+        assigned_tasks: workerIdentity.assigned_tasks,
+      },
+    ];
+    writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
+  }
   return stateRoot;
 }
 
@@ -126,11 +183,13 @@ function runNotifyHookAsWorker(
     'last-assistant-message': 'task done',
   };
 
+  hardenTestAuthorityTreeSync(cwd);
   return spawnSync(process.execPath, [NOTIFY_HOOK_SCRIPT.pathname, JSON.stringify(payload)], {
     encoding: 'utf8',
     env: {
       ...process.env,
       PATH: `${fakeBinDir}:${process.env.PATH || ''}`,
+      ...fixtureAuthorityEnv.get(cwd),
       OMX_TEAM_WORKER: workerEnv,
       OMX_TEAM_WORKER_IDLE_COOLDOWN_MS: '500',
       OMX_TEAM_ALL_IDLE_COOLDOWN_MS: '600000', // suppress all-idle to isolate per-worker

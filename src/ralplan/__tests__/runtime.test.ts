@@ -1,14 +1,60 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { readModeState, startMode } from '../../modes/base.js';
+import { readModeState, startMode as rawStartMode } from '../../modes/base.js';
 import { getBaseStateDir, getStatePath } from '../../state/paths.js';
 import { writeRoleRoutingMarker } from '../../subagents/role-routing-marker.js';
 import { subagentTrackingPath } from '../../subagents/tracker.js';
-import { cancelRalplanConsensus, runRalplanConsensus } from '../runtime.js';
+import { cancelRalplanConsensus, runRalplanConsensus as rawRunRalplanConsensus } from '../runtime.js';
+
+import { createHash } from 'node:crypto';
+import { initializeStateAuthority, mintStateAuthorityTransportCapability } from '../../state/authority.js';
+import { buildStateAuthorityTransportEnv } from '../../state/transport-env.js';
+
+const AUTHORITY_ENV_KEYS = [
+  'OMX_ROOT', 'OMX_STATE_ROOT', 'OMX_TEAM_STATE_ROOT', 'OMX_STARTUP_CWD', 'OMX_SESSION_ID',
+  'OMX_STATE_AUTHORITY_PATH', 'OMX_STATE_AUTHORITY_ID', 'OMX_STATE_AUTHORITY_GENERATION_ID',
+  'OMX_STATE_AUTHORITY_WORKSPACE_DIGEST', 'OMX_STATE_AUTHORITY_CAPABILITY',
+] as const;
+
+async function installTestAuthority(cwd: string): Promise<void> {
+  const sessionFile = join(cwd, '.omx', 'state', 'session.json');
+  const canonicalSessionId = await readFile(sessionFile, 'utf-8')
+    .then((raw) => (JSON.parse(raw) as { session_id?: string }).session_id?.trim())
+    .catch(() => undefined)
+    ?? `ralplan-runtime-${createHash('sha256').update(cwd).digest('hex').slice(0, 24)}`;
+  const requestedSessionId = process.env.OMX_SESSION_ID?.trim() || canonicalSessionId;
+  await mkdir(join(cwd, '.omx', 'state'), { recursive: true, mode: 0o700 });
+  await chmod(cwd, 0o700);
+  await chmod(join(cwd, '.omx'), 0o700);
+  await chmod(join(cwd, '.omx', 'state'), 0o700);
+  const authority = await initializeStateAuthority({
+    startup_cwd: cwd,
+    observed_cwd: cwd,
+    launch_id: `${canonicalSessionId}-launch`,
+    session_binding: {
+      canonical_session_id: canonicalSessionId,
+      ...(requestedSessionId === canonicalSessionId ? {} : {
+        aliases: { current_session_aliases: [requestedSessionId] },
+      }),
+    },
+  });
+  await mintStateAuthorityTransportCapability(authority);
+  Object.assign(process.env, buildStateAuthorityTransportEnv(authority, { OMX_SESSION_ID: requestedSessionId }));
+}
+
+async function runRalplanConsensus(...args: Parameters<typeof rawRunRalplanConsensus>): ReturnType<typeof rawRunRalplanConsensus> {
+  await installTestAuthority(args[1]?.cwd ?? process.cwd());
+  return rawRunRalplanConsensus(...args);
+}
+
+async function startMode(...args: Parameters<typeof rawStartMode>): ReturnType<typeof rawStartMode> {
+  await installTestAuthority(args[3] ?? process.cwd());
+  return rawStartMode(...args);
+}
 
 function sessionStatePath(cwd: string, sessionId: string): string {
   return getStatePath('ralplan', cwd, sessionId);
@@ -103,24 +149,15 @@ async function writeAdaptedSubagentTracking(cwd: string, sessionId: string): Pro
 }
 
 describe('ralplan runtime', () => {
-  let savedOmxEnv: Pick<NodeJS.ProcessEnv, 'OMX_ROOT' | 'OMX_STATE_ROOT' | 'OMX_TEAM_STATE_ROOT' | 'OMX_SESSION_ID'>;
+  let savedOmxEnv: Map<string, string | undefined>;
 
   beforeEach(() => {
-    savedOmxEnv = {
-      OMX_ROOT: process.env.OMX_ROOT,
-      OMX_STATE_ROOT: process.env.OMX_STATE_ROOT,
-      OMX_TEAM_STATE_ROOT: process.env.OMX_TEAM_STATE_ROOT,
-      OMX_SESSION_ID: process.env.OMX_SESSION_ID,
-    };
-    delete process.env.OMX_ROOT;
-    delete process.env.OMX_STATE_ROOT;
-    delete process.env.OMX_TEAM_STATE_ROOT;
-    delete process.env.OMX_SESSION_ID;
+    savedOmxEnv = new Map(AUTHORITY_ENV_KEYS.map((key) => [key, process.env[key]]));
+    for (const key of AUTHORITY_ENV_KEYS) delete process.env[key];
   });
 
   afterEach(() => {
-    for (const key of ['OMX_ROOT', 'OMX_STATE_ROOT', 'OMX_TEAM_STATE_ROOT', 'OMX_SESSION_ID'] as const) {
-      const value = savedOmxEnv[key];
+    for (const [key, value] of savedOmxEnv) {
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;
     }
@@ -253,7 +290,7 @@ describe('ralplan runtime', () => {
       assert.equal(finalState?.selected_execution_lane, 'none');
       assert.equal(ralplanHandoff?.execution_handoff_status, 'planning_only_terminal');
       assert.equal(ralplanHandoff?.planning_only_terminal, true);
-      assert.equal(existsSync(getStatePath('ultragoal', cwd)), false);
+      assert.equal(await readModeState('ultragoal', cwd), null);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -272,18 +309,18 @@ describe('ralplan runtime', () => {
           return { summary: 'draft', planPath: prdPath };
         },
         async architectReview() {
-          assert.equal(existsSync(getStatePath('ultragoal', cwd)), false);
+          assert.equal(await readModeState('ultragoal', cwd), null);
           return { verdict: 'approve', summary: 'architect ok' };
         },
         async criticReview() {
-          assert.equal(existsSync(getStatePath('ultragoal', cwd)), false);
+          assert.equal(await readModeState('ultragoal', cwd), null);
           return { verdict: 'approve', summary: 'critic ok' };
         },
       }, { task: 'approval starts ultragoal', cwd, maxIterations: 1, selectedExecutionLane: 'ultragoal' });
 
       assert.equal(result.status, 'completed');
       assert.equal(result.executionHandoffStarted, true);
-      const ultragoalState = JSON.parse(await readFile(getStatePath('ultragoal', cwd), 'utf-8')) as Record<string, unknown>;
+      const ultragoalState = await readModeState('ultragoal', cwd) as Record<string, unknown>;
       assert.equal(ultragoalState.active, true);
       assert.equal(ultragoalState.current_phase, 'starting');
       const finalState = await readModeState('ralplan', cwd);

@@ -297,7 +297,7 @@ function authorityAmbientRootConflict(
   authority: Readonly<ResolvedStateAuthorityContext>,
   env: NodeJS.ProcessEnv = process.env,
 ): string | null {
-  const expectedStateRoot = resolve(authority.canonical_state_root);
+  const expectedStateRoot = realpathSync(authority.canonical_state_root);
   const rootAliases: Array<[string, string]> = [
     ["OMX_TEAM_STATE_ROOT", safeString(env.OMX_TEAM_STATE_ROOT).trim()],
     ["OMX_ROOT", safeString(env.OMX_ROOT).trim()],
@@ -308,8 +308,15 @@ function authorityAmbientRootConflict(
     const candidate = name === "OMX_TEAM_STATE_ROOT"
       ? resolve(cwd, value)
       : join(resolve(cwd, value), ".omx", "state");
-    if (resolve(candidate) !== expectedStateRoot) {
-      return `${name} conflicts with the inherited committed state authority: candidate roots ${expectedStateRoot} and ${resolve(candidate)}. Restart the session from the intended workspace or rebind the session authority before retrying.`;
+    // Ambient aliases are diagnostic evidence, not state selectors. Compare an
+    // existing candidate's physical directory identity so macOS /var and
+    // /private/var spellings of the same persisted root do not manufacture a
+    // conflict; an absent or foreign candidate remains conflicting evidence.
+    const candidateStateRoot = existsSync(candidate) && statSync(candidate).isDirectory()
+      ? realpathSync(candidate)
+      : resolve(candidate);
+    if (candidateStateRoot !== expectedStateRoot) {
+      return `${name} conflicts with the inherited committed state authority: candidate roots ${expectedStateRoot} and ${candidateStateRoot}. Restart the session from the intended workspace or rebind the session authority before retrying.`;
     }
   }
   return null;
@@ -10651,11 +10658,16 @@ export async function dispatchCodexNativeHook(
         mode: safeString(payload.mode).trim() || undefined,
       },
     );
+    if (event.source === 'native' && event.event === 'stop' && event.session_id) {
+      const { markOwnedTeamsLeaderStopObserved } = await import('../team/state.js');
+      await markOwnedTeamsLeaderStopObserved(workspaceCwd, event.session_id, event.timestamp, 'native_stop');
+    }
     await withoutStateAuthorityTransport(async () => {
       await dispatchHookEventRuntime({
         event,
         cwd: workspaceCwd,
         allowTeamWorkerSideEffects: false,
+        skipNativeStopTeamLeaderAttention: true,
       });
     });
   }

@@ -1,4 +1,5 @@
-import { describe, it } from 'node:test';
+import { afterEach, beforeEach, describe, it } from 'node:test';
+
 import assert from 'node:assert/strict';
 import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, writeFile } from 'fs/promises';
 import { existsSync } from 'fs';
@@ -11,11 +12,72 @@ import {
   StateAuthorityError,
 } from '../../state/authority.js';
 
+const isolatedEnvKeys = [
+  'OMX_MCP_WORKDIR_ROOTS',
+  'OMX_STATE_SERVER_DISABLE_AUTO_START',
+  'OMX_AUTHORITY_MODULE_URL',
+  'OMX_AUTHORITY_WORKSPACE',
+  'OMX_ROOT',
+  'OMX_STATE_ROOT',
+  'OMX_TEAM_STATE_ROOT',
+  'OMX_SESSION_ID',
+  'CODEX_SESSION_ID',
+  'SESSION_ID',
+  'OMX_STARTUP_CWD',
+  'OMX_STATE_AUTHORITY_PATH',
+  'OMX_STATE_AUTHORITY_ID',
+  'OMX_STATE_AUTHORITY_GENERATION_ID',
+  'OMX_STATE_AUTHORITY_WORKSPACE_DIGEST',
+  'OMX_STATE_AUTHORITY_CAPABILITY',
+] as const;
+
+const originalEnv = Object.fromEntries(
+  isolatedEnvKeys.map((key) => [key, process.env[key]]),
+) as Record<(typeof isolatedEnvKeys)[number], string | undefined>;
+
+beforeEach(() => {
+  for (const key of isolatedEnvKeys) delete process.env[key];
+});
+
+afterEach(() => {
+  for (const key of isolatedEnvKeys) {
+    const value = originalEnv[key];
+    if (typeof value === 'string') process.env[key] = value;
+    else delete process.env[key];
+  }
+});
+
+const COMMITTED_TEST_OWNER_SESSION_ID = 'state-server-test-owner';
+
+async function secureTestAuthorityDirectories(workingDirectory: string): Promise<void> {
+  const omxRoot = join(workingDirectory, '.omx');
+  const stateRoot = join(omxRoot, 'state');
+  const sessionsRoot = join(stateRoot, 'sessions');
+  const directories = [
+    omxRoot,
+    join(omxRoot, 'bootstrap'),
+    stateRoot,
+    join(stateRoot, 'authority'),
+    sessionsRoot,
+  ];
+  for (const directory of directories) {
+    if (existsSync(directory)) await chmod(directory, 0o700);
+  }
+  if (existsSync(sessionsRoot)) {
+    for (const entry of await readdir(sessionsRoot, { withFileTypes: true })) {
+      if (entry.isDirectory()) await chmod(join(sessionsRoot, entry.name), 0o700);
+    }
+  }
+}
+
+function committedTestOwnerStateDir(workingDirectory: string): string {
+  return join(workingDirectory, '.omx', 'state', 'sessions', COMMITTED_TEST_OWNER_SESSION_ID);
+}
+
 const stateServerAuthorityInitByWorkspace = new Map<string, Promise<void>>();
 
 async function ensureTestStateServerAuthority(
   workingDirectory: string,
-  sessionId: string | undefined,
 ): Promise<void> {
   const canonicalWorkingDirectory = await realpath(workingDirectory);
   const existing = stateServerAuthorityInitByWorkspace.get(canonicalWorkingDirectory);
@@ -47,11 +109,15 @@ async function ensureTestStateServerAuthority(
     );
     const staged = existsSync(stateRoot);
     if (staged) await rename(stateRoot, stagedStateRoot);
+    await mkdir(join(canonicalWorkingDirectory, '.omx'), { recursive: true, mode: 0o700 });
+    await chmod(join(canonicalWorkingDirectory, '.omx'), 0o700);
+
     try {
-      const requestedSessionId = sessionId?.trim()
-        || `state-server-test-session-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const requestedSessionId = COMMITTED_TEST_OWNER_SESSION_ID;
+
       await initializeStateAuthority({
         startup_cwd: canonicalWorkingDirectory,
+        observed_cwd: canonicalWorkingDirectory,
         launch_id: `state-server-test-launch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
         session_binding: { canonical_session_id: requestedSessionId },
       });
@@ -61,6 +127,8 @@ async function ensureTestStateServerAuthority(
         }
         await rm(stagedStateRoot, { recursive: true, force: true });
       }
+      await secureTestAuthorityDirectories(canonicalWorkingDirectory);
+
     } catch (error) {
       if (staged && existsSync(stagedStateRoot) && !existsSync(stateRoot)) {
         await rename(stagedStateRoot, stateRoot);
@@ -86,10 +154,7 @@ async function handleStateToolCallWithCommittedAuthority(
     const workingDirectory = typeof rawArgs.workingDirectory === 'string'
       ? rawArgs.workingDirectory
       : process.cwd();
-    const requestedSessionId = typeof rawArgs.session_id === 'string'
-      ? rawArgs.session_id
-      : undefined;
-    await ensureTestStateServerAuthority(workingDirectory, requestedSessionId);
+    await ensureTestStateServerAuthority(workingDirectory);
   }
   return handleStateToolCall(request);
 }
@@ -202,7 +267,7 @@ describe('state-server directory initialization', () => {
     }
   });
 
-  it('ignores empty ambient OMX_ROOT for mutating tools', async () => {
+  it('rejects conflicting ambient OMX_ROOT without mutating committed state', async () => {
     process.env.OMX_STATE_SERVER_DISABLE_AUTO_START = '1';
     const previousOmxRoot = process.env.OMX_ROOT;
     const handleStateToolCall = await getTestStateToolCall();
@@ -212,6 +277,7 @@ describe('state-server directory initialization', () => {
     const wd = join(root, 'source');
     try {
       await mkdir(wd, { recursive: true });
+      await ensureTestStateServerAuthority(wd);
       process.env.OMX_ROOT = box;
 
       const response = await handleStateToolCall({
@@ -227,10 +293,10 @@ describe('state-server directory initialization', () => {
         },
       });
 
-      assert.equal(response.isError, undefined);
-      assert.equal(existsSync(join(wd, '.omx', 'state', 'ralph-state.json')), true);
-      assert.equal(existsSync(join(wd, '.omx', 'tmux-hook.json')), true);
-      assert.equal(existsSync(join(box, '.omx', 'state')), false);
+      assert.equal(response.isError, true);
+      assert.equal(existsSync(join(committedTestOwnerStateDir(wd), 'ralph-state.json')), false);
+      assert.equal(existsSync(join(wd, '.omx', 'tmux-hook.json')), false);
+      assert.equal(existsSync(box), false);
     } finally {
       if (typeof previousOmxRoot === 'string') process.env.OMX_ROOT = previousOmxRoot;
       else delete process.env.OMX_ROOT;
@@ -238,7 +304,7 @@ describe('state-server directory initialization', () => {
     }
   });
 
-  it('co-locates tracked mode and canonical skill state under committed authority', async () => {
+  it('rejects conflicting ambient OMX_ROOT before tracked-mode or canonical writes', async () => {
     process.env.OMX_STATE_SERVER_DISABLE_AUTO_START = '1';
     const previousOmxRoot = process.env.OMX_ROOT;
     const previousOmxStateRoot = process.env.OMX_STATE_ROOT;
@@ -251,6 +317,7 @@ describe('state-server directory initialization', () => {
     const sessionId = 'sess-boxed-ralplan';
     try {
       await mkdir(wd, { recursive: true });
+      await ensureTestStateServerAuthority(wd);
       process.env.OMX_ROOT = box;
       delete process.env.OMX_STATE_ROOT;
       delete process.env.OMX_TEAM_STATE_ROOT;
@@ -268,10 +335,10 @@ describe('state-server directory initialization', () => {
         },
       });
 
-      assert.equal(response.isError, undefined);
-      const canonicalSessionDir = join(wd, '.omx', 'state', 'sessions', sessionId);
-      assert.equal(existsSync(join(canonicalSessionDir, 'ralplan-state.json')), true);
-      assert.equal(existsSync(join(canonicalSessionDir, 'skill-active-state.json')), true);
+      assert.equal(response.isError, true);
+      const ownerStateDir = committedTestOwnerStateDir(wd);
+      assert.equal(existsSync(join(ownerStateDir, 'ralplan-state.json')), false);
+      assert.equal(existsSync(join(ownerStateDir, 'skill-active-state.json')), false);
       assert.equal(existsSync(box), false);
     } finally {
       if (typeof previousOmxRoot === 'string') process.env.OMX_ROOT = previousOmxRoot;
@@ -284,7 +351,7 @@ describe('state-server directory initialization', () => {
     }
   });
 
-  it('ignores empty ambient OMX_TEAM_STATE_ROOT for first mutation', async () => {
+  it('rejects conflicting ambient OMX_TEAM_STATE_ROOT without creating state there', async () => {
     process.env.OMX_STATE_SERVER_DISABLE_AUTO_START = '1';
     const previousOmxRoot = process.env.OMX_ROOT;
     const previousOmxStateRoot = process.env.OMX_STATE_ROOT;
@@ -297,6 +364,7 @@ describe('state-server directory initialization', () => {
     const sessionId = 'sess-team-ralplan';
     try {
       await mkdir(wd, { recursive: true });
+      await ensureTestStateServerAuthority(wd);
       delete process.env.OMX_ROOT;
       delete process.env.OMX_STATE_ROOT;
       process.env.OMX_TEAM_STATE_ROOT = teamStateRoot;
@@ -314,10 +382,10 @@ describe('state-server directory initialization', () => {
         },
       });
 
-      assert.equal(response.isError, undefined);
-      const canonicalSessionDir = join(wd, '.omx', 'state', 'sessions', sessionId);
-      assert.equal(existsSync(join(canonicalSessionDir, 'ralplan-state.json')), true);
-      assert.equal(existsSync(join(canonicalSessionDir, 'skill-active-state.json')), true);
+      assert.equal(response.isError, true);
+      const ownerStateDir = committedTestOwnerStateDir(wd);
+      assert.equal(existsSync(join(ownerStateDir, 'ralplan-state.json')), false);
+      assert.equal(existsSync(join(ownerStateDir, 'skill-active-state.json')), false);
       assert.equal(existsSync(teamStateRoot), false);
     } finally {
       if (typeof previousOmxRoot === 'string') process.env.OMX_ROOT = previousOmxRoot;
@@ -330,7 +398,7 @@ describe('state-server directory initialization', () => {
     }
   });
 
-  it('keeps auto-completed transition state under committed authority', async () => {
+  it('rejects conflicting ambient OMX_TEAM_STATE_ROOT before workflow transition writes', async () => {
     process.env.OMX_STATE_SERVER_DISABLE_AUTO_START = '1';
     const previousOmxRoot = process.env.OMX_ROOT;
     const previousOmxStateRoot = process.env.OMX_STATE_ROOT;
@@ -343,6 +411,7 @@ describe('state-server directory initialization', () => {
     const sessionId = 'sess-team-transition';
     try {
       await mkdir(wd, { recursive: true });
+      await ensureTestStateServerAuthority(wd);
       delete process.env.OMX_ROOT;
       delete process.env.OMX_STATE_ROOT;
       process.env.OMX_TEAM_STATE_ROOT = teamStateRoot;
@@ -363,31 +432,13 @@ describe('state-server directory initialization', () => {
           },
         },
       });
-      assert.equal(deepInterview.isError, undefined);
 
-      const ralplan = await handleStateToolCall({
-        params: {
-          name: 'state_write',
-          arguments: {
-            workingDirectory: wd,
-            session_id: sessionId,
-            mode: 'ralplan',
-            active: true,
-            current_phase: 'planning',
-          },
-        },
-      });
-
-      assert.equal(ralplan.isError, undefined);
-      const canonicalSessionDir = join(wd, '.omx', 'state', 'sessions', sessionId);
-      const completedDeepInterview = JSON.parse(
-        await readFile(join(canonicalSessionDir, 'deep-interview-state.json'), 'utf-8'),
-      ) as { active?: boolean; current_phase?: string };
-      assert.equal(completedDeepInterview.active, false);
-      assert.equal(completedDeepInterview.current_phase, 'completed');
-      assert.equal(existsSync(join(canonicalSessionDir, 'ralplan-state.json')), true);
-      assert.equal(existsSync(join(canonicalSessionDir, 'skill-active-state.json')), true);
-      assert.equal(existsSync(join(teamStateRoot, 'sessions')), false);
+      assert.equal(deepInterview.isError, true);
+      const ownerStateDir = committedTestOwnerStateDir(wd);
+      assert.equal(existsSync(join(ownerStateDir, 'deep-interview-state.json')), false);
+      assert.equal(existsSync(join(ownerStateDir, 'ralplan-state.json')), false);
+      assert.equal(existsSync(join(ownerStateDir, 'skill-active-state.json')), false);
+      assert.equal(existsSync(teamStateRoot), false);
     } finally {
       if (typeof previousOmxRoot === 'string') process.env.OMX_ROOT = previousOmxRoot;
       else delete process.env.OMX_ROOT;
@@ -526,7 +577,8 @@ describe('state-server directory initialization', () => {
         {
           success: true,
           mode: 'deep-interview',
-          path: join(wd, '.omx', 'state', 'deep-interview-state.json'),
+          path: join(committedTestOwnerStateDir(wd), 'deep-interview-state.json'),
+
         },
       );
 
@@ -680,7 +732,8 @@ describe('state-server directory initialization', () => {
       });
 
       assert.equal(response.isError, undefined);
-      const state = JSON.parse(await readFile(join(wd, '.omx', 'state', 'autopilot-state.json'), 'utf-8')) as {
+      const state = JSON.parse(await readFile(join(committedTestOwnerStateDir(wd), 'autopilot-state.json'), 'utf-8')) as {
+
         active?: boolean;
         lifecycle_outcome?: string;
         terminal_outcome?: string;
@@ -718,7 +771,8 @@ describe('state-server directory initialization', () => {
       });
 
       assert.equal(response.isError, undefined);
-      const state = JSON.parse(await readFile(join(wd, '.omx', 'state', 'autopilot-state.json'), 'utf-8')) as {
+      const state = JSON.parse(await readFile(join(committedTestOwnerStateDir(wd), 'autopilot-state.json'), 'utf-8')) as {
+
         lifecycle_outcome?: string;
         run_outcome?: string;
       };
@@ -751,7 +805,8 @@ describe('state-server directory initialization', () => {
         assert.equal(response.isError, undefined);
       }
 
-      const filePath = join(wd, '.omx', 'state', 'team-state.json');
+      const filePath = join(committedTestOwnerStateDir(wd), 'team-state.json');
+
       const state = JSON.parse(await readFile(filePath, 'utf-8')) as Record<string, unknown>;
       for (let i = 0; i < 16; i++) {
         assert.equal(state[`k${i}`], i);
@@ -772,7 +827,7 @@ describe('state-server directory initialization', () => {
           name: 'state_write',
           arguments: {
             workingDirectory: wd,
-            session_id: 'sess-sync',
+            session_id: COMMITTED_TEST_OWNER_SESSION_ID,
             mode: 'ralph',
             active: true,
             iteration: 1,
@@ -782,7 +837,7 @@ describe('state-server directory initialization', () => {
         },
       });
 
-      const canonicalPath = join(wd, '.omx', 'state', 'sessions', 'sess-sync', 'skill-active-state.json');
+      const canonicalPath = join(committedTestOwnerStateDir(wd), 'skill-active-state.json');
       const canonical = JSON.parse(await readFile(canonicalPath, 'utf-8')) as {
         active_skills?: Array<{ skill: string; session_id?: string; activated_at?: string; updated_at?: string }>;
       };
@@ -792,7 +847,7 @@ describe('state-server directory initialization', () => {
         active: true,
         activated_at: canonical.active_skills?.[0]?.activated_at,
         updated_at: canonical.active_skills?.[0]?.updated_at,
-        session_id: 'sess-sync',
+        session_id: COMMITTED_TEST_OWNER_SESSION_ID,
       }]);
 
       await handleStateToolCall({
@@ -800,7 +855,7 @@ describe('state-server directory initialization', () => {
           name: 'state_clear',
           arguments: {
             workingDirectory: wd,
-            session_id: 'sess-sync',
+            session_id: COMMITTED_TEST_OWNER_SESSION_ID,
             mode: 'ralph',
           },
         },
@@ -824,10 +879,11 @@ describe('state-server directory initialization', () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-state-server-clear-root-fallback-'));
     try {
       const stateDir = join(wd, '.omx', 'state');
-      const sessionId = 'sess-clear';
+      const sessionId = COMMITTED_TEST_OWNER_SESSION_ID;
       const sessionDir = join(stateDir, 'sessions', sessionId);
-      await mkdir(sessionDir, { recursive: true });
-      await writeFile(join(stateDir, 'session.json'), JSON.stringify({ session_id: sessionId }, null, 2));
+      await ensureTestStateServerAuthority(wd);
+      await mkdir(sessionDir, { recursive: true, mode: 0o700 });
+      await chmod(sessionDir, 0o700);
       await writeFile(
         join(stateDir, 'deep-interview-state.json'),
         JSON.stringify({ active: true, mode: 'deep-interview', current_phase: 'legacy-root' }, null, 2),
@@ -837,15 +893,17 @@ describe('state-server directory initialization', () => {
         JSON.stringify({ active: true, mode: 'deep-interview', current_phase: 'session-active' }, null, 2),
       );
 
-      await handleStateToolCall({
+      const clear = await handleStateToolCall({
         params: {
           name: 'state_clear',
           arguments: {
             workingDirectory: wd,
+            session_id: COMMITTED_TEST_OWNER_SESSION_ID,
             mode: 'deep-interview',
           },
         },
       });
+      assert.equal(clear.isError, undefined, JSON.stringify(clear));
 
       const sessionState = JSON.parse(
         await readFile(join(sessionDir, 'deep-interview-state.json'), 'utf-8'),
@@ -859,6 +917,7 @@ describe('state-server directory initialization', () => {
           name: 'state_list_active',
           arguments: {
             workingDirectory: wd,
+            session_id: COMMITTED_TEST_OWNER_SESSION_ID,
           },
         },
       });
@@ -869,6 +928,7 @@ describe('state-server directory initialization', () => {
           name: 'state_read',
           arguments: {
             workingDirectory: wd,
+            session_id: COMMITTED_TEST_OWNER_SESSION_ID,
             mode: 'deep-interview',
           },
         },
@@ -876,6 +936,11 @@ describe('state-server directory initialization', () => {
       const readBody = JSON.parse(readResponse.content[0]?.text || '{}') as Record<string, unknown>;
       assert.equal(readBody.active, false);
       assert.equal(readBody.current_phase, 'cleared');
+      const legacyRootState = JSON.parse(
+        await readFile(join(stateDir, 'deep-interview-state.json'), 'utf-8'),
+      ) as Record<string, unknown>;
+      assert.equal(legacyRootState.active, true);
+      assert.equal(legacyRootState.current_phase, 'legacy-root');
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
@@ -892,7 +957,7 @@ describe('state-server directory initialization', () => {
           name: 'state_write',
           arguments: {
             workingDirectory: wd,
-            session_id: 'sess-overlap',
+            session_id: COMMITTED_TEST_OWNER_SESSION_ID,
             mode: 'team',
             active: true,
             current_phase: 'running',
@@ -904,7 +969,7 @@ describe('state-server directory initialization', () => {
           name: 'state_write',
           arguments: {
             workingDirectory: wd,
-            session_id: 'sess-overlap',
+            session_id: COMMITTED_TEST_OWNER_SESSION_ID,
             mode: 'ralph',
             active: true,
             iteration: 1,
@@ -914,7 +979,7 @@ describe('state-server directory initialization', () => {
         },
       });
 
-      const canonicalPath = join(wd, '.omx', 'state', 'sessions', 'sess-overlap', 'skill-active-state.json');
+      const canonicalPath = join(committedTestOwnerStateDir(wd), 'skill-active-state.json');
       const canonical = JSON.parse(await readFile(canonicalPath, 'utf-8')) as {
         active_skills?: Array<{ skill: string }>;
       };
@@ -925,7 +990,7 @@ describe('state-server directory initialization', () => {
           name: 'state_clear',
           arguments: {
             workingDirectory: wd,
-            session_id: 'sess-overlap',
+            session_id: COMMITTED_TEST_OWNER_SESSION_ID,
             mode: 'team',
           },
         },
@@ -995,7 +1060,8 @@ describe('state-server directory initialization', () => {
 
     const wd = await mkdtemp(join(tmpdir(), 'omx-state-server-canonical-prevalidate-'));
     try {
-      await mkdir(join(wd, '.omx', 'state', 'sessions', 'sess-canonical-deny'), { recursive: true });
+      await mkdir(join(wd, '.omx', 'state', 'sessions', 'sess-canonical-deny'), { recursive: true, mode: 0o700 });
+      await secureTestAuthorityDirectories(wd);
       await writeFile(
         join(wd, '.omx', 'state', 'team-state.json'),
         JSON.stringify({ active: true, mode: 'team', current_phase: 'running' }, null, 2),
@@ -1052,48 +1118,56 @@ describe('state-server directory initialization', () => {
 
     const wd = await mkdtemp(join(tmpdir(), 'omx-state-server-canonical-clear-all-'));
     try {
-      await handleStateToolCall({
+      const writeResponse = await handleStateToolCall({
         params: {
           name: 'state_write',
           arguments: {
             workingDirectory: wd,
+            session_id: COMMITTED_TEST_OWNER_SESSION_ID,
             mode: 'team',
             active: true,
             current_phase: 'running',
           },
         },
       });
+      assert.equal(writeResponse.isError, undefined, JSON.stringify(writeResponse));
 
-      await handleStateToolCall({
+      const clearResponse = await handleStateToolCall({
         params: {
           name: 'state_clear',
           arguments: {
             workingDirectory: wd,
+            session_id: COMMITTED_TEST_OWNER_SESSION_ID,
             mode: 'team',
             all_sessions: true,
           },
         },
       });
+      assert.equal(clearResponse.isError, undefined, JSON.stringify(clearResponse));
 
-      const canonicalPath = join(wd, '.omx', 'state', 'skill-active-state.json');
-      const canonical = JSON.parse(await readFile(canonicalPath, 'utf-8')) as {
-        active: boolean;
-        active_skills?: unknown[];
-      };
-      assert.equal(canonical.active, false);
-      assert.deepEqual(canonical.active_skills, []);
+      const canonicalPath = join(committedTestOwnerStateDir(wd), 'skill-active-state.json');
+      assert.equal(existsSync(canonicalPath), false);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
   });
 
-  it('does not propagate root clears into isolated session canonical copies', async () => {
+  it('clears only the committed-owner canonical state and preserves unrelated session files', async () => {
     process.env.OMX_STATE_SERVER_DISABLE_AUTO_START = '1';
     const handleStateToolCall = await getTestStateToolCall();
 
     const wd = await mkdtemp(join(tmpdir(), 'omx-state-server-root-clear-propagate-'));
+    const unrelatedSessionId = 'sess-root-clear';
+    const unrelatedCanonicalPath = join(
+      wd,
+      '.omx',
+      'state',
+      'sessions',
+      unrelatedSessionId,
+      'skill-active-state.json',
+    );
     try {
-      await handleStateToolCall({
+      const teamWrite = await handleStateToolCall({
         params: {
           name: 'state_write',
           arguments: {
@@ -1104,44 +1178,56 @@ describe('state-server directory initialization', () => {
           },
         },
       });
-      await handleStateToolCall({
-        params: {
-          name: 'state_write',
-          arguments: {
-            workingDirectory: wd,
-            session_id: 'sess-root-clear',
-            mode: 'ralph',
-            active: true,
-            iteration: 1,
-            max_iterations: 3,
-            current_phase: 'executing',
-          },
-        },
-      });
-
-      await handleStateToolCall({
+      assert.equal(teamWrite.isError, undefined);
+      await writeFile(
+        join(wd, '.omx', 'state', 'team-state.json'),
+        JSON.stringify({ active: true, mode: 'team', current_phase: 'legacy-root' }, null, 2),
+      );
+      await mkdir(join(wd, '.omx', 'state', 'sessions', unrelatedSessionId), { recursive: true, mode: 0o700 });
+      await secureTestAuthorityDirectories(wd);
+      await writeFile(
+        unrelatedCanonicalPath,
+        JSON.stringify({
+          active: true,
+          skill: 'ralph',
+          session_id: unrelatedSessionId,
+          active_skills: [{ skill: 'ralph', session_id: unrelatedSessionId }],
+        }, null, 2),
+      );
+      const clear = await handleStateToolCall({
         params: {
           name: 'state_clear',
-          arguments: {
-            workingDirectory: wd,
-            mode: 'team',
-          },
+          arguments: { workingDirectory: wd, mode: 'team' },
         },
       });
+      assert.equal(clear.isError, undefined);
 
-      const sessionCanonical = JSON.parse(
-        await readFile(
-          join(wd, '.omx', 'state', 'sessions', 'sess-root-clear', 'skill-active-state.json'),
-          'utf-8',
-        ),
-      ) as { active_skills?: Array<{ skill: string }> };
-      assert.deepEqual(sessionCanonical.active_skills?.map((entry) => entry.skill), ['ralph']);
+      const ownerTombstone = JSON.parse(
+        await readFile(join(committedTestOwnerStateDir(wd), 'team-state.json'), 'utf-8'),
+      ) as Record<string, unknown>;
+      assert.equal(ownerTombstone.active, false);
+      assert.equal(ownerTombstone.current_phase, 'cleared');
+      assert.equal(ownerTombstone.session_id, COMMITTED_TEST_OWNER_SESSION_ID);
+      const legacyRootState = JSON.parse(
+        await readFile(join(wd, '.omx', 'state', 'team-state.json'), 'utf-8'),
+      ) as Record<string, unknown>;
+      assert.equal(legacyRootState.active, true);
+      assert.equal(legacyRootState.current_phase, 'legacy-root');
+      const ownerCanonical = JSON.parse(
+        await readFile(join(committedTestOwnerStateDir(wd), 'skill-active-state.json'), 'utf-8'),
+      ) as { active?: boolean; active_skills?: unknown[] };
+      assert.equal(ownerCanonical.active, false);
+      assert.deepEqual(ownerCanonical.active_skills, []);
+      const unrelatedCanonical = JSON.parse(await readFile(unrelatedCanonicalPath, 'utf-8')) as {
+        active_skills?: Array<{ skill: string }>;
+      };
+      assert.deepEqual(unrelatedCanonical.active_skills?.map((entry) => entry.skill), ['ralph']);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
   });
 
-  it('keeps root-scoped team state out of session-scoped ralph canonical state', async () => {
+  it('keeps tracked team and ralph state in the committed-owner canonical state', async () => {
     process.env.OMX_STATE_SERVER_DISABLE_AUTO_START = '1';
     const handleStateToolCall = await getTestStateToolCall();
 
@@ -1165,7 +1251,7 @@ describe('state-server directory initialization', () => {
           name: 'state_write',
           arguments: {
             workingDirectory: wd,
-            session_id: 'sess-team-ralph',
+            session_id: COMMITTED_TEST_OWNER_SESSION_ID,
             mode: 'ralph',
             active: true,
             iteration: 1,
@@ -1176,31 +1262,22 @@ describe('state-server directory initialization', () => {
       });
       assert.equal(ralphWrite.isError, undefined);
 
-      const rootCanonical = JSON.parse(
-        await readFile(join(wd, '.omx', 'state', 'skill-active-state.json'), 'utf-8'),
-      ) as { active_skills?: Array<{ skill: string; phase?: string; session_id?: string }> };
-      assert.deepEqual(
-        rootCanonical.active_skills?.map(({ skill, phase, session_id }) => ({
-          skill,
-          phase,
-          session_id,
-        })),
-        [{ skill: 'team', phase: 'running', session_id: undefined }],
-      );
+      const ownerCanonical = JSON.parse(
 
-      const sessionCanonical = JSON.parse(
-        await readFile(
-          join(wd, '.omx', 'state', 'sessions', 'sess-team-ralph', 'skill-active-state.json'),
-          'utf-8',
-        ),
+        await readFile(join(committedTestOwnerStateDir(wd), 'skill-active-state.json'), 'utf-8'),
+
       ) as { active_skills?: Array<{ skill: string; phase?: string; session_id?: string }> };
       assert.deepEqual(
-        sessionCanonical.active_skills?.map(({ skill, phase, session_id }) => ({
+        ownerCanonical.active_skills?.map(({ skill, phase, session_id }) => ({
+
           skill,
           phase,
           session_id,
         })),
-        [{ skill: 'ralph', phase: 'executing', session_id: 'sess-team-ralph' }],
+        [
+          { skill: 'team', phase: 'running', session_id: COMMITTED_TEST_OWNER_SESSION_ID },
+          { skill: 'ralph', phase: 'executing', session_id: COMMITTED_TEST_OWNER_SESSION_ID },
+        ],
       );
     } finally {
       await rm(wd, { recursive: true, force: true });
@@ -1265,32 +1342,37 @@ describe('state-server directory initialization', () => {
     }
   });
 
-  it('auto-completes deep-interview when starting ralplan and returns transition messaging', async () => {
+  it('auto-completes committed-owner deep-interview state when starting ralplan', async () => {
     process.env.OMX_STATE_SERVER_DISABLE_AUTO_START = '1';
     const handleStateToolCall = await getTestStateToolCall();
 
     const wd = await mkdtemp(join(tmpdir(), 'omx-state-server-handoff-interview-'));
     try {
-      await mkdir(join(wd, '.omx', 'state', 'sessions', 'sess-handoff'), { recursive: true });
-      await writeFile(
-        join(wd, '.omx', 'state', 'sessions', 'sess-handoff', 'deep-interview-state.json'),
-        JSON.stringify({
-          active: true,
-          mode: 'deep-interview',
-          current_phase: 'intent-first',
-          deep_interview_gate: {
-            status: 'complete',
-            rationale: 'Requirements are clarified and ready for ralplan consensus.',
+      const ownerStateDir = committedTestOwnerStateDir(wd);
+      const sourceWrite = await handleStateToolCall({
+        params: {
+          name: 'state_write',
+          arguments: {
+            workingDirectory: wd,
+            session_id: COMMITTED_TEST_OWNER_SESSION_ID,
+            mode: 'deep-interview',
+            active: true,
+            current_phase: 'intent-first',
+            deep_interview_gate: {
+              status: 'complete',
+              rationale: 'Requirements are clarified and ready for ralplan consensus.',
+            },
           },
-        }, null, 2),
-      );
+        },
+      });
+      assert.equal(sourceWrite.isError, undefined, JSON.stringify(sourceWrite));
 
       const response = await handleStateToolCall({
         params: {
           name: 'state_write',
           arguments: {
             workingDirectory: wd,
-            session_id: 'sess-handoff',
+            session_id: COMMITTED_TEST_OWNER_SESSION_ID,
             mode: 'ralplan',
             active: true,
             current_phase: 'planning',
@@ -1298,23 +1380,25 @@ describe('state-server directory initialization', () => {
         },
       });
 
-      assert.equal(response.isError, undefined);
+      assert.equal(response.isError, undefined, JSON.stringify(response));
       const body = JSON.parse(response.content[0]?.text || '{}') as { transition?: string };
       assert.equal(body.transition, 'mode transiting: deep-interview -> ralplan');
 
       const completed = JSON.parse(
-        await readFile(join(wd, '.omx', 'state', 'sessions', 'sess-handoff', 'deep-interview-state.json'), 'utf-8'),
+        await readFile(join(ownerStateDir, 'deep-interview-state.json'), 'utf-8'),
       ) as {
         active?: boolean;
         current_phase?: string;
         completed_at?: string;
         auto_completed_reason?: string;
         run_outcome?: string;
+        session_id?: string;
       };
       assert.equal(completed.active, false);
       assert.equal(completed.current_phase, 'completed');
       assert.equal(typeof completed.completed_at, 'string');
       assert.equal(completed.run_outcome, 'finish');
+      assert.equal(completed.session_id, COMMITTED_TEST_OWNER_SESSION_ID);
       assert.match(completed.auto_completed_reason || '', /mode transiting: deep-interview -> ralplan/);
     } finally {
       await rm(wd, { recursive: true, force: true });
@@ -1368,7 +1452,8 @@ describe('state-server directory initialization', () => {
 
     const wd = await mkdtemp(join(tmpdir(), 'omx-state-server-validate-before-transition-'));
     try {
-      await mkdir(join(wd, '.omx', 'state', 'sessions', 'sess-invalid'), { recursive: true });
+      await mkdir(join(wd, '.omx', 'state', 'sessions', 'sess-invalid'), { recursive: true, mode: 0o700 });
+      await secureTestAuthorityDirectories(wd);
       await writeFile(
         join(wd, '.omx', 'state', 'sessions', 'sess-invalid', 'ralplan-state.json'),
         JSON.stringify({ active: true, mode: 'ralplan', current_phase: 'planning' }, null, 2),
@@ -1505,113 +1590,140 @@ describe('state-server directory initialization', () => {
     }
   });
 
-  it('does not auto-complete session workflows from root-scoped workflow writes', async () => {
+  it('does not auto-complete unrelated session workflows from committed-owner writes', async () => {
     process.env.OMX_STATE_SERVER_DISABLE_AUTO_START = '1';
     const handleStateToolCall = await getTestStateToolCall();
 
     const wd = await mkdtemp(join(tmpdir(), 'omx-state-server-root-session-isolation-'));
+    const unrelatedSessionId = 'sess-interview';
+    const unrelatedStatePath = join(
+      wd,
+      '.omx',
+      'state',
+      'sessions',
+      unrelatedSessionId,
+      'deep-interview-state.json',
+    );
     try {
-      await handleStateToolCall({
-        params: {
-          name: 'state_write',
-          arguments: {
-            workingDirectory: wd,
-            session_id: 'sess-interview',
-            mode: 'deep-interview',
-            active: true,
-            current_phase: 'asking',
-          },
-        },
-      });
+      await ensureTestStateServerAuthority(wd);
+      await mkdir(join(wd, '.omx', 'state', 'sessions', unrelatedSessionId), { recursive: true, mode: 0o700 });
+      await secureTestAuthorityDirectories(wd);
+      await writeFile(
+        unrelatedStatePath,
+        JSON.stringify({
+          active: true,
+          mode: 'deep-interview',
+          current_phase: 'asking',
+          session_id: unrelatedSessionId,
+        }, null, 2),
+      );
 
-      const rootWrite = await handleStateToolCall({
+      const ownerWrite = await handleStateToolCall({
         params: {
           name: 'state_write',
           arguments: {
             workingDirectory: wd,
+            session_id: COMMITTED_TEST_OWNER_SESSION_ID,
             mode: 'ralplan',
             active: true,
             current_phase: 'planning',
           },
         },
       });
-      assert.equal(rootWrite.isError, undefined);
+      assert.equal(ownerWrite.isError, undefined, JSON.stringify(ownerWrite));
 
-      const sessionState = JSON.parse(
-        await readFile(join(wd, '.omx', 'state', 'sessions', 'sess-interview', 'deep-interview-state.json'), 'utf-8'),
+      const unrelatedState = JSON.parse(await readFile(unrelatedStatePath, 'utf-8')) as Record<string, unknown>;
+      assert.equal(unrelatedState.active, true);
+      assert.equal(unrelatedState.current_phase, 'asking');
+      assert.equal(unrelatedState.session_id, unrelatedSessionId);
+      assert.equal(unrelatedState.auto_completed_reason, undefined);
+      const ownerRalplanState = JSON.parse(
+        await readFile(join(committedTestOwnerStateDir(wd), 'ralplan-state.json'), 'utf-8'),
       ) as Record<string, unknown>;
-      assert.equal(sessionState.active, true);
-      assert.equal(sessionState.current_phase, 'asking');
-      assert.equal(sessionState.auto_completed_reason, undefined);
-
-      const sessionCanonical = JSON.parse(
-        await readFile(join(wd, '.omx', 'state', 'sessions', 'sess-interview', 'skill-active-state.json'), 'utf-8'),
-      ) as { active_skills?: Array<{ skill: string; session_id?: string }> };
-      assert.deepEqual(
-        sessionCanonical.active_skills?.map(({ skill, session_id }) => ({ skill, session_id })),
-        [{ skill: 'deep-interview', session_id: 'sess-interview' }],
-      );
-
-      const rootState = JSON.parse(await readFile(join(wd, '.omx', 'state', 'ralplan-state.json'), 'utf-8')) as Record<string, unknown>;
-      assert.equal(rootState.active, true);
+      assert.equal(ownerRalplanState.active, true);
+      assert.equal(ownerRalplanState.session_id, COMMITTED_TEST_OWNER_SESSION_ID);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
   });
 
-  it('keeps session canonical state when clearing the root scope without all_sessions', async () => {
+  it('clears the implicit committed-owner scope without touching unrelated session state', async () => {
     process.env.OMX_STATE_SERVER_DISABLE_AUTO_START = '1';
     const handleStateToolCall = await getTestStateToolCall();
 
     const wd = await mkdtemp(join(tmpdir(), 'omx-state-server-root-clear-isolation-'));
+    const unrelatedSessionId = 'sess-keep';
+    const unrelatedStatePath = join(
+      wd,
+      '.omx',
+      'state',
+      'sessions',
+      unrelatedSessionId,
+      'deep-interview-state.json',
+    );
     try {
-      await handleStateToolCall({
+      await ensureTestStateServerAuthority(wd);
+      await mkdir(join(wd, '.omx', 'state', 'sessions', unrelatedSessionId), { recursive: true, mode: 0o700 });
+      await secureTestAuthorityDirectories(wd);
+      await writeFile(
+        unrelatedStatePath,
+        JSON.stringify({
+          active: true,
+          mode: 'deep-interview',
+          current_phase: 'asking',
+          session_id: unrelatedSessionId,
+        }, null, 2),
+      );
+      const ownerWrite = await handleStateToolCall({
         params: {
           name: 'state_write',
           arguments: {
             workingDirectory: wd,
-            session_id: 'sess-keep',
+            session_id: COMMITTED_TEST_OWNER_SESSION_ID,
             mode: 'deep-interview',
             active: true,
-            current_phase: 'asking',
+            current_phase: 'owner-asking',
           },
         },
       });
-      await handleStateToolCall({
-        params: {
-          name: 'state_write',
-          arguments: {
-            workingDirectory: wd,
-            mode: 'deep-interview',
-            active: true,
-            current_phase: 'root-asking',
-          },
-        },
-      });
+      assert.equal(ownerWrite.isError, undefined);
+      await writeFile(
+        join(wd, '.omx', 'state', 'deep-interview-state.json'),
+        JSON.stringify({ active: true, mode: 'deep-interview', current_phase: 'legacy-root' }, null, 2),
+      );
 
-      await handleStateToolCall({
+      const clear = await handleStateToolCall({
         params: {
           name: 'state_clear',
           arguments: {
             workingDirectory: wd,
+            session_id: COMMITTED_TEST_OWNER_SESSION_ID,
             mode: 'deep-interview',
           },
         },
       });
+      assert.equal(clear.isError, undefined);
 
-      assert.equal(existsSync(join(wd, '.omx', 'state', 'deep-interview-state.json')), false);
-      const sessionState = JSON.parse(
-        await readFile(join(wd, '.omx', 'state', 'sessions', 'sess-keep', 'deep-interview-state.json'), 'utf-8'),
+      const ownerTombstone = JSON.parse(
+        await readFile(join(committedTestOwnerStateDir(wd), 'deep-interview-state.json'), 'utf-8'),
       ) as Record<string, unknown>;
-      assert.equal(sessionState.active, true);
-
-      const sessionCanonical = JSON.parse(
-        await readFile(join(wd, '.omx', 'state', 'sessions', 'sess-keep', 'skill-active-state.json'), 'utf-8'),
-      ) as { active_skills?: Array<{ skill: string; session_id?: string }> };
-      assert.deepEqual(
-        sessionCanonical.active_skills?.map(({ skill, session_id }) => ({ skill, session_id })),
-        [{ skill: 'deep-interview', session_id: 'sess-keep' }],
-      );
+      assert.equal(ownerTombstone.active, false);
+      assert.equal(ownerTombstone.current_phase, 'cleared');
+      assert.equal(ownerTombstone.session_id, COMMITTED_TEST_OWNER_SESSION_ID);
+      const legacyRootState = JSON.parse(
+        await readFile(join(wd, '.omx', 'state', 'deep-interview-state.json'), 'utf-8'),
+      ) as Record<string, unknown>;
+      assert.equal(legacyRootState.active, true);
+      assert.equal(legacyRootState.current_phase, 'legacy-root');
+      const ownerCanonical = JSON.parse(
+        await readFile(join(committedTestOwnerStateDir(wd), 'skill-active-state.json'), 'utf-8'),
+      ) as { active?: boolean; active_skills?: unknown[] };
+      assert.equal(ownerCanonical.active, false);
+      assert.deepEqual(ownerCanonical.active_skills, []);
+      const unrelatedState = JSON.parse(await readFile(unrelatedStatePath, 'utf-8')) as Record<string, unknown>;
+      assert.equal(unrelatedState.active, true);
+      assert.equal(unrelatedState.current_phase, 'asking');
+      assert.equal(unrelatedState.session_id, unrelatedSessionId);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }

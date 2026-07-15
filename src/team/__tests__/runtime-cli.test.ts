@@ -5,6 +5,7 @@ import { existsSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { initTeamState, createTask, readTeamConfig, saveTeamConfig } from '../state.js';
+import { clearTeamTestAuthority, installTeamTestAuthority } from './authority-fixture.js';
 
 async function loadRuntimeCliModule() {
   process.env.OMX_RUNTIME_CLI_DISABLE_AUTO_START = '1';
@@ -115,6 +116,8 @@ describe('runtime-cli helpers', () => {
   it('refreshes pane targets from live team config after scale changes', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-cli-live-'));
     try {
+      await installTeamTestAuthority(cwd);
+
       await initTeamState('live-refresh', 'task', 'executor', 2, cwd);
       const config = await readTeamConfig('live-refresh', cwd);
       assert.ok(config);
@@ -142,6 +145,7 @@ describe('runtime-cli helpers', () => {
         leaderPaneId: '%900',
       });
     } finally {
+      clearTeamTestAuthority();
       await rm(cwd, { recursive: true, force: true });
     }
   });
@@ -157,12 +161,14 @@ describe('runtime-cli helpers', () => {
     assert.equal(liveBehavior.fixingWithNoWorkers, false);
   });
 
-  it('ignores ambient OMX_TEAM_STATE_ROOT during shutdown collection', async () => {
+  it('rejects conflicting ambient OMX_TEAM_STATE_ROOT during shutdown collection', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-cli-env-root-cwd-'));
     const explicitStateRoot = await mkdtemp(join(tmpdir(), 'omx-runtime-cli-env-root-state-'));
     const previousTeamStateRoot = process.env.OMX_TEAM_STATE_ROOT;
     delete process.env.OMX_TEAM_STATE_ROOT;
     try {
+      await installTeamTestAuthority(cwd);
+
       await initTeamState('env-root-results', 'task', 'executor', 1, cwd);
       await createTask('env-root-results', {
         subject: 'completed task',
@@ -174,17 +180,13 @@ describe('runtime-cli helpers', () => {
       process.env.OMX_TEAM_STATE_ROOT = explicitStateRoot;
 
       const runtimeCli = await loadRuntimeCliModule();
-      const stateRoot = runtimeCli.resolveRuntimeCliStateRoot(cwd);
-      assert.equal(stateRoot, join(cwd, '.omx', 'state'));
-      assert.deepEqual(
-        runtimeCli.collectTaskResults(stateRoot, 'env-root-results'),
-        [{
-          taskId: '1',
-          status: 'completed',
-          summary: 'PASS: canonical root task result',
-        }],
+      assert.throws(
+        () => runtimeCli.resolveRuntimeCliStateRoot(cwd),
+        /OMX_TEAM_STATE_ROOT conflicts with the persisted session authority/,
       );
     } finally {
+      clearTeamTestAuthority();
+
       if (typeof previousTeamStateRoot === 'string') process.env.OMX_TEAM_STATE_ROOT = previousTeamStateRoot;
       else delete process.env.OMX_TEAM_STATE_ROOT;
       await rm(explicitStateRoot, { recursive: true, force: true });
@@ -197,6 +199,8 @@ describe('runtime-cli helpers', () => {
     const previousTeamStateRoot = process.env.OMX_TEAM_STATE_ROOT;
     delete process.env.OMX_TEAM_STATE_ROOT;
     try {
+      await installTeamTestAuthority(cwd);
+
       await initTeamState('shutdown-fallback', 'task', 'executor', 1, cwd);
       await createTask('shutdown-fallback', {
         subject: 'pending task',
@@ -222,6 +226,8 @@ describe('runtime-cli helpers', () => {
 
       assert.equal(existsSync(teamRoot), false);
     } finally {
+      clearTeamTestAuthority();
+
       if (typeof previousTeamStateRoot === 'string') process.env.OMX_TEAM_STATE_ROOT = previousTeamStateRoot;
       else delete process.env.OMX_TEAM_STATE_ROOT;
       await rm(cwd, { recursive: true, force: true });
@@ -233,6 +239,8 @@ describe('runtime-cli helpers', () => {
     const previousTeamStateRoot = process.env.OMX_TEAM_STATE_ROOT;
     delete process.env.OMX_TEAM_STATE_ROOT;
     try {
+      await installTeamTestAuthority(cwd);
+
       await initTeamState('shutdown-confirm-required', 'task', 'executor', 1, cwd);
       await createTask('shutdown-confirm-required', {
         subject: 'failed task',
@@ -251,6 +259,8 @@ describe('runtime-cli helpers', () => {
 
       assert.equal(existsSync(teamRoot), true);
     } finally {
+      clearTeamTestAuthority();
+
       if (typeof previousTeamStateRoot === 'string') process.env.OMX_TEAM_STATE_ROOT = previousTeamStateRoot;
       else delete process.env.OMX_TEAM_STATE_ROOT;
       await rm(cwd, { recursive: true, force: true });
@@ -262,6 +272,8 @@ describe('runtime-cli helpers', () => {
     const previousTeamStateRoot = process.env.OMX_TEAM_STATE_ROOT;
     delete process.env.OMX_TEAM_STATE_ROOT;
     try {
+      await installTeamTestAuthority(cwd);
+
       await initTeamState('runtime-cli-complete', 'task', 'executor', 1, cwd);
       await createTask('runtime-cli-complete', {
         subject: 'done task',
@@ -280,6 +292,8 @@ describe('runtime-cli helpers', () => {
       assert.equal(existsSync(teamRoot), true);
       assert.equal(typeof runtimeCli.shutdownWithForceFallback, 'function');
     } finally {
+      clearTeamTestAuthority();
+
       if (typeof previousTeamStateRoot === 'string') process.env.OMX_TEAM_STATE_ROOT = previousTeamStateRoot;
       else delete process.env.OMX_TEAM_STATE_ROOT;
       await rm(cwd, { recursive: true, force: true });
@@ -291,6 +305,8 @@ describe('runtime-cli helpers', () => {
     const previousTeamStateRoot = process.env.OMX_TEAM_STATE_ROOT;
     try {
       delete process.env.OMX_TEAM_STATE_ROOT;
+      await installTeamTestAuthority(cwd);
+
       await initTeamState('runtime-cli-preserve-complete', 'task', 'executor', 1, cwd);
       await createTask('runtime-cli-preserve-complete', {
         subject: 'done task',
@@ -325,6 +341,8 @@ describe('runtime-cli helpers', () => {
       assert.match(result.notice, /omx team shutdown runtime-cli-preserve-complete/);
       assert.match(result.notice, /omx team api read-stall-state/);
     } finally {
+      clearTeamTestAuthority();
+
       if (typeof previousTeamStateRoot === 'string') process.env.OMX_TEAM_STATE_ROOT = previousTeamStateRoot;
       else delete process.env.OMX_TEAM_STATE_ROOT;
       await rm(cwd, { recursive: true, force: true });
@@ -336,6 +354,8 @@ describe('runtime-cli helpers', () => {
     const previousTeamStateRoot = process.env.OMX_TEAM_STATE_ROOT;
     try {
       delete process.env.OMX_TEAM_STATE_ROOT;
+      await installTeamTestAuthority(cwd);
+
       await initTeamState('runtime-cli-preserve-failed', 'task', 'executor', 1, cwd);
       await createTask('runtime-cli-preserve-failed', {
         subject: 'failed task',
@@ -370,6 +390,8 @@ describe('runtime-cli helpers', () => {
       assert.match(result.notice, /omx team api read-stall-state/);
       assert.match(result.notice, /omx team shutdown runtime-cli-preserve-failed/);
     } finally {
+      clearTeamTestAuthority();
+
       if (typeof previousTeamStateRoot === 'string') process.env.OMX_TEAM_STATE_ROOT = previousTeamStateRoot;
       else delete process.env.OMX_TEAM_STATE_ROOT;
       await rm(cwd, { recursive: true, force: true });
@@ -381,6 +403,8 @@ describe('runtime-cli helpers', () => {
     const previousTeamStateRoot = process.env.OMX_TEAM_STATE_ROOT;
     try {
       delete process.env.OMX_TEAM_STATE_ROOT;
+      await installTeamTestAuthority(cwd);
+
       await initTeamState('runtime-cli-preserve-cancelled', 'task', 'executor', 1, cwd);
       await createTask('runtime-cli-preserve-cancelled', {
         subject: 'cancelled task',
@@ -406,6 +430,7 @@ describe('runtime-cli helpers', () => {
       assert.match(result.notice, /phase=cancelled/);
       assert.match(result.notice, /omx team shutdown runtime-cli-preserve-cancelled/);
     } finally {
+      clearTeamTestAuthority();
       if (typeof previousTeamStateRoot === 'string') process.env.OMX_TEAM_STATE_ROOT = previousTeamStateRoot;
       else delete process.env.OMX_TEAM_STATE_ROOT;
       await rm(cwd, { recursive: true, force: true });

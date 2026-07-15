@@ -1,4 +1,4 @@
-import { describe, it } from 'node:test';
+import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
@@ -7,6 +7,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { readTeamConfig, saveTeamConfig } from '../state.js';
 import { shutdownTeam, startTeam, type TeamRuntime } from '../runtime.js';
+import { clearTeamTestAuthority, installTeamTestAuthority } from './authority-fixture.js';
+
+afterEach(() => {
+  clearTeamTestAuthority();
+});
 
 async function initRepo(): Promise<string> {
   const cwd = await mkdtemp(join(tmpdir(), 'omx-shutdown-fallback-'));
@@ -65,6 +70,7 @@ process.on('SIGTERM', () => process.exit(0));
     let runtime: TeamRuntime | null = null;
     let preservedWorktreePath: string | null = null;
     try {
+      await installTeamTestAuthority(repo);
       runtime = await withMockPromptModeCodexAllowed(() =>
         withoutTeamWorkerEnv(() =>
           startTeam(

@@ -38,6 +38,7 @@ import {
   setWriteAtomicRenameForTests,
   resetWriteAtomicRenameForTests,
   writeWorkerInbox,
+  writeWorkerStatus,
   enqueueDispatchRequest,
   listDispatchRequests,
   markDispatchRequestNotified,
@@ -2037,6 +2038,25 @@ exit 1
       assert.equal(existsSync(p), true);
       const content = readFileSync(p, 'utf8');
       assert.ok(content === 'a' || content === 'b');
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects Team mutation selected only by an ambient state-root alias', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-state-'));
+    const ambientRoot = join(cwd, 'ambient-state');
+    process.env.OMX_TEAM_STATE_ROOT = ambientRoot;
+    try {
+      await mkdir(join(ambientRoot, 'team', 'team-ambient', 'workers', 'worker-1'), { recursive: true });
+      await assert.rejects(
+        () => writeWorkerStatus('team-ambient', 'worker-1', {
+          state: 'working',
+          updated_at: new Date().toISOString(),
+        }, cwd),
+        /ambient state-root alias|persisted session authority/,
+      );
+      assert.equal(existsSync(join(ambientRoot, 'team', 'team-ambient', 'workers', 'worker-1', 'status.json')), false);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

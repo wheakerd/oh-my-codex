@@ -17,6 +17,7 @@ import {
 import { pathToFileURL } from 'node:url';
 import { initializeStateAuthority, mintStateAuthorityTransportCapability } from '../../state/authority.js';
 import { buildStateAuthorityTransportEnv } from '../../state/transport-env.js';
+import { hardenTestAuthorityTreeSync } from '../../team/__tests__/authority-fixture.js';
 
 function buildFakeTmux(tmuxLogPath: string): string {
   return `#!/usr/bin/env bash
@@ -286,15 +287,37 @@ async function initTeamState(
     session_binding: { canonical_session_id: sessionId },
   });
   await mintStateAuthorityTransportCapability(authority);
-  return await initTeamStateDirect(
+  await chmod(authority.canonical_state_root, 0o700);
+  const transport = buildStateAuthorityTransportEnv(authority, {
+    ...process.env,
+    OMX_SESSION_ID: sessionId,
+  });
+  Object.assign(process.env, transport);
+  const config = await initTeamStateDirect(
     teamName,
     task,
     agentType,
     workerCount,
     cwd,
     undefined,
-    buildStateAuthorityTransportEnv(authority, { ...process.env, OMX_SESSION_ID: sessionId }),
+    transport,
   );
+  hardenTestAuthorityTreeSync(cwd);
+  return config;
+}
+
+interface DispatchDrainResult {
+  processed: number;
+  failed: number;
+  skipped: number;
+}
+
+async function drainPendingTeamDispatch(
+  mod: { drainPendingTeamDispatch: (options: Record<string, unknown>) => Promise<DispatchDrainResult> },
+  options: Record<string, unknown> & { cwd: string },
+): Promise<DispatchDrainResult> {
+  hardenTestAuthorityTreeSync(options.cwd);
+  return mod.drainPendingTeamDispatch(options);
 }
 
 describe('notify-hook team dispatch consumer', () => {
@@ -335,7 +358,7 @@ describe('notify-hook team dispatch consumer', () => {
 
       const modulePath = new URL('../../../dist/scripts/notify-hook/team-dispatch.js', import.meta.url).pathname;
       const mod = await import(pathToFileURL(modulePath).href);
-      const result = await mod.drainPendingTeamDispatch({
+      const result = await drainPendingTeamDispatch(mod, {
         cwd,
         maxPerTick: 5,
         injector: async () => ({ ok: true, reason: 'injected_for_test' }),
@@ -368,7 +391,7 @@ describe('notify-hook team dispatch consumer', () => {
 
       const modulePath = new URL('../../../dist/scripts/notify-hook/team-dispatch.js', import.meta.url).pathname;
       const mod = await import(pathToFileURL(modulePath).href);
-      const result = await mod.drainPendingTeamDispatch({
+      const result = await drainPendingTeamDispatch(mod, {
         cwd,
         maxPerTick: 5,
         injector: async () => ({ ok: true, reason: 'injected_for_test' }),
@@ -441,8 +464,8 @@ describe('notify-hook team dispatch consumer', () => {
 
       const modulePath = new URL('../../../dist/scripts/notify-hook/team-dispatch.js', import.meta.url).pathname;
       const mod = await import(pathToFileURL(modulePath).href);
-      await mod.drainPendingTeamDispatch({ cwd, maxPerTick: 5, injector: async () => ({ ok: true, reason: 'injected_for_test' }) });
-      await mod.drainPendingTeamDispatch({ cwd, maxPerTick: 5, injector: async () => ({ ok: true, reason: 'injected_for_test' }) });
+      await drainPendingTeamDispatch(mod, { cwd, maxPerTick: 5, injector: async () => ({ ok: true, reason: 'injected_for_test' }) });
+      await drainPendingTeamDispatch(mod, { cwd, maxPerTick: 5, injector: async () => ({ ok: true, reason: 'injected_for_test' }) });
 
       const eventsPath = join(cwd, '.omx', 'state', 'team', 'alpha', 'events', 'events.ndjson');
       const events = (await readFile(eventsPath, 'utf-8')).trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
@@ -507,7 +530,7 @@ exit 1
 
       const modulePath = new URL('../../../dist/scripts/notify-hook/team-dispatch.js', import.meta.url).pathname;
       const mod = await import(pathToFileURL(modulePath).href);
-      await mod.drainPendingTeamDispatch({
+      await drainPendingTeamDispatch(mod, {
         cwd,
         maxPerTick: 5,
         injector: async () => ({ ok: true, reason: 'injected_for_test' }),
@@ -553,7 +576,7 @@ exit 1
 
       const modulePath = new URL('../../../dist/scripts/notify-hook/team-dispatch.js', import.meta.url).pathname;
       const mod = await import(pathToFileURL(modulePath).href);
-      const result = await mod.drainPendingTeamDispatch({
+      const result = await drainPendingTeamDispatch(mod, {
         cwd,
         maxPerTick: 5,
         injector: async () => ({ ok: true, reason: 'injected_for_test' }),
@@ -595,7 +618,7 @@ exit 1
 
       const modulePath = new URL('../../../dist/scripts/notify-hook/team-dispatch.js', import.meta.url).pathname;
       const mod = await import(pathToFileURL(modulePath).href);
-      const result = await mod.drainPendingTeamDispatch({
+      const result = await drainPendingTeamDispatch(mod, {
         cwd,
         maxPerTick: 5,
         injector: async () => ({ ok: true, reason: 'injected_for_test' }),
@@ -661,7 +684,7 @@ exit 0
 
       const modulePath = new URL('../../../dist/scripts/notify-hook/team-dispatch.js', import.meta.url).pathname;
       const mod = await import(pathToFileURL(modulePath).href);
-      const result = await mod.drainPendingTeamDispatch({
+      const result = await drainPendingTeamDispatch(mod, {
         cwd,
         maxPerTick: 5,
         injector: async () => ({ ok: true, reason: 'injected_for_test' }),
@@ -720,7 +743,7 @@ exit 0
 
       const modulePath = new URL('../../../dist/scripts/notify-hook/team-dispatch.js', import.meta.url).pathname;
       const mod = await import(pathToFileURL(modulePath).href);
-      const result = await mod.drainPendingTeamDispatch({ cwd, maxPerTick: 5 });
+      const result = await drainPendingTeamDispatch(mod, { cwd, maxPerTick: 5 });
       assert.equal(result.processed, 1);
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf8');
@@ -1067,7 +1090,7 @@ exit 0
 
       const modulePath = new URL('../../../dist/scripts/notify-hook/team-dispatch.js', import.meta.url).pathname;
       const mod = await import(pathToFileURL(modulePath).href);
-      const result = await mod.drainPendingTeamDispatch({ cwd, maxPerTick: 5 });
+      const result = await drainPendingTeamDispatch(mod, { cwd, maxPerTick: 5 });
       assert.equal(result.processed, 1);
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf8');
@@ -1213,7 +1236,7 @@ exit 0
 
       const modulePath = new URL('../../../dist/scripts/notify-hook/team-dispatch.js', import.meta.url).pathname;
       const mod = await import(pathToFileURL(modulePath).href);
-      const result = await mod.drainPendingTeamDispatch({ cwd, maxPerTick: 5 });
+      const result = await drainPendingTeamDispatch(mod, { cwd, maxPerTick: 5 });
       assert.equal(result.processed, 1);
       assert.equal(result.failed, 1);
 
@@ -1254,7 +1277,7 @@ exit 0
 
       const modulePath = new URL('../../../dist/scripts/notify-hook/team-dispatch.js', import.meta.url).pathname;
       const mod = await import(pathToFileURL(modulePath).href);
-      const result = await mod.drainPendingTeamDispatch({
+      const result = await drainPendingTeamDispatch(mod, {
         cwd,
         stateDir,
         maxPerTick: 5,
@@ -1289,12 +1312,12 @@ exit 0
 
       const modulePath = new URL('../../../dist/scripts/notify-hook/team-dispatch.js', import.meta.url).pathname;
       const mod = await import(pathToFileURL(modulePath).href);
-      await mod.drainPendingTeamDispatch({
+      await drainPendingTeamDispatch(mod, {
         cwd,
         maxPerTick: 5,
         injector: async () => ({ ok: true, reason: 'injected_for_test' }),
       });
-      const second = await mod.drainPendingTeamDispatch({
+      const second = await drainPendingTeamDispatch(mod, {
         cwd,
         maxPerTick: 5,
         injector: async () => ({ ok: true, reason: 'injected_for_test' }),
@@ -1325,7 +1348,7 @@ exit 0
 
       const modulePath = new URL('../../../dist/scripts/notify-hook/team-dispatch.js', import.meta.url).pathname;
       const mod = await import(pathToFileURL(modulePath).href);
-      const slowDrain = mod.drainPendingTeamDispatch({
+      const slowDrain = drainPendingTeamDispatch(mod, {
         cwd,
         maxPerTick: 1,
         injector: async () => {
@@ -1392,7 +1415,7 @@ exit 0
 
       const modulePath = new URL('../../../dist/scripts/notify-hook/team-dispatch.js', import.meta.url).pathname;
       const mod = await import(pathToFileURL(modulePath).href);
-      const slowDrain = mod.drainPendingTeamDispatch({
+      const slowDrain = drainPendingTeamDispatch(mod, {
         cwd,
         maxPerTick: 1,
         injector: async () => {
@@ -1406,7 +1429,7 @@ exit 0
       });
 
       await injectorStarted;
-      const concurrentDrain = await mod.drainPendingTeamDispatch({
+      const concurrentDrain = await drainPendingTeamDispatch(mod, {
         cwd,
         maxPerTick: 1,
         injector: async () => {
@@ -1456,7 +1479,7 @@ exit 0
       const mod = await import(pathToFileURL(modulePath).href);
       let attempt = 0;
       await assert.rejects(
-        () => mod.drainPendingTeamDispatch({
+        () => drainPendingTeamDispatch(mod, {
           cwd,
           maxPerTick: 5,
           injector: async () => {
@@ -1470,7 +1493,7 @@ exit 0
 
       assert.deepEqual(await listDispatchProcessingLeases(cwd, 'alpha'), []);
 
-      const retry = await mod.drainPendingTeamDispatch({
+      const retry = await drainPendingTeamDispatch(mod, {
         cwd,
         maxPerTick: 5,
         injector: async () => ({ ok: true, reason: 'tmux_send_keys_confirmed' }),
@@ -1500,7 +1523,7 @@ exit 0
       const modulePath = new URL('../../../dist/scripts/notify-hook/team-dispatch.js', import.meta.url).pathname;
       const mod = await import(pathToFileURL(modulePath).href);
       // First tick: injector returns unconfirmed → should stay pending
-      const result = await mod.drainPendingTeamDispatch({
+      const result = await drainPendingTeamDispatch(mod, {
         cwd,
         maxPerTick: 5,
         injector: async () => ({ ok: true, reason: 'tmux_send_keys_unconfirmed' }),
@@ -1530,9 +1553,9 @@ exit 0
       const mod = await import(pathToFileURL(modulePath).href);
       const injector = async () => ({ ok: true, reason: 'tmux_send_keys_unconfirmed' });
       // Drain 3 times to exhaust max attempts (MAX_UNCONFIRMED_ATTEMPTS=3)
-      await mod.drainPendingTeamDispatch({ cwd, maxPerTick: 5, injector });
-      await mod.drainPendingTeamDispatch({ cwd, maxPerTick: 5, injector });
-      const result = await mod.drainPendingTeamDispatch({ cwd, maxPerTick: 5, injector });
+      await drainPendingTeamDispatch(mod, { cwd, maxPerTick: 5, injector });
+      await drainPendingTeamDispatch(mod, { cwd, maxPerTick: 5, injector });
+      const result = await drainPendingTeamDispatch(mod, { cwd, maxPerTick: 5, injector });
       assert.equal(result.processed, 1, 'should transition to failed on 3rd attempt');
       assert.equal(result.failed, 1);
       const request = await readDispatchRequest('alpha', queued.request.request_id, cwd);
@@ -1556,7 +1579,7 @@ exit 0
 
       const modulePath = new URL('../../../dist/scripts/notify-hook/team-dispatch.js', import.meta.url).pathname;
       const mod = await import(pathToFileURL(modulePath).href);
-      const result = await mod.drainPendingTeamDispatch({
+      const result = await drainPendingTeamDispatch(mod, {
         cwd,
         maxPerTick: 5,
         injector: async () => ({ ok: true, reason: 'tmux_send_keys_confirmed' }),
@@ -1580,7 +1603,7 @@ exit 0
 
       const modulePath = new URL('../../../dist/scripts/notify-hook/team-dispatch.js', import.meta.url).pathname;
       const mod = await import(pathToFileURL(modulePath).href);
-      await mod.drainPendingTeamDispatch({
+      await drainPendingTeamDispatch(mod, {
         cwd,
         maxPerTick: 5,
         injector: async () => ({ ok: true, reason: 'tmux_send_keys_unconfirmed' }),
@@ -1635,8 +1658,8 @@ exit 0
 
       const modulePath = new URL('../../../dist/scripts/notify-hook/team-dispatch.js', import.meta.url).pathname;
       const mod = await import(pathToFileURL(modulePath).href);
-      await mod.drainPendingTeamDispatch({ cwd, maxPerTick: 5 });
-      await mod.drainPendingTeamDispatch({ cwd, maxPerTick: 5 });
+      await drainPendingTeamDispatch(mod, { cwd, maxPerTick: 5 });
+      await drainPendingTeamDispatch(mod, { cwd, maxPerTick: 5 });
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf8');
       const typeMatches = tmuxLog.match(/send-keys -t %42 -l ping/g) || [];
@@ -1701,9 +1724,9 @@ exit 0
 
       const modulePath = new URL('../../../dist/scripts/notify-hook/team-dispatch.js', import.meta.url).pathname;
       const mod = await import(pathToFileURL(modulePath).href);
-      await mod.drainPendingTeamDispatch({ cwd, maxPerTick: 5 });
-      await mod.drainPendingTeamDispatch({ cwd, maxPerTick: 5 });
-      await mod.drainPendingTeamDispatch({ cwd, maxPerTick: 5 });
+      await drainPendingTeamDispatch(mod, { cwd, maxPerTick: 5 });
+      await drainPendingTeamDispatch(mod, { cwd, maxPerTick: 5 });
+      await drainPendingTeamDispatch(mod, { cwd, maxPerTick: 5 });
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf8');
       const typeMatches = tmuxLog.match(/send-keys -t %42 -l ping/g) || [];
@@ -1763,7 +1786,7 @@ exit 0
 
       const modulePath = new URL('../../../dist/scripts/notify-hook/team-dispatch.js', import.meta.url).pathname;
       const mod = await import(pathToFileURL(modulePath).href);
-      const result = await mod.drainPendingTeamDispatch({ cwd, maxPerTick: 5 });
+      const result = await drainPendingTeamDispatch(mod, { cwd, maxPerTick: 5 });
       assert.equal(result.processed, 0, 'must not mark notified when wide tail still shows trigger');
       assert.ok(result.skipped >= 1);
 
@@ -1818,7 +1841,7 @@ exit 0
 
       const modulePath = new URL('../../../dist/scripts/notify-hook/team-dispatch.js', import.meta.url).pathname;
       const mod = await import(pathToFileURL(modulePath).href);
-      const result = await mod.drainPendingTeamDispatch({ cwd, maxPerTick: 5 });
+      const result = await drainPendingTeamDispatch(mod, { cwd, maxPerTick: 5 });
       assert.equal(result.processed, 0);
       assert.ok(result.skipped >= 1);
 
@@ -1855,7 +1878,7 @@ exit 0
 
       const modulePath = new URL('../../../dist/scripts/notify-hook/team-dispatch.js', import.meta.url).pathname;
       const mod = await import(pathToFileURL(modulePath).href);
-      const result = await mod.drainPendingTeamDispatch({
+      const result = await drainPendingTeamDispatch(mod, {
         cwd,
         maxPerTick: 5,
         injector: async () => ({ ok: true, reason: 'injected_for_test' }),
@@ -1902,8 +1925,8 @@ exit 0
         return { ok: true, reason: 'tmux_send_keys_unconfirmed' };
       };
 
-      const firstTick = await mod.drainPendingTeamDispatch({ cwd, maxPerTick: 5, injector });
-      const secondTick = await mod.drainPendingTeamDispatch({ cwd, maxPerTick: 5, injector });
+      const firstTick = await drainPendingTeamDispatch(mod, { cwd, maxPerTick: 5, injector });
+      const secondTick = await drainPendingTeamDispatch(mod, { cwd, maxPerTick: 5, injector });
 
       assert.equal(firstTick.processed, 0);
       assert.ok(firstTick.skipped >= 1);
@@ -1959,7 +1982,7 @@ exit 0
       const prevPath = process.env.PATH;
       process.env.PATH = `${fakeBinDir}:${prevPath || ''}`;
       try {
-        await mod.drainPendingTeamDispatch({ cwd, stateDir, logsDir, maxPerTick: 5 });
+        await drainPendingTeamDispatch(mod, { cwd, stateDir, logsDir, maxPerTick: 5 });
       } finally {
         process.env.PATH = prevPath;
       }
@@ -2200,7 +2223,7 @@ exit 0
 
       const modulePath = new URL('../../../dist/scripts/notify-hook/team-dispatch.js', import.meta.url).pathname;
       const mod = await import(pathToFileURL(modulePath).href);
-      const result = await mod.drainPendingTeamDispatch({
+      const result = await drainPendingTeamDispatch(mod, {
         cwd,
         maxPerTick: 5,
         injector: async () => ({ ok: true, reason: 'injected_for_test' }),

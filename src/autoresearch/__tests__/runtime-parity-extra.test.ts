@@ -1,7 +1,7 @@
-import { describe, it } from 'node:test';
+import { afterEach, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -16,6 +16,40 @@ import {
   resumeAutoresearchRuntime,
 } from '../runtime.js';
 
+import { createHash } from 'node:crypto';
+import { initializeStateAuthority, mintStateAuthorityTransportCapability } from '../../state/authority.js';
+import { buildStateAuthorityTransportEnv } from '../../state/transport-env.js';
+
+const AUTHORITY_ENV_KEYS = [
+  'OMX_ROOT', 'OMX_STATE_ROOT', 'OMX_TEAM_STATE_ROOT', 'OMX_STARTUP_CWD', 'OMX_SESSION_ID',
+  'OMX_STATE_AUTHORITY_PATH', 'OMX_STATE_AUTHORITY_ID', 'OMX_STATE_AUTHORITY_GENERATION_ID',
+  'OMX_STATE_AUTHORITY_WORKSPACE_DIGEST', 'OMX_STATE_AUTHORITY_CAPABILITY',
+] as const;
+let savedAuthorityEnvironment: Map<string, string | undefined>;
+
+async function installTestAuthority(cwd: string): Promise<void> {
+  const sessionId = `autoresearch-parity-${createHash('sha256').update(cwd).digest('hex').slice(0, 24)}`;
+  await chmod(cwd, 0o700);
+  await mkdir(join(cwd, '.omx', 'state'), { recursive: true, mode: 0o700 });
+  await chmod(join(cwd, '.omx'), 0o700);
+  await chmod(join(cwd, '.omx', 'state'), 0o700);
+  const authority = await initializeStateAuthority({
+    startup_cwd: cwd,
+    observed_cwd: cwd,
+    launch_id: `${sessionId}-launch`,
+    session_binding: { canonical_session_id: sessionId },
+  });
+  await mintStateAuthorityTransportCapability(authority);
+  Object.assign(process.env, buildStateAuthorityTransportEnv(authority, { OMX_SESSION_ID: sessionId }));
+}
+
+function restoreAuthorityEnvironment(): void {
+  for (const [key, value] of savedAuthorityEnvironment) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+}
+
 async function initRepo(): Promise<string> {
   const cwd = await mkdtemp(join(tmpdir(), 'omx-autoresearch-parity-extra-'));
   execFileSync('git', ['init'], { cwd, stdio: 'ignore' });
@@ -24,6 +58,8 @@ async function initRepo(): Promise<string> {
   await writeFile(join(cwd, 'README.md'), 'hello\n', 'utf-8');
   execFileSync('git', ['add', 'README.md'], { cwd, stdio: 'ignore' });
   execFileSync('git', ['commit', '-m', 'init'], { cwd, stdio: 'ignore' });
+  await installTestAuthority(cwd);
+
   return cwd;
 }
 
@@ -60,6 +96,12 @@ async function makeContract(repo: string, keepPolicy?: 'score_improvement' | 'pa
 }
 
 describe('autoresearch runtime parity extras', () => {
+  beforeEach(() => {
+    savedAuthorityEnvironment = new Map(AUTHORITY_ENV_KEYS.map((key) => [key, process.env[key]]));
+    for (const key of AUTHORITY_ENV_KEYS) delete process.env[key];
+  });
+
+  afterEach(() => restoreAuthorityEnvironment());
   it('treats allowed runtime files as reset-safe and blocks unrelated dirt', async () => {
     const repo = await initRepo();
     try {

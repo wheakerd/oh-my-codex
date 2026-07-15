@@ -44,7 +44,6 @@ import {
   getQuotaUsage,
   normalizeInputMessages,
 } from './notify-hook/payload-parser.js';
-import { getBaseStateDir } from '../mcp/state-paths.js';
 import {
   getScopedStatePath,
   getScopedStatePathAtScope,
@@ -587,7 +586,8 @@ async function main() {
     ? await resolveTeamStateDirForWorker(cwd, parsedTeamWorker)
     : null;
   const workerStateRootResolved = !isTeamWorker || !!resolvedWorkerStateDir;
-  const stateDir = resolvedWorkerStateDir || getBaseStateDir(cwd);
+  const leaderPointerContext = isTeamWorker ? null : resolveSessionPointerContext(cwd);
+  const stateDir = resolvedWorkerStateDir || leaderPointerContext?.baseStateDir || '';
   const logsDir = join(cwd, '.omx', 'logs');
   const omxDir = join(cwd, '.omx');
   const leaderWriteDecision = isTeamWorker
@@ -712,20 +712,6 @@ async function main() {
       reason: 'skip_team_worker_state_mutations',
     }).catch(() => {});
 
-    // Keep the fail-closed worker state-root behavior for normal team-worker
-    // mutations, but allow the narrow auto-nudge path to use an explicitly
-    // supplied, already-existing worker state root. Auto-nudge only needs the
-    // worker-scoped state files/pane anchor and should not fall back to creating
-    // local `.omx/state` when identity resolution failed.
-    const explicitWorkerStateRoot = safeString(process.env.OMX_TEAM_STATE_ROOT || '').trim();
-    const autoNudgeStateDir = explicitWorkerStateRoot ? resolve(cwd, explicitWorkerStateRoot) : '';
-    if (autoNudgeStateDir && existsSync(autoNudgeStateDir)) {
-      try {
-        await maybeAutoNudge({ cwd, stateDir: autoNudgeStateDir, logsDir, payload });
-      } catch {
-        // Non-critical
-      }
-    }
     return;
   }
 

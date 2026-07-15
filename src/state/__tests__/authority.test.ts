@@ -704,6 +704,53 @@ describe('state authority foundation', () => {
       await rm(runRoot, { recursive: true, force: true });
     }
   });
+  it('rejects a copied pre-rollover anchor and binding after a committed successor rollover', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'omx-authority-rollover-resurrection-'));
+    const runRoot = await mkdtemp(join(tmpdir(), 'omx-authority-rollover-resurrection-run-'));
+    try {
+      const initial = await initializeStateAuthority({
+        startup_cwd: workspace,
+        launch_id: 'resurrection-source-launch',
+        session_binding: { canonical_session_id: 'resurrection-session' },
+      });
+      const workspaceIdentity = resolveWorkspaceIdentity(workspace);
+      const snapshotAnchor = await readWorkspaceAuthorityAnchor(workspaceIdentity);
+      if (!snapshotAnchor?.active_binding_locator) throw new Error('initial authority binding locator is missing');
+      const snapshotBinding = await readFile(snapshotAnchor.active_binding_locator, 'utf8');
+
+      await rolloverStateAuthorityToAlternateRoot({
+        context: initial,
+        proposed_state_root: join(runRoot, '.omx', 'state'),
+        creation_root: runRoot,
+        launch_id: 'resurrection-successor-launch',
+        consumer_kind: 'madmax',
+        issuer: {
+          kind: 'first-party-launcher',
+          package_version: 'test',
+          package_digest: 'a'.repeat(64),
+        },
+      });
+
+      await writeFile(
+        stateAuthorityPaths(workspaceIdentity).anchor_path,
+        `${JSON.stringify(snapshotAnchor)}\n`,
+      );
+      await writeFile(snapshotAnchor.active_binding_locator, snapshotBinding);
+
+      const restored = await resolveStateAuthority({
+        startup_cwd: workspace,
+        session_id: 'resurrection-session',
+      });
+      assert.equal(restored.can_mutate, false);
+      assert.equal(
+        restored.diagnostics.some((entry) => entry.code === AUTHORITY_DIAGNOSTIC_CODES.anchorRevisionConflict),
+        true,
+      );
+    } finally {
+      await rm(workspace, { recursive: true, force: true });
+      await rm(runRoot, { recursive: true, force: true });
+    }
+  });
   it('rejects an alternate state root that is lexically outside its creation root before canonicalization', async () => {
     const workspace = await mkdtemp(join(tmpdir(), 'omx-authority-alternate-lexical-workspace-'));
     const runRoot = await mkdtemp(join(tmpdir(), 'omx-authority-alternate-lexical-run-'));

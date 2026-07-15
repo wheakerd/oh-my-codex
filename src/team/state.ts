@@ -814,14 +814,36 @@ function isTeamManifestV2(value: unknown): value is TeamManifestV2 {
 }
 
 // Atomic write: write to {path}.tmp.{pid}, then rename.
-export async function writeAtomic(filePath: string, data: string): Promise<void> {
+export async function writeAtomic(
+  filePath: string,
+  data: string,
+  expectedRootIdentity?: string,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<void> {
   const parent = dirname(filePath);
   const stateRoot = teamStateMutationRoot(filePath);
   if (stateRoot) {
-    await assertTeamStateMutationPath(stateRoot, filePath);
+    // The target path is not authority. Re-resolve from its workspace identity
+    // and require a complete persisted transport before touching Team state.
+    const authoritativeRoot = resolveCanonicalTeamMutationStateRoot(
+      dirname(dirname(stateRoot)),
+      env,
+    );
+    const validatedExpectedRoot = expectedRootIdentity
+      ? resolve(expectedRootIdentity)
+      : authoritativeRoot;
+    if (
+      resolve(stateRoot) !== authoritativeRoot
+      || validatedExpectedRoot !== authoritativeRoot
+    ) {
+      throw new Error(
+        `team_state_root_authority_conflict:${resolve(stateRoot)}:${authoritativeRoot}`,
+      );
+    }
+    await assertTeamStateMutationPath(authoritativeRoot, filePath);
     await mkdir(parent, { recursive: true, mode: 0o700 });
-    await assertTeamStateMutationPath(stateRoot, filePath);
-    await atomicWriteAuthorityFile(filePath, data, { authority_root: stateRoot });
+    await assertTeamStateMutationPath(authoritativeRoot, filePath);
+    await atomicWriteAuthorityFile(filePath, data, { authority_root: authoritativeRoot });
     return;
   }
 
@@ -916,7 +938,7 @@ export async function initTeamState(
     await assertTeamStateMutationPath(stateRoot, path);
   }
 
-  await writeAtomic(join(dispatchRoot, 'requests.json'), JSON.stringify([], null, 2));
+  await writeAtomic(join(dispatchRoot, 'requests.json'), JSON.stringify([], null, 2), stateRoot, env);
 
   const workers: WorkerInfo[] = [];
   for (let i = 1; i <= workerCount; i++) {
@@ -960,7 +982,7 @@ export async function initTeamState(
     identity_source: workspace.identity_source,
   };
 
-  await writeAtomic(join(root, 'config.json'), JSON.stringify(config, null, 2));
+  await writeAtomic(join(root, 'config.json'), JSON.stringify(config, null, 2), stateRoot, env);
   await writeAtomic(
     join(root, 'phase.json'),
     JSON.stringify(
@@ -974,6 +996,8 @@ export async function initTeamState(
       null,
       2,
     ),
+    stateRoot,
+    env,
   );
   await writeTeamManifestV2(
     {
@@ -1155,6 +1179,7 @@ export async function writeTeamManifestV2(
   const tmuxPaneOwnerId = typeof manifest.tmux_pane_owner_id === 'string' && manifest.tmux_pane_owner_id.trim() !== ''
     ? manifest.tmux_pane_owner_id.trim()
     : defaultTmuxPaneOwnerId(manifest.name);
+  const expectedRootIdentity = resolveCanonicalTeamMutationStateRoot(cwd, env);
   const p = teamManifestV2Path(manifest.name, cwd, env);
   await writeAtomic(
     p,
@@ -1169,6 +1194,8 @@ export async function writeTeamManifestV2(
       null,
       2,
     ),
+    expectedRootIdentity,
+    env,
   );
 }
 
@@ -1589,7 +1616,7 @@ export async function appendTeamEvent(teamName: string, event: Omit<TeamEvent, '
   try {
     return await withMailboxLock(teamName, 'event-log', cwd, async () => {
       const p = teamEventLogPath(teamName, cwd);
-      const stateRoot = resolveTeamStateRoot(cwd);
+      const stateRoot = resolveCanonicalTeamMutationStateRoot(cwd);
       await assertTeamStateMutationPath(stateRoot, p);
       const existing = await readFile(p, 'utf8').catch((error: NodeJS.ErrnoException) => {
         if (error.code === 'ENOENT') return '';
@@ -2337,7 +2364,7 @@ export async function saveTeamConfig(config: TeamConfig, cwd: string): Promise<v
 // Delete team state directory.
 export async function cleanupTeamState(teamName: string, cwd: string): Promise<void> {
   assertSafeTeamName(teamName);
-  const root = resolveTeamStateRoot(cwd);
+  const root = resolveCanonicalTeamMutationStateRoot(cwd);
   const path = teamDir(teamName, cwd);
   await assertTeamStateMutationPath(root, path);
   await rm(path, { recursive: true, force: true });

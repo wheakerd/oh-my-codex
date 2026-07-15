@@ -8,6 +8,27 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const CLI_SPAWN_TIMEOUT_MS = 15_000;
+const STATE_AUTHORITY_ENV_KEYS = [
+  'OMX_STARTUP_CWD',
+  'OMX_ROOT',
+  'OMX_STATE_ROOT',
+  'OMX_TEAM_STATE_ROOT',
+  'OMX_STATE_AUTHORITY_PATH',
+  'OMX_STATE_AUTHORITY_ID',
+  'OMX_STATE_AUTHORITY_GENERATION_ID',
+  'OMX_STATE_AUTHORITY_WORKSPACE_DIGEST',
+  'OMX_STATE_AUTHORITY_CAPABILITY',
+  'OMX_SESSION_ID',
+] as const;
+
+async function prepareFixtureWorkspace(cwd: string): Promise<void> {
+  const omxDir = join(cwd, '.omx');
+  const stateDir = join(omxDir, 'state');
+  await mkdir(stateDir, { recursive: true, mode: 0o700 });
+  await chmod(omxDir, 0o700);
+  await chmod(stateDir, 0o700);
+}
+
 
 function runOmx(
   cwd: string,
@@ -24,6 +45,7 @@ function runOmx(
     killSignal: 'SIGKILL',
     env: {
       ...process.env,
+      ...Object.fromEntries(STATE_AUTHORITY_ENV_KEYS.map((key) => [key, undefined])),
       ...envOverrides,
     },
   });
@@ -43,6 +65,7 @@ async function initRepo(prefix: string): Promise<string> {
   const cwd = await mkdtemp(join(tmpdir(), prefix));
   execFileSync('git', ['init'], { cwd, stdio: 'ignore' });
   await writeFile(join(cwd, 'README.md'), 'hello\n', 'utf-8');
+  await prepareFixtureWorkspace(cwd);
   return cwd;
 }
 

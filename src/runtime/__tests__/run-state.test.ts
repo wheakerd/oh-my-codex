@@ -1,10 +1,48 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
 import { buildRunState, syncRunStateFromModeState } from '../run-state.js';
+import { initializeStateAuthority, mintStateAuthorityTransportCapability } from '../../state/authority.js';
+import { buildStateAuthorityTransportEnv } from '../../state/transport-env.js';
+
+const STATE_AUTHORITY_ENV_KEYS = [
+  'OMX_STARTUP_CWD',
+  'OMX_ROOT',
+  'OMX_STATE_ROOT',
+  'OMX_TEAM_STATE_ROOT',
+  'OMX_STATE_AUTHORITY_PATH',
+  'OMX_STATE_AUTHORITY_ID',
+  'OMX_STATE_AUTHORITY_GENERATION_ID',
+  'OMX_STATE_AUTHORITY_WORKSPACE_DIGEST',
+  'OMX_STATE_AUTHORITY_CAPABILITY',
+  'OMX_SESSION_ID',
+] as const;
+
+async function establishFixtureAuthority(cwd: string, sessionId: string): Promise<() => void> {
+  const stateDir = join(cwd, '.omx', 'state');
+  await mkdir(stateDir, { recursive: true, mode: 0o700 });
+  await chmod(join(cwd, '.omx'), 0o700);
+  await chmod(stateDir, 0o700);
+  const authority = await initializeStateAuthority({
+    startup_cwd: cwd,
+    observed_cwd: cwd,
+    launch_id: `run-state-test-${sessionId}`,
+    session_binding: { canonical_session_id: sessionId },
+  });
+  await mintStateAuthorityTransportCapability(authority);
+  const previous = new Map(STATE_AUTHORITY_ENV_KEYS.map((key) => [key, process.env[key]]));
+  Object.assign(process.env, buildStateAuthorityTransportEnv(authority, { OMX_SESSION_ID: sessionId }));
+  return () => {
+    for (const key of STATE_AUTHORITY_ENV_KEYS) {
+      const value = previous.get(key);
+      if (typeof value === 'string') process.env[key] = value;
+      else delete process.env[key];
+    }
+  };
+}
 
 describe('run state sync', () => {
   it('preserves canonical askuserQuestion lifecycle while keeping legacy blocked_on_user outcome', () => {
@@ -25,7 +63,9 @@ describe('run state sync', () => {
 
   it('writes canonical askuserQuestion lifecycle to run-state.json during sync', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-run-state-'));
+    let restoreAuthority = () => {};
     try {
+      restoreAuthority = await establishFixtureAuthority(wd, 'run-state-sync');
       const synced = await syncRunStateFromModeState(
         {
           mode: 'deep-interview',
@@ -34,16 +74,18 @@ describe('run state sync', () => {
           lifecycle_outcome: 'askuserQuestion',
         },
         wd,
+        'run-state-sync',
       );
 
       const persisted = JSON.parse(
-        await readFile(join(wd, '.omx', 'state', 'run-state.json'), 'utf-8'),
+        await readFile(join(wd, '.omx', 'state', 'sessions', 'run-state-sync', 'run-state.json'), 'utf-8'),
       ) as typeof synced;
 
       assert.equal(synced.outcome, 'blocked_on_user');
       assert.equal(synced.lifecycle_outcome, 'askuserQuestion');
       assert.equal(persisted.lifecycle_outcome, 'askuserQuestion');
     } finally {
+      restoreAuthority();
       await rm(wd, { recursive: true, force: true });
     }
   });

@@ -12,6 +12,49 @@ import {
   readPendingExecFollowups,
 } from '../../exec/followup.js';
 import { writeSessionStart } from '../../hooks/session.js';
+import { initializeStateAuthority, mintStateAuthorityTransportCapability } from '../../state/authority.js';
+import { buildStateAuthorityTransportEnv } from '../../state/transport-env.js';
+
+const STATE_AUTHORITY_ENV_KEYS = [
+  'OMX_STARTUP_CWD',
+  'OMX_ROOT',
+  'OMX_STATE_ROOT',
+  'OMX_TEAM_STATE_ROOT',
+  'OMX_STATE_AUTHORITY_PATH',
+  'OMX_STATE_AUTHORITY_ID',
+  'OMX_STATE_AUTHORITY_GENERATION_ID',
+  'OMX_STATE_AUTHORITY_WORKSPACE_DIGEST',
+  'OMX_STATE_AUTHORITY_CAPABILITY',
+  'OMX_SESSION_ID',
+] as const;
+
+async function prepareFixtureWorkspace(cwd: string): Promise<void> {
+  const omxDir = join(cwd, '.omx');
+  const stateDir = join(omxDir, 'state');
+  await mkdir(stateDir, { recursive: true, mode: 0o700 });
+  await chmod(omxDir, 0o700);
+  await chmod(stateDir, 0o700);
+}
+
+async function establishFixtureAuthority(cwd: string, sessionId: string): Promise<() => void> {
+  await prepareFixtureWorkspace(cwd);
+  const authority = await initializeStateAuthority({
+    startup_cwd: cwd,
+    observed_cwd: cwd,
+    launch_id: `exec-test-${sessionId}`,
+    session_binding: { canonical_session_id: sessionId },
+  });
+  await mintStateAuthorityTransportCapability(authority);
+  const previous = new Map(STATE_AUTHORITY_ENV_KEYS.map((key) => [key, process.env[key]]));
+  Object.assign(process.env, buildStateAuthorityTransportEnv(authority, { OMX_SESSION_ID: sessionId }));
+  return () => {
+    for (const key of STATE_AUTHORITY_ENV_KEYS) {
+      const value = previous.get(key);
+      if (typeof value === 'string') process.env[key] = value;
+      else delete process.env[key];
+    }
+  };
+}
 
 function runOmx(
   cwd: string,
@@ -26,6 +69,7 @@ function runOmx(
     encoding: 'utf-8',
     env: {
       ...process.env,
+      ...Object.fromEntries(STATE_AUTHORITY_ENV_KEYS.map((key) => [key, undefined])),
       CODEX_HOME: '',
       OMX_MODEL_INSTRUCTIONS_FILE: '',
       OMX_TEAM_WORKER: '',
@@ -45,7 +89,9 @@ function runOmx(
 describe('omx exec', () => {
   it('persists audited follow-up prompts for the active exec session without pane input', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-exec-followup-'));
+    let restoreAuthority = () => {};
     try {
+      restoreAuthority = await establishFixtureAuthority(wd, 'omx-test-followup');
       const session = await writeSessionStart(wd, 'omx-test-followup');
       const result = await injectExecFollowup({
         cwd: wd,
@@ -70,13 +116,16 @@ describe('omx exec', () => {
       assert.match(await readFile(auditPath, 'utf-8'), /exec_followup_queued/);
       assert.match(await readFile(auditPath, 'utf-8'), /Please include the new migration note/);
     } finally {
+      restoreAuthority();
       await rm(wd, { recursive: true, force: true });
     }
   });
 
   it('preserves all follow-up prompts from concurrent injections', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-exec-followup-concurrent-'));
+    let restoreAuthority = () => {};
     try {
+      restoreAuthority = await establishFixtureAuthority(wd, 'omx-test-concurrent-followup');
       const session = await writeSessionStart(wd, 'omx-test-concurrent-followup');
       const count = 25;
       const results = await Promise.all(Array.from({ length: count }, async (_, index) => (
@@ -100,13 +149,16 @@ describe('omx exec', () => {
         Array.from({ length: count }, (_, index) => `Concurrent follow-up ${index}`).sort(),
       );
     } finally {
+      restoreAuthority();
       await rm(wd, { recursive: true, force: true });
     }
   });
 
   it('delivers queued follow-ups through Stop hook output and marks them delivered', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-exec-followup-stop-'));
+    let restoreAuthority = () => {};
     try {
+      restoreAuthority = await establishFixtureAuthority(wd, 'omx-test-stop-followup');
       const session = await writeSessionStart(wd, 'omx-test-stop-followup');
       const queued = await injectExecFollowup({
         cwd: wd,
@@ -130,13 +182,16 @@ describe('omx exec', () => {
       assert.equal(persisted.records[0]?.delivery_event, 'stop-hook');
       assert.ok(persisted.records[0]?.delivered_at);
     } finally {
+      restoreAuthority();
       await rm(wd, { recursive: true, force: true });
     }
   });
 
   it('quarantines malformed follow-up queue JSON instead of crashing Stop delivery', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-exec-followup-corrupt-'));
+    let restoreAuthority = () => {};
     try {
+      restoreAuthority = await establishFixtureAuthority(wd, 'omx-test-corrupt-followup');
       const session = await writeSessionStart(wd, 'omx-test-corrupt-followup');
       const queuePath = join(wd, '.omx', 'state', 'sessions', session.session_id, 'exec-followups.json');
       await mkdir(dirname(queuePath), { recursive: true });
@@ -158,6 +213,7 @@ describe('omx exec', () => {
       const auditPath = join(wd, '.omx', 'logs', `exec-followups-${new Date().toISOString().slice(0, 10)}.jsonl`);
       assert.match(await readFile(auditPath, 'utf-8'), /exec_followup_queue_corrupt_recovered/);
     } finally {
+      restoreAuthority();
       await rm(wd, { recursive: true, force: true });
     }
   });
@@ -165,6 +221,7 @@ describe('omx exec', () => {
   it('runs codex exec with session-scoped instructions that preserve AGENTS and overlay content', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-exec-cli-'));
     try {
+      await prepareFixtureWorkspace(wd);
       const home = join(wd, 'home');
       const fakeBin = join(wd, 'bin');
       const fakeCodexPath = join(fakeBin, 'codex');
@@ -226,6 +283,7 @@ describe('omx exec', () => {
   it('passes exec --help through to codex exec', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-exec-help-'));
     try {
+      await prepareFixtureWorkspace(wd);
       const home = join(wd, 'home');
       const fakeBin = join(wd, 'bin');
       const fakeCodexPath = join(fakeBin, 'codex');

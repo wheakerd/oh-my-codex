@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, it } from 'node:test';
+import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, rm, readFile } from 'fs/promises';
 import { join } from 'path';
@@ -14,22 +14,17 @@ import {
   queueDirectMailboxMessage,
   queueBroadcastMailboxMessage,
 } from '../mcp-comm.js';
-
-const ORIGINAL_OMX_TEAM_STATE_ROOT = process.env.OMX_TEAM_STATE_ROOT;
-
-beforeEach(() => {
-  delete process.env.OMX_TEAM_STATE_ROOT;
-});
+import { clearTeamTestAuthority, installTeamTestAuthority } from './authority-fixture.js';
 
 afterEach(() => {
-  if (typeof ORIGINAL_OMX_TEAM_STATE_ROOT === 'string') process.env.OMX_TEAM_STATE_ROOT = ORIGINAL_OMX_TEAM_STATE_ROOT;
-  else delete process.env.OMX_TEAM_STATE_ROOT;
+  clearTeamTestAuthority();
 });
 
 describe('mcp-comm', () => {
   it('queueInboxInstruction writes inbox before notifying', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-mcp-comm-'));
     try {
+      await installTeamTestAuthority(cwd);
       await initTeamState('alpha', 't', 'executor', 1, cwd);
 
       const events: string[] = [];
@@ -63,6 +58,7 @@ describe('mcp-comm', () => {
   it('queueDirectMailboxMessage writes message and marks notified only on successful notify', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-mcp-comm-'));
     try {
+      await installTeamTestAuthority(cwd);
       await initTeamState('alpha', 't', 'executor', 2, cwd);
 
       const outcome = await queueDirectMailboxMessage({
@@ -96,6 +92,7 @@ describe('mcp-comm', () => {
   it('queueDirectMailboxMessage keeps leader-fixed missing-pane request pending/deferred', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-mcp-comm-'));
     try {
+      await installTeamTestAuthority(cwd);
       await initTeamState('alpha', 't', 'executor', 1, cwd);
 
       const outcome = await queueDirectMailboxMessage({
@@ -130,6 +127,7 @@ describe('mcp-comm', () => {
   it('queueDirectMailboxMessage does not create a new dispatch for an already-notified identical message', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-mcp-comm-'));
     try {
+      await installTeamTestAuthority(cwd);
       await initTeamState('alpha-dedupe', 'task', 'executor', 1, cwd);
 
       const first = await queueDirectMailboxMessage({
@@ -177,6 +175,7 @@ describe('mcp-comm', () => {
   it('queueBroadcastMailboxMessage notifies and marks notified per recipient', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-mcp-comm-'));
     try {
+      await installTeamTestAuthority(cwd);
       await initTeamState('alpha', 't', 'executor', 2, cwd);
 
       // Pre-seed a broadcast message set by calling state-layer broadcast through the helper.
@@ -212,6 +211,7 @@ describe('mcp-comm', () => {
   it('prevents duplicate pending mailbox dispatch requests for same message id', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-mcp-comm-'));
     try {
+      await installTeamTestAuthority(cwd);
       await initTeamState('alpha', 't', 'executor', 2, cwd);
 
       const first = await queueDirectMailboxMessage({
@@ -252,6 +252,7 @@ describe('mcp-comm', () => {
   it('marks direct dispatch request failed when notify transport fails (prevents poisoned pending)', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-mcp-comm-'));
     try {
+      await installTeamTestAuthority(cwd);
       await initTeamState('alpha', 't', 'executor', 1, cwd);
 
       const first = await queueInboxInstruction({
@@ -292,6 +293,7 @@ describe('mcp-comm', () => {
   it('marks prompt dispatch request failed when notify throws (prevents poisoned pending)', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-mcp-comm-'));
     try {
+      await installTeamTestAuthority(cwd);
       await initTeamState('alpha', 't', 'executor', 2, cwd);
 
       const outcome = await queueDirectMailboxMessage({

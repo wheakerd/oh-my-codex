@@ -475,98 +475,92 @@ describe('state operations directory initialization', () => {
     }
   });
 
-  it('does not let a populated ambient OMX_TEAM_STATE_ROOT become state mutation authority', async () => {
-
-    const root = await mkdtemp(join(tmpdir(), 'omx-state-ops-team-root-'));
-    try {
-      const wd = join(root, 'workspace');
-      const teamStateRoot = join(root, 'team-state');
-      await mkdir(wd, { recursive: true });
-      await mkdir(teamStateRoot, { recursive: true });
-      await writeFile(join(teamStateRoot, 'session.json'), JSON.stringify({
-        session_id: 'sess-team-write',
-        cwd: wd,
-      }));
-      await writeFile(join(teamStateRoot, 'autoresearch-state.json'), JSON.stringify({
-        active: true,
-        current_phase: 'ambient-forged',
-      }));
-
-
-      await withStateRootEnv({ OMX_TEAM_STATE_ROOT: teamStateRoot }, async () => {
-        const writeResponse = await executeStateOperation('state_write', {
-          workingDirectory: wd,
-          session_id: 'sess-team-write',
-          mode: 'autoresearch',
-          active: true,
-          current_phase: 'running',
-        });
-        const writePayload = responsePayload<{ path: string }>(writeResponse);
-        const canonicalPath = canonicalizeAuthorityPathForCreation(
-          join(wd, '.omx', 'state', 'sessions', 'sess-team-write', 'autoresearch-state.json'),
-        );
-        assert.equal(writePayload.path, canonicalPath);
-        assert.equal(existsSync(canonicalPath), true);
-        assert.equal(existsSync(join(teamStateRoot, 'sessions')), false);
-        assert.equal(existsSync(join(teamStateRoot, 'authority')), false);
-
-
-        const clearResponse = await executeStateOperation('state_clear', {
-          workingDirectory: wd,
-          session_id: 'sess-team-write',
-          mode: 'autoresearch',
-        });
-        const clearPayload = responsePayload<{ path: string }>(clearResponse);
-        assert.equal(clearPayload.path, canonicalPath);
-        assert.equal(existsSync(canonicalPath), false);
-        assert.equal(existsSync(join(wd, '.omx', 'state', 'sessions', 'sess-team-write', 'skill-active-state.json')), true);
-        assert.equal(existsSync(join(teamStateRoot, 'sessions')), false);
-        assert.equal(existsSync(join(teamStateRoot, 'authority')), false);
-      });
-    } finally {
-      await rm(root, { recursive: true, force: true });
-    }
-  });
-
-  it('does not let populated OMX_ROOT or OMX_STATE_ROOT candidates retarget state mutations', async () => {
-
-    for (const envName of ['OMX_ROOT', 'OMX_STATE_ROOT'] as const) {
+  it('rejects conflicting ambient root aliases for state writes and clears without mutating the committed authority', async () => {
+    for (const envName of ['OMX_TEAM_STATE_ROOT', 'OMX_ROOT', 'OMX_STATE_ROOT'] as const) {
       const root = await mkdtemp(join(tmpdir(), `omx-state-ops-${envName.toLowerCase()}-`));
       try {
         const workspace = join(root, 'workspace');
         const ambientRoot = join(root, 'ambient-root');
+        const sessionId = `sess-${envName.toLowerCase()}`;
         await mkdir(workspace, { recursive: true });
-        const ambientStateRoot = join(ambientRoot, '.omx', 'state');
-        await mkdir(ambientStateRoot, { recursive: true });
-        await writeFile(join(ambientStateRoot, 'session.json'), JSON.stringify({
-          session_id: `sess-${envName.toLowerCase()}`,
-          cwd: workspace,
-        }));
-        await writeFile(join(ambientStateRoot, 'autoresearch-state.json'), JSON.stringify({
-          active: true,
-          current_phase: 'ambient-forged',
-        }));
+        await mkdir(join(ambientRoot, '.omx', 'state'), { recursive: true });
 
-        await withStateRootEnv({ [envName]: ambientRoot }, async () => {
-          const response = await executeStateOperation('state_write', {
+        const established = await executeStateOperation('state_write', {
+          workingDirectory: workspace,
+          session_id: sessionId,
+          mode: 'autoresearch',
+          active: true,
+          current_phase: 'running',
+        });
+        const establishedPath = responsePayload<{ path: string }>(established).path;
+        const ambientValue = envName === 'OMX_TEAM_STATE_ROOT'
+          ? join(ambientRoot, '.omx', 'state')
+          : ambientRoot;
+
+        await withStateRootEnv({ [envName]: ambientValue }, async () => {
+          const writeResponse = await executeStateOperation('state_write', {
             workingDirectory: workspace,
-            session_id: `sess-${envName.toLowerCase()}`,
+            session_id: sessionId,
             mode: 'autoresearch',
             active: true,
-            current_phase: 'running',
+            current_phase: 'forged',
           });
-          const payload = responsePayload<{ path: string }>(response);
-          assert.equal(
-            payload.path,
-            canonicalizeAuthorityPathForCreation(
-              join(workspace, '.omx', 'state', 'sessions', `sess-${envName.toLowerCase()}`, 'autoresearch-state.json'),
-            ),
-          );
-          assert.equal(existsSync(join(ambientStateRoot, 'authority')), false, envName);
+          assert.equal(writeResponse.isError, true, envName);
+          assert.match(String((writeResponse.payload as { error?: string }).error), /conflicts with committed authority root/);
+
+          const clearResponse = await executeStateOperation('state_clear', {
+            workingDirectory: workspace,
+            session_id: sessionId,
+            mode: 'autoresearch',
+          });
+          assert.equal(clearResponse.isError, true, envName);
+          assert.match(String((clearResponse.payload as { error?: string }).error), /conflicts with committed authority root/);
         });
+
+        assert.equal(existsSync(establishedPath), true, `${envName} must not clear the committed state`);
+        assert.equal(existsSync(join(ambientRoot, '.omx', 'state', 'authority')), false, envName);
       } finally {
         await rm(root, { recursive: true, force: true });
       }
+    }
+  });
+
+  it('accepts empty and authenticated ambient root aliases that canonicalize to the committed root', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'omx-state-ops-matching-root-aliases-'));
+    const sessionId = 'sess-matching-root-aliases';
+    try {
+      const stateRoot = join(workspace, '.omx', 'state');
+      await executeStateOperation('state_write', {
+        workingDirectory: workspace,
+        session_id: sessionId,
+        mode: 'autoresearch',
+        active: true,
+        current_phase: 'running',
+      });
+      await withStateRootEnv({
+        OMX_TEAM_STATE_ROOT: join(stateRoot, '..', 'state'),
+        OMX_ROOT: workspace,
+        OMX_STATE_ROOT: workspace,
+      }, async () => {
+        const clearResponse = await executeStateOperation('state_clear', {
+          workingDirectory: workspace,
+          session_id: sessionId,
+          mode: 'autoresearch',
+        });
+        assert.equal(clearResponse.isError, undefined);
+      });
+      await withStateRootEnv({ OMX_ROOT: ' ', OMX_STATE_ROOT: ' ', OMX_TEAM_STATE_ROOT: ' ' }, async () => {
+        const writeResponse = await executeStateOperation('state_write', {
+          workingDirectory: workspace,
+          session_id: sessionId,
+          mode: 'autoresearch',
+          active: true,
+          current_phase: 'running',
+        });
+        assert.equal(writeResponse.isError, undefined);
+      });
+    } finally {
+      await rm(workspace, { recursive: true, force: true });
     }
   });
 
@@ -795,6 +789,32 @@ describe('state operations directory initialization', () => {
       assert.deepEqual(response.payload, { exists: false, mode: 'deep-interview' });
     } finally {
       await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('does not read ambient root aliases when committed authority is missing', async () => {
+    const observed = await mkdtemp(join(tmpdir(), 'omx-state-ops-readonly-observed-'));
+    const ambient = await mkdtemp(join(tmpdir(), 'omx-state-ops-readonly-ambient-'));
+    try {
+      const ambientStateDir = join(ambient, '.omx', 'state');
+      await mkdir(ambientStateDir, { recursive: true });
+      await writeFile(join(ambientStateDir, 'deep-interview-state.json'), JSON.stringify({ active: true }));
+
+      await withStateRootEnv({ OMX_ROOT: ambient }, async () => {
+        const read = await executeStateOperation('state_read', {
+          workingDirectory: observed,
+          mode: 'deep-interview',
+        });
+        const active = await executeStateOperation('state_list_active', { workingDirectory: observed });
+        const status = await executeStateOperation('state_get_status', { workingDirectory: observed });
+
+        assert.deepEqual(read.payload, { exists: false, mode: 'deep-interview' });
+        assert.deepEqual(active.payload, { active_modes: [] });
+        assert.deepEqual(status.payload, { statuses: {} });
+      });
+    } finally {
+      await rm(observed, { recursive: true, force: true });
+      await rm(ambient, { recursive: true, force: true });
     }
   });
 
@@ -5603,7 +5623,7 @@ describe('state operations directory initialization', () => {
     }
   });
 
-  it('does not use OMX_TEAM_STATE_ROOT question/session artifacts as mutation authority', async () => {
+  it('rejects conflicting OMX_TEAM_STATE_ROOT question/session artifacts without mutating parent or ambient state', async () => {
 
     const root = await mkdtemp(join(tmpdir(), 'omx-state-ops-autopilot-team-question-'));
     const previousOmxRoot = process.env.OMX_ROOT;
@@ -5616,6 +5636,11 @@ describe('state operations directory initialization', () => {
       const sessionDir = join(teamStateRoot, 'sessions', sessionId);
       const questionId = 'question-team-satisfied';
       await mkdir(wd, { recursive: true });
+      await mkdir(join(wd, '.omx', 'state', 'sessions', sessionId), { recursive: true });
+      await writeFile(
+        join(wd, '.omx', 'state', 'sessions', sessionId, 'autoresearch-state.json'),
+        JSON.stringify({ active: false, mode: 'autoresearch', current_phase: 'idle' }, null, 2),
+      );
       await mkdir(join(sessionDir, 'questions'), { recursive: true });
       await writeFile(join(teamStateRoot, 'session.json'), JSON.stringify({ session_id: sessionId, cwd: wd }, null, 2));
       await writeFile(
@@ -5653,6 +5678,12 @@ describe('state operations directory initialization', () => {
           },
         }, null, 2),
       );
+      const parentStatePath = join(wd, '.omx', 'state', 'sessions', sessionId, 'autoresearch-state.json');
+      const ambientStatePath = join(sessionDir, 'autopilot-state.json');
+      const ambientQuestionPath = join(sessionDir, 'questions', `${questionId}.json`);
+      const parentStateBefore = await readFile(parentStatePath, 'utf-8');
+      const ambientStateBefore = await readFile(ambientStatePath, 'utf-8');
+      const ambientQuestionBefore = await readFile(ambientQuestionPath, 'utf-8');
 
       delete process.env.OMX_ROOT;
       delete process.env.OMX_STATE_ROOT;
@@ -5667,14 +5698,15 @@ describe('state operations directory initialization', () => {
 
       });
 
-      assert.equal(response.isError, undefined, JSON.stringify(response.payload));
-      const state = JSON.parse(
-        await readFile(join(wd, '.omx', 'state', 'sessions', sessionId, 'autoresearch-state.json'), 'utf-8'),
-      ) as Record<string, unknown>;
-      assert.equal(state.current_phase, 'running');
-      const ambientState = JSON.parse(await readFile(join(sessionDir, 'autopilot-state.json'), 'utf-8')) as Record<string, unknown>;
-      assert.equal(ambientState.current_phase, 'deep-interview');
+      assert.equal(response.isError, true);
+      assert.match(
+        String((response.payload as { error?: string }).error || ''),
+        /OMX_TEAM_STATE_ROOT state root .* conflicts with committed authority root/,
+      );
+      assert.equal(await readFile(parentStatePath, 'utf-8'), parentStateBefore);
+      assert.equal(await readFile(ambientStatePath, 'utf-8'), ambientStateBefore);
       assert.equal(existsSync(join(wd, '.omx', 'state', 'sessions', sessionId, 'questions', `${questionId}.json`)), false);
+      assert.equal(await readFile(ambientQuestionPath, 'utf-8'), ambientQuestionBefore);
     } finally {
       if (typeof previousOmxRoot === 'string') process.env.OMX_ROOT = previousOmxRoot;
       else delete process.env.OMX_ROOT;

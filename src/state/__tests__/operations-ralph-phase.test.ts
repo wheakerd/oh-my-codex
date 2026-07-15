@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -9,25 +9,47 @@ import {
   type StateOperationName,
   type StateOperationResponse,
 } from '../operations.js';
-import { initializeStateAuthority } from '../authority.js';
+import { initializeStateAuthority, mintStateAuthorityTransportCapability } from '../authority.js';
+import { buildStateAuthorityTransportEnv } from '../transport-env.js';
 
-const ralphPhaseAuthorityInitByWorkspace = new Map<string, Promise<void>>();
+const STATE_AUTHORITY_ENV_KEYS = [
+  'OMX_STARTUP_CWD',
+  'OMX_ROOT',
+  'OMX_STATE_ROOT',
+  'OMX_TEAM_STATE_ROOT',
+  'OMX_STATE_AUTHORITY_PATH',
+  'OMX_STATE_AUTHORITY_ID',
+  'OMX_STATE_AUTHORITY_GENERATION_ID',
+  'OMX_STATE_AUTHORITY_WORKSPACE_DIGEST',
+  'OMX_STATE_AUTHORITY_CAPABILITY',
+  'OMX_SESSION_ID',
+] as const;
 
-async function ensureTestRalphPhaseAuthority(workingDirectory: string): Promise<void> {
-  const existing = ralphPhaseAuthorityInitByWorkspace.get(workingDirectory);
-  if (existing) return existing;
-  const initializing = initializeStateAuthority({
-    startup_cwd: workingDirectory,
-    launch_id: `ralph-phase-test-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-    session_binding: {
-      canonical_session_id: `ralph-phase-session-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-    },
-  }).then(() => undefined);
-  ralphPhaseAuthorityInitByWorkspace.set(workingDirectory, initializing);
+const ralphPhaseAuthorityTransportByWorkspace = new Map<string, Promise<NodeJS.ProcessEnv>>();
+
+async function ensureTestRalphPhaseAuthority(workingDirectory: string): Promise<NodeJS.ProcessEnv> {
+  const existing = ralphPhaseAuthorityTransportByWorkspace.get(workingDirectory);
+  if (existing) return await existing;
+  const sessionId = 'ralph-phase-session';
+  const initializing = (async () => {
+    const stateDir = join(workingDirectory, '.omx', 'state');
+    await mkdir(stateDir, { recursive: true, mode: 0o700 });
+    await chmod(join(workingDirectory, '.omx'), 0o700);
+    await chmod(stateDir, 0o700);
+    const authority = await initializeStateAuthority({
+      startup_cwd: workingDirectory,
+      observed_cwd: workingDirectory,
+      launch_id: `ralph-phase-test-${sessionId}`,
+      session_binding: { canonical_session_id: sessionId },
+    });
+    await mintStateAuthorityTransportCapability(authority);
+    return buildStateAuthorityTransportEnv(authority, { OMX_SESSION_ID: sessionId });
+  })();
+  ralphPhaseAuthorityTransportByWorkspace.set(workingDirectory, initializing);
   try {
-    await initializing;
+    return await initializing;
   } catch (error) {
-    ralphPhaseAuthorityInitByWorkspace.delete(workingDirectory);
+    ralphPhaseAuthorityTransportByWorkspace.delete(workingDirectory);
     throw error;
   }
 }
@@ -40,7 +62,18 @@ async function executeStateOperation(
     const workingDirectory = typeof rawArgs.workingDirectory === 'string'
       ? rawArgs.workingDirectory
       : process.cwd();
-    await ensureTestRalphPhaseAuthority(workingDirectory);
+    const transport = await ensureTestRalphPhaseAuthority(workingDirectory);
+    const previous = new Map(STATE_AUTHORITY_ENV_KEYS.map((key) => [key, process.env[key]]));
+    Object.assign(process.env, transport);
+    try {
+      return await executeStateOperationRaw(name, rawArgs);
+    } finally {
+      for (const key of STATE_AUTHORITY_ENV_KEYS) {
+        const value = previous.get(key);
+        if (typeof value === 'string') process.env[key] = value;
+        else delete process.env[key];
+      }
+    }
   }
   return executeStateOperationRaw(name, rawArgs);
 }
@@ -58,7 +91,7 @@ describe('state operations Ralph phase contract', () => {
       });
       assert.equal(response.isError, undefined);
 
-      const file = join(wd, '.omx', 'state', 'ralph-state.json');
+      const file = join(wd, '.omx', 'state', 'sessions', 'ralph-phase-session', 'ralph-state.json');
       const state = JSON.parse(await readFile(file, 'utf-8'));
       assert.equal(state.current_phase, 'executing');
       assert.equal(state.ralph_phase_normalized_from, 'execution');
@@ -79,7 +112,7 @@ describe('state operations Ralph phase contract', () => {
       });
       assert.equal(response.isError, undefined);
 
-      const file = join(wd, '.omx', 'state', 'ralph-state.json');
+      const file = join(wd, '.omx', 'state', 'sessions', 'ralph-phase-session', 'ralph-state.json');
       const state = JSON.parse(await readFile(file, 'utf-8'));
       assert.equal(state.current_phase, 'blocked_on_user');
       assert.equal(state.run_outcome, 'blocked_on_user');
@@ -177,7 +210,7 @@ describe('state operations Ralph phase contract', () => {
       });
       assert.equal(response.isError, undefined);
 
-      const file = join(wd, '.omx', 'state', 'ralph-state.json');
+      const file = join(wd, '.omx', 'state', 'sessions', 'ralph-phase-session', 'ralph-state.json');
       const state = JSON.parse(await readFile(file, 'utf-8'));
       assert.equal(state.current_phase, 'complete');
       assert.equal(state.active, false);

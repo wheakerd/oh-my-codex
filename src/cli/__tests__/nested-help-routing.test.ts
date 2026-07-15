@@ -2,13 +2,14 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
 
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { writeSessionStart } from '../../hooks/session.js';
 
-function runOmx(cwd: string, argv: string[]) {
+function runOmx(cwd: string, argv: string[], env: NodeJS.ProcessEnv = {}) {
   const testDir = dirname(fileURLToPath(import.meta.url));
   const repoRoot = join(testDir, '..', '..', '..');
   const omxBin = join(repoRoot, 'dist', 'cli', 'omx.js');
@@ -20,6 +21,10 @@ function runOmx(cwd: string, argv: string[]) {
       OMX_AUTO_UPDATE: '0',
       OMX_NOTIFY_FALLBACK: '0',
       OMX_HOOK_DERIVED_SIGNALS: '0',
+      OMX_ROOT: undefined,
+      OMX_STATE_ROOT: undefined,
+      OMX_TEAM_STATE_ROOT: undefined,
+      ...env,
     },
   });
 }
@@ -63,6 +68,42 @@ describe('nested help routing', () => {
       assert.equal(result.status, 0, result.stderr || result.stdout);
       assert.match(result.stdout.trim(), /^\{"exists":false,"mode":"ralph"\}$/);
       assert.doesNotMatch(result.stdout, /Unknown command: state/i);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects command-local conflicting root aliases for packaged state write and clear', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-state-packed-root-alias-'));
+    const sessionId = 'sess-packed-root-alias';
+    try {
+      await writeSessionStart(cwd, sessionId);
+      const writeArgs = ['state', 'write', '--input', JSON.stringify({
+        mode: 'autoresearch', active: true, current_phase: 'running', session_id: sessionId,
+      }), '--json'];
+      const clearArgs = ['state', 'clear', '--input', JSON.stringify({
+        mode: 'autoresearch', session_id: sessionId,
+      }), '--json'];
+      const established = runOmx(cwd, writeArgs);
+      assert.equal(established.status, 0, established.stderr || established.stdout);
+
+      for (const envName of ['OMX_TEAM_STATE_ROOT', 'OMX_ROOT', 'OMX_STATE_ROOT'] as const) {
+        const ambientRoot = await mkdtemp(join(tmpdir(), `omx-state-packed-${envName.toLowerCase()}-`));
+        try {
+          await mkdir(join(ambientRoot, '.omx', 'state'), { recursive: true });
+          const env = {
+            [envName]: envName === 'OMX_TEAM_STATE_ROOT' ? join(ambientRoot, '.omx', 'state') : ambientRoot,
+          };
+          const rejectedWrite = runOmx(cwd, writeArgs, env);
+          assert.equal(rejectedWrite.status, 1, rejectedWrite.stderr || rejectedWrite.stdout);
+          assert.match(rejectedWrite.stderr, /conflicts with committed authority root/);
+          const rejectedClear = runOmx(cwd, clearArgs, env);
+          assert.equal(rejectedClear.status, 1, rejectedClear.stderr || rejectedClear.stdout);
+          assert.match(rejectedClear.stderr, /conflicts with committed authority root/);
+        } finally {
+          await rm(ambientRoot, { recursive: true, force: true });
+        }
+      }
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

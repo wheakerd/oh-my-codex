@@ -1605,18 +1605,14 @@ function sameJson(left: unknown, right: unknown): boolean {
 
 function isolatedSmokeEnv(home: string, codexHome: string): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env, HOME: home, CODEX_HOME: codexHome };
-  for (const key of [
-    'OMX_SESSION_ID',
-    'OMX_RUN_ID',
-    'OMX_ROOT',
-    'OMX_STATE_ROOT',
-    'OMX_ACTIVE_SESSION_PID',
-    'CODEX_SESSION_ID',
-    'TMUX',
-    'TMUX_PANE',
-  ]) {
-    delete env[key];
-  }
+  delete env.OMX_SESSION_ID;
+  delete env.OMX_RUN_ID;
+  delete env.OMX_ROOT;
+  delete env.OMX_STATE_ROOT;
+  delete env.OMX_ACTIVE_SESSION_PID;
+  delete env.CODEX_SESSION_ID;
+  delete env.TMUX;
+  delete env.TMUX_PANE;
   return env;
 }
 

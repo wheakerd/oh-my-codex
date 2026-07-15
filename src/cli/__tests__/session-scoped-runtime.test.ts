@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, rm, writeFile, readFile } from 'fs/promises';
+import { chmod, mkdir, mkdtemp, rm, writeFile, readFile } from 'fs/promises';
 import { existsSync } from 'fs';
 import { dirname, join } from 'path';
 import { tmpdir } from 'os';
@@ -31,6 +31,10 @@ async function establishCommittedAuthority(
   cwd: string,
   sessionId: string,
 ): Promise<NodeJS.ProcessEnv> {
+  const stateDir = join(cwd, '.omx', 'state');
+  await mkdir(stateDir, { recursive: true, mode: 0o700 });
+  await chmod(join(cwd, '.omx'), 0o700);
+  await chmod(stateDir, 0o700);
   const authority = await initializeStateAuthority({
     startup_cwd: cwd,
     observed_cwd: cwd,
@@ -38,7 +42,10 @@ async function establishCommittedAuthority(
     session_binding: { canonical_session_id: sessionId },
   });
   await mintStateAuthorityTransportCapability(authority);
-  return buildStateAuthorityTransportEnv(authority, { OMX_SESSION_ID: sessionId });
+  return buildStateAuthorityTransportEnv(authority, {
+    ...Object.fromEntries(STATE_AUTHORITY_ENV_KEYS.map((key) => [key, undefined])),
+    OMX_SESSION_ID: sessionId,
+  });
 }
 
 function unauthenticatedEnv(overrides: NodeJS.ProcessEnv): NodeJS.ProcessEnv {

@@ -20,6 +20,7 @@ import { executeTeamApiOperation } from '../api-interop.js';
 import { sendWorkerMessage, broadcastWorkerMessage } from '../runtime.js';
 import { drainPendingTeamDispatch } from '../../scripts/notify-hook/team-dispatch.js';
 import { teamCommand } from '../../cli/team.js';
+import { installTeamTestAuthority } from './authority-fixture.js';
 
 const EXACT_GLOBAL_PANE_PROOF_COMMAND = 'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}';
 
@@ -224,14 +225,11 @@ switch (command.command) {
 
 async function setupTeam(name: string, workerCount: number = 2): Promise<{ cwd: string; cleanup: () => Promise<void> }> {
   const cwd = await mkdtemp(join(tmpdir(), `omx-delivery-e2e-${name}-`));
-  const previousTeamStateRoot = process.env.OMX_TEAM_STATE_ROOT;
-  process.env.OMX_TEAM_STATE_ROOT = join(cwd, '.omx', 'state');
+  await installTeamTestAuthority(cwd);
   await initTeamState(name, 'delivery smoke test', 'executor', workerCount, cwd);
   return {
     cwd,
     cleanup: async () => {
-      if (typeof previousTeamStateRoot === 'string') process.env.OMX_TEAM_STATE_ROOT = previousTeamStateRoot;
-      else delete process.env.OMX_TEAM_STATE_ROOT;
       await rm(cwd, { recursive: true, force: true });
     },
   };

@@ -7,6 +7,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:pat
 
 import { withModeRuntimeContext } from './mode-state-context.js';
 import {
+  assertAmbientStateRootAliasesMatchAuthority,
   resolveAuthorityRuntimeStateScope,
   resolveRuntimeStateScope,
   resolveWorkingDirectoryForState,
@@ -2303,7 +2304,7 @@ async function executeStateOperationInternal(
         throw error;
       }
       if (name !== 'state_write' && name !== 'state_clear') {
-        scope = await resolveRuntimeStateScope(cwd, explicitSessionId);
+        scope = await resolveRuntimeStateScope(cwd, explicitSessionId, { ambientRootAliases: false });
       } else {
         throw new StateAuthorityError(
           AUTHORITY_DIAGNOSTIC_CODES.anchorMissing,
@@ -2311,6 +2312,10 @@ async function executeStateOperationInternal(
         );
       }
     }
+    if ((name === 'state_write' || name === 'state_clear') && scope.authority) {
+      assertAmbientStateRootAliasesMatchAuthority(scope.authority);
+    }
+
   } catch (error) {
     return {
       payload: { error: (error as Error).message },
@@ -2495,6 +2500,7 @@ async function executeStateOperationInternal(
             delete mergedRaw.terminal_outcome;
           }
 
+          if (effectiveSessionId) mergedRaw.session_id = effectiveSessionId;
           if (
             mode === 'ralph' &&
             effectiveSessionId &&
@@ -2958,6 +2964,9 @@ async function executeStateOperationInternal(
           AUTHORITY_DIAGNOSTIC_CODES.anchorRevisionConflict,
           'state authority changed while refreshing the operation transaction context',
         );
+      }
+      if (name === 'state_write' || name === 'state_clear') {
+        assertAmbientStateRootAliasesMatchAuthority(refreshedScope.authority);
       }
       return execute({ ...refreshedScope, authority: refreshedAuthority }, lock);
     };

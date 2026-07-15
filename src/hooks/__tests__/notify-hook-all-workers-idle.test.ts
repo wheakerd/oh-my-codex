@@ -6,20 +6,44 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+import { clearTeamTestAuthority, hardenTestAuthorityTreeSync, installTeamTestAuthority } from '../../team/__tests__/authority-fixture.js';
+
 const NOTIFY_HOOK_SCRIPT = new URL('../../../dist/scripts/notify-hook.js', import.meta.url);
 
 async function withTempWorkingDir(run: (cwd: string) => Promise<void>): Promise<void> {
   const cwd = await mkdtemp(join(tmpdir(), 'omx-notify-all-idle-'));
   try {
+    await installTeamTestAuthority(cwd, 'notify-hook-all-workers-idle');
     await run(cwd);
   } finally {
+    clearTeamTestAuthority();
     await rm(cwd, { recursive: true, force: true });
   }
 }
 
 async function writeJson(path: string, value: unknown): Promise<void> {
+  const persisted = /(?:config|manifest\.v2)\.json$/.test(path) && value && typeof value === 'object'
+    ? {
+        session_id: 'notify-hook-all-workers-idle',
+        owner_session_id: 'notify-hook-all-workers-idle',
+        ...value as Record<string, unknown>,
+      }
+    : value;
   await mkdir(join(path, '..'), { recursive: true });
-  await writeFile(path, JSON.stringify(value, null, 2));
+  await writeFile(path, JSON.stringify(persisted, null, 2));
+  if (path.endsWith('config.json') && persisted && typeof persisted === 'object') {
+    const config = persisted as { workers?: unknown[]; tmux_session?: unknown; leader_pane_id?: unknown };
+    await writeFile(join(path, '..', 'manifest.v2.json'), JSON.stringify({
+      leader: {
+        session_id: 'notify-hook-all-workers-idle',
+        worker_id: 'leader-fixed',
+        role: 'coordinator',
+      },
+      tmux_session: config.tmux_session ?? null,
+      leader_pane_id: config.leader_pane_id ?? null,
+      workers: config.workers ?? [],
+    }, null, 2));
+  }
 }
 
 function buildFakeTmux(tmuxLogPath: string): string {
@@ -104,6 +128,21 @@ function writeWorkerIdentityFixture(cwd: string, workerEnv: string): string {
       team_state_root: stateRoot,
     }, null, 2));
   }
+  const manifestPath = join(stateRoot, 'team', teamName, 'manifest.v2.json');
+  if (existsSync(manifestPath)) {
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as { workers?: Array<Record<string, unknown>> };
+    const workerIdentity = JSON.parse(readFileSync(identityPath, 'utf8')) as Record<string, unknown>;
+    manifest.workers = [
+      ...(manifest.workers ?? []).filter((candidate) => candidate.name !== workerName),
+      {
+        name: workerName,
+        index: workerIdentity.index,
+        role: workerIdentity.role,
+        assigned_tasks: workerIdentity.assigned_tasks,
+      },
+    ];
+    writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
+  }
   return stateRoot;
 }
 
@@ -114,6 +153,7 @@ function runNotifyHookAsWorker(
   extraEnv: Record<string, string> = {},
 ): ReturnType<typeof spawnSync> {
   const stateRoot = writeWorkerIdentityFixture(cwd, workerEnv);
+  hardenTestAuthorityTreeSync(cwd);
   const payload = {
     cwd,
     type: 'agent-turn-complete',

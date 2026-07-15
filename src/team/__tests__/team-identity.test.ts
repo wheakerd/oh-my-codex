@@ -1,4 +1,4 @@
-import { describe, it } from 'node:test';
+import { afterEach, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
 import { mkdir, mkdtemp, rm, writeFile } from 'fs/promises';
@@ -11,6 +11,49 @@ import { initializeStateAuthority, mintStateAuthorityTransportCapability } from 
 import { buildStateAuthorityTransportEnv } from '../../state/transport-env.js';
 
 const longDisplay = 'this-is-a-very-long-team-display-name-that-would-overflow';
+
+let environmentBeforeTest: NodeJS.ProcessEnv;
+let authorityTransportByWorkspace = new Map<string, NodeJS.ProcessEnv>();
+const TEAM_IDENTITY_SESSION_ALIASES = [
+  'session-shared',
+  'session-worker-authority',
+  'session-active',
+  'session-terminal',
+  'session-a',
+  'session-b',
+  'session-current',
+  'session-other',
+  'session-old',
+  'session-new',
+];
+
+beforeEach(() => {
+  environmentBeforeTest = { ...process.env };
+  authorityTransportByWorkspace = new Map();
+});
+
+afterEach(() => {
+  for (const key of Object.keys(process.env)) delete process.env[key];
+  Object.assign(process.env, environmentBeforeTest);
+});
+
+async function authenticatedEnvironment(cwd: string, sessionId: string): Promise<NodeJS.ProcessEnv> {
+  const existing = authorityTransportByWorkspace.get(cwd);
+  if (existing) return { ...existing, OMX_SESSION_ID: sessionId };
+  const authority = await initializeStateAuthority({
+    startup_cwd: cwd,
+    observed_cwd: cwd,
+    launch_id: `team-identity-${sessionId}`,
+    session_binding: {
+      canonical_session_id: sessionId,
+      aliases: { current_session_aliases: TEAM_IDENTITY_SESSION_ALIASES },
+    },
+  });
+  await mintStateAuthorityTransportCapability(authority);
+  const transport = buildStateAuthorityTransportEnv(authority, { OMX_SESSION_ID: sessionId });
+  authorityTransportByWorkspace.set(cwd, transport);
+  return transport;
+}
 
 async function writePhase(cwd: string, teamName: string, currentPhase: string, updatedAt: string): Promise<void> {
   await writeFile(join(cwd, '.omx', 'state', 'team', teamName, 'phase.json'), JSON.stringify({
@@ -43,35 +86,29 @@ describe('team identity', () => {
     assert.equal(scope.paneId, '%42');
   });
 
-  it('keeps ambient root combinations out of canonical persistence and lookup', async () => {
+  it('keeps ambient root combinations diagnostic-only for canonical persistence and lookup', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-team-identity-canonical-'));
     const foreignTeamStateRoot = await mkdtemp(join(tmpdir(), 'omx-team-identity-foreign-team-'));
     const foreignOmxRoot = await mkdtemp(join(tmpdir(), 'omx-team-identity-foreign-root-'));
     const foreignStateRoot = await mkdtemp(join(tmpdir(), 'omx-team-identity-foreign-state-'));
-    const previous = {
-      teamStateRoot: process.env.OMX_TEAM_STATE_ROOT,
-      root: process.env.OMX_ROOT,
-      stateRoot: process.env.OMX_STATE_ROOT,
-    };
     const teamName = 'shared-demo-aaaaaaaa';
     try {
-      process.env.OMX_TEAM_STATE_ROOT = foreignTeamStateRoot;
-      process.env.OMX_ROOT = foreignOmxRoot;
-      process.env.OMX_STATE_ROOT = foreignStateRoot;
-      await initTeamState(teamName, 'task', 'executor', 1, cwd, undefined, { OMX_SESSION_ID: 'session-shared' }, {
+      const transport = await authenticatedEnvironment(cwd, 'session-shared');
+      await initTeamState(teamName, 'task', 'executor', 1, cwd, undefined, transport, {
         display_name: 'shared-demo', requested_name: 'shared-demo', identity_source: 'env-session',
       });
 
       assert.equal(existsSync(join(cwd, '.omx', 'state', 'team', teamName, 'config.json')), true);
-      assert.equal(
-        resolveTeamNameForCurrentContext('shared-demo', cwd, {
-          OMX_SESSION_ID: 'session-shared',
-          OMX_TEAM_STATE_ROOT: foreignTeamStateRoot,
-          OMX_ROOT: foreignOmxRoot,
-          OMX_STATE_ROOT: foreignStateRoot,
-        }),
-        teamName,
-      );
+      for (const [name, value] of [
+        ['OMX_TEAM_STATE_ROOT', foreignTeamStateRoot],
+        ['OMX_ROOT', foreignOmxRoot],
+        ['OMX_STATE_ROOT', foreignStateRoot],
+      ]) {
+        assert.throws(
+          () => resolveTeamNameForCurrentContext('shared-demo', cwd, { ...transport, [name]: value }),
+          (error: unknown) => error instanceof Error && 'code' in error && error.code === 'authority_workspace_mismatch',
+        );
+      }
       for (const root of [
         foreignTeamStateRoot,
         join(foreignOmxRoot, '.omx', 'state'),
@@ -80,12 +117,6 @@ describe('team identity', () => {
         assert.equal(existsSync(join(root, 'team', teamName)), false);
       }
     } finally {
-      if (typeof previous.teamStateRoot === 'string') process.env.OMX_TEAM_STATE_ROOT = previous.teamStateRoot;
-      else delete process.env.OMX_TEAM_STATE_ROOT;
-      if (typeof previous.root === 'string') process.env.OMX_ROOT = previous.root;
-      else delete process.env.OMX_ROOT;
-      if (typeof previous.stateRoot === 'string') process.env.OMX_STATE_ROOT = previous.stateRoot;
-      else delete process.env.OMX_STATE_ROOT;
       await rm(cwd, { recursive: true, force: true });
       await rm(foreignTeamStateRoot, { recursive: true, force: true });
       await rm(foreignOmxRoot, { recursive: true, force: true });
@@ -100,21 +131,9 @@ describe('team identity', () => {
     const teamName = 'worker-demo-aaaaaaaa';
     try {
       await mkdir(workerCwd, { recursive: true });
-      const authority = await initializeStateAuthority({
-        startup_cwd: leaderCwd,
-        observed_cwd: leaderCwd,
-        launch_id: 'team-identity-worker-authority',
-        session_binding: { canonical_session_id: 'session-worker-authority' },
-      });
-      await mintStateAuthorityTransportCapability(authority);
-      await initTeamState(teamName, 'task', 'executor', 1, leaderCwd, undefined, {
-        OMX_SESSION_ID: 'session-worker-authority',
-      }, {
+      const transport = await authenticatedEnvironment(leaderCwd, 'session-worker-authority');
+      await initTeamState(teamName, 'task', 'executor', 1, leaderCwd, undefined, transport, {
         display_name: 'worker-demo', requested_name: 'worker-demo', identity_source: 'env-session',
-      });
-
-      const transport = buildStateAuthorityTransportEnv(authority, {
-        OMX_SESSION_ID: 'session-worker-authority',
       });
       assert.equal(resolveTeamNameForCurrentContext('worker-demo', workerCwd, transport), teamName);
       for (const [name, value] of [
@@ -139,10 +158,10 @@ describe('team identity', () => {
   it('prefers active display-name candidates over retained terminal states', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-team-identity-active-'));
     try {
-      await initTeamState('demo-active', 'task', 'executor', 1, cwd, undefined, { OMX_SESSION_ID: 'session-active' }, {
+      await initTeamState('demo-active', 'task', 'executor', 1, cwd, undefined, await authenticatedEnvironment(cwd, 'session-active'), {
         display_name: 'demo', requested_name: 'demo', identity_source: 'env-session',
       });
-      await initTeamState('demo-terminal', 'task', 'executor', 1, cwd, undefined, { OMX_SESSION_ID: 'session-terminal' }, {
+      await initTeamState('demo-terminal', 'task', 'executor', 1, cwd, undefined, await authenticatedEnvironment(cwd, 'session-terminal'), {
         display_name: 'demo', requested_name: 'demo', identity_source: 'env-session',
       });
       await writePhase(cwd, 'demo-terminal', 'complete', '2026-01-01T00:00:00.000Z');
@@ -157,10 +176,10 @@ describe('team identity', () => {
   it('prefers active display-name candidates over an exact retained terminal directory', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-team-identity-exact-terminal-'));
     try {
-      await initTeamState('demo', 'task', 'executor', 1, cwd, undefined, { OMX_SESSION_ID: 'session-terminal' }, {
+      await initTeamState('demo', 'task', 'executor', 1, cwd, undefined, await authenticatedEnvironment(cwd, 'session-terminal'), {
         display_name: 'demo', requested_name: 'demo', identity_source: 'env-session',
       });
-      await initTeamState('demo-aaaaaaaa', 'task', 'executor', 1, cwd, undefined, { OMX_SESSION_ID: 'session-active' }, {
+      await initTeamState('demo-aaaaaaaa', 'task', 'executor', 1, cwd, undefined, await authenticatedEnvironment(cwd, 'session-active'), {
         display_name: 'demo', requested_name: 'demo', identity_source: 'env-session',
       });
       await writePhase(cwd, 'demo', 'complete', '2026-01-01T00:00:00.000Z');
@@ -174,14 +193,14 @@ describe('team identity', () => {
   it('uses current leader identity to break active display-name ties', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-team-identity-current-'));
     try {
-      await initTeamState('demo-aaaaaaaa', 'task', 'executor', 1, cwd, undefined, { OMX_SESSION_ID: 'session-a' }, {
+      await initTeamState('demo-aaaaaaaa', 'task', 'executor', 1, cwd, undefined, await authenticatedEnvironment(cwd, 'session-a'), {
         display_name: 'demo', requested_name: 'demo', identity_source: 'env-session',
       });
-      await initTeamState('demo-bbbbbbbb', 'task', 'executor', 1, cwd, undefined, { OMX_SESSION_ID: 'session-b' }, {
+      await initTeamState('demo-bbbbbbbb', 'task', 'executor', 1, cwd, undefined, await authenticatedEnvironment(cwd, 'session-b'), {
         display_name: 'demo', requested_name: 'demo', identity_source: 'env-session',
       });
 
-      assert.equal(resolveTeamNameForCurrentContext('demo', cwd, { OMX_SESSION_ID: 'session-b' }), 'demo-bbbbbbbb');
+      assert.equal(resolveTeamNameForCurrentContext('demo', cwd, await authenticatedEnvironment(cwd, 'session-b')), 'demo-bbbbbbbb');
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -190,16 +209,16 @@ describe('team identity', () => {
   it('uses current leader identity before latest retained terminal state', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-team-identity-terminal-current-'));
     try {
-      await initTeamState('demo-old-current', 'task', 'executor', 1, cwd, undefined, { OMX_SESSION_ID: 'session-current' }, {
+      await initTeamState('demo-old-current', 'task', 'executor', 1, cwd, undefined, await authenticatedEnvironment(cwd, 'session-current'), {
         display_name: 'demo', requested_name: 'demo', identity_source: 'env-session',
       });
-      await initTeamState('demo-new-other', 'task', 'executor', 1, cwd, undefined, { OMX_SESSION_ID: 'session-other' }, {
+      await initTeamState('demo-new-other', 'task', 'executor', 1, cwd, undefined, await authenticatedEnvironment(cwd, 'session-other'), {
         display_name: 'demo', requested_name: 'demo', identity_source: 'env-session',
       });
       await writePhase(cwd, 'demo-old-current', 'failed', '2026-01-01T00:00:00.000Z');
       await writePhase(cwd, 'demo-new-other', 'complete', '2026-01-02T00:00:00.000Z');
 
-      assert.equal(resolveTeamNameForCurrentContext('demo', cwd, { OMX_SESSION_ID: 'session-current' }), 'demo-old-current');
+      assert.equal(resolveTeamNameForCurrentContext('demo', cwd, await authenticatedEnvironment(cwd, 'session-current')), 'demo-old-current');
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -208,16 +227,16 @@ describe('team identity', () => {
   it('keeps a retained terminal session binding instead of selecting another active team', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-team-identity-terminal-pane-'));
     try {
-      await initTeamState('demo-terminal-current', 'task', 'executor', 1, cwd, undefined, { OMX_SESSION_ID: 'session-current' }, {
+      await initTeamState('demo-terminal-current', 'task', 'executor', 1, cwd, undefined, await authenticatedEnvironment(cwd, 'session-current'), {
         display_name: 'demo', requested_name: 'demo', identity_source: 'env-session',
       });
-      await initTeamState('demo-active-other', 'task', 'executor', 1, cwd, undefined, { OMX_SESSION_ID: 'session-other' }, {
+      await initTeamState('demo-active-other', 'task', 'executor', 1, cwd, undefined, await authenticatedEnvironment(cwd, 'session-other'), {
         display_name: 'demo', requested_name: 'demo', identity_source: 'env-session',
       });
       await writePhase(cwd, 'demo-terminal-current', 'complete', '2026-01-01T00:00:00.000Z');
 
       assert.equal(
-        resolveTeamNameForCurrentContext('demo', cwd, { OMX_SESSION_ID: 'session-current' }),
+        resolveTeamNameForCurrentContext('demo', cwd, await authenticatedEnvironment(cwd, 'session-current')),
         'demo-terminal-current',
       );
     } finally {
@@ -228,10 +247,10 @@ describe('team identity', () => {
   it('resolves the latest retained terminal display-name state only when unambiguous', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-team-identity-latest-terminal-'));
     try {
-      await initTeamState('demo-old', 'task', 'executor', 1, cwd, undefined, { OMX_SESSION_ID: 'session-old' }, {
+      await initTeamState('demo-old', 'task', 'executor', 1, cwd, undefined, await authenticatedEnvironment(cwd, 'session-old'), {
         display_name: 'demo', requested_name: 'demo', identity_source: 'env-session',
       });
-      await initTeamState('demo-new', 'task', 'executor', 1, cwd, undefined, { OMX_SESSION_ID: 'session-new' }, {
+      await initTeamState('demo-new', 'task', 'executor', 1, cwd, undefined, await authenticatedEnvironment(cwd, 'session-new'), {
         display_name: 'demo', requested_name: 'demo', identity_source: 'env-session',
       });
       await writePhase(cwd, 'demo-old', 'failed', '2026-01-01T00:00:00.000Z');
@@ -262,14 +281,14 @@ describe('team identity', () => {
   it('resolves display names to the current session candidate and fails closed on ambiguity', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-team-identity-'));
     try {
-      await initTeamState('demo-aaaaaaaa', 'task', 'executor', 1, cwd, undefined, { OMX_SESSION_ID: 'session-a' }, {
+      await initTeamState('demo-aaaaaaaa', 'task', 'executor', 1, cwd, undefined, await authenticatedEnvironment(cwd, 'session-a'), {
         display_name: 'demo', requested_name: 'demo', identity_source: 'env-session',
       });
-      await initTeamState('demo-bbbbbbbb', 'task', 'executor', 1, cwd, undefined, { OMX_SESSION_ID: 'session-b' }, {
+      await initTeamState('demo-bbbbbbbb', 'task', 'executor', 1, cwd, undefined, await authenticatedEnvironment(cwd, 'session-b'), {
         display_name: 'demo', requested_name: 'demo', identity_source: 'env-session',
       });
 
-      assert.equal(resolveTeamNameForCurrentContext('demo', cwd, { OMX_SESSION_ID: 'session-a' }), 'demo-aaaaaaaa');
+      assert.equal(resolveTeamNameForCurrentContext('demo', cwd, await authenticatedEnvironment(cwd, 'session-a')), 'demo-aaaaaaaa');
       assert.equal(resolveTeamNameForCurrentContext('demo-bbbbbbbb', cwd, {}), 'demo-bbbbbbbb');
       assert.throws(() => resolveTeamNameForCurrentContext('demo', cwd, {}), TeamLookupAmbiguityError);
     } finally {

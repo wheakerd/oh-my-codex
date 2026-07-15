@@ -67,13 +67,8 @@ export interface HudAuthorityReadScope {
   diagnostics: HudAuthorityDiagnostic[];
 }
 
-function inheritedAuthorityLocatorPresent(env: NodeJS.ProcessEnv): boolean {
+function inheritedAuthorityTransportPresent(env: NodeJS.ProcessEnv): boolean {
   return [
-    env.OMX_CODEX_LAUNCH_ID,
-    env.OMX_STARTUP_CWD,
-    env.OMX_ROOT,
-    env.OMX_STATE_ROOT,
-    env.OMX_TEAM_STATE_ROOT,
     env.OMX_STATE_AUTHORITY_PATH,
     env.OMX_STATE_AUTHORITY_ID,
     env.OMX_STATE_AUTHORITY_GENERATION_ID,
@@ -102,6 +97,7 @@ function authorityDiagnostic(code: string, message: string, fatal = true): HudAu
 async function authorityLocatorDiagnostics(
   context: ResolvedStateAuthorityContext,
   env: NodeJS.ProcessEnv,
+  cwd: string,
 ): Promise<HudAuthorityDiagnostic[]> {
   const diagnostics: HudAuthorityDiagnostic[] = [];
   const locator = env.OMX_STATE_AUTHORITY_PATH?.trim();
@@ -135,27 +131,18 @@ async function authorityLocatorDiagnostics(
       'inherited authority workspace digest does not match the active workspace',
     ));
   }
-  const rootEvidence: Array<{ name: string; value?: string; stateRoot: string }> = [
-    {
-      name: 'OMX_TEAM_STATE_ROOT',
-      value: env.OMX_TEAM_STATE_ROOT?.trim(),
-      stateRoot: env.OMX_TEAM_STATE_ROOT?.trim() ?? '',
-    },
-    {
-      name: 'OMX_ROOT',
-      value: env.OMX_ROOT?.trim(),
-      stateRoot: env.OMX_ROOT?.trim() ? join(env.OMX_ROOT.trim(), '.omx', 'state') : '',
-    },
-    {
-      name: 'OMX_STATE_ROOT',
-      value: env.OMX_STATE_ROOT?.trim(),
-      stateRoot: env.OMX_STATE_ROOT?.trim() ? join(env.OMX_STATE_ROOT.trim(), '.omx', 'state') : '',
-    },
+  const rootEvidence: Array<{ name: string; value?: string }> = [
+    { name: 'OMX_TEAM_STATE_ROOT', value: env.OMX_TEAM_STATE_ROOT?.trim() },
+    { name: 'OMX_ROOT', value: env.OMX_ROOT?.trim() },
+    { name: 'OMX_STATE_ROOT', value: env.OMX_STATE_ROOT?.trim() },
   ];
   for (const evidence of rootEvidence) {
     if (!evidence.value) continue;
+    const receivedPath = evidence.name === 'OMX_TEAM_STATE_ROOT'
+      ? resolvePath(cwd, evidence.value)
+      : join(resolvePath(cwd, evidence.value), '.omx', 'state');
     const [received, expected] = await Promise.all([
-      canonicalPath(evidence.stateRoot),
+      canonicalPath(receivedPath),
       canonicalPath(context.canonical_state_root),
     ]);
     if (received !== expected) {
@@ -208,10 +195,10 @@ export async function resolveHudAuthorityReadScope(
   context?: ResolvedStateAuthorityContext,
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<HudAuthorityReadScope> {
-  const locatorPresent = inheritedAuthorityLocatorPresent(env);
+  const transportPresent = inheritedAuthorityTransportPresent(env);
   let resolvedContext = context;
   let diagnostics: HudAuthorityDiagnostic[] = [];
-  if (locatorPresent) {
+  if (transportPresent) {
     try {
       const transportedContext = await resolveAuthenticatedTransportAuthority(cwd, env);
       if (!transportedContext) {
@@ -249,7 +236,7 @@ export async function resolveHudAuthorityReadScope(
         resolvedContext = resolution.context;
         diagnostics = resolution.diagnostics;
       } else if (
-        !locatorPresent
+        !transportPresent
         && resolution.diagnostics.length === 1
         && resolution.diagnostics[0]?.code === AUTHORITY_DIAGNOSTIC_CODES.anchorMissing
       ) {
@@ -298,7 +285,7 @@ export async function resolveHudAuthorityReadScope(
         'validated authority context state root differs from its generation record',
       ));
     }
-    diagnostics.push(...await authorityLocatorDiagnostics(resolvedContext, env));
+    diagnostics.push(...await authorityLocatorDiagnostics(resolvedContext, env, cwd));
   } catch (error) {
     return {
       workspaceRoot: resolvedContext.workspace_identity.canonical_path,

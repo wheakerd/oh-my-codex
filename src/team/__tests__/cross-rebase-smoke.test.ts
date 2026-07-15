@@ -15,6 +15,7 @@ import {
 } from '../state.js';
 import { monitorTeam } from '../runtime.js';
 import { readTeamEvents } from '../state/events.js';
+import { installTeamTestAuthority } from './authority-fixture.js';
 
 async function initRepo(): Promise<string> {
   const cwd = await mkdtemp(join(tmpdir(), 'omx-cross-rebase-smoke-repo-'));
@@ -38,6 +39,7 @@ async function configureWorkers(
   repo: string,
   workers: Array<{ path: string; branch: string }>,
 ): Promise<void> {
+  await installTeamTestAuthority(repo);
   await initTeamState(teamName, 'cross rebase smoke', 'executor', workers.length, repo);
   const cfg = await readTeamConfig(teamName, repo);
   assert.ok(cfg);

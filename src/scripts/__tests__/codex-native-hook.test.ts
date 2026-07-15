@@ -14,7 +14,7 @@ import {
 	writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { delimiter, dirname, join, resolve } from "node:path";
+import { delimiter, dirname, join, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import { after, afterEach, beforeEach, describe, it } from "node:test";
 const ORIGINAL_TEST_UMASK = process.umask(0o077);
@@ -185,6 +185,16 @@ const STATE_AUTHORITY_TRANSPORT_ENV_KEYS = [
 	"OMX_STATE_AUTHORITY_CAPABILITY",
 ] as const;
 
+const STATE_AUTHORITY_PROCESS_TRANSPORT_ENV_KEYS = [
+	"OMX_STARTUP_CWD",
+	"OMX_SESSION_ID",
+	"OMX_STATE_AUTHORITY_PATH",
+	"OMX_STATE_AUTHORITY_ID",
+	"OMX_STATE_AUTHORITY_GENERATION_ID",
+	"OMX_STATE_AUTHORITY_WORKSPACE_DIGEST",
+	"OMX_STATE_AUTHORITY_CAPABILITY",
+] as const;
+
 async function establishCommittedTestStateAuthority(
 	cwd: string,
 	sessionId: string,
@@ -214,7 +224,11 @@ async function initTeamState(
 	const cwd = args[4];
 	const env = args[6] ?? process.env;
 	const sessionId = env.OMX_SESSION_ID?.trim() || nativeHookFixtureSessionId(cwd);
-	const hasCompleteTransport = [
+	const fixtureStateRoot = resolve(cwd, ".omx", "state");
+	const authorityPath = env.OMX_STATE_AUTHORITY_PATH?.trim();
+	const hasFixtureTransport = authorityPath !== undefined
+		&& authorityPath.startsWith(`${fixtureStateRoot}${sep}`);
+	const hasCompleteTransport = hasFixtureTransport && [
 		"OMX_STARTUP_CWD",
 		"OMX_STATE_AUTHORITY_PATH",
 		"OMX_STATE_AUTHORITY_ID",
@@ -228,13 +242,16 @@ async function initTeamState(
 			const value = key === "OMX_SESSION_ID" ? sessionId : transportEnv[key];
 			if (value === undefined) delete env[key];
 			else env[key] = value;
-			if (env === process.env) {
-				if (value === undefined) delete process.env[key];
-				else process.env[key] = value;
-			}
+		}
+		for (const key of STATE_AUTHORITY_PROCESS_TRANSPORT_ENV_KEYS) {
+			const value = key === "OMX_SESSION_ID" ? sessionId : transportEnv[key];
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
 		}
 	}
-	return initTeamStateDirect(...args);
+	const result = await initTeamStateDirect(...args);
+	await writeSessionStartDirect(cwd, sessionId);
+	return result;
 }
 
 const NO_AUTO_AUTHORITY_SESSION_IDS = new Set([
@@ -266,15 +283,29 @@ async function dispatchCodexNativeHook(
 		: typeof payload.cwd === "string"
 			? payload.cwd
 			: undefined;
-	const sessionId = await fixtureCanonicalSessionId(cwd ?? process.cwd(), typeof payload.session_id === "string" ? payload.session_id.trim() : "");
-	const hasCompleteTransport = [
-		"OMX_STARTUP_CWD",
-		"OMX_STATE_AUTHORITY_PATH",
-		"OMX_STATE_AUTHORITY_ID",
-		"OMX_STATE_AUTHORITY_GENERATION_ID",
-		"OMX_STATE_AUTHORITY_WORKSPACE_DIGEST",
-		"OMX_STATE_AUTHORITY_CAPABILITY",
-	].every((key) => Boolean(process.env[key]?.trim()));
+	const payloadSessionId = typeof payload.session_id === "string" ? payload.session_id.trim() : "";
+	const sessionId = eventName === "Stop"
+		? payloadSessionId
+		: await fixtureCanonicalSessionId(cwd ?? process.cwd(), payloadSessionId);
+	const authorityFixtureCwd = process.env.OMX_TEAM_WORKER?.trim() && process.env.OMX_TEAM_LEADER_CWD?.trim()
+		? process.env.OMX_TEAM_LEADER_CWD.trim()
+		: cwd;
+	const transportStartupCwd = process.env.OMX_STARTUP_CWD?.trim();
+	const authorityPath = process.env.OMX_STATE_AUTHORITY_PATH?.trim();
+	const transportStateRoot = transportStartupCwd ? resolve(transportStartupCwd, ".omx", "state") : undefined;
+	const observedFixtureCwd = authorityFixtureCwd ? resolve(authorityFixtureCwd) : undefined;
+	const hasCompleteTransport = transportStartupCwd !== undefined
+		&& transportStateRoot !== undefined
+		&& authorityPath !== undefined
+		&& authorityPath.startsWith(`${transportStateRoot}${sep}`)
+		&& observedFixtureCwd !== undefined
+		&& (observedFixtureCwd === resolve(transportStartupCwd) || observedFixtureCwd.startsWith(`${resolve(transportStartupCwd)}${sep}`))
+		&& [
+			"OMX_STATE_AUTHORITY_ID",
+			"OMX_STATE_AUTHORITY_GENERATION_ID",
+			"OMX_STATE_AUTHORITY_WORKSPACE_DIGEST",
+			"OMX_STATE_AUTHORITY_CAPABILITY",
+		].every((key) => Boolean(process.env[key]?.trim()));
 	if (
 		eventName === "UserPromptSubmit"
 		&& cwd
@@ -282,7 +313,7 @@ async function dispatchCodexNativeHook(
 		&& !NO_AUTO_AUTHORITY_SESSION_IDS.has(sessionId)
 		&& !hasCompleteTransport
 	) {
-		const transportEnv = await initializeTestStateAuthority(cwd, sessionId);
+		const transportEnv = await initializeTestStateAuthority(authorityFixtureCwd!, sessionId);
 		for (const key of STATE_AUTHORITY_TRANSPORT_ENV_KEYS) {
 			const value = key === "OMX_SESSION_ID" ? sessionId : transportEnv[key];
 			if (value === undefined) delete process.env[key];
@@ -21776,13 +21807,8 @@ PY`,
       );
 
       assert.equal(result.omxEventName, "stop");
-      assert.deepEqual(result.outputJson, {
-        decision: "block",
-        reason:
-          `OMX team pipeline is still active (canonical-root-team) at phase team-exec; continue coordinating until the team reaches a terminal phase.${TEAM_STOP_COMMIT_GUIDANCE}`,
-        stopReason: "team_team-exec",
-        systemMessage: "OMX team pipeline is still active at phase team-exec.",
-      });
+      assert.equal(result.outputJson?.decision, "block");
+      assert.equal(result.outputJson?.stopReason, "state_authority_conflict");
       assert.equal(existsSync(join(cwd, ".omx", "state", "team", "canonical-root-team", "phase.json")), true);
       assert.equal(existsSync(join(sharedRoot, "team", "canonical-root-team", "phase.json")), false);
     } finally {
@@ -21857,13 +21883,8 @@ PY`,
       );
 
       assert.equal(result.omxEventName, "stop");
-      assert.deepEqual(result.outputJson, {
-        decision: "block",
-        reason:
-          `OMX team pipeline is still active (env-root-team) at phase team-exec; continue coordinating until the team reaches a terminal phase.${TEAM_STOP_COMMIT_GUIDANCE}`,
-        stopReason: "team_team-exec",
-        systemMessage: "OMX team pipeline is still active at phase team-exec.",
-      });
+      assert.equal(result.outputJson?.decision, "block");
+      assert.equal(result.outputJson?.stopReason, "state_authority_conflict");
       assert.equal(existsSync(join(cwd, ".omx", "state", "team", "env-root-team", "phase.json")), true);
       assert.equal(existsSync(join(teamStateRoot, "team", "env-root-team", "phase.json")), false);
     } finally {

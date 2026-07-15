@@ -3909,6 +3909,7 @@ export async function startTeam(
         {
           ownerSessionId: leaderSessionId,
           teamPaneOwnerId: config.tmux_pane_owner_id,
+          authorityTransport: workerAuthorityTransport,
         },
       );
       sessionName = createdSession.name;

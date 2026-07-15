@@ -3,7 +3,7 @@
  * All execution modes (autopilot, autoresearch, deep-interview, ralph, ultrawork, team, ultraqa, ralplan) share this base.
  */
 
-import { readFile, writeFile, mkdir, readdir } from 'fs/promises';
+import { chmod, readFile, writeFile, mkdir, readdir } from 'fs/promises';
 import { existsSync } from 'fs';
 import { basename, dirname, join } from 'node:path';
 import { withModeRuntimeContext } from '../state/mode-state-context.js';
@@ -183,7 +183,12 @@ export async function startMode(
     });
     transitionMessage = transition.transitionMessage;
   }
-  await mkdir(scope.stateDir, { recursive: true });
+  await mkdir(scope.stateDir, { recursive: true, mode: 0o700 });
+  await chmod(scope.stateDir, 0o700);
+  await chmod(dirname(scope.stateDir), 0o700);
+  if (basename(dirname(scope.stateDir)) === 'sessions') {
+    await chmod(dirname(dirname(scope.stateDir)), 0o700);
+  }
 
   const stateBase: ModeState = {
     active: true,
@@ -297,9 +302,21 @@ export async function updateModeState(
   const scope = await resolveWritableStateScope(projectRoot, explicitSessionId);
   const baseStateDir = dirname(dirname(scope.stateDir));
   const modeStatePath = join(scope.stateDir, basename(getStatePath(mode)));
+  const mutationAuthority = isTrackedWorkflowMode(mode)
+    ? await resolveStateAuthorityForGuard({
+        startup_cwd: projectRoot ?? process.cwd(),
+        observed_cwd: projectRoot ?? process.cwd(),
+        session_id: scope.source === 'explicit' ? undefined : scope.sessionId,
+      })
+    : null;
   const current = await readModeStateFromPaths([modeStatePath]);
   if (!current) throw new Error(`Mode ${mode} not found`);
-  await mkdir(scope.stateDir, { recursive: true });
+  await mkdir(scope.stateDir, { recursive: true, mode: 0o700 });
+  await chmod(scope.stateDir, 0o700);
+  await chmod(dirname(scope.stateDir), 0o700);
+  if (basename(dirname(scope.stateDir)) === 'sessions') {
+    await chmod(dirname(dirname(scope.stateDir)), 0o700);
+  }
 
   if (mode === 'ralph') {
     assertRalphUpdateMatchesSession(current, scope.sessionId);
@@ -386,11 +403,7 @@ export async function updateModeState(
       explicitSessionId: scope.sessionId,
     });
     if (!ralplanCompletionHandled) {
-      const authority = await resolveStateAuthorityForGuard({
-        startup_cwd: cwd,
-        observed_cwd: cwd,
-        session_id: scope.sessionId,
-      });
+      if (!mutationAuthority) throw new Error('Tracked mode mutation authority was not resolved');
       await syncCanonicalSkillStateForMode({
         cwd,
         baseStateDir,
@@ -399,7 +412,7 @@ export async function updateModeState(
         currentPhase: typeof updated.current_phase === 'string' ? updated.current_phase : undefined,
         sessionId: scope.sessionId,
         source: 'updateModeState',
-        expectedRootIdentity: authority.generation.root_identity,
+        expectedRootIdentity: mutationAuthority.generation.root_identity,
       });
     }
   }

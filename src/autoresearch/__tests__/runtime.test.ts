@@ -1,6 +1,7 @@
-import { describe, it } from 'node:test';
+import { afterEach, beforeEach, describe, it } from 'node:test';
+import { createHash } from 'node:crypto';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
@@ -15,6 +16,47 @@ import {
   processAutoresearchCandidate,
 } from '../runtime.js';
 import { readModeState } from '../../modes/base.js';
+
+import { initializeStateAuthority, mintStateAuthorityTransportCapability } from '../../state/authority.js';
+import { buildStateAuthorityTransportEnv } from '../../state/transport-env.js';
+
+const AUTHORITY_ENV_KEYS = [
+  'OMX_ROOT',
+  'OMX_STATE_ROOT',
+  'OMX_TEAM_STATE_ROOT',
+  'OMX_STARTUP_CWD',
+  'OMX_SESSION_ID',
+  'OMX_STATE_AUTHORITY_PATH',
+  'OMX_STATE_AUTHORITY_ID',
+  'OMX_STATE_AUTHORITY_GENERATION_ID',
+  'OMX_STATE_AUTHORITY_WORKSPACE_DIGEST',
+  'OMX_STATE_AUTHORITY_CAPABILITY',
+] as const;
+
+let savedAuthorityEnvironment: Map<string, string | undefined>;
+
+async function installTestAuthority(cwd: string): Promise<void> {
+  const sessionId = `autoresearch-runtime-${createHash('sha256').update(cwd).digest('hex').slice(0, 24)}`;
+  await chmod(cwd, 0o700);
+  await mkdir(join(cwd, '.omx', 'state'), { recursive: true, mode: 0o700 });
+  await chmod(join(cwd, '.omx'), 0o700);
+  await chmod(join(cwd, '.omx', 'state'), 0o700);
+  const authority = await initializeStateAuthority({
+    startup_cwd: cwd,
+    observed_cwd: cwd,
+    launch_id: `${sessionId}-launch`,
+    session_binding: { canonical_session_id: sessionId },
+  });
+  await mintStateAuthorityTransportCapability(authority);
+  Object.assign(process.env, buildStateAuthorityTransportEnv(authority, { OMX_SESSION_ID: sessionId }));
+}
+
+function restoreAuthorityEnvironment(): void {
+  for (const [key, value] of savedAuthorityEnvironment) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+}
 
 async function initRepo(): Promise<string> {
   const cwd = await mkdtemp(join(tmpdir(), 'omx-autoresearch-runtime-'));
@@ -41,6 +83,8 @@ async function makeContract(repo: string): Promise<AutoresearchMissionContract> 
   await writeFile(join(repo, 'scripts', 'eval.js'), "import { readFileSync } from 'node:fs';\nconst score = Number(readFileSync('score.txt', 'utf-8').trim());\nprocess.stdout.write(JSON.stringify({ pass: true, score }));\n", 'utf-8');
   execFileSync('git', ['add', 'missions/demo/mission.md', 'missions/demo/sandbox.md', 'scripts/eval.js', 'score.txt'], { cwd: repo, stdio: 'ignore' });
   execFileSync('git', ['commit', '-m', 'add autoresearch fixtures'], { cwd: repo, stdio: 'ignore' });
+  await installTestAuthority(repo);
+
   return {
     missionDir,
     repoRoot: repo,
@@ -57,6 +101,13 @@ async function makeContract(repo: string): Promise<AutoresearchMissionContract> 
     missionSlug: 'missions-demo',
   };
 }
+
+  beforeEach(() => {
+    savedAuthorityEnvironment = new Map(AUTHORITY_ENV_KEYS.map((key) => [key, process.env[key]]));
+    for (const key of AUTHORITY_ENV_KEYS) delete process.env[key];
+  });
+
+  afterEach(() => restoreAuthorityEnvironment());
 
 describe('autoresearch runtime', () => {
   it('builds bootstrap instructions with mission, sandbox, and evaluator contract', async () => {
@@ -138,8 +189,10 @@ describe('autoresearch runtime', () => {
       const state = await readModeState('autoresearch', repo);
       assert.ok(state);
 
-      const worktreeState = await readModeState('autoresearch', worktreePath);
-      assert.equal(worktreeState, null);
+      await assert.rejects(
+        () => readModeState('autoresearch', worktreePath),
+        (error: unknown) => (error as { code?: string }).code === 'authority_observed_cwd_outside_workspace',
+      );
       assert.equal(state?.active, true);
       assert.equal(state?.current_phase, 'running');
       assert.equal(state?.mission_slug, 'missions-demo');

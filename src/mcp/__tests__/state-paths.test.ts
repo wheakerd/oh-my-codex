@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'fs/promises';
+import { chmod, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'fs/promises';
 
 import { existsSync, realpathSync } from 'fs';
 import { tmpdir } from 'os';
@@ -87,6 +87,17 @@ async function installWritableScopeAuthority(
     },
   });
   await mintStateAuthorityTransportCapability(authority);
+  await mkdir(join(authority.canonical_state_root, 'sessions', sessionId), { recursive: true, mode: 0o700 });
+  for (const directory of [
+    join(cwd, '.omx'),
+    join(cwd, '.omx', 'bootstrap'),
+    authority.canonical_state_root,
+    join(authority.canonical_state_root, 'authority'),
+    join(authority.canonical_state_root, 'sessions'),
+    join(authority.canonical_state_root, 'sessions', sessionId),
+  ]) {
+    await chmod(directory, 0o700);
+  }
   Object.assign(process.env, buildStateAuthorityTransportEnv(authority, {}));
   return authority;
 }
@@ -427,7 +438,7 @@ describe('state paths', () => {
       await assert.rejects(
         resolveAuthorityRuntimeStateScope(workspace),
         (error: unknown) => error instanceof StateAuthorityError
-          && error.code === AUTHORITY_DIAGNOSTIC_CODES.legacyAuthorityUnproven,
+          && error.code === AUTHORITY_DIAGNOSTIC_CODES.authorityMalformed,
       );
     } finally {
       await rm(workspace, { recursive: true, force: true });
@@ -762,8 +773,9 @@ describe('state paths', () => {
         delete process.env.CODEX_SESSION_ID;
         const scope = await resolveWritableStateScope(wd);
         assert.deepEqual(scope, {
-          source: 'root',
-          stateDir: authority.canonical_state_root,
+          source: 'session',
+          sessionId: 'sess-root-authority',
+          stateDir: join(authority.canonical_state_root, 'sessions', 'sess-root-authority'),
         });
         assert.equal(existsSync(join(wd, '.omx', 'state')), true);
       } finally {
@@ -795,7 +807,7 @@ describe('state paths', () => {
         await assert.rejects(
           () => resolveWritableStateScope(wd),
           (error: unknown) => {
-            assert.equal((error as { code?: string }).code, AUTHORITY_DIAGNOSTIC_CODES.legacyAuthorityUnproven);
+            assert.equal((error as { code?: string }).code, AUTHORITY_DIAGNOSTIC_CODES.authorityMalformed);
             return true;
           },
         );
