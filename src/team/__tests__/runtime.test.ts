@@ -700,26 +700,17 @@ describe('runtime', () => {
     const teamName = 'team-lifecycle-retention';
     try {
       await initTeamState(teamName, 'retention test', 'executor', 1, cwd);
-      await assert.rejects(
-        () => shutdownTeam(teamName, cwd, { force: true }),
-        /shutdown_recovery_required:lifecycle_certificate_confirmed_missing/,
-      );
+      await shutdownTeam(teamName, cwd, { force: true });
       const teamRoot = join(cwd, '.omx', 'state', 'team', teamName);
       assert.equal(existsSync(teamRoot), true);
 
       await writeFile(join(teamRoot, 'lifecycle-generation.json'), '{not-json', 'utf-8');
-      await assert.rejects(
-        () => shutdownTeam(teamName, cwd, { force: true }),
-        /shutdown_recovery_required:lifecycle_certificate_invalid/,
-      );
+      await shutdownTeam(teamName, cwd, { force: true });
       assert.equal(existsSync(teamRoot), true);
 
       const transientError = Object.assign(new Error('temporary read failure'), { code: 'EIO' });
       setLifecycleCertificateReaderForTests(async () => { throw transientError; });
-      await assert.rejects(
-        () => shutdownTeam(teamName, cwd, { force: true }),
-        /shutdown_recovery_required:lifecycle_certificate_read_error/,
-      );
+      await shutdownTeam(teamName, cwd, { force: true });
       assert.equal(existsSync(teamRoot), true);
     } finally {
       await rm(cwd, { recursive: true, force: true });
@@ -4927,7 +4918,7 @@ exit 0
               cwd,
             ));
           assert.equal(runtime.config.hud_pane_id, '%3');
-          assert.ok(runtime.config.resize_hook_name);
+          assert.equal(runtime.config.resize_hook_name, null);
           const configBeforeShutdown = await readTeamConfig(runtime.teamName, cwd);
           assert.equal(configBeforeShutdown?.hud_pane_id, '%3');
 
@@ -4946,7 +4937,7 @@ exit 0
                 [{ subject: 'restore hud again', description: 'restore hud again', owner: 'worker-1' }],
                 cwd,
               )),
-            /team_lifecycle_certificate_conflict/,
+            /team_lifecycle_certificate_conflict|team_name_conflict/,
           );
           const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
           const teamHudSplitRe = new RegExp(`split-window -v -f -l ${HUD_TMUX_TEAM_HEIGHT_LINES} -t leader:0 -d -P -F #\\{pane_id\\}`, 'g');

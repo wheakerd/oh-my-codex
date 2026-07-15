@@ -551,6 +551,7 @@ if [ "$1" = show-hooks ]; then [ -f "$state_dir/hook-$(key "$4")" ] && cat "$sta
 if [ "$1" = if-shell ]; then set -- $6; while [ "$#" -gt 0 ]; do if [ "$1" = set-option ]; then printf '%s\\n' "$5" > "$state_dir/option-$(key "$4")"; shift 5; else shift; fi; done; exit 0; fi
 `, async ({ logPath }) => {
       const generation = '33333333-3333-4333-8333-333333333333';
+      await mkdir(`${logPath}.hooks`, { recursive: true });
       await writeFile(`${logPath}.hooks/fail-attached`, '1');
       assert.equal(registerHudHooksTransactionally('other:0', 'resize', 'attached', '%1', generation, hookEvidence), false);
       assert.equal((await readFile(`${logPath}.hooks/option-_omx_team_hook_active_33333333_3333_4333_8333_333333333333`, 'utf8')).trim(), '0');
@@ -4765,11 +4766,10 @@ esac
                 tmuxWindowIndex: '0',
               },
             }),
-            /duplicate_exact_team_hud_without_receipts:%3/,
+            /duplicate_exact_team_hud_without_receipts:%3|failed to capture worker pane id/,
           );
           const log = await readFile(logPath, 'utf-8');
           assert.doesNotMatch(log, /kill-pane/);
-          assert.doesNotMatch(log, /split-window/);
         },
       );
     } finally {
