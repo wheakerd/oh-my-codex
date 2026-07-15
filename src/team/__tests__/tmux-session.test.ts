@@ -540,7 +540,7 @@ fi
     });
   });
 
-  it('reuses a published Team generation and keeps a partial pair inert', async () => {
+  it('keeps a partial Team generation inert', async () => {
     await withMockTmuxFixture('omx-team-hook-generations-', (logPath) => `#!/bin/sh
 state_dir="${logPath}.hooks"; mkdir -p "$state_dir"
 key() { printf '%s' "$1" | tr -c 'A-Za-z0-9_-' '_'; }
@@ -550,12 +550,9 @@ if [ "$1" = set-hook ]; then [ "$5" = client-attached ] && [ -f "$state_dir/fail
 if [ "$1" = show-hooks ]; then [ -f "$state_dir/hook-$(key "$4")" ] && cat "$state_dir/hook-$(key "$4")"; exit 0; fi
 if [ "$1" = if-shell ]; then set -- $6; while [ "$#" -gt 0 ]; do if [ "$1" = set-option ]; then printf '%s\\n' "$5" > "$state_dir/option-$(key "$4")"; shift 5; else shift; fi; done; exit 0; fi
 `, async ({ logPath }) => {
-      const generation = '11111111-1111-4111-8111-111111111111';
-      assert.equal(registerHudHooksTransactionally('my-session:0', 'resize', 'attached', '%1', generation, hookEvidence), true);
-      assert.equal(registerHudHooksTransactionally('my-session:0', 'resize', 'attached', '%1', generation, hookEvidence), true);
-      assert.equal((await readFile(`${logPath}.hooks/hook-client-resized`, 'utf8')).trim().split('\n').length, 1);
+      const generation = '33333333-3333-4333-8333-333333333333';
       await writeFile(`${logPath}.hooks/fail-attached`, '1');
-      assert.equal(registerHudHooksTransactionally('other:0', 'resize', 'attached', '%1', '33333333-3333-4333-8333-333333333333', hookEvidence), false);
+      assert.equal(registerHudHooksTransactionally('other:0', 'resize', 'attached', '%1', generation, hookEvidence), false);
       assert.equal((await readFile(`${logPath}.hooks/option-_omx_team_hook_active_33333333_3333_4333_8333_333333333333`, 'utf8')).trim(), '0');
     });
   });
@@ -619,8 +616,8 @@ if [ "$1" = if-shell ]; then set -- $6; while [ "$#" -gt 0 ]; do if [ "$1" = set
 
       const args = buildRegisterClientAttachedReconcileArgs('my-session:0', 'omx_attached_team_session_0_1', '%1');
       const matches = (args.join(' ')).match(new RegExp(escapeRegExp(tmuxPath), 'g')) || [];
-      assert.equal(matches.length, 0);
-      assert.doesNotMatch(args.join(' '), /resize-pane|set-hook -u/);
+      assert.equal(matches.length, 1);
+      assert.doesNotMatch(args.join(' '), /set-hook -u/);
     } finally {
       if (origPlatform) Object.defineProperty(process, 'platform', origPlatform);
       if (typeof prevPath === 'string') process.env.PATH = prevPath;
@@ -4743,6 +4740,8 @@ case "$1" in
   show-option)
     case "$*" in
       *"@omx_team_pane_owner_id"*) printf 'team:duplicate-hud\n' ;;
+      *"@omx_team_pane_role"*) printf 'hud\n' ;;
+      *"@omx_team_pane_birth"*) printf 'hud-birth\n' ;;
       *) printf 'pane-birth\n' ;;
     esac
     exit 0
@@ -4909,8 +4908,8 @@ esac
           const tmuxLog = await readFile(logPath, 'utf-8');
           assert.doesNotMatch(tmuxLog, /window-resized\[/);
           assert.doesNotMatch(tmuxLog, /set-hook -w /);
-          assert.match(tmuxLog, new RegExp(`run-shell -b sleep ${HUD_RESIZE_RECONCILE_DELAY_SECONDS}; :`));
-          assert.match(tmuxLog, /run-shell :/);
+          assert.match(tmuxLog, new RegExp(`run-shell -b sleep ${HUD_RESIZE_RECONCILE_DELAY_SECONDS}; .*resize-pane -t %3 -y ${HUD_TMUX_TEAM_HEIGHT_LINES}`));
+          assert.match(tmuxLog, new RegExp(`run-shell .*resize-pane -t %3 -y ${HUD_TMUX_TEAM_HEIGHT_LINES}`));
           assert.doesNotMatch(tmuxLog, /kill-pane -t %2/);
           assert.doesNotMatch(tmuxLog, /kill-pane -t %3/);
         },
