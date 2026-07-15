@@ -61,6 +61,7 @@ import {
   establishExactTeamHudCandidate,
   probeExactTeamHudCandidate,
   unregisterHudHooksTransactionally,
+  registerHudHookIfVacant,
 } from '../tmux-session.js';
 import { HUD_RESIZE_RECONCILE_DELAY_SECONDS, HUD_TMUX_TEAM_HEIGHT_LINES } from '../../hud/constants.js';
 import * as tmuxSessionModule from '../tmux-session.js';
@@ -417,6 +418,30 @@ describe('HUD resize hook command builders', () => {
     const registered = buildRegisterClientAttachedReconcileArgs('my-session:0', 'omx_attached_team_session_0_1', '%1');
     const unregistered = buildUnregisterClientAttachedReconcileArgs('my-session:0', 'omx_attached_team_session_0_1');
     assert.deepEqual(unregistered, ['set-hook', '-u', '-t', 'my-session:0', registered[3] as string]);
+  });
+
+  it('preserves a foreign resize hook occupying the derived slot', async () => {
+    const args = buildRegisterResizeHookArgs('team:0', 'omx_resize_collision', '%1');
+    const slot = args[3] as string;
+    await withMockTmuxFixture('omx-tmux-hook-foreign-resize-', (logPath) => `#!/bin/sh
+printf '%s\\n' "$*" >> "${logPath}"
+[ "$1" = show-hooks ] && echo "${slot} run-shell -b 'foreign'"
+`, async ({ logPath }) => {
+      assert.equal(registerHudHookIfVacant('team:0', args), false);
+      assert.doesNotMatch(await readFile(logPath, 'utf-8'), /set-hook -t/);
+    });
+  });
+
+  it('preserves a foreign client-attached hook occupying the derived slot', async () => {
+    const args = buildRegisterClientAttachedReconcileArgs('team:0', 'omx_attached_collision', '%1');
+    const slot = args[3] as string;
+    await withMockTmuxFixture('omx-tmux-hook-foreign-attached-', (logPath) => `#!/bin/sh
+printf '%s\\n' "$*" >> "${logPath}"
+[ "$1" = show-hooks ] && echo "${slot} run-shell -b 'foreign'"
+`, async ({ logPath }) => {
+      assert.equal(registerHudHookIfVacant('team:0', args), false);
+      assert.doesNotMatch(await readFile(logPath, 'utf-8'), /set-hook -t/);
+    });
   });
 
   it('does not remove the resize hook when client-attached hook deletion fails', async () => {

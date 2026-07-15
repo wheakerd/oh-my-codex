@@ -43,7 +43,7 @@ import {
   findExactTeamHudPane,
 } from './tmux-session.js';
 import { acquireHudLifecycleLock, releaseHudLifecycleLock } from '../hud/lifecycle-lock.js';
-import { normalizeSessionId, resolveHudControlPlaneDomain } from '../mcp/state-paths.js';
+import { normalizeSessionId, resolveHudControlPlaneDomain, writeHudTmuxBirthLineage } from '../mcp/state-paths.js';
 import type { HudRuntimeRootSource } from '../hud/tmux.js';
 
 import type { HudRuntimeEnvInput } from '../hud/tmux.js';
@@ -3044,6 +3044,11 @@ export async function startTeam(
         throw new Error(`hud_lifecycle_lock_${hudLifecycleLock.status}`);
       }
       let createdSession!: TeamSession;
+      const hudExactCandidate = establishExactTeamHudCandidate({
+        sessionId: hudDomain.claimant.sessionId,
+        sessionIds: hudDomain.session?.equivalentIds,
+        expectedLeaderPaneId: hudDomain.claimant.leaderPaneId,
+      });
       try {
         createdSession = createTeamSession(
           sanitized,
@@ -3055,13 +3060,31 @@ export async function startTeam(
             ownerSessionId: hudDomain.claimant.sessionId,
             teamPaneOwnerId: config.tmux_pane_owner_id,
             hudRuntime,
-            hudExactCandidate: establishExactTeamHudCandidate({
-              sessionId: hudDomain.claimant.sessionId,
-              sessionIds: hudDomain.session?.equivalentIds,
-              expectedLeaderPaneId: hudDomain.claimant.leaderPaneId,
-            }),
+            hudExactCandidate,
           },
         );
+        const revalidatedHudCandidate = hudExactCandidate
+          ? probeExactTeamHudCandidate({
+            sessionId: hudExactCandidate.sessionId,
+            sessionIds: hudExactCandidate.sessionIds,
+            expectedLeaderPaneId: hudExactCandidate.leaderPaneId,
+          })
+          : null;
+        if (
+          hudExactCandidate
+          && createdSession.hudPaneId
+          && revalidatedHudCandidate
+          && revalidatedHudCandidate.tmuxSessionName === hudExactCandidate.tmuxSessionName
+          && revalidatedHudCandidate.tmuxSessionInstanceId === hudExactCandidate.tmuxSessionInstanceId
+          && revalidatedHudCandidate.tmuxPaneInstanceId === hudExactCandidate.tmuxPaneInstanceId
+        ) {
+          await writeHudTmuxBirthLineage(hudDomain, {
+            sessionId: hudExactCandidate.sessionId,
+            tmuxSessionName: hudExactCandidate.tmuxSessionName ?? createdSession.name.split(':')[0] ?? '',
+            tmuxSessionInstanceId: hudExactCandidate.tmuxSessionInstanceId,
+            tmuxPaneInstanceId: hudExactCandidate.tmuxPaneInstanceId,
+          });
+        }
       } finally {
         await releaseHudLifecycleLock(hudLifecycleLock.lock);
       }

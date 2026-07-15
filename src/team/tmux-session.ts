@@ -996,6 +996,17 @@ function tmuxHookIsAbsent(hookTarget: string, slot: string): boolean {
   return readTmuxHookSnapshot(hookTarget, slot)?.command === null;
 }
 
+/** Registers only an empty hook slot or an identical OMX command; foreign collisions are preserved. */
+export function registerHudHookIfVacant(hookTarget: string, args: string[]): boolean {
+  const slot = args[3]?.trim() ?? '';
+  const command = args[4] ?? '';
+  if (!slot || !command) return false;
+  const snapshot = readTmuxHookSnapshot(hookTarget, slot);
+  if (!snapshot || (snapshot.command !== null && snapshot.command !== command)) return false;
+  if (snapshot.command === command) return true;
+  return runTmux(args).ok;
+}
+
 function restoreHudHookSnapshots(
   hookTarget: string,
   clientAttachedSnapshot: TmuxHookSnapshot,
@@ -2085,14 +2096,14 @@ export function createTeamSession(
           } else {
             const hookTarget = buildResizeHookTarget(sessionName, windowIndex);
             const hookName = buildResizeHookName(safeTeamName, sessionName, windowIndex, hudPaneId);
-            const registerHook = runTmux(buildRegisterResizeHookArgs(hookTarget, hookName, hudPaneId));
+            const registerHook = registerHudHookIfVacant(hookTarget, buildRegisterResizeHookArgs(hookTarget, hookName, hudPaneId));
             const clientAttachedHookName = buildClientAttachedReconcileHookName(
               safeTeamName,
               sessionName,
               windowIndex,
               hudPaneId,
             );
-            if (registerHook.ok) {
+            if (registerHook) {
               resizeHookTarget = hookTarget;
               resizeHookName = hookName;
               registeredResizeHook = { name: resizeHookName, target: resizeHookTarget };
@@ -2104,19 +2115,20 @@ export function createTeamSession(
               // delayed/direct resize checks below so real tmux/run-shell failures
               // still surface.
               console.warn(
-                `[omx] tmux resize hook unavailable for ${hookTarget} (${hookName}): ${registerHook.stderr}; `
+                `[omx] tmux resize hook unavailable or occupied for ${hookTarget} (${hookName}); `
                   + 'continuing with best-effort HUD resize fallback.',
               );
             }
-            const registerClientAttachedHook = runTmux(
+            const registerClientAttachedHook = registerHudHookIfVacant(
+              hookTarget,
               buildRegisterClientAttachedReconcileArgs(hookTarget, clientAttachedHookName, hudPaneId),
             );
-            if (registerClientAttachedHook.ok) {
+            if (registerClientAttachedHook) {
               registeredClientAttachedHook = { name: clientAttachedHookName, target: hookTarget };
             } else {
               console.warn(
-                `[omx] tmux client-attached resize fallback unavailable for ${hookTarget} `
-                  + `(${clientAttachedHookName}): ${registerClientAttachedHook.stderr}; continuing with delayed HUD resize fallback.`,
+                `[omx] tmux client-attached resize fallback unavailable or occupied for ${hookTarget} `
+                  + `(${clientAttachedHookName}); continuing with delayed HUD resize fallback.`,
               );
             }
 
