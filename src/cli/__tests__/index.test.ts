@@ -3385,6 +3385,69 @@ esac
       await rm(cwd, { recursive: true, force: true });
     }
   });
+
+  it("accepts only a complete concurrent winning pair after the atomic publisher is rejected", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-tmux-birth-interleaved-"));
+    const bin = join(cwd, "bin");
+    const tmux = join(bin, "tmux");
+    const state = join(cwd, "published");
+    const previousPath = process.env.PATH;
+    try {
+      await mkdir(bin, { recursive: true });
+      await writeFile(tmux, `#!/bin/sh
+case "$1" in
+  display-message) printf 'leader\\t$1\\t@1\\t%%1\\n' ;;
+  show-option)
+    if [ -f "${state}" ]; then
+      case "$*" in *' -p '*) printf 'winning-pane-birth\\n' ;; *) printf 'winning-session-birth\\n' ;; esac
+    fi
+    ;;
+  if-shell)
+    : > "${state}"
+    for arg in "$@"; do
+      case "$arg" in *__omx_birth_rejected_*) receipt="${'$'}{arg#*display-message -p }" ;; esac
+    done
+    printf '%s\\n' "$receipt"
+    ;;
+esac
+`);
+      await chmod(tmux, 0o755);
+      process.env.PATH = `${bin}:${previousPath ?? ""}`;
+      const evidence = await establishCurrentTmuxInstanceBinding("logical-session", "%1");
+      assert.equal(evidence?.sessionInstanceId, "winning-session-birth");
+      assert.equal(evidence?.paneInstanceId, "winning-pane-birth");
+    } finally {
+      if (typeof previousPath === "string") process.env.PATH = previousPath;
+      else delete process.env.PATH;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects mixed birth evidence without attempting to repair an uncertain pair", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-tmux-birth-partial-"));
+    const bin = join(cwd, "bin");
+    const tmux = join(bin, "tmux");
+    const log = join(cwd, "tmux.log");
+    const previousPath = process.env.PATH;
+    try {
+      await mkdir(bin, { recursive: true });
+      await writeFile(tmux, `#!/bin/sh
+printf '%s\\n' "$*" >> "${log}"
+case "$1" in
+  display-message) printf 'leader\\t$1\\t@1\\t%%1\\n' ;;
+  show-option) case "$*" in *' -p '*) ;; *) printf 'orphaned-session-birth\\n' ;; esac ;;
+esac
+`);
+      await chmod(tmux, 0o755);
+      process.env.PATH = `${bin}:${previousPath ?? ""}`;
+      assert.equal(await establishCurrentTmuxInstanceBinding("logical-session", "%1"), null);
+      assert.doesNotMatch(await readFile(log, "utf-8"), /if-shell|set-option/);
+    } finally {
+      if (typeof previousPath === "string") process.env.PATH = previousPath;
+      else delete process.env.PATH;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("tmux HUD pane helpers", () => {
@@ -3491,7 +3554,7 @@ describe("tmux HUD pane helpers", () => {
 });
 
 describe("detached tmux new-session sequencing", () => {
-  it("buildDetachedSessionBootstrapSteps creates and tags the leader before reconciliation", () => {
+  it("buildDetachedSessionBootstrapSteps creates the leader before reconciliation without tagging opaque birth with the logical session id", () => {
     const steps = buildDetachedSessionBootstrapSteps(
       "omx-demo",
       "/tmp/project",
@@ -3505,7 +3568,7 @@ describe("detached tmux new-session sequencing", () => {
     );
     assert.deepEqual(
       steps.map((step) => step.name),
-      ["new-session", "tag-session", "reconcile-managed-hud"],
+      ["new-session", "reconcile-managed-hud"],
     );
     assert.ok(!steps.some((step) => step.args[0] === "split-window"));
     assert.equal(steps[0]?.args.includes("-e"), true);
@@ -3550,22 +3613,15 @@ describe("detached tmux new-session sequencing", () => {
       "sess-detached-managed",
     );
     const newSession = steps.find((step) => step.name === "new-session");
-    const tagSession = steps.find((step) => step.name === "tag-session");
     assert.ok(newSession);
-    assert.ok(tagSession);
     assert.equal(
       newSession!.args.includes("-e") &&
         newSession!.args.some((arg) => arg === "OMX_SESSION_ID=sess-detached-managed"),
       true,
     );
     assert.equal(newSession!.args.some((arg) => arg === "OMX_TMUX_HUD_OWNER=1"), true);
-    assert.deepEqual(tagSession!.args, [
-      "set-option",
-      "-t",
-      "omx-demo",
-      "@omx_instance_id",
-      "sess-detached-managed",
-    ]);
+    assert.equal(steps.some((step) => step.name === "tag-session"), false);
+    assert.doesNotMatch(newSession!.args.join(" "), /@omx_instance_id/);
   });
 
   it("buildDetachedSessionBootstrapSteps forwards inherited leader model separately from worker launch args", () => {
@@ -4184,7 +4240,7 @@ exit 0
     assert.doesNotMatch(script, /execFileSync\('tmux'/);
   });
 
-  it("buildDetachedSessionBootstrapSteps kills detached tmux session on normal shell exit", () => {
+  it("buildDetachedSessionBootstrapSteps preserves the detached session on normal shell exit until exact rollback evidence exists", () => {
     const steps = buildDetachedSessionBootstrapSteps(
       "omx-demo",
       "/tmp/project",
@@ -4205,9 +4261,7 @@ exit 0
     assert.match(leaderCmd!, /wait "\$omx_codex_pid";/);
     assert.match(leaderCmd!, /kill -TERM "\$omx_codex_pid"/);
     assert.match(leaderCmd!, /releaseTmuxExtendedKeysLease/);
-    assert.match(leaderCmd!, /if \[ "\$status" -eq 0 \]; then/);
-    assert.match(leaderCmd!, /tmux kill-session -t/);
-    assert.match(leaderCmd!, /"omx-demo"/);
+    assert.doesNotMatch(leaderCmd!, /kill-session/);
     assert.match(leaderCmd!, /codex exited immediately with code 0/);
     assert.match(leaderCmd!, /codex exited with code/);
     assert.match(leaderCmd!, /detached tmux session is being kept open/);
@@ -4235,14 +4289,7 @@ exit 0
     assert.match(leaderCmd!, /\/tmp\/codex-home/);
     assert.match(leaderCmd!, /\/tmp\/project\/\.codex-project/);
     assert.match(leaderCmd!, /\/tmp\/project\/\.omx\/runtime\/codex-home\/omx-session-123/);
-    const helperIndex = leaderCmd!.indexOf("runDetachedSessionPostLaunch");
-    const signalGateIndex = leaderCmd!.indexOf('if [ "$status" -eq 0 ]');
-    assert.ok(helperIndex >= 0);
-    assert.ok(signalGateIndex >= 0);
-    assert.ok(
-      helperIndex < signalGateIndex,
-      "detached postLaunch helper must run before the signal-derived tmux kill-session gate",
-    );
+    assert.doesNotMatch(leaderCmd!, /kill-session/);
   });
 
   it("detached leader command keeps stdin open for the Codex child", async () => {
@@ -4391,7 +4438,7 @@ exit 0
       assert.match(log, /tmux:show-options -sv extended-keys/);
       assert.match(log, /tmux:set-option -sq extended-keys always/);
       assert.match(log, /tmux:set-option -sq extended-keys off/);
-      assert.match(log, /tmux:kill-session -t omx-demo/);
+      assert.doesNotMatch(log, /tmux:kill-session -t omx-demo/);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -4606,7 +4653,7 @@ exit 0
       assert.match(result.stderr, /codex exited immediately with code 0 during startup/);
       assert.match(result.stderr, /detached tmux session is being kept open/);
       const log = await readFile(logPath, "utf-8");
-      assert.match(log, /tmux:kill-session -t omx-demo/);
+      assert.doesNotMatch(log, /tmux:kill-session -t omx-demo/);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -5261,7 +5308,7 @@ exit 0
     assert.equal(steps.some((step) => step.name === "set-mouse"), true);
   });
 
-  it("buildDetachedSessionFinalizeSteps uses quiet best-effort tmux resize commands", () => {
+  it("buildDetachedSessionFinalizeSteps keeps resize actions inert without immutable pane evidence", () => {
     const steps = buildDetachedSessionFinalizeSteps(
       "omx-demo",
       "%12",
@@ -5278,24 +5325,9 @@ exit 0
       (step) => step.name === "reconcile-hud-resize",
     );
 
-    assert.match((registerHook?.args ?? []).join(" "), />\/dev\/null 2>&1 \|\| true/);
-    assert.match(
-      (registerHook?.args ?? []).join(" "),
-      new RegExp(`-y ${HUD_TMUX_HEIGHT_LINES}\\b`),
-    );
-    assert.match(schedule?.args[2] ?? "", />\/dev\/null 2>&1 \|\| true/);
-    assert.match(
-      schedule?.args[2] ?? "",
-      new RegExp(`-y ${HUD_TMUX_HEIGHT_LINES}\\b`),
-    );
-    assert.match(
-      (reconcile?.args ?? []).join(" "),
-      />\/dev\/null 2>&1 \|\| true/,
-    );
-    assert.match(
-      (reconcile?.args ?? []).join(" "),
-      new RegExp(`-y ${HUD_TMUX_HEIGHT_LINES}\\b`),
-    );
+    assert.doesNotMatch((registerHook?.args ?? []).join(" "), /resize-pane/);
+    assert.doesNotMatch(schedule?.args[2] ?? "", /resize-pane/);
+    assert.doesNotMatch((reconcile?.args ?? []).join(" "), /resize-pane/);
   });
 
   it("buildDetachedSessionFinalizeSteps skips detached resize hooks on native Windows", () => {
@@ -5348,38 +5380,45 @@ exit 0
     );
   });
 
-  it("buildDetachedSessionRollbackSteps makes retained hook generations inert before killing session", () => {
+  it("buildDetachedSessionRollbackSteps destroys only the matching session birth and rejects name-reused successors", () => {
     const steps = buildDetachedSessionRollbackSteps(
       "omx-demo",
       "omx-demo:0",
       "omx_resize_launch_demo_0_12",
       "omx_attached_launch_demo_0_12",
+      "opaque-session-birth",
     );
     assert.deepEqual(
       steps.map((step) => step.name),
       [
         "unregister-client-attached-reconcile",
         "unregister-resize-hook",
-        "kill-session",
+        "kill-session-if-birth-matches",
       ],
     );
     assert.equal(steps[0]?.args[0], "show-hooks");
     assert.equal(steps[1]?.args[0], "show-hooks");
     assert.doesNotMatch(steps.flatMap((step) => step.args).join(" "), /set-hook -u/);
-    assert.deepEqual(steps[2]?.args, ["kill-session", "-t", "omx-demo"]);
+    const rollback = steps[2]!;
+    assert.deepEqual(rollback.args.slice(0, 4), ["if-shell", "-t", "omx-demo", "-F"]);
+    assert.match(rollback.args[4]!, /session_name/);
+    assert.match(rollback.args[4]!, /@omx_instance_id/);
+    assert.match(rollback.args[4]!, /opaque-session-birth/);
+    assert.doesNotMatch(rollback.args[4]!, /successor-session-birth/);
+    assert.match(rollback.args[5]!, /kill-session -t 'omx-demo'/);
+    assert.match(rollback.args[5]!, /__omx_detached_session_rollback_applied_/);
+    assert.match(rollback.args[6]!, /__omx_detached_session_rollback_rejected_/);
   });
 
-  it("buildDetachedSessionRollbackSteps only kills session when no hook metadata exists", () => {
+  it("buildDetachedSessionRollbackSteps preserves uncertain sessions without an opaque birth", () => {
     const steps = buildDetachedSessionRollbackSteps(
       "omx-demo",
       null,
       null,
       null,
+      null,
     );
-    assert.deepEqual(
-      steps.map((step) => step.name),
-      ["kill-session"],
-    );
+    assert.deepEqual(steps, []);
   });
 });
 

@@ -4574,6 +4574,130 @@ esac
     }
   });
 
+  it('rolls back only panes whose journaled birth evidence still exactly matches the opaque session birth', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-rollback-opaque-birth-'));
+    const previousTmux = process.env.TMUX;
+    const previousPane = process.env.TMUX_PANE;
+    const previousWorkerCli = process.env.OMX_TEAM_WORKER_CLI;
+    try {
+      await withMockTmuxFixture(
+        'omx-tmux-team-rollback-opaque-birth-',
+        (logPath) => `#!/bin/sh
+set -eu
+state_dir="$(dirname "${logPath}")/rollback-state"
+mkdir -p "$state_dir"
+printf '%s\\n' "$*" >> "${logPath}"
+case "$1" in
+  -V) printf 'tmux 3.4\\n' ;;
+  display-message)
+    case "$*" in *'#{window_width}'*) printf '120\\n' ;; *) printf 'shared:0 %%1\\n' ;; esac
+    ;;
+  list-panes)
+    case "$*" in *'pane_current_command'*) printf "%%1\\tnode\\t'codex'\\n" ;; *) printf '%%1\\n' ;; esac
+    ;;
+  show-options)
+    if [ -f "$state_dir/fail-session-birth" ]; then exit 1; fi
+    printf 'opaque-session-birth\\n'
+    ;;
+  show-option)
+    case "$*" in
+      *'@omx_team_pane_birth'*) IFS= read -r birth < "$state_dir/birth"; printf '%s\\n' "$birth" ;;
+      *'@omx_team_pane_owner_id'*) printf 'team:logical-owner\\n' ;;
+      *'@omx_team_pane_role'*) printf 'hud\\n' ;;
+      *) printf 'opaque-pane-birth\\n' ;;
+    esac
+    ;;
+  split-window) case "$*" in *' -h '*) printf '%%2\\n' ;; *) printf '%%3\\n' ;; esac ;;
+  set-option)
+    if [ "${'$'}{5:-}" = '@omx_team_pane_birth' ]; then printf '%s' "${'$'}{6:-}" > "$state_dir/birth"; fi
+    ;;
+  select-pane) : > "$state_dir/fail-session-birth" ;;
+  if-shell)
+    IFS= read -r mode < "$state_dir/mode"
+    condition="${'$'}{5:-}"
+    case "$mode" in
+      matching) needle='immutable-team-session-birth' ;;
+      command) needle='mutated-command' ;;
+      pane-birth) needle='mutated-pane-birth' ;;
+      session-birth) needle='mutated-session-birth' ;;
+      owner) needle='mutated-owner' ;;
+      role) needle='mutated-role' ;;
+    esac
+    case "$condition" in
+      *"$needle"*) printf 'applied\\n' >> "$state_dir/receipts" ;;
+      *) printf 'rejected\\n' >> "$state_dir/receipts" ;;
+    esac
+    ;;
+  *) ;;
+esac
+`,
+        async ({ logPath }) => {
+          const stateDir = join(dirname(logPath), 'rollback-state');
+          const fakeBinDir = dirname(logPath);
+          const geminiPath = join(fakeBinDir, 'gemini');
+          await writeFile(geminiPath, '#!/bin/sh\nexit 0\n');
+          await chmod(geminiPath, 0o755);
+          process.env.TMUX = 'shared,stub,0';
+          process.env.TMUX_PANE = '%1';
+          process.env.OMX_TEAM_WORKER_CLI = 'gemini';
+
+          for (const mutation of ['matching', 'command', 'pane-birth', 'session-birth', 'owner', 'role']) {
+            await rm(stateDir, { recursive: true, force: true });
+            await mkdir(stateDir, { recursive: true });
+            await writeFile(join(stateDir, 'mode'), mutation);
+            await writeFile(join(stateDir, 'receipts'), '');
+            let journaledWorker = false;
+            await writeFile(logPath, '');
+            assert.throws(
+              () => createTeamSession('Opaque Rollback', 1, cwd, [], [], {
+                ownerSessionId: 'logical-owner-id',
+                teamPaneOwnerId: 'team:logical-owner',
+                hudExactCandidate: {
+                  sessionId: 'logical-owner-id',
+                  sessionIds: ['logical-owner-id'],
+                  leaderPaneId: '%1',
+                  tmuxSessionInstanceId: 'opaque-session-birth',
+                  tmuxPaneInstanceId: 'opaque-pane-birth',
+                  tmuxSessionName: 'shared',
+                  tmuxWindowIndex: '0',
+                },
+                journalResource: (resource) => {
+                  const isWorker = resource.kind === 'worker'
+                    && resource.created === true
+                    && resource.id === '%2'
+                    && Boolean(resource.pane_birth)
+                    && resource.role === 'worker';
+                  journaledWorker ||= isWorker;
+                  if (isWorker) throw new Error('forced rollback after worker journal');
+                },
+              }),
+              /forced rollback after worker journal/,
+            );
+            assert.equal(journaledWorker, true);
+            const log = await readFile(logPath, 'utf-8');
+            await readFile(join(stateDir, 'receipts'), 'utf-8');
+            assert.match(log, /if-shell -t %2 -F/);
+            assert.match(log, /pane_start_command/);
+            assert.match(log, /@omx_instance_id},immutable-team-session-birth/);
+            assert.match(log, /@omx_team_pane_owner_id},team#:logical-owner/);
+            assert.match(log, /@omx_team_pane_birth}/);
+            assert.match(log, /@omx_team_pane_role},worker/);
+            assert.match(log, /kill-pane -t %2.*__omx_startup_rollback_applied_.*__omx_startup_rollback_rejected_/);
+            assert.doesNotMatch(log, /@omx_instance_id.*logical-owner-id/);
+          }
+        },
+      );
+    } finally {
+      if (typeof previousTmux === 'string') process.env.TMUX = previousTmux;
+      else delete process.env.TMUX;
+      if (typeof previousPane === 'string') process.env.TMUX_PANE = previousPane;
+      else delete process.env.TMUX_PANE;
+      if (typeof previousWorkerCli === 'string') process.env.OMX_TEAM_WORKER_CLI = previousWorkerCli;
+      else delete process.env.OMX_TEAM_WORKER_CLI;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it('does not reuse the Team pane owner token as the HUD logical session id', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-team-hud-session-boundary-'));
     const prevTmux = process.env.TMUX;

@@ -2090,7 +2090,7 @@ export function createTeamSession(
   let createdHudPaneCommand: string | null = null;
   let createdHudPaneBirth: string | null = null;
 
-  let rollbackOwnerSessionId = '';
+  let rollbackSessionBirth = '';
   let rollbackTeamPaneOwnerId = '';
 
   try {
@@ -2111,7 +2111,6 @@ export function createTeamSession(
     const teamTarget = `${sessionName}:${windowIndex}`;
     const ownerSessionId = (options.ownerSessionId ?? process.env.OMX_SESSION_ID ?? '').trim();
     const teamPaneOwnerId = (options.teamPaneOwnerId ?? `team:${safeTeamName}`).trim();
-    rollbackOwnerSessionId = ownerSessionId;
     rollbackTeamPaneOwnerId = teamPaneOwnerId;
 
     const panes = listPanes(teamTarget);
@@ -2121,15 +2120,17 @@ export function createTeamSession(
       options,
       'hudExactCandidate',
     );
-    const recheckedSessionTag = hudExactCandidate?.tmuxSessionName
-      ? runTmux(['show-options', '-qv', '-t', sessionName, OMX_INSTANCE_OPTION])
-      : null;
+    // Capture the session's persisted opaque birth before creating any rollback
+    // candidates. The logical owner/session id is only an alias and must never
+    // authorize destruction of panes in a later session generation.
+    const observedSessionBirth = runTmux(['show-options', '-qv', '-t', sessionName, OMX_INSTANCE_OPTION]);
+    rollbackSessionBirth = observedSessionBirth.ok ? observedSessionBirth.stdout.trim() : '';
     const hudEvidenceStillMatches = !hudExactCandidate?.tmuxSessionName
       || (
         hudExactCandidate.tmuxSessionName === sessionName
         && hudExactCandidate.tmuxWindowIndex === windowIndex
-        && recheckedSessionTag?.ok
-        && recheckedSessionTag.stdout.trim() === hudExactCandidate.tmuxSessionInstanceId
+        && observedSessionBirth.ok
+        && observedSessionBirth.stdout.trim() === hudExactCandidate.tmuxSessionInstanceId
         && paneHasOmxInstanceTag(leaderPaneId, hudExactCandidate.tmuxPaneInstanceId)
       );
     const hasExactHudAuthority = Boolean(
@@ -2451,15 +2452,23 @@ export function createTeamSession(
       }
     }
     // Every rollback candidate was tagged and read back before being journaled.
-    // Revalidate its exact Team ownership and opaque per-pane birth in tmux itself;
-    // a failed conditional kill deliberately retains the pane for recovery.
+    // Revalidate its exact Team ownership and opaque per-pane/session births in
+    // tmux itself; a failed conditional kill deliberately retains the pane for
+    // recovery. Logical session IDs remain aliases and are not destruction
+    // authority.
     for (const paneId of rollbackPaneIds) {
       const paneBirth = rollbackPaneBirths.get(paneId);
       const role = rollbackPaneRoles.get(paneId);
       const command = workerPaneCommands.get(paneId) ?? (role === 'hud' ? createdHudPaneCommand : null);
-      if (!rollbackOwnerSessionId || !rollbackTeamPaneOwnerId || !paneBirth || !role || !command) continue;
-      const condition = `#{&&:#{==:#{pane_id},${escapeTmuxFormatLiteral(paneId)}},#{==:#{pane_start_command},${escapeTmuxFormatLiteral(command)}},#{==:#{@omx_pane_instance_id},${escapeTmuxFormatLiteral(rollbackOwnerSessionId)}},#{==:#{@omx_instance_id},${escapeTmuxFormatLiteral(rollbackOwnerSessionId)}},#{==:#{@omx_team_pane_owner_id},${escapeTmuxFormatLiteral(rollbackTeamPaneOwnerId)}},#{==:#{@omx_team_pane_birth},${escapeTmuxFormatLiteral(paneBirth)}},#{==:#{@omx_team_pane_role},${escapeTmuxFormatLiteral(role)}}}`;
-      runTmux(['if-shell', '-t', paneId, '-F', condition, `kill-pane -t ${paneId}`, '']);
+      if (!rollbackSessionBirth || !rollbackTeamPaneOwnerId || !paneBirth || !role || !command) continue;
+      const appliedReceipt = `__omx_startup_rollback_applied_${randomUUID()}__`;
+      const rejectedReceipt = `__omx_startup_rollback_rejected_${randomUUID()}__`;
+      const condition = `#{&&:#{==:#{pane_id},${escapeTmuxFormatLiteral(paneId)}},#{==:#{pane_start_command},${escapeTmuxFormatLiteral(command)}},#{==:#{@omx_instance_id},${escapeTmuxFormatLiteral(rollbackSessionBirth)}},#{==:#{@omx_team_pane_owner_id},${escapeTmuxFormatLiteral(rollbackTeamPaneOwnerId)}},#{==:#{@omx_team_pane_birth},${escapeTmuxFormatLiteral(paneBirth)}},#{==:#{@omx_team_pane_role},${escapeTmuxFormatLiteral(role)}}}`;
+      runTmux([
+        'if-shell', '-t', paneId, '-F', condition,
+        `kill-pane -t ${paneId} \\; display-message -p ${appliedReceipt}`,
+        `display-message -p ${rejectedReceipt}`,
+      ]);
     }
     throw error;
   }

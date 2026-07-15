@@ -133,6 +133,7 @@ import {
   resetSessionMetrics,
 } from "../hooks/session.js";
 import { probeActualTmuxInstanceEvidence, tmuxEvidenceBindsCandidate, type ActualTmuxInstanceEvidence } from "../scripts/notify-hook/managed-tmux.js";
+import { resolveHudControlPlaneDomain, writeHudTmuxBirthLineage } from "../mcp/state-paths.js";
 import {
   buildClientAttachedReconcileHookName,
   buildReconcileHudResizeArgs,
@@ -3568,6 +3569,10 @@ async function resolvePreLaunchSessionPointerOptions(): Promise<{
   };
 }
 
+function escapeTmuxFormatLiteral(value: string): string {
+  return value.replace(/[#{},:]/g, (character) => `#${character}`);
+}
+
 /**
  * Establishes opaque tmux births exactly once. The logical Codex session id is
  * deliberately not a tmux birth: it can be replayed after tmux has recycled a
@@ -3578,28 +3583,55 @@ export async function establishCurrentTmuxInstanceBinding(
   paneId: string | undefined = process.env.TMUX_PANE,
   expectedSessionName?: string,
 ): Promise<ActualTmuxInstanceEvidence | null> {
-  const paneTarget = paneId?.trim() ?? '';
+  const paneTarget = paneId?.trim() ?? "";
   if (!sessionId.trim() || !paneTarget) return null;
   try {
     const before = await probeActualTmuxInstanceEvidence(paneTarget);
     const sessionName = expectedSessionName?.trim() || before.sessionName;
     if (!sessionName || before.sessionName !== sessionName || !before.contextStable
       || before.paneTarget !== paneTarget
-      || before.paneTagStatus === 'error' || before.sessionTagStatus === 'error') return null;
+      || before.paneTagStatus === "error" || before.sessionTagStatus === "error") return null;
 
-    const sessionBirth = before.sessionInstanceId || randomUUID();
-    if (!before.sessionInstanceId) {
-      execFileSync('tmux', ['set-option', '-o', '-t', sessionName, OMX_INSTANCE_OPTION, sessionBirth], {
-        stdio: ['ignore', 'ignore', 'ignore'],
+    const existingSessionBirth = before.sessionInstanceId;
+    const existingPaneBirth = before.paneInstanceId;
+    if (Boolean(existingSessionBirth) !== Boolean(existingPaneBirth)) return null;
+    if (existingSessionBirth && existingSessionBirth === existingPaneBirth) return null;
+
+    let sessionBirth = existingSessionBirth;
+    let paneBirth = existingPaneBirth;
+    if (!sessionBirth && !paneBirth) {
+      sessionBirth = randomUUID();
+      paneBirth = randomUUID();
+      const appliedReceipt = `__omx_birth_established_${randomUUID()}__`;
+      const rejectedReceipt = `__omx_birth_rejected_${randomUUID()}__`;
+      const condition = `#{&&:#{==:#{${OMX_INSTANCE_OPTION}},},#{==:#{${OMX_PANE_INSTANCE_OPTION}},}}`;
+      const publish = [
+        `set-option -t ${quoteShellArg(sessionName)} ${OMX_INSTANCE_OPTION} ${quoteShellArg(sessionBirth)}`,
+        `set-option -p -t ${quoteShellArg(paneTarget)} ${OMX_PANE_INSTANCE_OPTION} ${quoteShellArg(paneBirth)}`,
+        `display-message -p ${appliedReceipt}`,
+      ].join(" \\; ");
+      const receipt = execFileSync("tmux", [
+        "if-shell", "-t", paneTarget, "-F", condition, publish,
+        `display-message -p ${rejectedReceipt}`,
+      ], {
+        encoding: "utf-8",
+        stdio: ["ignore", "pipe", "ignore"],
         timeout: 2000,
-      });
-    }
-    const paneBirth = before.paneInstanceId || randomUUID();
-    if (!before.paneInstanceId) {
-      execFileSync('tmux', ['set-option', '-o', '-p', '-t', paneTarget, OMX_PANE_INSTANCE_OPTION, paneBirth], {
-        stdio: ['ignore', 'ignore', 'ignore'],
-        timeout: 2000,
-      });
+      }).split("\n").map((line) => line.trim());
+      if (receipt.includes(appliedReceipt)) {
+        // This invocation published its complete opaque pair.
+      } else if (receipt.includes(rejectedReceipt)) {
+        const winning = await probeActualTmuxInstanceEvidence(paneTarget);
+        if (!winning.contextStable || winning.paneTarget !== paneTarget
+          || winning.sessionName !== sessionName
+          || winning.sessionId !== before.sessionId
+          || winning.windowId !== before.windowId
+          || !winning.sessionInstanceId || !winning.paneInstanceId
+          || winning.sessionInstanceId === winning.paneInstanceId
+          || winning.sessionTagStatus !== "present" || winning.paneTagStatus !== "present") return null;
+        sessionBirth = winning.sessionInstanceId;
+        paneBirth = winning.paneInstanceId;
+      } else return null;
     }
 
     const after = await probeActualTmuxInstanceEvidence(paneTarget);
@@ -3610,12 +3642,41 @@ export async function establishCurrentTmuxInstanceBinding(
       || after.windowId !== before.windowId
       || after.sessionInstanceId !== sessionBirth
       || after.paneInstanceId !== paneBirth
-      || after.sessionTagStatus !== 'present'
-      || after.paneTagStatus !== 'present') return null;
+      || sessionBirth === paneBirth
+      || after.sessionTagStatus !== "present"
+      || after.paneTagStatus !== "present") return null;
     return after;
   } catch {
     return null;
   }
+}
+
+async function persistTmuxBirthLineage(
+  cwd: string,
+  sessionId: string,
+  evidence: ActualTmuxInstanceEvidence,
+): Promise<void> {
+  const tmuxSessionName = evidence.sessionName.trim();
+  const tmuxSessionInstanceId = evidence.sessionInstanceId.trim();
+  const tmuxPaneInstanceId = evidence.paneInstanceId.trim();
+  if (!tmuxSessionName || !tmuxSessionInstanceId || !tmuxPaneInstanceId) return;
+  const domain = await resolveHudControlPlaneDomain({
+    cwd,
+    requestedSessionId: sessionId,
+    claimant: {
+      sessionId,
+      leaderPaneId: evidence.paneTarget,
+      tmuxSessionName,
+      tmuxSessionInstanceId,
+      tmuxPaneInstanceId,
+    },
+  });
+  await writeHudTmuxBirthLineage(domain, {
+    sessionId,
+    tmuxSessionName,
+    tmuxSessionInstanceId,
+    tmuxPaneInstanceId,
+  });
 }
 
 function buildNativeHookBaseContext(
@@ -3750,9 +3811,6 @@ export function detectDetachedSessionWindowIndex(sessionName: string): string | 
   }
 }
 
-function escapeShellDoubleQuotedValue(value: string): string {
-  return value.replace(/["\\$`]/g, "\\$&");
-}
 
 interface TmuxExtendedKeysLeaseHolderRecord {
   id: string;
@@ -3997,7 +4055,6 @@ function withTmuxExtendedKeysLeaseLock<T>(
 
 function buildDetachedSessionLeaderCommand(
   cwd: string,
-  sessionName: string,
   codexCmd: string,
   sessionId?: string,
   codexHomeOverride?: string,
@@ -4031,9 +4088,6 @@ function buildDetachedSessionLeaderCommand(
     buildTmuxExtendedKeysReleaseShellSnippet(cwd),
     parentEnvCleanup,
     detachedPostLaunchHelper,
-    'if [ "$status" -eq 0 ]; then',
-    `tmux kill-session -t "${escapeShellDoubleQuotedValue(sessionName)}" >/dev/null 2>&1 || true;`,
-    "fi;",
     "exit $status;",
     "};",
     "trap omx_detached_session_cleanup 0 INT TERM HUP;",
@@ -4319,7 +4373,6 @@ export function buildDetachedSessionBootstrapSteps(
     ? "powershell.exe"
     : buildDetachedSessionLeaderCommand(
         cwd,
-        sessionName,
         codexCmd,
         sessionId,
         codexHomeOverride,
@@ -4373,14 +4426,6 @@ export function buildDetachedSessionBootstrapSteps(
   ];
   return [
     { name: "new-session", args: newSessionArgs },
-    ...(sessionId
-      ? [
-          {
-            name: "tag-session",
-            args: ["set-option", "-t", sessionName, OMX_INSTANCE_OPTION, sessionId],
-          },
-        ]
-      : []),
     { name: "reconcile-managed-hud", args: [] },
   ];
 }
@@ -4505,6 +4550,7 @@ export function buildDetachedSessionRollbackSteps(
   hookTarget: string | null,
   hookName: string | null,
   clientAttachedHookName: string | null,
+  sessionBirth: string | null = null,
 ): DetachedSessionTmuxStep[] {
   const steps: DetachedSessionTmuxStep[] = [];
   if (hookTarget && clientAttachedHookName) {
@@ -4522,10 +4568,20 @@ export function buildDetachedSessionRollbackSteps(
       args: buildUnregisterResizeHookArgs(hookTarget, hookName),
     });
   }
-  steps.push({
-    name: "kill-session",
-    args: ["kill-session", "-t", sessionName],
-  });
+  const normalizedSessionBirth = sessionBirth?.trim() ?? "";
+  if (normalizedSessionBirth) {
+    const appliedReceipt = `__omx_detached_session_rollback_applied_${randomUUID()}__`;
+    const rejectedReceipt = `__omx_detached_session_rollback_rejected_${randomUUID()}__`;
+    const condition = `#{&&:#{==:#{session_name},${escapeTmuxFormatLiteral(sessionName)}},#{==:#{${OMX_INSTANCE_OPTION}},${escapeTmuxFormatLiteral(normalizedSessionBirth)}}}`;
+    steps.push({
+      name: "kill-session-if-birth-matches",
+      args: [
+        "if-shell", "-t", sessionName, "-F", condition,
+        `kill-session -t ${quoteShellArg(sessionName)} \\; display-message -p ${appliedReceipt}`,
+        `display-message -p ${rejectedReceipt}`,
+      ],
+    });
+  }
   return steps;
 }
 
@@ -5044,6 +5100,7 @@ export async function preLaunch(
       ...(tmuxBinding.sessionName ? { tmuxSessionName: tmuxBinding.sessionName } : {}),
       ...(tmuxBinding.paneTarget ? { tmuxPaneId: tmuxBinding.paneTarget } : {}),
     });
+    await persistTmuxBirthLineage(cwd, sessionId, tmuxBinding);
   }
 
   // 3. Generate runtime overlay + write session-scoped model instructions file
@@ -5326,17 +5383,21 @@ async function runCodex(
       }
 
       let detachedSessionBindingWrite: Promise<unknown> = Promise.resolve();
-      const writeDetachedSessionBinding = (tmuxPaneId?: string | null) => {
+      const writeDetachedSessionBinding = (
+        tmuxPaneId?: string | null,
+        tmuxBinding?: ActualTmuxInstanceEvidence | null,
+      ) => {
         detachedSessionBindingWrite = detachedSessionBindingWrite
           .catch((err) => {
             logCliOperationFailure(err);
           })
-          .then(() =>
-            writeSessionStart(cwd, sessionId, {
+          .then(async () => {
+            await writeSessionStart(cwd, sessionId, {
               tmuxSessionName: sessionName,
               ...(tmuxPaneId ? { tmuxPaneId } : {}),
-            }),
-          );
+            });
+            if (tmuxBinding) await persistTmuxBirthLineage(cwd, sessionId, tmuxBinding);
+          });
         void detachedSessionBindingWrite.catch((err) => {
           logCliOperationFailure(err);
           // Non-fatal: managed tmux recovery can still use compatibility fallback.
@@ -5350,6 +5411,7 @@ async function runCodex(
       let detachedParentEnvFilePath: string | undefined;
       let detachedLeaderPaneId: string | null = null;
       let detachedHudEvidenceVerified = false;
+      let detachedSessionBirth: string | null = null;
       try {
         // This path is the user-shell interactive launch: OMX creates a tmux
         // session and immediately attaches the user's terminal to it. If a tmux
@@ -5450,12 +5512,16 @@ async function runCodex(
                   tmux_pane_id: leaderPaneId,
                 });
               }
-              writeDetachedSessionBinding(leaderPaneId);
-              detachedHudEvidenceVerified = await establishCurrentTmuxInstanceBinding(
+              const tmuxBinding = await establishCurrentTmuxInstanceBinding(
                 sessionId,
                 leaderPaneId,
                 sessionName,
-              ) !== null;
+              );
+              if (tmuxBinding) {
+                detachedSessionBirth = tmuxBinding.sessionInstanceId;
+                writeDetachedSessionBinding(leaderPaneId, tmuxBinding);
+                detachedHudEvidenceVerified = true;
+              }
             }
           }
         }
@@ -5473,6 +5539,7 @@ async function runCodex(
             registeredHookTarget,
             registeredHookName,
             registeredClientAttachedHookName,
+            detachedSessionBirth,
           );
           for (const rollbackStep of rollbackSteps) {
             try {
