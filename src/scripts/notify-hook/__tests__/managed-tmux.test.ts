@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 import { resolveHudControlPlaneDomain, writeHudTmuxBirthLineage } from '../../../mcp/state-paths.js';
+import { writeSessionStart } from '../../../hooks/session.js';
 import { isManagedOmxSession } from '../managed-tmux.js';
 
 describe('managed tmux opaque birth lineage', () => {
@@ -17,13 +18,7 @@ describe('managed tmux opaque birth lineage', () => {
     const sessionBirthId = '7d667f3f-4c4b-4e80-8ea5-050ba1dbfe1f';
     const paneBirthId = '388b3d25-c797-4223-bb30-3eb3511e4101';
     try {
-      await mkdir(join(cwd, '.omx', 'state'), { recursive: true });
-      await writeFile(join(cwd, '.omx', 'state', 'session.json'), JSON.stringify({
-        session_id: sessionId,
-        cwd,
-        pid: process.pid,
-        started_at: new Date().toISOString(),
-      }));
+      await writeSessionStart(cwd, sessionId);
       const domain = await resolveHudControlPlaneDomain({ cwd, requestedSessionId: sessionId });
       await writeHudTmuxBirthLineage(domain, {
         sessionId,
@@ -35,8 +30,13 @@ describe('managed tmux opaque birth lineage', () => {
       await writeFile(join(binDir, 'tmux'), `#!/bin/sh
 case "$1" in
 display-message) printf 'team-session\t$1\t@1\t%%1\n' ;;
-show-option) printf '${paneBirthId}\n' ;;
-show-options) printf '${sessionBirthId}\n' ;;
+show-option)
+  case "$*" in
+    *"-p -t %1 @omx_pane_instance_id"*) printf '${paneBirthId}\n' ;;
+    *"-t team-session @omx_instance_id"*) printf '${sessionBirthId}\n' ;;
+    *) exit 1 ;;
+  esac
+  ;;
 *) exit 1 ;;
 esac
 `);
