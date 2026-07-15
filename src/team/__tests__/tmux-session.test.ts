@@ -4598,6 +4598,7 @@ esac
           assert.match(tmuxLog, /set-option -p -t %2 @omx_pane_instance_id omx-pane-scope/);
           assert.match(tmuxLog, /set-option -p -t %3 @omx_pane_instance_id [0-9a-f-]{36}/);
           assert.doesNotMatch(tmuxLog, /set-option -p -t %3 @omx_pane_instance_id omx-pane-scope/);
+          assert.doesNotMatch(tmuxLog, /set-option -p -t %3 @omx_pane_instance_id pane-birth/);
           assert.match(tmuxLog, /set-option -p -t %1 @omx_team_pane_owner_id team:pane-tags/);
           assert.match(tmuxLog, /set-option -p -t %2 @omx_team_pane_owner_id team:pane-tags/);
           assert.match(tmuxLog, /set-option -p -t %3 @omx_team_pane_owner_id team:pane-tags/);
@@ -6960,6 +6961,8 @@ esac
         }), false);
         const log = await readFile(logPath, 'utf-8');
         assert.match(log, /if-shell -t %2 -F .*kill-pane -t %2.*__omx_hud_teardown_applied_.*__omx_hud_teardown_rejected_/);
+        assert.match(log, /@omx_pane_instance_id},hud-birth/);
+        assert.doesNotMatch(log, /@omx_pane_instance_id},pane-birth/);
         assert.doesNotMatch(log, /^kill-pane -t %2$/m);
       },
     );
