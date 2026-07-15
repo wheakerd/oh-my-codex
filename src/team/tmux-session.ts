@@ -947,6 +947,73 @@ export function unregisterClientAttachedReconcileHook(hookTarget: string, hookNa
   return result.ok;
 }
 
+type TmuxHookSnapshot = {
+  slot: string;
+  command: string | null;
+};
+
+function readTmuxHookSnapshot(hookTarget: string, slot: string): TmuxHookSnapshot | null {
+  const result = runTmux(['show-hooks', '-t', hookTarget, slot]);
+  if (!result.ok) return null;
+  const output = result.stdout.trim();
+  if (output === '') return { slot, command: null };
+  const prefix = `${slot} `;
+  return output.startsWith(prefix) ? { slot, command: output.slice(prefix.length) } : null;
+}
+
+function restoreTmuxHookSnapshot(hookTarget: string, snapshot: TmuxHookSnapshot): boolean {
+  if (snapshot.command === null) return true;
+  return runTmux(['set-hook', '-t', hookTarget, snapshot.slot, snapshot.command]).ok;
+}
+
+function tmuxHookMatchesSnapshot(hookTarget: string, expected: TmuxHookSnapshot): boolean {
+  const actual = readTmuxHookSnapshot(hookTarget, expected.slot);
+  return actual?.command === expected.command;
+}
+
+function tmuxHookIsAbsent(hookTarget: string, slot: string): boolean {
+  return readTmuxHookSnapshot(hookTarget, slot)?.command === null;
+}
+
+function restoreHudHookSnapshots(
+  hookTarget: string,
+  clientAttachedSnapshot: TmuxHookSnapshot,
+  resizeSnapshot: TmuxHookSnapshot,
+): boolean {
+  return restoreTmuxHookSnapshot(hookTarget, clientAttachedSnapshot)
+    && restoreTmuxHookSnapshot(hookTarget, resizeSnapshot)
+    && tmuxHookMatchesSnapshot(hookTarget, clientAttachedSnapshot)
+    && tmuxHookMatchesSnapshot(hookTarget, resizeSnapshot);
+}
+
+/**
+ * Removes the paired Team HUD hooks only when both can be snapshotted first.
+ * If the second deletion fails, restore the first hook and report failure so
+ * shutdown preserves the HUD pane and lifecycle metadata.
+ */
+export function unregisterHudHooksTransactionally(
+  hookTarget: string,
+  resizeHookName: string,
+  clientAttachedHookName: string,
+): boolean {
+  const resizeSlot = buildResizeHookSlot(resizeHookName);
+  const clientAttachedSlot = buildClientAttachedHookSlot(clientAttachedHookName);
+  const clientAttachedSnapshot = readTmuxHookSnapshot(hookTarget, clientAttachedSlot);
+  const resizeSnapshot = readTmuxHookSnapshot(hookTarget, resizeSlot);
+  if (!clientAttachedSnapshot || !resizeSnapshot) return false;
+
+  if (!runTmux(['set-hook', '-u', '-t', hookTarget, clientAttachedSlot]).ok) return false;
+  if (!tmuxHookIsAbsent(hookTarget, clientAttachedSlot)) {
+    restoreHudHookSnapshots(hookTarget, clientAttachedSnapshot, resizeSnapshot);
+    return false;
+  }
+  if (!runTmux(['set-hook', '-u', '-t', hookTarget, resizeSlot]).ok || !tmuxHookIsAbsent(hookTarget, resizeSlot)) {
+    restoreHudHookSnapshots(hookTarget, clientAttachedSnapshot, resizeSnapshot);
+    return false;
+  }
+  return true;
+}
+
 export function buildScheduleDelayedHudResizeArgs(
   hudPaneId: string,
   delaySeconds: number = HUD_RESIZE_RECONCILE_DELAY_SECONDS,
