@@ -772,9 +772,17 @@ function readSubagentTrackingStateSync(cwd: string): SubagentTrackingState {
 // be bypassed. Callers making a security decision (attest vs deny) use these.
 function readSubagentTrackingStateSyncStrict(cwd: string): { ok: true; state: SubagentTrackingState } | { ok: false } {
   const path = subagentTrackingPath(cwd);
-  if (!existsSync(path)) return { ok: true, state: createSubagentTrackingState() };
+  let raw: string;
   try {
-    return { ok: true, state: normalizeSubagentTrackingState(JSON.parse(readFileSync(path, 'utf-8'))) };
+    raw = readFileSync(path, 'utf-8');
+  } catch (error) {
+    // Only a genuine ENOENT (no file) is a clean empty state. Any other read/access error
+    // (permissions, I/O, ELOOP, …) must fail closed rather than be treated as empty.
+    if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return { ok: true, state: createSubagentTrackingState() };
+    return { ok: false };
+  }
+  try {
+    return { ok: true, state: normalizeSubagentTrackingState(JSON.parse(raw)) };
   } catch {
     return { ok: false };
   }
@@ -782,9 +790,15 @@ function readSubagentTrackingStateSyncStrict(cwd: string): { ok: true; state: Su
 
 export async function readSubagentTrackingStateStrict(cwd: string): Promise<{ ok: true; state: SubagentTrackingState } | { ok: false }> {
   const path = subagentTrackingPath(cwd);
-  if (!existsSync(path)) return { ok: true, state: createSubagentTrackingState() };
+  let raw: string;
   try {
-    return { ok: true, state: normalizeSubagentTrackingState(JSON.parse(await readFile(path, 'utf-8'))) };
+    raw = await readFile(path, 'utf-8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return { ok: true, state: createSubagentTrackingState() };
+    return { ok: false };
+  }
+  try {
+    return { ok: true, state: normalizeSubagentTrackingState(JSON.parse(raw)) };
   } catch {
     return { ok: false };
   }
@@ -1090,7 +1104,11 @@ export function ensureLeaderAndRecordIntent(
   if (canonicalOrigin === null) return { ok: false, reason: 'invalid_origin' };
   const { isOwn, shouldPruneExpired } = pendingRoleIntentPredicates(cwd, canonicalOrigin, nowMs);
   return withCrossProcessFileLockSync(subagentTrackingPath(cwd), (context) => {
-    const state = readSubagentTrackingStateSync(cwd);
+    // Strict read under the lock: an unreadable/corrupt tracker fails closed rather than
+    // being treated as empty state.
+    const read = readSubagentTrackingStateSyncStrict(cwd);
+    if (!read.ok) return { ok: false, reason: 'native_anchor_unavailable' as const };
+    const state = read.state;
     const session = state.sessions[sessionId];
     const attestedLeader = session?.leader_thread_id?.trim();
     // Fail closed unless a durable native attestation established the leader anchor.
@@ -1098,6 +1116,13 @@ export function ensureLeaderAndRecordIntent(
       return { ok: false, reason: 'native_anchor_unavailable' as const };
     }
     if (parentThreadId !== attestedLeader) {
+      return { ok: false, reason: 'native_anchor_mismatch' as const };
+    }
+    // Symmetric subagent exclusion: independent of which writer won the tracker lock, a
+    // leader thread that is ALSO recorded as a subagent in ANY session (even a different
+    // one) must never receive an adapted role intent. Re-scanned here under the intent-write
+    // lock so a cross-session child record committed after attestation cannot slip through.
+    if (threadIsTrackedAsSubagent(state, attestedLeader)) {
       return { ok: false, reason: 'native_anchor_mismatch' as const };
     }
 

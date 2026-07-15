@@ -161,4 +161,36 @@ describe('#3181 leader bootstrap tracker carrier', () => {
       assert.deepEqual(result, { ok: false, reason: 'native_anchor_unavailable' });
     });
   });
+
+  it('fails closed (native_anchor_unavailable) when the tracker exists but is unreadable (non-ENOENT)', async () => {
+    await withCwd(async (cwd) => {
+      // Make the tracker path a directory so a read throws EISDIR (not ENOENT); an existing
+      // but unreadable tracker must deny attestation, not be treated as clean empty state.
+      await mkdir(subagentTrackingPath(cwd), { recursive: true });
+      const result = attestLeaderThread(cwd, { sessionId: 'sess-a', leaderThreadId: 'leader-thread-a', source: 'native-pretooluse' });
+      assert.deepEqual(result, { ok: false, reason: 'native_anchor_unavailable' });
+    });
+  });
+
+  it('symmetric exclusion: a leader also tracked as a subagent in a DIFFERENT session cannot record an intent', async () => {
+    await withCwd(async (cwd) => {
+      // Attestation wins first for session A.
+      const attest = attestLeaderThread(cwd, { sessionId: 'sess-A', leaderThreadId: 'thread-x', source: 'native-pretooluse' });
+      assert.equal(attest.ok, true);
+      // A cross-session child record then classifies thread-x as a subagent under session B.
+      await recordSubagentTurnForSession(cwd, {
+        sessionId: 'sess-B',
+        threadId: 'thread-x',
+        kind: 'subagent',
+        leaderThreadId: 'sess-B',
+        timestamp: new Date().toISOString(),
+      });
+      // ensureLeaderAndRecordIntent must re-scan all sessions and refuse.
+      const result = ensureLeaderAndRecordIntent(cwd, {
+        role: 'architect', sessionId: 'sess-A', parentThreadId: 'thread-x', correlationToken: TOKEN,
+      });
+      assert.deepEqual(result, { ok: false, reason: 'native_anchor_mismatch' });
+      assert.deepEqual((await readSubagentTrackingState(cwd)).pending_role_intents, []);
+    });
+  });
 });
