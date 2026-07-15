@@ -1687,8 +1687,10 @@ esac
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
       assert.doesNotMatch(tmuxLog, /kill-pane -t %12/);
-      assert.match(tmuxLog, /kill-pane -t %13/);
-      assert.match(tmuxLog, /kill-pane -t %14/);
+      // Owner tags without opaque pane/session births are not exact teardown
+      // authority. Shared-session shutdown preserves every uncertain pane.
+      assert.doesNotMatch(tmuxLog, /kill-pane -t %13/);
+      assert.doesNotMatch(tmuxLog, /kill-pane -t %14/);
       assert.doesNotMatch(tmuxLog, /kill-pane -t %11/);
     } finally {
       if (typeof previousPath === 'string') process.env.PATH = previousPath;
