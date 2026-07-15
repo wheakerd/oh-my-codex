@@ -93,10 +93,13 @@ function ensureHudResizeHook(
   cwd: string,
   deps: ReconcileHudForPromptSubmitDeps,
 ): boolean {
-  return (deps.registerHudResizeHook ?? registerHudResizeHook)(hudPaneId, leaderPaneId, desiredHeight, {
+  const options = {
     cwd,
     env: deps.env ?? process.env,
-  });
+  };
+  return deps.registerHudResizeHook
+    ? deps.registerHudResizeHook(hudPaneId, leaderPaneId, desiredHeight, options) !== false
+    : registerHudResizeHook(hudPaneId, leaderPaneId, desiredHeight, options);
 }
 
 function hasCompleteGeometry(pane: TmuxPaneSnapshot): boolean {
@@ -354,7 +357,9 @@ export async function reconcileHudForPromptSubmit(
   const killPane = deps.killManagedHudPane
     ? (candidate: ExactHudPaneKillCandidate) => deps.killManagedHudPane!(candidate) !== false
     : killExactHudPane;
-  const resizePane = deps.resizeTmuxPane ?? ((paneId, lines) => resizeTmuxPane(paneId, lines));
+  const resizePane = deps.resizeTmuxPane
+    ? (paneId: string, lines: number) => deps.resizeTmuxPane!(paneId, lines) !== false
+    : (paneId: string, lines: number) => resizeTmuxPane(paneId, lines);
   const lock = acquired.lock;
   const resolvedSessionId = domain.session?.canonicalId;
   const equivalentSessionIds = domain.session?.equivalentIds ?? [];
@@ -478,9 +483,9 @@ export async function reconcileHudForPromptSubmit(
   if (singleHudPane && !needsHudTopologyRecreate(singleHudPane, leaderPane)) {
     const shouldResize = needsHudHeightResize(singleHudPane, desiredHeight);
     const resized = shouldResize ? resizePane(singleHudPane.paneId, desiredHeight) : true;
-    const hooksRegistered = resized && ensureHudResizeHook(singleHudPane.paneId, currentPaneId, desiredHeight, cwd, deps);
+    if (resized) ensureHudResizeHook(singleHudPane.paneId, currentPaneId, desiredHeight, cwd, deps);
     return {
-      status: resized && hooksRegistered ? (shouldResize ? 'resized' : 'unchanged') : 'failed',
+      status: resized ? (shouldResize ? 'resized' : 'unchanged') : 'failed',
       paneId: singleHudPane.paneId,
       desiredHeight,
       duplicateCount,
@@ -505,9 +510,9 @@ export async function reconcileHudForPromptSubmit(
         }
       }
       const resized = resizePane(keeperPane.paneId, desiredHeight);
-      const hooksRegistered = resized && ensureHudResizeHook(keeperPane.paneId, currentPaneId, desiredHeight, cwd, deps);
+      if (resized) ensureHudResizeHook(keeperPane.paneId, currentPaneId, desiredHeight, cwd, deps);
       return {
-        status: resized && hooksRegistered ? 'replaced_duplicates' : 'failed',
+        status: resized ? 'replaced_duplicates' : 'failed',
         paneId: keeperPane.paneId,
         desiredHeight,
         duplicateCount,
@@ -540,8 +545,10 @@ export async function reconcileHudForPromptSubmit(
     }
   }
 
-  const unregisterHook = deps.unregisterHudResizeHook ?? unregisterHudResizeHook;
-  if (!unregisterHook(currentPaneId) && hudPaneIds.length > 0) {
+  const hooksUnregistered = deps.unregisterHudResizeHook
+    ? deps.unregisterHudResizeHook(currentPaneId) !== false
+    : unregisterHudResizeHook(currentPaneId);
+  if (!hooksUnregistered && hudPaneIds.length > 0) {
     return { status: 'unchanged', paneId: null, desiredHeight, duplicateCount };
   }
 
@@ -610,10 +617,10 @@ export async function reconcileHudForPromptSubmit(
       duplicateCount: postCreate.duplicatePaneIds.length,
     };
   }
-  const hooksRegistered = ensureHudResizeHook(postCreate.paneId, currentPaneId, desiredHeight, cwd, deps);
+  ensureHudResizeHook(postCreate.paneId, currentPaneId, desiredHeight, cwd, deps);
 
   return {
-    status: hooksRegistered ? (postCreate.duplicatePaneIds.length > 0 || hudPaneIds.length > 1 ? 'replaced_duplicates' : 'recreated') : 'failed',
+    status: postCreate.duplicatePaneIds.length > 0 || hudPaneIds.length > 1 ? 'replaced_duplicates' : 'recreated',
     paneId: postCreate.paneId,
     desiredHeight,
     duplicateCount: postCreate.duplicatePaneIds.length,
