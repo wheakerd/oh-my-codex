@@ -204,6 +204,26 @@ export function probeExactTeamHudCandidate(
   };
 }
 
+/** Returns the exact live HUD pane only when its command, logical claimant, and opaque tmux birth tags all match. */
+export function findExactTeamHudPane(
+  sessionName: string,
+  expectedHudPaneId: string | null | undefined,
+  candidate: ExactTeamHudCandidate & { tmuxSessionName: string },
+): string | null {
+  const hudPaneId = normalizePaneTarget(expectedHudPaneId);
+  if (!hudPaneId || sessionName.trim() !== candidate.tmuxSessionName) return null;
+  const pane = listPanes(sessionName).find((entry) => entry.paneId === hudPaneId);
+  if (!pane || !isHudWatchPane(pane)) return null;
+  return hudPaneMatchesExactCandidate(pane, {
+    sessionId: candidate.sessionId,
+    sessionIds: candidate.sessionIds,
+    leaderPaneId: candidate.leaderPaneId,
+  }, {
+    tmuxSessionInstanceId: candidate.tmuxSessionInstanceId,
+    tmuxPaneInstanceId: candidate.tmuxPaneInstanceId,
+  }) ? hudPaneId : null;
+}
+
 export interface RestoreStandaloneHudPaneOptions {
   /** Canonical session id that prompt-submit HUD reconciliation should use to dedupe the restored HUD. */
   sessionId?: string | null;
@@ -957,8 +977,9 @@ function readTmuxHookSnapshot(hookTarget: string, slot: string): TmuxHookSnapsho
   if (!result.ok) return null;
   const output = result.stdout.trim();
   if (output === '') return { slot, command: null };
-  const prefix = `${slot} `;
-  return output.startsWith(prefix) ? { slot, command: output.slice(prefix.length) } : null;
+  const escapedSlot = slot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const match = output.split('\n').map((value) => value.trim()).map((value) => value.match(new RegExp(`^${escapedSlot}\\s+(.+)$`))).find(Boolean);
+  return match?.[1] ? { slot, command: match[1] } : null;
 }
 
 function restoreTmuxHookSnapshot(hookTarget: string, snapshot: TmuxHookSnapshot): boolean {
@@ -995,12 +1016,20 @@ export function unregisterHudHooksTransactionally(
   hookTarget: string,
   resizeHookName: string,
   clientAttachedHookName: string,
+  hudPaneId: string,
 ): boolean {
   const resizeSlot = buildResizeHookSlot(resizeHookName);
   const clientAttachedSlot = buildClientAttachedHookSlot(clientAttachedHookName);
   const clientAttachedSnapshot = readTmuxHookSnapshot(hookTarget, clientAttachedSlot);
   const resizeSnapshot = readTmuxHookSnapshot(hookTarget, resizeSlot);
-  if (!clientAttachedSnapshot || !resizeSnapshot) return false;
+  const expectedResizeCommand = buildRegisterResizeHookArgs(hookTarget, resizeHookName, hudPaneId)[4];
+  const expectedClientAttachedCommand = buildRegisterClientAttachedReconcileArgs(hookTarget, clientAttachedHookName, hudPaneId)[4];
+  if (
+    !clientAttachedSnapshot
+    || !resizeSnapshot
+    || clientAttachedSnapshot.command !== expectedClientAttachedCommand
+    || resizeSnapshot.command !== expectedResizeCommand
+  ) return false;
 
   if (!runTmux(['set-hook', '-u', '-t', hookTarget, clientAttachedSlot]).ok) return false;
   if (!tmuxHookIsAbsent(hookTarget, clientAttachedSlot)) {

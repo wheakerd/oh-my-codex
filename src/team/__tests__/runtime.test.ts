@@ -4741,13 +4741,13 @@ exit 0
           const teamHudSplitRe = new RegExp(`split-window -v -f -l ${HUD_TMUX_TEAM_HEIGHT_LINES} -t leader:0 -d -P -F #\\{pane_id\\}`, 'g');
           const standaloneHudSplitRe = new RegExp(`split-window -v -f -l ${HUD_TMUX_TEAM_HEIGHT_LINES} -t %1 -d -P -F #\\{pane_id\\}`, 'g');
           assert.equal(tmuxLog.match(teamHudSplitRe)?.length ?? 0, 1);
-          assert.equal(tmuxLog.match(standaloneHudSplitRe)?.length ?? 0, 1);
+          assert.equal(tmuxLog.match(standaloneHudSplitRe)?.length ?? 0, 0);
           assert.equal(tmuxLog.match(/set-hook -t leader:0 client-resized\[\d+\]/g)?.length ?? 0, 2);
           assert.equal(tmuxLog.match(/set-hook -t leader:0 client-attached\[\d+\]/g)?.length ?? 0, 2);
-          assert.equal(tmuxLog.match(/run-shell -b sleep \d+; tmux resize-pane -t %3 -y \d+ >/g)?.length ?? 0, 3);
-          assert.equal(tmuxLog.match(/run-shell tmux resize-pane -t %3 -y \d+ >/g)?.length ?? 0, 3);
+          assert.equal(tmuxLog.match(/run-shell -b sleep \d+; tmux resize-pane -t %3 -y \d+ >/g)?.length ?? 0, 2);
+          assert.equal(tmuxLog.match(/run-shell tmux resize-pane -t %3 -y \d+ >/g)?.length ?? 0, 2);
           assert.ok((tmuxLog.match(/select-layout -t leader:0 main-vertical/g)?.length ?? 0) >= 2);
-          assert.equal(tmuxLog.match(/kill-pane -t %3/g)?.length ?? 0, 1);
+          assert.equal(tmuxLog.match(/kill-pane -t %3/g)?.length ?? 0, 0);
         },
       );
     } finally {
@@ -6384,7 +6384,10 @@ esac
           process.env.TMUX_TEST_LOG = tmuxLogPath;
 
           await shutdownTeam('team-shutdown-gate-failed', cwd);
-          assert.equal(existsSync(teamStateTestPath(cwd, 'team', 'team-shutdown-gate-failed')), false);
+          assert.equal(existsSync(teamStateTestPath(cwd, 'team', 'team-shutdown-gate-failed')), true);
+          const retainedConfig = JSON.parse(await readFile(configPath, 'utf-8')) as Record<string, unknown>;
+          assert.equal(retainedConfig.hud_pane_id, '%9');
+          assert.equal(retainedConfig.resize_hook_name, 'omx_resize_team_shutdown_gate_failed_test');
 
           const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
           assert.doesNotMatch(tmuxLog, /set-hook -u -t omx-team-team-shutdown-gate-failed:0 client-resized\[\d+\]/);
