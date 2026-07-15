@@ -41,6 +41,8 @@ export interface TeamLifecycleResource {
   acquired_at: string;
 }
 
+export type TeamLifecycleGenerationStatus = 'preparing' | 'active' | 'cleanup_complete' | 'transferred';
+
 export interface TeamLifecycleGenerationCertificate {
   version: 1;
   token: string;
@@ -52,7 +54,7 @@ export interface TeamLifecycleGenerationCertificate {
   tmux_context: string | null;
   team_pane_owner_id: string;
   hook_generation: string;
-  status: 'preparing' | 'active' | 'cleanup_complete' | 'transferred';
+  status: TeamLifecycleGenerationStatus;
   created_at: string;
   resources: TeamLifecycleResource[];
 }

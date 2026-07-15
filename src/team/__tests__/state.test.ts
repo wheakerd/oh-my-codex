@@ -45,6 +45,10 @@ import {
   readMonitorSnapshot,
   resolveDispatchLockTimeoutMs,
   writeTeamManifestV2,
+  createTeamLifecycleGeneration,
+  appendTeamLifecycleResource,
+  finalizeTeamLifecycleGeneration,
+  readTeamLifecycleGeneration,
 } from '../state.js';
 import { normalizeDispatchRequest } from '../state/dispatch.js';
 
@@ -1989,6 +1993,71 @@ exit 1
       assert.equal(reread?.result, 'r1');
       assert.equal(reread?.error, 'e2');
       assert.ok((reread?.version ?? 0) >= 3);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('serializes lifecycle certificate creation, receipt appends, and status transitions', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-lifecycle-generation-'));
+    try {
+      await initTeamState('team-lifecycle-generation', 't', 'executor', 1, cwd);
+      const certificate = (token: string) => ({
+        version: 1 as const,
+        token,
+        team_name: 'team-lifecycle-generation',
+        canonical_session_id: 'canonical-session',
+        native_session_ids: ['native-session'],
+        tmux_session_name: null,
+        tmux_session_birth: null,
+        tmux_context: null,
+        team_pane_owner_id: 'owner-token',
+        hook_generation: 'hook-token',
+        status: 'preparing' as const,
+        created_at: '2026-01-01T00:00:00.000Z',
+        resources: [],
+      });
+
+      const [firstCreated, secondCreated] = await Promise.all([
+        createTeamLifecycleGeneration(certificate('generation-a'), cwd),
+        createTeamLifecycleGeneration(certificate('generation-b'), cwd),
+      ]);
+      assert.equal(Number(firstCreated) + Number(secondCreated), 1);
+
+      const generation = await readTeamLifecycleGeneration('team-lifecycle-generation', cwd);
+      assert.ok(generation);
+      const resources = Array.from({ length: 8 }, (_, index) => ({
+        kind: 'worker' as const,
+        id: `worker-${index + 1}`,
+        created: true,
+        pane_birth: `birth-${index + 1}`,
+        command: `command-${index + 1}`,
+        role: 'worker' as const,
+        acquired_at: `2026-01-01T00:00:0${index}.000Z`,
+      }));
+      assert.deepEqual(
+        await Promise.all(resources.map((resource) => appendTeamLifecycleResource('team-lifecycle-generation', generation.token, resource, cwd))),
+        Array(resources.length).fill(true),
+      );
+
+      const afterAppend = await readTeamLifecycleGeneration('team-lifecycle-generation', cwd);
+      assert.deepEqual(afterAppend?.resources.map((resource) => resource.id).sort(), resources.map((resource) => resource.id).sort());
+
+      assert.equal(await finalizeTeamLifecycleGeneration(
+        'team-lifecycle-generation',
+        generation.token,
+        'active',
+        cwd,
+        {
+          tmux_session_name: 'omx-team-lifecycle-generation',
+          tmux_session_birth: 'session-birth',
+          tmux_context: 'server-context',
+        },
+      ), true);
+      assert.equal(await appendTeamLifecycleResource('team-lifecycle-generation', 'stale-token', resources[0], cwd), false);
+      assert.equal(await appendTeamLifecycleResource('team-lifecycle-generation', generation.token, resources[0], cwd), false);
+      assert.equal(await finalizeTeamLifecycleGeneration('team-lifecycle-generation', generation.token, 'cleanup_complete', cwd), false);
+      assert.equal(await finalizeTeamLifecycleGeneration('team-lifecycle-generation', 'stale-token', 'cleanup_complete', cwd), false);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

@@ -37,7 +37,9 @@ import {
   isWorkerAlive,
   killWorker,
   killWorkerByPaneId,
+  killExactTeamHudPane,
   teardownWorkerPanes,
+  destroyTeamSession,
   listTeamSessions,
   resolveTeamWorkerCli,
   resolveTeamWorkerLaunchMode,
@@ -170,24 +172,36 @@ if [ "${'$'}{1:-}" = "if-shell" ]; then
   if [ "${'$'}{4:-}" = "-F" ]; then
     condition="${'$'}{5:-}"
     branch="${'$'}{6:-}"
+    rejected_branch="${'$'}{7:-}"
     hook_target="${'$'}{3:-}"
   else
     condition="${'$'}{4:-}"
     branch="${'$'}{5:-}"
+    rejected_branch="${'$'}{6:-}"
     hook_target="${'$'}{2:-}"
   fi
+  case "${'$'}branch" in
+    *__omx_*_teardown_applied_*)
+      selected="${'$'}branch"
+      [ -f "$state_dir/if-shell-reject" ] && selected="${'$'}rejected_branch"
+      receipt="${'$'}{selected##*display-message -p }"
+      receipt="${'$'}{receipt%% *}"
+      printf '%s\n' "${'$'}receipt"
+      exit 0
+      ;;
+  esac
   receipt="${'$'}{condition#*#{@}"
   receipt_option="${'$'}{receipt%%\}*}"
   expected_receipt="${'$'}{condition##*,}"
   expected_receipt="${'$'}{expected_receipt%\}}"
   receipt_file="$(option_path "${'$'}hook_target" "${'$'}receipt_option")"
   actual_receipt="$(cat "$receipt_file" 2>/dev/null || true)"
-  if [ -z "$receipt_option" ] || [ "$actual_receipt" = "$expected_receipt" ]; then
+  if [ -z "${'$'}receipt_option" ] || [ "${'$'}actual_receipt" = "${'$'}expected_receipt" ]; then
     first="${'$'}{branch%% \\; *}"
     second="${'$'}{branch#* \\; }"
     eval "set -- ${'$'}first"
     "${'$'}0" "${'$'}@"
-    if [ "$second" != "$branch" ]; then
+    if [ "${'$'}second" != "${'$'}branch" ]; then
       eval "set -- ${'$'}second"
       "${'$'}0" "${'$'}@"
     fi
@@ -478,6 +492,8 @@ describe('HUD resize hook command builders', () => {
     sessionBirth: 'session-birth',
     hudPaneId: '%1',
     hudPaneBirth: 'pane-birth',
+    hudPaneCommand: 'exec env OMX_SESSION_ID=session-owner node omx hud --watch',
+
     ownerId: 'team:demo',
   };
 
@@ -487,6 +503,8 @@ describe('HUD resize hook command builders', () => {
     assert.match(args[5] ?? '', /if-shell -t %1 -F/);
     assert.match(args[5] ?? '', /session-birth/);
     assert.match(args[5] ?? '', /pane-birth/);
+    assert.match(args[5] ?? '', /pane_start_command/);
+    assert.ok((args[5]?.match(/if-shell/g) ?? []).length >= 2);
     assert.match(args[5] ?? '', /omx-generation=generation-a/);
     assert.doesNotMatch(args.join(' '), /set-hook -u/);
   });
@@ -521,20 +539,16 @@ fi
     });
   });
 
-  it('buildScheduleDelayedHudResizeArgs schedules tmux-side delayed reconcile', () => {
-    assert.deepEqual(
-      buildScheduleDelayedHudResizeArgs('%1'),
-      ['run-shell', '-b', `sleep ${HUD_RESIZE_RECONCILE_DELAY_SECONDS}; tmux resize-pane -t %1 -y ${HUD_TMUX_TEAM_HEIGHT_LINES} >/dev/null 2>&1 || true`],
-    );
-  });
-
-  it('buildReconcileHudResizeArgs executes a best-effort quiet resize command', () => {
-    const args = buildReconcileHudResizeArgs('%7');
-    assert.equal(args.join(' ').includes('split-window'), false);
-    assert.deepEqual(
-      args,
-      ['run-shell', `tmux resize-pane -t %7 -y ${HUD_TMUX_TEAM_HEIGHT_LINES} >/dev/null 2>&1 || true`],
-    );
+  it('revalidates complete immutable evidence immediately before delayed and reconciled resize commands', () => {
+    const evidence = { ...hookEvidence, generation: 'generation-a' };
+    const delayed = buildScheduleDelayedHudResizeArgs('%1', HUD_RESIZE_RECONCILE_DELAY_SECONDS, HUD_TMUX_TEAM_HEIGHT_LINES, evidence);
+    const reconcile = buildReconcileHudResizeArgs('%7', HUD_TMUX_TEAM_HEIGHT_LINES, { ...evidence, hudPaneId: '%7' });
+    assert.match(delayed[2] ?? '', /sleep/);
+    assert.match(delayed[2] ?? '', /pane_start_command/);
+    assert.match(delayed[2] ?? '', /@omx_team_pane_owner_id/);
+    assert.match(delayed[2] ?? '', /@omx_team_hook_active_generation_a/);
+    assert.match(reconcile[1] ?? '', /pane_start_command/);
+    assert.match(reconcile[1] ?? '', /resize-pane -t %7/);
   });
 
   it('resolves the tmux executable for win32 hook shell snippets', async () => {
@@ -549,9 +563,10 @@ fi
       process.env.PATHEXT = '.EXE';
       Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
 
-      const resizeArgs = buildRegisterResizeHookArgs('my-session:0', 'omx_resize_team_session_0_1', '%1');
-      const delayedArgs = buildScheduleDelayedHudResizeArgs('%1');
-      const reconcileArgs = buildReconcileHudResizeArgs('%1');
+      const evidence = { ...hookEvidence, generation: 'generation-a' };
+      const resizeArgs = buildRegisterResizeHookArgs('my-session:0', 'omx_resize_team_session_0_1', '%1', HUD_TMUX_TEAM_HEIGHT_LINES, 'generation-a', hookEvidence);
+      const delayedArgs = buildScheduleDelayedHudResizeArgs('%1', HUD_RESIZE_RECONCILE_DELAY_SECONDS, HUD_TMUX_TEAM_HEIGHT_LINES, evidence);
+      const reconcileArgs = buildReconcileHudResizeArgs('%1', HUD_TMUX_TEAM_HEIGHT_LINES, evidence);
 
       assert.match(resizeArgs[5] ?? '', new RegExp(escapeRegExp(tmuxPath)));
       assert.doesNotMatch(resizeArgs[5] ?? '', /^run-shell -b 'tmux resize-pane/);
@@ -569,7 +584,7 @@ fi
     }
   });
 
-  it('resolves the tmux executable once for win32 lifecycle-owned client-attached hooks', async () => {
+  it('does not issue an unvalidated win32 client-attached resize command', async () => {
     const fakeBin = await mkdtemp(join(tmpdir(), 'omx-win32-attached-hook-'));
     const prevPath = process.env.PATH;
     const prevPathext = process.env.PATHEXT;
@@ -582,9 +597,9 @@ fi
       Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
 
       const args = buildRegisterClientAttachedReconcileArgs('my-session:0', 'omx_attached_team_session_0_1', '%1');
-      const matches = (args[5] ?? '').match(new RegExp(escapeRegExp(tmuxPath), 'g')) || [];
-      assert.equal(matches.length, 1, 'client-attached hook should resolve tmux only for its resize command');
-      assert.doesNotMatch(args[5] ?? '', /; tmux set-hook -u -t my-session:0 client-attached/);
+      const matches = (args.join(' ')).match(new RegExp(escapeRegExp(tmuxPath), 'g')) || [];
+      assert.equal(matches.length, 0);
+      assert.doesNotMatch(args.join(' '), /resize-pane|set-hook -u/);
     } finally {
       if (origPlatform) Object.defineProperty(process, 'platform', origPlatform);
       if (typeof prevPath === 'string') process.env.PATH = prevPath;
@@ -4812,8 +4827,8 @@ esac
           const tmuxLog = await readFile(logPath, 'utf-8');
           assert.doesNotMatch(tmuxLog, /window-resized\[/);
           assert.doesNotMatch(tmuxLog, /set-hook -w /);
-          assert.match(tmuxLog, new RegExp(`run-shell -b sleep ${HUD_RESIZE_RECONCILE_DELAY_SECONDS}; .*resize-pane -t %3 -y ${HUD_TMUX_TEAM_HEIGHT_LINES}`));
-          assert.match(tmuxLog, new RegExp(`run-shell .*resize-pane -t %3 -y ${HUD_TMUX_TEAM_HEIGHT_LINES}`));
+          assert.match(tmuxLog, new RegExp(`run-shell -b sleep ${HUD_RESIZE_RECONCILE_DELAY_SECONDS}; :`));
+          assert.match(tmuxLog, /run-shell :/);
           assert.doesNotMatch(tmuxLog, /kill-pane -t %2/);
           assert.doesNotMatch(tmuxLog, /kill-pane -t %3/);
         },
@@ -5023,7 +5038,7 @@ esac
           assert.match(tmuxLog, /display-message -p #\{session_name\}:#\{window_index\} #\{pane_id\}/);
           assert.match(tmuxLog, /powershell\.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -EncodedCommand/);
           assert.doesNotMatch(tmuxLog, /\/bin\/sh -lc/);
-          assert.match(tmuxLog, new RegExp(`resize-pane -t %3 -y ${HUD_TMUX_TEAM_HEIGHT_LINES}`));
+          assert.doesNotMatch(tmuxLog, new RegExp(`resize-pane -t %3 -y ${HUD_TMUX_TEAM_HEIGHT_LINES}`));
         },
       );
     } finally {
@@ -5142,7 +5157,7 @@ esac
           assert.equal(session.resizeHookTarget, null);
 
           const tmuxLog = await readFile(logPath, 'utf-8');
-          assert.match(tmuxLog, new RegExp(`resize-pane -t %3 -y ${HUD_TMUX_TEAM_HEIGHT_LINES}`));
+          assert.doesNotMatch(tmuxLog, new RegExp(`resize-pane -t %3 -y ${HUD_TMUX_TEAM_HEIGHT_LINES}`));
           assert.doesNotMatch(tmuxLog, /set-hook -w /);
           assert.doesNotMatch(tmuxLog, /window-resized\[/);
           assert.doesNotMatch(tmuxLog, /set-hook -t leader:0 client-attached\[\d+\]/);
@@ -5282,7 +5297,7 @@ esac
     }
   });
 
-  it('restores standalone HUD panes with direct resize on native Windows', async () => {
+  it('preserves standalone HUD layout on native Windows without strict resize evidence', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-standalone-win32-hud-'));
     const prevLeaderNodePath = process.env.OMX_LEADER_NODE_PATH;
     const prevMsystem = process.env.MSYSTEM;
@@ -5326,7 +5341,7 @@ esac
 
           const tmuxLog = await readFile(logPath, 'utf-8');
           assert.match(tmuxLog, /'C:\\Program Files\\nodejs\\node\.exe'/);
-          assert.match(tmuxLog, new RegExp(`resize-pane -t %44 -y ${HUD_TMUX_TEAM_HEIGHT_LINES}`));
+          assert.doesNotMatch(tmuxLog, new RegExp(`resize-pane -t %44 -y ${HUD_TMUX_TEAM_HEIGHT_LINES}`));
           assert.match(tmuxLog, /select-pane -t %11/);
           assert.doesNotMatch(tmuxLog, /run-shell -b sleep \d+; tmux resize-pane -t %44 -y \d+ >/);
           assert.doesNotMatch(tmuxLog, /run-shell tmux resize-pane -t %44 -y \d+ >/);
@@ -6485,7 +6500,7 @@ esac
     const source = await readFile(join(process.cwd(), 'src/team/tmux-session.ts'), 'utf-8');
     const primitiveBlock = source.split('export async function teardownWorkerPanes')[1] ?? '';
     assert.equal(primitiveBlock.includes("runTmuxAsync(['kill-pane'"), false);
-    assert.match(primitiveBlock, /runTmuxAsync\(\['if-shell'.*kill-pane/s);
+    assert.match(primitiveBlock, /runTmuxAsync\(\[\s*'if-shell'.*kill-pane/s);
   });
 
   it('fails closed without exact generation evidence', async () => {
@@ -6506,6 +6521,86 @@ exit 0
           throw error;
         });
         assert.doesNotMatch(log, /kill-pane/);
+      },
+    );
+  });
+});
+
+describe('conditional teardown receipts', () => {
+  it('treats a worker conditional false branch as uncertain without issuing an unconditional kill', async () => {
+    await withMockTmuxFixture(
+      'omx-tmux-teardown-rejected-',
+      (logPath) => `#!/bin/sh
+printf '%s\\n' "$*" >> "${logPath}"
+exit 0
+`,
+      async ({ logPath }) => {
+        await mkdir(`${logPath}.tmux-state`, { recursive: true });
+        await writeFile(`${logPath}.tmux-state/if-shell-reject`, '1');
+        const summary = await teardownWorkerPanes(['%3'], {
+          teamPaneOwnerId: 'team:generation-a',
+          sessionName: 'omx-team-x:0',
+          sessionBirth: 'session-birth',
+          workerReceipts: {
+            '%3': { kind: 'worker', id: '%3', created: true, pane_birth: 'pane-birth', command: 'worker-command', role: 'worker', acquired_at: '2026-01-01T00:00:00.000Z' },
+          },
+          graceMs: 1,
+        });
+        assert.equal(summary.kill.succeeded, 0);
+        assert.equal(summary.kill.failed, 1);
+        const log = await readFile(logPath, 'utf-8');
+        assert.match(log, /if-shell -t %3 -F .*kill-pane -t %3.*display-message -p __omx_worker_teardown_applied_.*display-message -p __omx_worker_teardown_rejected_/);
+        assert.doesNotMatch(log, /^kill-pane -t %3$/m);
+      },
+    );
+  });
+
+  it('treats a Team HUD conditional false branch as uncertain', async () => {
+    await withMockTmuxFixture(
+      'omx-tmux-hud-teardown-rejected-',
+      (logPath) => `#!/bin/sh
+printf '%s\\n' "$*" >> "${logPath}"
+case "$1" in
+  list-panes)
+    printf '%%1\\tzsh\\tzsh\\tpane-leader\\tsession-birth\\n%%2\\tnode\\tenv OMX_SESSION_ID=canonical OMX_TMUX_HUD_LEADER_PANE=%%1 node omx hud --watch\\tpane-birth\\tsession-birth\\n'
+    ;;
+  *) exit 0 ;;
+esac
+`,
+      async ({ logPath }) => {
+        await mkdir(`${logPath}.tmux-state`, { recursive: true });
+        await writeFile(`${logPath}.tmux-state/if-shell-reject`, 'replacement');
+        assert.equal(killExactTeamHudPane('leader:0', '%2', {
+          sessionId: 'canonical',
+          sessionIds: ['canonical'],
+          leaderPaneId: '%1',
+          tmuxSessionInstanceId: 'session-birth',
+          tmuxPaneInstanceId: 'pane-birth',
+          tmuxSessionName: 'leader',
+        }, 'team:canonical', {
+          kind: 'hud', id: '%2', created: true, pane_birth: 'hud-birth', command: 'env OMX_SESSION_ID=canonical OMX_TMUX_HUD_LEADER_PANE=%1 node omx hud --watch', role: 'hud', acquired_at: '2026-01-01T00:00:00.000Z',
+        }), false);
+        const log = await readFile(logPath, 'utf-8');
+        assert.match(log, /if-shell -t %2 -F .*kill-pane -t %2.*__omx_hud_teardown_applied_.*__omx_hud_teardown_rejected_/);
+        assert.doesNotMatch(log, /^kill-pane -t %2$/m);
+      },
+    );
+  });
+
+  it('uses a single immutable server-side conditional for standalone session destruction', async () => {
+    await withMockTmuxFixture(
+      'omx-tmux-session-destroy-',
+      (logPath) => `#!/bin/sh
+printf '%s\\n' "$*" >> "${logPath}"
+exit 0
+`,
+      async ({ logPath }) => {
+        assert.equal(destroyTeamSession('omx-team-x', 'original-session-birth'), true);
+        await writeFile(`${logPath}.tmux-state/if-shell-reject`, 'replacement');
+        assert.equal(destroyTeamSession('omx-team-x', 'original-session-birth'), false);
+        const log = await readFile(logPath, 'utf-8');
+        assert.match(log, /if-shell -t omx-team-x -F .*session_name.*original-session-birth.*kill-session -t omx-team-x.*__omx_session_teardown_applied_.*__omx_session_teardown_rejected_/);
+        assert.doesNotMatch(log, /^kill-session -t omx-team-x$/m);
       },
     );
   });

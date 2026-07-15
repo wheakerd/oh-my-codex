@@ -1,4 +1,4 @@
-import { appendFile, readFile, writeFile, mkdir, rm, rename, readdir } from 'fs/promises';
+import { appendFile, readFile, writeFile, mkdir, rm, rename, readdir, open as openFile } from 'fs/promises';
 import { join, dirname, resolve, sep } from 'path';
 import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync, rmSync, openSync, fsyncSync, closeSync } from 'fs';
 import { randomUUID } from 'crypto';
@@ -118,6 +118,8 @@ export interface TeamLifecycleResource {
 }
 
 /** Immutable-generation journal. Resource entries are only appended. */
+export type TeamLifecycleGenerationStatus = 'preparing' | 'active' | 'cleanup_complete' | 'transferred';
+
 export interface TeamLifecycleGenerationCertificate {
   version: 1;
   token: string;
@@ -129,7 +131,7 @@ export interface TeamLifecycleGenerationCertificate {
   tmux_context: string | null;
   team_pane_owner_id: string;
   hook_generation: string;
-  status: 'preparing' | 'active' | 'cleanup_complete' | 'transferred';
+  status: TeamLifecycleGenerationStatus;
   created_at: string;
   resources: TeamLifecycleResource[];
 }
@@ -701,22 +703,32 @@ export async function readTeamLifecycleGeneration(teamName: string, cwd: string)
   }
 }
 
+/** Serializes lifecycle certificate creation, status updates, and receipt appends. */
+async function withLifecycleGenerationLock<T>(teamName: string, cwd: string, fn: () => Promise<T>): Promise<T> {
+  await mkdir(teamDir(teamName, cwd), { recursive: true });
+  return await withTeamLock(teamName, cwd, fn);
+}
+
 /** Persists the immutable certificate before the first tmux mutation. */
 export async function createTeamLifecycleGeneration(certificate: TeamLifecycleGenerationCertificate, cwd: string): Promise<boolean> {
-  const existing = await readTeamLifecycleGeneration(certificate.team_name, cwd);
-  if (existing) return existing.token === certificate.token;
-  await mkdir(dirname(lifecycleGenerationPath(certificate.team_name, cwd)), { recursive: true });
-  await writeAtomic(lifecycleGenerationPath(certificate.team_name, cwd), `${JSON.stringify(certificate, null, 2)}\n`);
-  return true;
+  if (!isLifecycleCertificate(certificate) || certificate.status !== 'preparing') return false;
+  return await withLifecycleGenerationLock(certificate.team_name, cwd, async () => {
+    const existing = await readTeamLifecycleGeneration(certificate.team_name, cwd);
+    if (existing) return existing.token === certificate.token;
+    await writeAtomic(lifecycleGenerationPath(certificate.team_name, cwd), `${JSON.stringify(certificate, null, 2)}\n`);
+    return true;
+  });
 }
 
 /** Appends acquisition evidence; duplicate entries are idempotent. */
 export async function appendTeamLifecycleResource(teamName: string, token: string, resource: TeamLifecycleResource, cwd: string): Promise<boolean> {
-  const current = await readTeamLifecycleGeneration(teamName, cwd);
-  if (!current || current.token !== token || current.status !== 'preparing') return false;
-  if (current.resources.some((entry) => entry.kind === resource.kind && entry.id === resource.id)) return true;
-  await writeAtomic(lifecycleGenerationPath(teamName, cwd), `${JSON.stringify({ ...current, resources: [...current.resources, resource] }, null, 2)}\n`);
-  return true;
+  return await withLifecycleGenerationLock(teamName, cwd, async () => {
+    const current = await readTeamLifecycleGeneration(teamName, cwd);
+    if (!current || current.token !== token || current.status !== 'preparing') return false;
+    if (current.resources.some((entry) => entry.kind === resource.kind && entry.id === resource.id)) return true;
+    await writeAtomic(lifecycleGenerationPath(teamName, cwd), `${JSON.stringify({ ...current, resources: [...current.resources, resource] }, null, 2)}\n`);
+    return true;
+  });
 }
 
 /**
@@ -727,26 +739,38 @@ export async function appendTeamLifecycleResource(teamName: string, token: strin
  */
 export function appendTeamLifecycleResourceSync(teamName: string, token: string, resource: TeamLifecycleResource, cwd: string): boolean {
   const path = lifecycleGenerationPath(teamName, cwd);
-  let current: TeamLifecycleGenerationCertificate;
+  const lockDir = join(teamDir(teamName, cwd), '.lock.create-task');
   try {
-    current = JSON.parse(readFileSync(path, 'utf8')) as TeamLifecycleGenerationCertificate;
+    mkdirSync(lockDir);
   } catch {
+    // A concurrent asynchronous lifecycle write owns the same lock. Do not block
+    // the event loop waiting for it: an unacknowledged receipt must fail closed.
     return false;
   }
-  if (!isLifecycleCertificate(current) || current.token !== token || current.status !== 'preparing') return false;
-  if (current.resources.some((entry) => entry.kind === resource.kind && entry.id === resource.id)) return true;
-  const next = { ...current, resources: [...current.resources, resource] };
+
   const temporaryPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
   try {
-    mkdirSync(dirname(path), { recursive: true });
+    let current: TeamLifecycleGenerationCertificate;
+    try {
+      current = JSON.parse(readFileSync(path, 'utf8')) as TeamLifecycleGenerationCertificate;
+    } catch {
+      return false;
+    }
+    if (!isLifecycleCertificate(current) || current.token !== token || current.status !== 'preparing') return false;
+    if (current.resources.some((entry) => entry.kind === resource.kind && entry.id === resource.id)) return true;
+    const next = { ...current, resources: [...current.resources, resource] };
     writeFileSync(temporaryPath, `${JSON.stringify(next, null, 2)}\n`, 'utf8');
     const descriptor = openSync(temporaryPath, 'r');
     try { fsyncSync(descriptor); } finally { closeSync(descriptor); }
     renameSync(temporaryPath, path);
+    const directoryDescriptor = openSync(dirname(path), 'r');
+    try { fsyncSync(directoryDescriptor); } finally { closeSync(directoryDescriptor); }
     return true;
   } catch {
     try { rmSync(temporaryPath, { force: true }); } catch { /* preserve prior certificate */ }
     return false;
+  } finally {
+    try { rmSync(lockDir, { recursive: true, force: true }); } catch { /* fail closed above */ }
   }
 }
 
@@ -757,11 +781,25 @@ export async function finalizeTeamLifecycleGeneration(
   cwd: string,
   identity?: Pick<TeamLifecycleGenerationCertificate, 'tmux_session_name' | 'tmux_session_birth' | 'tmux_context'>,
 ): Promise<boolean> {
-  const current = await readTeamLifecycleGeneration(teamName, cwd);
-  if (!current || current.token !== token || current.status !== 'preparing') return false;
-  if (status === 'active' && (!identity?.tmux_session_name || !identity.tmux_session_birth || !identity.tmux_context)) return false;
-  await writeAtomic(lifecycleGenerationPath(teamName, cwd), `${JSON.stringify({ ...current, ...identity, status }, null, 2)}\n`);
-  return true;
+  return await withLifecycleGenerationLock(teamName, cwd, async () => {
+    const current = await readTeamLifecycleGeneration(teamName, cwd);
+    if (!current || current.token !== token) return false;
+    if (status === 'active') {
+      if (current.status !== 'preparing' || !identity?.tmux_session_name || !identity.tmux_session_birth || !identity.tmux_context) return false;
+    } else if (status === 'cleanup_complete') {
+      if (
+        current.status !== 'active'
+        || !identity
+        || identity.tmux_session_name !== current.tmux_session_name
+        || identity.tmux_session_birth !== current.tmux_session_birth
+        || identity.tmux_context !== current.tmux_context
+      ) return false;
+    } else if (current.status !== 'preparing') {
+      return false;
+    }
+    await writeAtomic(lifecycleGenerationPath(teamName, cwd), `${JSON.stringify({ ...current, ...identity, status }, null, 2)}\n`);
+    return true;
+  });
 }
 
 function taskClaimLockDir(teamName: string, taskId: string, cwd: string): string {
@@ -869,13 +907,19 @@ function isTeamManifestV2(value: unknown): value is TeamManifestV2 {
   return true;
 }
 
-// Atomic write: write to {path}.tmp.{pid}, then rename
+// Atomic write: fsync the temporary file, rename it into place, then fsync its directory.
 export async function writeAtomic(filePath: string, data: string): Promise<void> {
   const parent = dirname(filePath);
   await mkdir(parent, { recursive: true });
 
   const tmpPath = `${filePath}.tmp.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}`;
   await writeFile(tmpPath, data, 'utf8');
+  const temporaryFile = await openFile(tmpPath, 'r');
+  try {
+    await temporaryFile.sync();
+  } finally {
+    await temporaryFile.close();
+  }
 
   try {
     await renameForAtomicWrite(tmpPath, filePath);
@@ -890,6 +934,13 @@ export async function writeAtomic(filePath: string, data: string): Promise<void>
       }
     }
     throw error;
+  }
+
+  const directory = await openFile(parent, 'r');
+  try {
+    await directory.sync();
+  } finally {
+    await directory.close();
   }
 }
 

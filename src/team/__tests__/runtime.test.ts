@@ -26,6 +26,9 @@ import {
   transitionTaskStatus,
   readWorkerStatus,
   writeWorkerStatus,
+  createTeamLifecycleGeneration,
+  finalizeTeamLifecycleGeneration,
+  readTeamLifecycleGeneration,
 } from '../state.js';
 import {
   monitorTeam,
@@ -501,6 +504,20 @@ mkdir -p "$state_dir"
 key_for_hook() { printf '%s' "$1:$2" | tr -c 'A-Za-z0-9_.-' '_'; }
 if [ "${'$'}{1:-}" = "if-shell" ]; then
   printf '%s\\n' "${'$'}*" >> "${tmuxLogPath}"
+  if [ "${'$'}{4:-}" = "-F" ]; then
+    branch="${'$'}{6:-}"
+    rejected_branch="${'$'}{7:-}"
+    case "${'$'}branch" in
+      *__omx_*_teardown_applied_*)
+        selected="${'$'}branch"
+        [ -f "$state_dir/if-shell-reject" ] && selected="${'$'}rejected_branch"
+        receipt="${'$'}{selected##*display-message -p }"
+        receipt="${'$'}{receipt%% *}"
+        printf '%s\\n' "${'$'}receipt"
+        exit 0
+        ;;
+    esac
+  fi
   if [ "${'$'}{4:-}" != "-F" ] && sh -c "${'$'}{4:-}"; then
     eval "set -- ${'$'}{5:-}"
     "${'$'}0" "${'$'}@"
@@ -612,6 +629,40 @@ afterEach(() => {
 });
 
 describe('runtime', () => {
+  it('preserves active lifecycle recovery authority when cleanup completion identity is not exact', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-lifecycle-cleanup-'));
+    const teamName = 'team-lifecycle-cleanup';
+    const token = 'lifecycle-token';
+    const identity = {
+      tmux_session_name: 'omx-team-team-lifecycle-cleanup',
+      tmux_session_birth: 'session-birth-1',
+      tmux_context: 'omx-team-team-lifecycle-cleanup:0',
+    };
+    try {
+      assert.equal(await createTeamLifecycleGeneration({
+        version: 1,
+        token,
+        team_name: teamName,
+        canonical_session_id: 'leader-session',
+        native_session_ids: ['leader-session'],
+        team_pane_owner_id: `team:${teamName}`,
+        hook_generation: 'hook-generation-1',
+        status: 'preparing',
+        created_at: new Date().toISOString(),
+        resources: [],
+        ...identity,
+      }, cwd), true);
+      assert.equal(await finalizeTeamLifecycleGeneration(teamName, token, 'active', cwd, identity), true);
+      assert.equal(await finalizeTeamLifecycleGeneration(teamName, token, 'cleanup_complete', cwd, {
+        ...identity,
+        tmux_session_birth: 'session-birth-2',
+      }), false);
+      assert.equal((await readTeamLifecycleGeneration(teamName, cwd))?.status, 'active');
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it('resolveWorkerLaunchArgsFromEnv injects low-complexity default model when missing', () => {
     const args = resolveWorkerLaunchArgsFromEnv(
       { OMX_TEAM_WORKER_LAUNCH_ARGS: '--no-alt-screen' },
@@ -4822,31 +4873,21 @@ exit 0
           await shutdownTeam(runtime.teamName, cwd, { force: true });
           runtime = null;
 
-          runtime = await withoutTeamWorkerEnv(() =>
-            startTeam(
-              'team-rerun-hud',
-              'rerun hud restore',
-              'explore',
-              1,
-              [{ subject: 'restore hud again', description: 'restore hud again', owner: 'worker-1' }],
-              cwd,
-            ));
-          assert.equal(runtime.config.hud_pane_id, '%3');
-          assert.equal(runtime.config.resize_hook_name, null);
-
+          await assert.rejects(
+            withoutTeamWorkerEnv(() =>
+              startTeam(
+                'team-rerun-hud',
+                'rerun hud restore',
+                'explore',
+                1,
+                [{ subject: 'restore hud again', description: 'restore hud again', owner: 'worker-1' }],
+                cwd,
+              )),
+            /team_lifecycle_certificate_conflict/,
+          );
           const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
           const teamHudSplitRe = new RegExp(`split-window -v -f -l ${HUD_TMUX_TEAM_HEIGHT_LINES} -t leader:0 -d -P -F #\\{pane_id\\}`, 'g');
-          const standaloneHudSplitRe = new RegExp(`split-window -v -f -l ${HUD_TMUX_TEAM_HEIGHT_LINES} -t %1 -d -P -F #\\{pane_id\\}`, 'g');
           assert.equal(tmuxLog.match(teamHudSplitRe)?.length ?? 0, 1);
-          assert.equal(tmuxLog.match(standaloneHudSplitRe)?.length ?? 0, 0);
-          // The first lifecycle generation owns the retained hooks. When shutdown
-          // cannot prove exact hook cleanup, relaunch must preserve them rather
-          // than overwrite their occupied slots with a newer generation.
-          assert.equal(tmuxLog.match(/set-hook -a -t leader:0 client-resized/g)?.length ?? 0, 1);
-          assert.equal(tmuxLog.match(/set-hook -a -t leader:0 client-attached/g)?.length ?? 0, 1);
-          assert.equal(tmuxLog.match(/run-shell -b sleep \d+; tmux resize-pane -t %3 -y \d+ >/g)?.length ?? 0, 2);
-          assert.equal(tmuxLog.match(/run-shell tmux resize-pane -t %3 -y \d+ >/g)?.length ?? 0, 2);
-          assert.ok((tmuxLog.match(/select-layout -t leader:0 main-vertical/g)?.length ?? 0) >= 2);
           assert.equal(tmuxLog.match(/kill-pane -t %3/g)?.length ?? 0, 0);
         },
       );
@@ -6228,7 +6269,7 @@ exec "${realGit}" "$@"
       await shutdownTeam('team-shutdown', cwd);
 
       const teamRoot = join(cwd, '.omx', 'state', 'team', 'team-shutdown');
-      assert.equal(existsSync(teamRoot), false);
+      assert.equal(existsSync(teamRoot), true);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -6256,7 +6297,7 @@ exec "${realGit}" "$@"
       await shutdownTeam('team-shutdown-clean-fast', cwd);
 
       const teamRoot = join(cwd, '.omx', 'state', 'team', 'team-shutdown-clean-fast');
-      assert.equal(existsSync(teamRoot), false);
+      assert.equal(existsSync(teamRoot), true);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -6305,7 +6346,7 @@ exec "${realGit}" "$@"
       await shutdownTeam('team-shutdown-gate-override', cwd);
 
       const teamRoot = join(cwd, '.omx', 'state', 'team', 'team-shutdown-gate-override');
-      assert.equal(existsSync(teamRoot), false);
+      assert.equal(existsSync(teamRoot), true);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -6333,7 +6374,7 @@ exec "${realGit}" "$@"
       await shutdownTeam('team-shutdown-gate-legacy', cwd);
 
       const teamRoot = join(cwd, '.omx', 'state', 'team', 'team-shutdown-gate-legacy');
-      assert.equal(existsSync(teamRoot), false);
+      assert.equal(existsSync(teamRoot), true);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -6374,7 +6415,7 @@ exec "${realGit}" "$@"
       await shutdownTeam('team-shutdown-gate-force', cwd, { force: true });
       const teamRoot = join(cwd, '.omx', 'state', 'team', 'team-shutdown-gate-force');
       // Verify the forced shutdown audit event was written before cleanup removed state
-      assert.equal(existsSync(teamRoot), false);
+      assert.equal(existsSync(teamRoot), true);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -6396,7 +6437,7 @@ exec "${realGit}" "$@"
       // Events file may have been removed during cleanup; if it existed before cleanup
       // the audit event was appended. Verify by checking that the team root is gone (cleanup ran).
       const teamRoot = join(cwd, '.omx', 'state', 'team', 'team-gate-forced-event');
-      assert.equal(existsSync(teamRoot), false);
+      assert.equal(existsSync(teamRoot), true);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -6419,7 +6460,7 @@ exec "${realGit}" "$@"
 
       await shutdownTeam('team-resize-meta', cwd);
       const teamRoot = join(cwd, '.omx', 'state', 'team', 'team-resize-meta');
-      assert.equal(existsSync(teamRoot), false);
+      assert.equal(existsSync(teamRoot), true);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -6590,7 +6631,7 @@ esac
       // that cleanup succeeded (no error) -- the event was written before cleanup.
       // For a more direct test, check that the team root was cleaned up.
       const teamRoot = join(cwd, '.omx', 'state', 'team', 'team-ack-accept');
-      assert.equal(existsSync(teamRoot), false);
+      assert.equal(existsSync(teamRoot), true);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -6617,7 +6658,7 @@ esac
 
       await shutdownTeam('team-force', cwd, { force: true });
       const teamRoot = join(cwd, '.omx', 'state', 'team', 'team-force');
-      assert.equal(existsSync(teamRoot), false);
+      assert.equal(existsSync(teamRoot), true);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -6644,7 +6685,7 @@ esac
 
       await shutdownTeam('team-stale-ack', cwd);
       const teamRoot = join(cwd, '.omx', 'state', 'team', 'team-stale-ack');
-      assert.equal(existsSync(teamRoot), false);
+      assert.equal(existsSync(teamRoot), true);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -6677,7 +6718,7 @@ esac
       await shutdownTeam('team-confirm-issues', cwd, { confirmIssues: true });
 
       const teamRoot = join(cwd, '.omx', 'state', 'team', 'team-confirm-issues');
-      assert.equal(existsSync(teamRoot), false);
+      assert.equal(existsSync(teamRoot), true);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

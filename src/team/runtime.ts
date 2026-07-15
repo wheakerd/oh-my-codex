@@ -2710,6 +2710,7 @@ export async function startTeam(
   const overlay = generateWorkerOverlay(sanitized);
   let workerInstructionsPath: string | null = null;
   let sessionCreated = false;
+  let interactiveSessionCreationAttempted = false;
   let lifecycleCertificate: TeamLifecycleGenerationCertificate | null = null;
 
   let config: TeamConfig | null = null;
@@ -3084,6 +3085,7 @@ export async function startTeam(
           sessionIds: hudDomain.session?.equivalentIds,
           expectedLeaderPaneId: hudDomain.claimant.leaderPaneId,
         });
+        interactiveSessionCreationAttempted = true;
         createdSession = createTeamSession(
           sanitized,
           workerCount,
@@ -3420,16 +3422,6 @@ export async function startTeam(
         }
       }
 
-      if (config && hookCleanupCertain) {
-        config.resize_hook_name = null;
-        config.resize_hook_target = null;
-        try {
-          await saveTeamConfig(config, leaderCwd);
-        } catch (cleanupError) {
-          hookCleanupCertain = false;
-          rollbackErrors.push(`saveTeamConfig(clear resize hook): ${String(cleanupError)}`);
-        }
-      }
       if (!hookCleanupCertain) {
         rollbackErrors.push('preserving HUD metadata and container because hook cleanup was uncertain');
       }
@@ -3443,6 +3435,10 @@ export async function startTeam(
         rollbackErrors.push('preserving standalone session and Team metadata: exact session birth journal unavailable');
       }
 
+    } else if (interactiveSessionCreationAttempted && lifecycleCertificate) {
+      // createTeamSession can throw after a tmux mutation but before returning a
+      // TeamSession. Its preparing journal is the only safe recovery authority.
+      rollbackErrors.push('preserving Team metadata: createTeamSession may have mutated before throwing');
     }
     if (workerLaunchMode === 'prompt' && config) {
       const promptTeardownFailures: string[] = [];
@@ -4268,7 +4264,7 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
     // or the pane unless a fresh live tmux proof was obtained under this
     // domain's lock.
     if (hudPaneId && !ownsHudTeardownAuthority) {
-      retainHudLifecycleState = !sessionName.includes(':');
+      retainHudLifecycleState = true;
       console.warn(`[team shutdown] ${sanitized}: preserving Team HUD pane, hooks, and metadata because fresh exact HUD authority evidence or lifecycle lock was unavailable`);
     }
 
@@ -4295,11 +4291,8 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
         && unregisterHudHooksTransactionally(clientHookTarget, config.resize_hook_name, clientHookName, persistedHudPaneId, config.hook_generation ?? undefined)
       );
       if (!hooksRemoved) {
+        retainHudLifecycleState = true;
         console.warn(`[team shutdown] ${sanitized}: preserving Team HUD pane and metadata because authorized HUD hook cleanup failed; hook state may have changed`);
-      } else {
-        config.resize_hook_name = null;
-        config.resize_hook_target = null;
-        await saveTeamConfig(config, cwd);
       }
     }
 
@@ -4313,8 +4306,8 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
         hudReceipt,
       );
       if (!killedHudPane) {
-        retainHudContainer = !sessionName.includes(':');
-        retainHudLifecycleState = !sessionName.includes(':');
+        retainHudContainer = true;
+        retainHudLifecycleState = true;
         console.warn(`[team shutdown] ${sanitized}: preserving Team HUD metadata because final tmux authority revalidation failed`);
       }
       if (killedHudPane && sessionName.includes(':') && freshHudRestoreDomain) {
@@ -4331,8 +4324,8 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
         }
       }
     } else if (hudPaneId) {
-      retainHudContainer = !sessionName.includes(':');
-      retainHudLifecycleState = !sessionName.includes(':');
+      retainHudContainer = true;
+      retainHudLifecycleState = true;
       console.warn(`[team shutdown] ${sanitized}: preserving Team HUD pane, hooks, and metadata because fresh exact HUD authority, lifecycle lock, or hook cleanup was unavailable`);
     }
     shutdownPaneIds = collectShutdownPaneIds({
@@ -4365,7 +4358,7 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
     });
     if (workerTeardown.kill.failed > 0) {
       retainHudLifecycleState = true;
-      retainHudContainer = !sessionName.includes(':');
+      retainHudContainer = true;
       console.warn(`[team shutdown] ${sanitized}: preserving lifecycle metadata because ${workerTeardown.kill.failed} worker pane teardown CAS operation(s) were uncertain`);
     }
     } finally {
@@ -4374,12 +4367,17 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
       }
     }
 
-    // 4. Destroy tmux session only when it contains preserved exact Team HUD state.
+    // 4. Destroy only the exact standalone Team session generation. A rejected
+    // server-side comparison is uncertainty, so retain recovery metadata.
     if (!sessionName.includes(':') && !retainHudContainer) {
-      try {
-        destroyTeamSession(sessionName);
-      } catch (err) {
-        process.stderr.write(`[team/runtime] operation failed: ${err}\n`);
+      const destroyedSession = destroyTeamSession(
+        sessionName,
+        lifecycleCertificate?.tmux_session_birth ?? '',
+      );
+      if (!destroyedSession) {
+        retainHudContainer = true;
+        retainHudLifecycleState = true;
+        console.warn(`[team shutdown] ${sanitized}: preserving lifecycle metadata because standalone session teardown CAS was rejected or unconfirmed`);
       }
     }
   } else {
@@ -4490,8 +4488,28 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
     }
   }
 
-  // 7. Retain state only when an exact Team HUD lifecycle retry remains actionable.
+  // 7. An active interactive certificate is retired only after every exact
+  // teardown receipt completed. Any missing/rejected receipt leaves the config
+  // and immutable journal in place for recovery.
   let teamStateCleaned = false;
+  if (config.worker_launch_mode === 'interactive' && lifecycleCertificate && !retainHudLifecycleState) {
+    if (lifecycleCertificate.status === 'cleanup_complete') {
+      // A prior exact cleanup persisted its completion before process exit.
+    } else if (!lifecycleAuthority) {
+      retainHudLifecycleState = true;
+      cleanupErrors.push('finalizeTeamLifecycleGeneration: active certificate lacks exact teardown authority');
+    } else {
+      const completed = await finalizeTeamLifecycleGeneration(sanitized, lifecycleCertificate.token, 'cleanup_complete', cwd, {
+        tmux_session_name: lifecycleCertificate.tmux_session_name,
+        tmux_session_birth: lifecycleCertificate.tmux_session_birth,
+        tmux_context: lifecycleCertificate.tmux_context,
+      });
+      if (!completed) {
+        retainHudLifecycleState = true;
+        cleanupErrors.push('finalizeTeamLifecycleGeneration: exact cleanup completion could not be persisted');
+      }
+    }
+  }
   if (!retainHudLifecycleState) {
     try {
       await cleanupTeamState(sanitized, cwd);
@@ -4619,6 +4637,10 @@ async function detectAndCleanStaleTeam(
   const stateDir = teamRuntimeTeamRoot(teamName, leaderCwd);
   if (!existsSync(stateDir)) return;
 
+  // listTeamSessions has no error channel. An active/preparing immutable
+  // generation therefore makes a missing session result uncertain, not stale.
+  const lifecycleCertificate = await readTeamLifecycleGeneration(teamName, leaderCwd);
+  if (lifecycleCertificate?.status === 'active' || lifecycleCertificate?.status === 'preparing') return;
   const sessions = new Set(listTeamSessions());
   if (sessions.has(`omx-team-${teamName}`)) return;
   const retainedHudConfig = await readTeamConfig(teamName, leaderCwd);

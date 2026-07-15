@@ -600,9 +600,15 @@ export function killExactTeamHudPane(
   if (!findExactTeamHudPaneIds(target, candidate).includes(paneId)) return false;
   const sessionName = candidate.tmuxSessionName ?? target.split(':')[0] ?? '';
   if (!sessionName || !candidate.tmuxSessionInstanceId || !candidate.tmuxPaneInstanceId) return false;
+  const appliedReceipt = `__omx_hud_teardown_applied_${randomUUID()}__`;
+  const rejectedReceipt = `__omx_hud_teardown_rejected_${randomUUID()}__`;
   const condition = `#{&&:#{==:#{pane_id},${paneId}},#{==:#{pane_start_command},${receipt.command}},#{==:#{@omx_pane_instance_id},${candidate.tmuxPaneInstanceId}},#{==:#{@omx_instance_id},${candidate.tmuxSessionInstanceId}},#{==:#{session_name},${sessionName}},#{==:#{@omx_team_pane_owner_id},${teamOwnerId}},#{==:#{@omx_team_pane_birth},${receipt.pane_birth}},#{==:#{@omx_team_pane_role},hud}}`;
-  const result = runTmux(['if-shell', '-t', paneId, '-F', condition, `kill-pane -t ${paneId}`, '']);
-  return result.ok && !findExactTeamHudPaneIds(target, candidate).includes(paneId);
+  const result = runTmux([
+    'if-shell', '-t', paneId, '-F', condition,
+    `kill-pane -t ${paneId} \\; display-message -p ${appliedReceipt}`,
+    `display-message -p ${rejectedReceipt}`,
+  ]);
+  return result.ok && result.stdout.split('\n').some((line) => line.trim() === appliedReceipt);
 }
 
 function normalizeExactTeamHudCandidate(candidate: ExactTeamHudCandidate | null | undefined): ExactTeamHudCandidate | null {
@@ -914,12 +920,6 @@ function buildHudResizeCommand(hudPaneId: string, heightLines: number = HUD_TMUX
   return `resize-pane -t ${buildHudPaneTarget(hudPaneId)} -y ${resolveHudHeightLines(heightLines)}`;
 }
 
-function buildHudResizeArgs(
-  hudPaneId: string,
-  heightLines: number = HUD_TMUX_TEAM_HEIGHT_LINES,
-): string[] {
-  return ['resize-pane', '-t', buildHudPaneTarget(hudPaneId), '-y', String(resolveHudHeightLines(heightLines))];
-}
 
 function buildNestedTmuxShellCommand(command: string): string {
   if (process.platform !== 'win32') {
@@ -946,6 +946,7 @@ export interface TeamHudHookEvidence {
   sessionBirth: string;
   hudPaneId: string;
   hudPaneBirth: string;
+  hudPaneCommand: string;
   ownerId: string;
   generation: string;
 }
@@ -954,17 +955,26 @@ function teamHookActiveOption(generation: string): string {
   return `@omx_team_hook_active_${generation.replace(/[^a-zA-Z0-9_]/g, '_')}`;
 }
 
-function buildTeamHookCommand(
-  hookCommand: string,
-  evidence?: TeamHudHookEvidence,
-): string {
+function buildTeamHookCondition(evidence?: TeamHudHookEvidence): string {
+  const generation = evidence?.generation.trim() ?? '';
+  if (!evidence || !generation || !evidence.hudPaneCommand.trim()) return '#{==:0,1}';
+  return `#{&&:#{==:#{pane_id},${buildHudPaneTarget(evidence.hudPaneId)}},#{==:#{pane_start_command},${evidence.hudPaneCommand}},#{==:#{session_name},${evidence.sessionName}},#{==:#{window_index},${evidence.windowIndex}},#{==:#{@omx_instance_id},${evidence.sessionBirth}},#{==:#{@omx_team_pane_owner_id},${evidence.ownerId}},#{==:#{@omx_team_pane_birth},${evidence.hudPaneBirth}},#{==:#{@omx_team_pane_role},hud},#{==:#{${teamHookActiveOption(generation)}},1}}`;
+}
+
+function buildGuardedTeamResizeCommand(hudPaneId: string, heightLines: number, evidence?: TeamHudHookEvidence): string {
+  const condition = buildTeamHookCondition(evidence);
+  if (condition === '#{==:0,1}') return ':';
+  const resizeCommand = buildHudResizeCommand(hudPaneId, heightLines);
+  const guarded = `if-shell -t ${buildHudPaneTarget(hudPaneId)} -F ${shellQuoteSingle(condition)} ${shellQuoteSingle(resizeCommand)} ''`;
+  return buildBestEffortShellCommand(buildNestedTmuxShellCommand(guarded));
+}
+
+function buildTeamHookCommand(hookCommand: string, evidence?: TeamHudHookEvidence): string {
   const generation = evidence?.generation?.trim() ?? '';
-  const active = generation ? teamHookActiveOption(generation) : '';
-  const condition = evidence
-    ? `#{&&:#{==:#{pane_id},${buildHudPaneTarget(evidence.hudPaneId)}},#{==:#{session_name},${evidence.sessionName}},#{==:#{window_index},${evidence.windowIndex}},#{==:#{@omx_instance_id},${evidence.sessionBirth}},#{==:#{@omx_team_pane_owner_id},${evidence.ownerId}},#{==:#{@omx_team_pane_birth},${evidence.hudPaneBirth}},#{==:#{@omx_team_pane_role},hud},#{==:#{${active}},1}}`
-    : '#{==:0,1}';
+  const condition = buildTeamHookCondition(evidence);
   return `if-shell -t ${buildHudPaneTarget(evidence?.hudPaneId ?? '')} -F ${shellQuoteSingle(condition)} ${shellQuoteSingle(`run-shell -b ${hookCommand}`)} ''${generation ? ` # omx-generation=${generation}` : ''}`;
 }
+
 
 export function buildRegisterResizeHookArgs(
   hookTarget: string,
@@ -974,12 +984,14 @@ export function buildRegisterResizeHookArgs(
   generation?: string,
   evidence?: Omit<TeamHudHookEvidence, 'generation'>,
 ): string[] {
-  const resizeCommand = buildBestEffortShellCommand(buildNestedTmuxShellCommand(buildHudResizeCommand(hudPaneId, heightLines)));
+  const hookEvidence = generation && evidence ? { ...evidence, generation } : undefined;
+  const resizeCommand = buildGuardedTeamResizeCommand(hudPaneId, heightLines, hookEvidence);
   void hookName;
   return [
     'set-hook', '-a', '-t', hookTarget, 'client-resized',
-    buildTeamHookCommand(resizeCommand, generation && evidence ? { ...evidence, generation } : undefined),
+    buildTeamHookCommand(resizeCommand, hookEvidence),
   ];
+
 }
 
 /** Deprecated diagnostic helper: append-only registrations are never removed live. */
@@ -1012,11 +1024,13 @@ export function buildRegisterClientAttachedReconcileArgs(
   evidence?: Omit<TeamHudHookEvidence, 'generation'>,
 ): string[] {
   void hookName;
-  const oneShotCommand = buildBestEffortShellCommand(buildNestedTmuxShellCommand(buildHudResizeCommand(hudPaneId, heightLines)));
+  const hookEvidence = generation && evidence ? { ...evidence, generation } : undefined;
+  const oneShotCommand = buildGuardedTeamResizeCommand(hudPaneId, heightLines, hookEvidence);
   return [
     'set-hook', '-a', '-t', hookTarget, 'client-attached',
-    buildTeamHookCommand(oneShotCommand, generation && evidence ? { ...evidence, generation } : undefined),
+    buildTeamHookCommand(oneShotCommand, hookEvidence),
   ];
+
 }
 
 /** Deprecated diagnostic helper: append-only registrations are never removed live. */
@@ -1050,12 +1064,15 @@ export function registerHudHooksTransactionally(
   evidence?: Omit<TeamHudHookEvidence, 'generation'>,
 ): boolean {
   if (!generation || !evidence) return false;
-  // Enable before append. A partial pair is safe: both commands are generation-gated
-  // and later teardown only makes this generation inert.
+  // Enable before append. A partial pair is safe only after a failed registration
+  // makes its unique generation inert; retained append-only commands then cannot resize.
   if (!runTmux(['set-option', '-t', hookTarget, teamHookActiveOption(generation), '1']).ok) return false;
   const resizeArgs = buildRegisterResizeHookArgs(hookTarget, resizeHookName, hudPaneId, HUD_TMUX_TEAM_HEIGHT_LINES, generation, evidence);
   const attachedArgs = buildRegisterClientAttachedReconcileArgs(hookTarget, clientAttachedHookName, hudPaneId, HUD_TMUX_TEAM_HEIGHT_LINES, generation, evidence);
-  return appendHudHook(hookTarget, resizeArgs) && appendHudHook(hookTarget, attachedArgs);
+  if (appendHudHook(hookTarget, resizeArgs) && appendHudHook(hookTarget, attachedArgs)) return true;
+  runTmux(['set-option', '-t', hookTarget, teamHookActiveOption(generation), '0']);
+  return false;
+
 }
 
 /** Makes this generation inert. It deliberately retains every tmux hook receipt and slot. */
@@ -1077,16 +1094,18 @@ export function buildScheduleDelayedHudResizeArgs(
   hudPaneId: string,
   delaySeconds: number = HUD_RESIZE_RECONCILE_DELAY_SECONDS,
   heightLines: number = HUD_TMUX_TEAM_HEIGHT_LINES,
+  evidence?: TeamHudHookEvidence,
 ): string[] {
   const delay = Number.isFinite(delaySeconds) && delaySeconds > 0 ? delaySeconds : HUD_RESIZE_RECONCILE_DELAY_SECONDS;
-  return ['run-shell', '-b', `sleep ${delay}; ${buildBestEffortShellCommand(buildNestedTmuxShellCommand(buildHudResizeCommand(hudPaneId, heightLines)))}`];
+  return ['run-shell', '-b', `sleep ${delay}; ${buildGuardedTeamResizeCommand(hudPaneId, heightLines, evidence)}`];
 }
 
 export function buildReconcileHudResizeArgs(
   hudPaneId: string,
   heightLines: number = HUD_TMUX_TEAM_HEIGHT_LINES,
+  evidence?: TeamHudHookEvidence,
 ): string[] {
-  return ['run-shell', buildBestEffortShellCommand(buildNestedTmuxShellCommand(buildHudResizeCommand(hudPaneId, heightLines)))];
+  return ['run-shell', buildGuardedTeamResizeCommand(hudPaneId, heightLines, evidence)];
 }
 
 function redrawLeaderPaneAfterTeamLayout(leaderPaneId: string): void {
@@ -2173,13 +2192,12 @@ export function createTeamSession(
           hudPaneId = id;
 
           if (isNativeWindows()) {
-            // Native Windows tmux support may flow through psmux; issuing a
-            // direct control-plane resize avoids nested run-shell PATH drift.
-            const reconcile = runTmux(buildHudResizeArgs(hudPaneId));
-            if (!reconcile.ok) {
-              throw new Error(`failed to reconcile HUD resize: ${reconcile.stderr}`);
-            }
+            // The direct control-plane path cannot revalidate a deferred resize.
+            // Retain the pane rather than risking a reused pane ID.
+            console.warn(`[omx] strict HUD resize validation is unavailable for ${hudPaneId} on native Windows; retaining layout.`);
           } else {
+
+
             const hookTarget = buildResizeHookTarget(sessionName, windowIndex);
             const hookName = buildResizeHookName(safeTeamName, sessionName, windowIndex, hudPaneId);
             const clientAttachedHookName = buildClientAttachedReconcileHookName(
@@ -2200,6 +2218,8 @@ export function createTeamSession(
                   sessionBirth: hookSessionBirth.stdout.trim(),
                   hudPaneId,
                   hudPaneBirth: createdHudPaneBirth,
+                  hudPaneCommand: createdHudPaneCommand ?? '',
+
                   ownerId: teamPaneOwnerId,
                 }
               : null;
@@ -2228,11 +2248,13 @@ export function createTeamSession(
               );
             }
 
-            const delayed = runTmux(buildScheduleDelayedHudResizeArgs(hudPaneId));
+            const resizeEvidence = hookEvidence && options.hookGeneration ? { ...hookEvidence, generation: options.hookGeneration } : undefined;
+            const delayed = runTmux(buildScheduleDelayedHudResizeArgs(hudPaneId, HUD_RESIZE_RECONCILE_DELAY_SECONDS, HUD_TMUX_TEAM_HEIGHT_LINES, resizeEvidence));
+
             if (!delayed.ok) {
               console.warn(`[omx] tmux delayed HUD resize unavailable for ${hudPaneId}: ${delayed.stderr}; continuing.`);
             }
-            const reconcile = runTmux(buildReconcileHudResizeArgs(hudPaneId));
+            const reconcile = runTmux(buildReconcileHudResizeArgs(hudPaneId, HUD_TMUX_TEAM_HEIGHT_LINES, resizeEvidence));
             if (!reconcile.ok) {
               console.warn(`[omx] tmux HUD resize reconcile unavailable for ${hudPaneId}: ${reconcile.stderr}; continuing.`);
             }
@@ -2331,12 +2353,9 @@ export function restoreStandaloneHudPane(
     }),
   );
   if (existingHudPaneId) {
-    if (isNativeWindows()) {
-      runTmux(buildHudResizeArgs(existingHudPaneId));
-    } else {
-      runTmux(buildScheduleDelayedHudResizeArgs(existingHudPaneId));
-      runTmux(buildReconcileHudResizeArgs(existingHudPaneId));
-    }
+    // No standalone generation carries complete immutable resize evidence.
+    // Retain the existing layout rather than resizing a potentially reused pane ID.
+
     runTmux(['select-pane', '-t', normalizedLeaderPaneId]);
     return existingHudPaneId;
   }
@@ -2375,12 +2394,8 @@ export function restoreStandaloneHudPane(
   if (!paneId.startsWith('%')) return null;
   if (tmuxPaneInstanceId && !tagNewHudPaneOrRollback(paneId, tmuxPaneInstanceId)) return null;
 
-  if (isNativeWindows()) {
-    runTmux(buildHudResizeArgs(paneId));
-  } else {
-    runTmux(buildScheduleDelayedHudResizeArgs(paneId));
-    runTmux(buildReconcileHudResizeArgs(paneId));
-  }
+  // A restored standalone pane is not resize-authorized until a complete
+  // immutable hook generation exists.
   runTmux(['select-pane', '-t', normalizedLeaderPaneId]);
   return paneId;
 }
@@ -3444,9 +3459,15 @@ export async function teardownWorkerPanes(
       await sleep(perPaneGrace);
       continue;
     }
+    const appliedReceipt = `__omx_worker_teardown_applied_${randomUUID()}__`;
+    const rejectedReceipt = `__omx_worker_teardown_rejected_${randomUUID()}__`;
     const condition = `#{&&:#{==:#{pane_id},${paneId}},#{==:#{pane_start_command},${receipt.command}},#{==:#{session_name},${sessionName}},#{==:#{@omx_instance_id},${sessionBirth}},#{==:#{@omx_team_pane_owner_id},${teamOwnerId}},#{==:#{@omx_team_pane_birth},${receipt.pane_birth}},#{==:#{@omx_team_pane_role},worker}}`;
-    const result = await runTmuxAsync(['if-shell', '-t', paneId, '-F', condition, `kill-pane -t ${paneId}`, '']);
-    if (result.ok) summary.kill.succeeded += 1;
+    const result = await runTmuxAsync([
+      'if-shell', '-t', paneId, '-F', condition,
+      `kill-pane -t ${paneId} \\; display-message -p ${appliedReceipt}`,
+      `display-message -p ${rejectedReceipt}`,
+    ]);
+    if (result.ok && result.stdout.split('\n').some((line) => line.trim() === appliedReceipt)) summary.kill.succeeded += 1;
     else summary.kill.failed += 1;
     await sleep(perPaneGrace);
   }
@@ -3463,13 +3484,20 @@ export async function killWorkerPanes(
   return teardownWorkerPanes(paneIds, { leaderPaneId, hudPaneId: hudPaneId ?? null, graceMs });
 }
 
-// Kill entire tmux session. Tolerates already-dead sessions.
-export function destroyTeamSession(sessionName: string): void {
-  try {
-    runTmux(['kill-session', '-t', sessionName]);
-  } catch {
-    // tolerate
-  }
+/** Destroys only the immutable standalone Team session generation and returns its same-command receipt. */
+export function destroyTeamSession(sessionName: string, sessionBirth: string): boolean {
+  const normalizedSessionName = sessionName.trim();
+  const normalizedSessionBirth = sessionBirth.trim();
+  if (!normalizedSessionName || !normalizedSessionBirth) return false;
+  const appliedReceipt = `__omx_session_teardown_applied_${randomUUID()}__`;
+  const rejectedReceipt = `__omx_session_teardown_rejected_${randomUUID()}__`;
+  const condition = `#{&&:#{==:#{session_name},${normalizedSessionName}},#{==:#{@omx_instance_id},${normalizedSessionBirth}}}`;
+  const result = runTmux([
+    'if-shell', '-t', normalizedSessionName, '-F', condition,
+    `kill-session -t ${normalizedSessionName} \\; display-message -p ${appliedReceipt}`,
+    `display-message -p ${rejectedReceipt}`,
+  ]);
+  return result.ok && result.stdout.split('\n').some((line) => line.trim() === appliedReceipt);
 }
 
 // List all tmux sessions matching omx-team-* pattern

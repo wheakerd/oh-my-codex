@@ -136,11 +136,22 @@ describe('HUD resize hook helpers', () => {
 
   function appendOnlyHooks() {
     const hooks = new Map<string, string[]>();
+    const options = new Map<string, string>();
+
     const calls: string[][] = [];
     const exec = (args: string[]): string => {
       calls.push(args);
       if (args[0] === 'display-message' && args.at(-1) === '#{session_id}\t#{window_id}') return '$7\t@3\n';
       if (args[0] === 'display-message' && args.at(-1) === '#{@omx_pane_instance_id}\t#{@omx_instance_id}\t#{session_name}') return 'pane-birth\tsession-birth\tmanaged\n';
+      if (args[0] === 'display-message' && args.at(-1) === '#{@omx_pane_instance_id}\t#{@omx_instance_id}\t#{session_name}\t#{window_id}\t#{pane_current_command}\t#{pane_start_command}') return 'pane-birth\tsession-birth\tmanaged\t@3\tnode\texec env OMX_SESSION_ID=sess OMX_TMUX_HUD_LEADER_PANE=%1 node omx hud --watch\n';
+
+      if (args[0] === 'display-message' && args.at(-1) === '#{@omx_pane_instance_id}') return 'leader-birth\n';
+
+      if (args[0] === 'set-option') {
+        options.set(args.at(-2) ?? '', args.at(-1) ?? '');
+        return '';
+      }
+      if (args[0] === 'show-option') return options.get(args.at(-1) ?? '') ?? '';
       if (args[0] === 'set-hook' && args[1] === '-a') {
         const event = args[4]!;
         hooks.set(event, [...(hooks.get(event) ?? []), args[5]!]);
@@ -163,16 +174,21 @@ describe('HUD resize hook helpers', () => {
     assert.match(command, /if-shell -t %9 -F/);
     assert.match(command, /pane-birth/);
     assert.match(command, /session-birth/);
+    assert.match(command, /pane_start_command/);
+    assert.match(command, /window_id/);
+    assert.ok((command.match(/if-shell/g) ?? []).length >= 2);
     assert.match(command, /omx-hud-owned:[0-9a-f-]{36}/);
     assert.ok(fixture.calls.some((args) => args[0] === 'set-hook' && args[1] === '-a'));
     assert.equal(fixture.calls.some((args) => args[0] === 'set-hook' && args.includes('-u')), false);
   });
 
-  it('retains a partial pair and makes every retained generation inert on teardown', () => {
+  it('retains a partial pair and deactivates only its persisted generation on teardown', () => {
     const fixture = appendOnlyHooks();
     assert.equal(registerHudResizeHook('%9', '%1', 3, { cwd: '/repo', env: { TMUX: '/tmp/tmux' } }, fixture.exec), true);
     assert.equal(unregisterHudResizeHook('%1', fixture.exec), true);
-    assert.ok(fixture.calls.some((args) => args[0] === 'set-option' && args.at(-1) === '0'));
+    const inactive = fixture.calls.filter((args) => args[0] === 'set-option' && args.at(-1) === '0');
+    assert.equal(inactive.length, 1);
+    assert.equal(fixture.calls.some((args) => args[0] === 'show-hooks'), false);
     assert.equal(fixture.calls.some((args) => args[0] === 'set-hook' && args.includes('-u')), false);
     assert.equal(fixture.hooks.get('client-resized')?.length, 1);
     assert.equal(fixture.hooks.get('window-layout-changed')?.length, 1);
