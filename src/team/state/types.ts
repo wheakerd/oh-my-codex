@@ -35,7 +35,9 @@ export interface TeamLifecycleResource {
   id: string;
   created: boolean;
   pane_birth?: string;
+  /** Exact pane_start_command or hook generation captured at acquisition. */
   command?: string;
+  role?: 'worker' | 'hud' | 'leader';
   acquired_at: string;
 }
 

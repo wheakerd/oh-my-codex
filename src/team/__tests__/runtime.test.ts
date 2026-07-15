@@ -2580,6 +2580,9 @@ esac
         resizeHookName: 'resize-hook',
         resizeHookTarget: 'leader:0',
         teamPaneOwnerId: 'team:team-pane-persist-race',
+        tmuxSessionName: 'leader',
+        tmuxSessionBirth: 'session-birth',
+        tmuxContext: 'leader:0 %1',
       }, workerPaneIds);
 
       assert.equal(config.tmux_session, 'leader:0');

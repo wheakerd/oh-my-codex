@@ -12,7 +12,12 @@ import { buildLeaderMonitoringHints, parseTeamStartArgs, teamCommand } from '../
 import { readModeState } from '../../modes/base.js';
 import { readApprovedExecutionLaunchHint } from '../../planning/artifacts.js';
 import { buildRepoAwareTeamExecutionPlan } from '../../team/repo-aware-decomposition.js';
-import { DEFAULT_MAX_WORKERS } from '../../team/state.js';
+import {
+  DEFAULT_MAX_WORKERS,
+  createTeamLifecycleGeneration,
+  finalizeTeamLifecycleGeneration,
+  type TeamConfig,
+} from '../../team/state.js';
 import { shutdownTeam } from '../../team/runtime.js';
 import { sameFilePath } from '../../utils/paths.js';
 import {
@@ -37,6 +42,42 @@ const OMX_CLI_PATH = fileURLToPath(new URL('../omx.js', import.meta.url));
 const ORIGINAL_OMX_TEAM_WORKER = process.env.OMX_TEAM_WORKER;
 const ORIGINAL_OMX_TEAM_STATE_ROOT = process.env.OMX_TEAM_STATE_ROOT;
 
+
+async function persistUnverifiableShutdownLifecycle(config: TeamConfig, cwd: string): Promise<void> {
+  const token = `test-unverifiable-shutdown-${config.name}`;
+  const resources = [
+    ...(config.hud_pane_id ? [{ kind: 'hud' as const, id: config.hud_pane_id, role: 'hud' as const }] : []),
+    ...config.workers
+      .filter((worker) => /^%\d+$/.test(worker.pane_id ?? ''))
+      .map((worker) => ({ kind: 'worker' as const, id: worker.pane_id!, role: 'worker' as const })),
+  ].map((resource) => ({
+    ...resource,
+    created: true,
+    pane_birth: `unverifiable-birth-${resource.id}`,
+    command: `unverifiable-command-${resource.id}`,
+    acquired_at: new Date().toISOString(),
+  }));
+  assert.equal(await createTeamLifecycleGeneration({
+    version: 1,
+    token,
+    team_name: config.name,
+    canonical_session_id: `test-session-${config.name}`,
+    native_session_ids: [`test-session-${config.name}`],
+    tmux_session_name: null,
+    tmux_session_birth: null,
+    tmux_context: null,
+    team_pane_owner_id: config.tmux_pane_owner_id ?? `team:${config.name}`,
+    hook_generation: `test-hook-${config.name}`,
+    status: 'preparing',
+    created_at: new Date().toISOString(),
+    resources,
+  }, cwd), true);
+  assert.equal(await finalizeTeamLifecycleGeneration(config.name, token, 'active', cwd, {
+    tmux_session_name: config.tmux_session?.split(':')[0] ?? 'leader',
+    tmux_session_birth: `unverifiable-session-birth-${config.name}`,
+    tmux_context: config.tmux_session ?? 'leader:0',
+  }), true);
+}
 function encodeApprovedExecutionTask(task: string, quote: 'single' | 'double'): string {
   return quote === 'single'
     ? `'${task.replace(/'/g, "\\'")}'`
@@ -1683,7 +1724,7 @@ esac
       assert.equal(result.signal, null, `shutdown CLI received signal ${result.signal ?? 'none'}\n${result.stderr}`);
       assert.equal(result.code, 0, `shutdown CLI exit=${result.code}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`);
       assert.match(result.stdout, /Team shutdown complete: shared-shutdown-cli/);
-      assert.equal(existsSync(join(wd, '.omx', 'state', 'team', 'shared-shutdown-cli')), false);
+      assert.equal(existsSync(join(wd, '.omx', 'state', 'team', 'shared-shutdown-cli')), true);
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
       assert.doesNotMatch(tmuxLog, /kill-pane -t %12/);
@@ -1721,6 +1762,7 @@ esac
         config.workers[0]!.pane_id = workerPaneOne;
         config.workers[1]!.pane_id = workerPaneTwo;
         await saveTeamConfig(config, wd);
+        await persistUnverifiableShutdownLifecycle(config, wd);
 
         const result = await runNodeCli(['team', 'shutdown', teamName, '--force'], {
           cwd: wd,
@@ -1738,12 +1780,11 @@ esac
         assert.equal(result.code, 0, `shutdown CLI exit=${result.code}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`);
         const stdout = result.stdout;
         assert.match(stdout, new RegExp(`Team shutdown complete: ${teamName}`));
+        // Shared-session shutdown retains the leader pane but has no standalone
+        // lifecycle retry surface, so it clears stale Team metadata.
         assert.equal(existsSync(join(teamStateRoot, 'team', teamName)), false);
+        assert.equal(await readTeamConfig(teamName, wd), null);
         assert.equal(fixturePaneExists(fixture, fixture.leaderPaneId), true, 'leader pane should remain alive');
-        // Exact HUD/worker-pane teardown is covered in runtime shutdown tests.
-        // This CLI test owns the stable operator contract: the command must not
-        // die by signal, it must exit 0, and explicit shutdown must remove team
-        // state while preserving leader survival in a real tmux client context.
       });
     } finally {
       await rm(wd, { recursive: true, force: true });

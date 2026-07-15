@@ -111,7 +111,9 @@ export interface TeamLifecycleResource {
   id: string;
   created: boolean;
   pane_birth?: string;
+  /** Exact pane_start_command or hook generation captured at acquisition. */
   command?: string;
+  role?: 'worker' | 'hud' | 'leader';
   acquired_at: string;
 }
 
@@ -683,7 +685,11 @@ function isLifecycleCertificate(value: unknown): value is TeamLifecycleGeneratio
   const certificate = value as Partial<TeamLifecycleGenerationCertificate>;
   return certificate.version === 1 && typeof certificate.token === 'string'
     && typeof certificate.team_name === 'string' && Array.isArray(certificate.resources)
-    && typeof certificate.hook_generation === 'string';
+    && typeof certificate.hook_generation === 'string'
+    && (certificate.status === 'preparing'
+      || (typeof certificate.tmux_session_name === 'string'
+        && typeof certificate.tmux_session_birth === 'string'
+        && typeof certificate.tmux_context === 'string'));
 }
 
 export async function readTeamLifecycleGeneration(teamName: string, cwd: string): Promise<TeamLifecycleGenerationCertificate | null> {
@@ -749,10 +755,12 @@ export async function finalizeTeamLifecycleGeneration(
   token: string,
   status: Extract<TeamLifecycleGenerationCertificate['status'], 'active' | 'cleanup_complete' | 'transferred'>,
   cwd: string,
+  identity?: Pick<TeamLifecycleGenerationCertificate, 'tmux_session_name' | 'tmux_session_birth' | 'tmux_context'>,
 ): Promise<boolean> {
   const current = await readTeamLifecycleGeneration(teamName, cwd);
   if (!current || current.token !== token || current.status !== 'preparing') return false;
-  await writeAtomic(lifecycleGenerationPath(teamName, cwd), `${JSON.stringify({ ...current, status }, null, 2)}\n`);
+  if (status === 'active' && (!identity?.tmux_session_name || !identity.tmux_session_birth || !identity.tmux_context)) return false;
+  await writeAtomic(lifecycleGenerationPath(teamName, cwd), `${JSON.stringify({ ...current, ...identity, status }, null, 2)}\n`);
   return true;
 }
 

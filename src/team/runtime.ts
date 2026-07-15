@@ -3143,7 +3143,11 @@ export async function startTeam(
             throw new Error(`team_lifecycle_receipt_failed:${resource.kind}:${resource.id}`);
           }
         }
-        if (!await finalizeTeamLifecycleGeneration(sanitized, lifecycleCertificate.token, 'active', leaderCwd)) {
+        if (!await finalizeTeamLifecycleGeneration(sanitized, lifecycleCertificate.token, 'active', leaderCwd, {
+          tmux_session_name: createdSession.tmuxSessionName,
+          tmux_session_birth: createdSession.tmuxSessionBirth,
+          tmux_context: createdSession.tmuxContext,
+        })) {
           throw new Error('team_lifecycle_activation_failed');
         }
         const revalidatedHudCandidate = hudExactCandidate
@@ -3936,17 +3940,13 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
   const sanitized = resolveTeamNameForCurrentContext(teamName, cwd);
   const config = await readTeamConfig(sanitized, cwd);
   if (!config) {
-    // No config -- just try to kill tmux session and clean up
-    try {
-      destroyTeamSession(`omx-team-${sanitized}`);
-    } catch (err) {
-      process.stderr.write(`[team/runtime] operation failed: ${err}\n`);
-    }
-    await cleanupTeamState(sanitized, cwd);
-    await syncTeamModeStateOnShutdown(sanitized, cwd);
-    restoreTeamModelInstructionsFile(sanitized);
-    return { commitHygieneArtifacts: null };
+    // A missing mutable config is never authority to guess a session name or
+    // delete recovery state. Retain any immutable certificate for recovery.
+    const certificate = await readTeamLifecycleGeneration(sanitized, cwd);
+    if (certificate) throw new Error(`shutdown_recovery_required:missing_config:${certificate.token}`);
+    throw new Error(`Team ${sanitized} not found`);
   }
+  const lifecycleCertificate = await readTeamLifecycleGeneration(sanitized, cwd);
   const manifest = await readTeamManifestV2(sanitized, cwd);
   const leaderSessionId = typeof manifest?.leader?.session_id === 'string'
     ? manifest.leader.session_id.trim()
@@ -4088,6 +4088,19 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
   const hudPaneId = config.hud_pane_id;
   let retainHudLifecycleState = false;
   let retainHudContainer = false;
+  const lifecycleAuthority = lifecycleCertificate?.status === 'active'
+    && lifecycleCertificate.team_name === sanitized
+    && lifecycleCertificate.team_pane_owner_id === config.tmux_pane_owner_id
+    && lifecycleCertificate.tmux_session_name === sessionName.split(':')[0]
+    && lifecycleCertificate.tmux_context === sessionName
+    && Boolean(lifecycleCertificate.tmux_session_birth);
+  const lifecycleResources = lifecycleAuthority ? lifecycleCertificate.resources : [];
+  const workerReceipts = Object.fromEntries(
+    lifecycleResources.filter((resource) => resource.kind === 'worker' && resource.role === 'worker' && resource.pane_birth && resource.command)
+      .map((resource) => [resource.id, resource]),
+  );
+  const hudReceipt = lifecycleResources.find((resource) => resource.kind === 'hud'
+    && resource.id === hudPaneId && resource.role === 'hud' && resource.pane_birth && resource.command);
 
   if (config.worker_launch_mode === 'interactive') {
     const sharedSessionTopology = sessionName.includes(':')
@@ -4240,10 +4253,13 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
       ? freshHudOwnerTag.value
       : '';
     const ownsHudTeardownAuthority = Boolean(
-      ownsHudLifecycleLock
+      lifecycleAuthority
+      && hudReceipt
+      && ownsHudLifecycleLock
       && hasFreshHudRestoreEvidence
       && lockedHudPaneId
       && tmuxPaneOwnerId
+      && freshHudCandidate?.tmuxSessionInstanceId === lifecycleCertificate?.tmux_session_birth
       && paneHasOmxInstanceTag(lockedHudPaneId, freshHudCandidate?.tmuxPaneInstanceId)
       && freshHudOwnerId === tmuxPaneOwnerId,
     );
@@ -4259,9 +4275,13 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
     const persistedHudPaneId = hudPaneId;
     const hasPersistedHudHooks = Boolean(config.resize_hook_name && config.resize_hook_target);
     const ownsHudHookTeardownAuthority = Boolean(
-      ownsHudLifecycleLock
-      && hasFreshHudRestoreEvidence
-      && persistedHudPaneId,
+      ownsHudTeardownAuthority
+      && config.hook_generation
+      && config.hook_generation === lifecycleCertificate?.hook_generation
+      && config.resize_hook_name
+      && lifecycleResources.some((resource) => resource.kind === 'hook'
+        && resource.id === config.resize_hook_name
+        && resource.command === lifecycleCertificate.hook_generation),
     );
     const clientHookTarget = ownsHudHookTeardownAuthority && hasPersistedHudHooks ? config.resize_hook_target : null;
     let hooksRemoved = ownsHudHookTeardownAuthority && !hasPersistedHudHooks;
@@ -4290,6 +4310,7 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
         lockedHudPaneId,
         freshHudCandidate!,
         tmuxPaneOwnerId,
+        hudReceipt,
       );
       if (!killedHudPane) {
         retainHudContainer = !sessionName.includes(':');
@@ -4334,12 +4355,19 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
       leaderPaneId: effectiveLeaderPaneId,
       hudPaneId: effectiveHudPaneId,
     });
-    await teardownWorkerPanes(shutdownPaneIds, {
+    const workerTeardown = await teardownWorkerPanes(shutdownPaneIds, {
       leaderPaneId: effectiveLeaderPaneId,
       hudPaneId: restoredHudPaneId ?? (ownsHudTeardownAuthority && hooksRemoved ? effectiveHudPaneId : undefined),
       teamPaneOwnerId: tmuxPaneOwnerId,
       sessionName,
+      sessionBirth: lifecycleCertificate?.tmux_session_birth,
+      workerReceipts,
     });
+    if (workerTeardown.kill.failed > 0) {
+      retainHudLifecycleState = true;
+      retainHudContainer = !sessionName.includes(':');
+      console.warn(`[team shutdown] ${sanitized}: preserving lifecycle metadata because ${workerTeardown.kill.failed} worker pane teardown CAS operation(s) were uncertain`);
+    }
     } finally {
       if (hudLifecycleLock?.status === 'acquired' && hudLifecycleLock.lock) {
         await releaseHudLifecycleLock(hudLifecycleLock.lock);

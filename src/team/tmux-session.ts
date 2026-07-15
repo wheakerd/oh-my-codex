@@ -53,23 +53,22 @@ const OMX_TEAM_PANE_ROLE_OPTION = '@omx_team_pane_role';
 
 
 export interface TeamSession {
-  name: string; // tmux target in "session:window" form
+  name: string;
   workerCount: number;
   cwd: string;
   workerPaneIds: string[];
-  /** Leader's own pane ID — must never be targeted by worker cleanup routines. */
   leaderPaneId: string;
-  /** HUD pane spawned below the leader column, or null if creation failed. */
   hudPaneId: string | null;
-  /** Registered tmux resize hook name for the HUD pane, or null if unavailable. */
   resizeHookName: string | null;
-  /** Registered tmux resize hook target in "<session>:<window>" form, or null. */
   resizeHookTarget: string | null;
-  /** Team-scoped tmux pane ownership token used by shutdown safety checks. */
   teamPaneOwnerId: string;
-  /** Opaque births captured after exact tmux tagging; required for lifecycle recovery. */
+  tmuxSessionName: string;
+  tmuxSessionBirth: string;
+  tmuxContext: string;
   workerPaneBirths?: Record<string, string>;
+  workerPaneCommands?: Record<string, string>;
   hudPaneBirth?: string | null;
+  hudPaneCommand?: string | null;
 }
 
 export interface CreateTeamSessionOptions {
@@ -588,19 +587,21 @@ function findExactTeamHudPaneIds(target: string, candidate: ExactTeamHudCandidat
     .map((pane) => pane.paneId);
 }
 
-/** Kills only a still-exact HUD pane, with tmux evaluating identity immediately before kill. */
+/** Kills only an immutable journaled HUD generation, with tmux evaluating every identity immediately before kill. */
 export function killExactTeamHudPane(
   target: string,
   paneId: string,
   candidate: ExactTeamHudCandidate,
   teamOwnerId?: string,
+  receipt?: TeamLifecycleResource,
 ): boolean {
+  if (!receipt || receipt.kind !== 'hud' || receipt.id !== paneId || receipt.role !== 'hud'
+    || !receipt.pane_birth || !receipt.command || !teamOwnerId) return false;
   if (!findExactTeamHudPaneIds(target, candidate).includes(paneId)) return false;
   const sessionName = candidate.tmuxSessionName ?? target.split(':')[0] ?? '';
-  const ownerCondition = teamOwnerId ? `,#{==:#{@omx_team_pane_owner_id},${teamOwnerId}}` : '';
-  const condition = `#{&&:#{==:#{pane_id},${paneId}},#{==:#{@omx_pane_instance_id},${candidate.tmuxPaneInstanceId}},#{==:#{@omx_instance_id},${candidate.tmuxSessionInstanceId}},#{==:#{session_name},${sessionName}}${ownerCondition}}`;
+  if (!sessionName || !candidate.tmuxSessionInstanceId || !candidate.tmuxPaneInstanceId) return false;
+  const condition = `#{&&:#{==:#{pane_id},${paneId}},#{==:#{pane_start_command},${receipt.command}},#{==:#{@omx_pane_instance_id},${candidate.tmuxPaneInstanceId}},#{==:#{@omx_instance_id},${candidate.tmuxSessionInstanceId}},#{==:#{session_name},${sessionName}},#{==:#{@omx_team_pane_owner_id},${teamOwnerId}},#{==:#{@omx_team_pane_birth},${receipt.pane_birth}},#{==:#{@omx_team_pane_role},hud}}`;
   const result = runTmux(['if-shell', '-t', paneId, '-F', condition, `kill-pane -t ${paneId}`, '']);
-
   return result.ok && !findExactTeamHudPaneIds(target, candidate).includes(paneId);
 }
 
@@ -937,23 +938,32 @@ function buildBestEffortShellCommand(command: string): string {
   return `${command} >/dev/null 2>&1 || true`;
 }
 
-/** Upper bound for tmux hook indices (signed 32-bit max). */
-const TMUX_HOOK_INDEX_MAX = 2147483647;
 
-function buildResizeHookSlot(hookName: string): string {
-  let hash = 0;
-  for (let i = 0; i < hookName.length; i++) {
-    hash = (hash * 31 + hookName.charCodeAt(i)) | 0;
-  }
-  return `client-resized[${Math.abs(hash) % TMUX_HOOK_INDEX_MAX}]`;
+
+export interface TeamHudHookEvidence {
+  sessionName: string;
+  windowIndex: string;
+  sessionBirth: string;
+  hudPaneId: string;
+  hudPaneBirth: string;
+  ownerId: string;
+  generation: string;
 }
 
-function buildClientAttachedHookSlot(hookName: string): string {
-  let hash = 0;
-  for (let i = 0; i < hookName.length; i++) {
-    hash = (hash * 31 + hookName.charCodeAt(i)) | 0;
-  }
-  return `client-attached[${Math.abs(hash) % TMUX_HOOK_INDEX_MAX}]`;
+function teamHookActiveOption(generation: string): string {
+  return `@omx_team_hook_active_${generation.replace(/[^a-zA-Z0-9_]/g, '_')}`;
+}
+
+function buildTeamHookCommand(
+  hookCommand: string,
+  evidence?: TeamHudHookEvidence,
+): string {
+  const generation = evidence?.generation?.trim() ?? '';
+  const active = generation ? teamHookActiveOption(generation) : '';
+  const condition = evidence
+    ? `#{&&:#{==:#{pane_id},${buildHudPaneTarget(evidence.hudPaneId)}},#{==:#{session_name},${evidence.sessionName}},#{==:#{window_index},${evidence.windowIndex}},#{==:#{@omx_instance_id},${evidence.sessionBirth}},#{==:#{@omx_team_pane_owner_id},${evidence.ownerId}},#{==:#{@omx_team_pane_birth},${evidence.hudPaneBirth}},#{==:#{@omx_team_pane_role},hud},#{==:#{${active}},1}}`
+    : '#{==:0,1}';
+  return `if-shell -t ${buildHudPaneTarget(evidence?.hudPaneId ?? '')} -F ${shellQuoteSingle(condition)} ${shellQuoteSingle(`run-shell -b ${hookCommand}`)} ''${generation ? ` # omx-generation=${generation}` : ''}`;
 }
 
 export function buildRegisterResizeHookArgs(
@@ -962,16 +972,20 @@ export function buildRegisterResizeHookArgs(
   hudPaneId: string,
   heightLines: number = HUD_TMUX_TEAM_HEIGHT_LINES,
   generation?: string,
+  evidence?: Omit<TeamHudHookEvidence, 'generation'>,
 ): string[] {
   const resizeCommand = buildBestEffortShellCommand(buildNestedTmuxShellCommand(buildHudResizeCommand(hudPaneId, heightLines)));
-  const hookCommand = shellQuoteSingle(
-    `${resizeCommand}; sleep ${HUD_RESIZE_RECONCILE_DELAY_SECONDS}; ${resizeCommand}`,
-  );
-  return ['set-hook', '-t', hookTarget, buildResizeHookSlot(hookName), `run-shell -b ${hookCommand}${generation ? ` # omx-generation=${generation}` : ''}`];
+  void hookName;
+  return [
+    'set-hook', '-a', '-t', hookTarget, 'client-resized',
+    buildTeamHookCommand(resizeCommand, generation && evidence ? { ...evidence, generation } : undefined),
+  ];
 }
 
+/** Deprecated diagnostic helper: append-only registrations are never removed live. */
 export function buildUnregisterResizeHookArgs(hookTarget: string, hookName: string): string[] {
-  return ['set-hook', '-u', '-t', hookTarget, buildResizeHookSlot(hookName)];
+  void hookName;
+  return ['show-hooks', '-t', hookTarget, 'client-resized'];
 }
 
 export function buildClientAttachedReconcileHookName(
@@ -995,50 +1009,36 @@ export function buildRegisterClientAttachedReconcileArgs(
   hudPaneId: string,
   heightLines: number = HUD_TMUX_TEAM_HEIGHT_LINES,
   generation?: string,
+  evidence?: Omit<TeamHudHookEvidence, 'generation'>,
 ): string[] {
-  const hookSlot = buildClientAttachedHookSlot(hookName);
-  // Keep the owned command installed until transactional lifecycle cleanup. A shell
-  // callback cannot safely prove it is still the same hook after queueing.
-  const oneShotCommand = shellQuoteSingle(
-    buildBestEffortShellCommand(buildNestedTmuxShellCommand(buildHudResizeCommand(hudPaneId, heightLines))),
-  );
-  return ['set-hook', '-t', hookTarget, hookSlot, `run-shell -b ${oneShotCommand}${generation ? ` # omx-generation=${generation}` : ''}`];
+  void hookName;
+  const oneShotCommand = buildBestEffortShellCommand(buildNestedTmuxShellCommand(buildHudResizeCommand(hudPaneId, heightLines)));
+  return [
+    'set-hook', '-a', '-t', hookTarget, 'client-attached',
+    buildTeamHookCommand(oneShotCommand, generation && evidence ? { ...evidence, generation } : undefined),
+  ];
 }
 
+/** Deprecated diagnostic helper: append-only registrations are never removed live. */
 export function buildUnregisterClientAttachedReconcileArgs(hookTarget: string, hookName: string): string[] {
-  return ['set-hook', '-u', '-t', hookTarget, buildClientAttachedHookSlot(hookName)];
+  void hookName;
+  return ['show-hooks', '-t', hookTarget, 'client-attached'];
 }
 
-export function unregisterResizeHook(hookTarget: string, hookName: string): boolean {
-  const result = runTmux(buildUnregisterResizeHookArgs(hookTarget, hookName));
-  return result.ok;
-}
-
-export function unregisterClientAttachedReconcileHook(hookTarget: string, hookName: string): boolean {
-  const result = runTmux(buildUnregisterClientAttachedReconcileArgs(hookTarget, hookName));
-  return result.ok;
-}
-
-/** One tmux-server conditional mutation; foreign or newer hook commands survive. */
-function mutateHudHookIfCurrent(hookTarget: string, slot: string, expected: string | null, next: string | null): boolean {
-  const expectedLine = expected === null ? '' : `${slot} ${expected}`;
-  const condition = expected === null
-    ? `test -z "$(tmux show-hooks -t ${shellQuoteSingle(hookTarget)} ${shellQuoteSingle(slot)})"`
-    : `test "$(tmux show-hooks -t ${shellQuoteSingle(hookTarget)} ${shellQuoteSingle(slot)})" = ${shellQuoteSingle(expectedLine)}`;
-  const mutation = next === null
-    ? `set-hook -u -t ${shellQuoteSingle(hookTarget)} ${shellQuoteSingle(slot)}`
-    : `set-hook -t ${shellQuoteSingle(hookTarget)} ${shellQuoteSingle(slot)} ${shellQuoteSingle(next)}`;
-  const result = runTmux(['if-shell', '-t', hookTarget, condition, mutation, '']);
+function appendHudHook(hookTarget: string, args: string[]): boolean {
+  const event = args[4]?.trim() ?? '';
+  const command = args[5] ?? '';
+  if (!event || !command) return false;
+  const result = runTmux(args);
   if (!result.ok) return false;
-  const readback = runTmux(['show-hooks', '-t', hookTarget, slot]);
-  return readback.ok && readback.stdout.trim() === (next === null ? '' : `${slot} ${next}`);
+  // Discover the server-assigned numeric slot and exact command for durable recovery diagnostics.
+  const observed = runTmux(['show-hooks', '-t', hookTarget, event]);
+  return observed.ok && observed.stdout.includes(command);
 }
 
-/** Registers only an empty hook slot; callers retain metadata on uncertainty. */
+/** Appends a hook; no existing hook slot is inspected, replaced, or authorized by a sidecar. */
 export function registerHudHookIfVacant(hookTarget: string, args: string[]): boolean {
-  const slot = args[3]?.trim() ?? '';
-  const command = args[4] ?? '';
-  return Boolean(slot && command && mutateHudHookIfCurrent(hookTarget, slot, null, command));
+  return appendHudHook(hookTarget, args);
 }
 
 export function registerHudHooksTransactionally(
@@ -1047,20 +1047,18 @@ export function registerHudHooksTransactionally(
   clientAttachedHookName: string,
   hudPaneId: string,
   generation?: string,
+  evidence?: Omit<TeamHudHookEvidence, 'generation'>,
 ): boolean {
-  const resizeArgs = buildRegisterResizeHookArgs(hookTarget, resizeHookName, hudPaneId, HUD_TMUX_TEAM_HEIGHT_LINES, generation);
-  const attachedArgs = buildRegisterClientAttachedReconcileArgs(hookTarget, clientAttachedHookName, hudPaneId, HUD_TMUX_TEAM_HEIGHT_LINES, generation);
-  const resizeSlot = resizeArgs[3]!;
-  const attachedSlot = attachedArgs[3]!;
-  const resizeCommand = resizeArgs[4]!;
-  const attachedCommand = attachedArgs[4]!;
-  if (!mutateHudHookIfCurrent(hookTarget, resizeSlot, null, resizeCommand)) return false;
-  if (mutateHudHookIfCurrent(hookTarget, attachedSlot, null, attachedCommand)) return true;
-  mutateHudHookIfCurrent(hookTarget, resizeSlot, resizeCommand, null);
-  return false;
+  if (!generation || !evidence) return false;
+  // Enable before append. A partial pair is safe: both commands are generation-gated
+  // and later teardown only makes this generation inert.
+  if (!runTmux(['set-option', '-t', hookTarget, teamHookActiveOption(generation), '1']).ok) return false;
+  const resizeArgs = buildRegisterResizeHookArgs(hookTarget, resizeHookName, hudPaneId, HUD_TMUX_TEAM_HEIGHT_LINES, generation, evidence);
+  const attachedArgs = buildRegisterClientAttachedReconcileArgs(hookTarget, clientAttachedHookName, hudPaneId, HUD_TMUX_TEAM_HEIGHT_LINES, generation, evidence);
+  return appendHudHook(hookTarget, resizeArgs) && appendHudHook(hookTarget, attachedArgs);
 }
 
-/** Teardown removes exactly the generation we installed; no snapshot/restore race. */
+/** Makes this generation inert. It deliberately retains every tmux hook receipt and slot. */
 export function unregisterHudHooksTransactionally(
   hookTarget: string,
   resizeHookName: string,
@@ -1068,11 +1066,11 @@ export function unregisterHudHooksTransactionally(
   hudPaneId: string,
   generation?: string,
 ): boolean {
-  const resizeArgs = buildRegisterResizeHookArgs(hookTarget, resizeHookName, hudPaneId, HUD_TMUX_TEAM_HEIGHT_LINES, generation);
-  const attachedArgs = buildRegisterClientAttachedReconcileArgs(hookTarget, clientAttachedHookName, hudPaneId, HUD_TMUX_TEAM_HEIGHT_LINES, generation);
-  const attachedRemoved = mutateHudHookIfCurrent(hookTarget, attachedArgs[3]!, attachedArgs[4]!, null);
-  const resizeRemoved = mutateHudHookIfCurrent(hookTarget, resizeArgs[3]!, resizeArgs[4]!, null);
-  return attachedRemoved && resizeRemoved;
+  void resizeHookName;
+  void clientAttachedHookName;
+  void hudPaneId;
+  if (!generation) return false;
+  return runTmux(['set-option', '-t', hookTarget, teamHookActiveOption(generation), '0']).ok;
 }
 
 export function buildScheduleDelayedHudResizeArgs(
@@ -1942,8 +1940,12 @@ export function createTeamSession(
   const safeTeamName = sanitizeTeamName(teamName);
   let registeredResizeHook: { name: string; target: string } | null = null;
   let registeredClientAttachedHook: { name: string; target: string } | null = null;
+  let registeredHudPaneId: string | null = null;
   const rollbackPaneIds: string[] = [];
   const rollbackPaneBirths = new Map<string, string>();
+  const workerPaneCommands = new Map<string, string>();
+  const rollbackPaneRoles = new Map<string, 'worker' | 'hud'>();
+  let createdHudPaneCommand: string | null = null;
   let createdHudPaneBirth: string | null = null;
 
   let rollbackOwnerSessionId = '';
@@ -2076,11 +2078,17 @@ export function createTeamSession(
       tagTeamPaneBirth(paneId, paneBirth);
       rollbackPaneBirths.set(paneId, paneBirth);
       tagTeamPaneRole(paneId, 'worker');
+      const paneCommand = listPanes(teamTarget).find((pane) => pane.paneId === paneId)?.startCommand ?? '';
+      if (!paneCommand) throw new Error(`failed to capture immutable worker command for ${paneId}`);
+      workerPaneCommands.set(paneId, paneCommand);
+      rollbackPaneRoles.set(paneId, 'worker');
       options.journalResource?.({
         kind: 'worker',
         id: paneId,
         created: true,
         pane_birth: paneBirth,
+        command: paneCommand,
+        role: 'worker',
         acquired_at: new Date().toISOString(),
       });
 
@@ -2148,11 +2156,17 @@ export function createTeamSession(
             rollbackPaneBirths.set(id, paneBirth);
             createdHudPaneBirth = paneBirth;
             tagTeamPaneRole(id, 'hud');
+            const paneCommand = listPanes(teamTarget).find((pane) => pane.paneId === id)?.startCommand ?? '';
+            if (!paneCommand) throw new Error(`failed to capture immutable HUD command for ${id}`);
+            createdHudPaneCommand = paneCommand;
+            rollbackPaneRoles.set(id, 'hud');
             options.journalResource?.({
               kind: 'hud',
               id,
               created: true,
               pane_birth: paneBirth,
+              command: paneCommand,
+              role: 'hud',
               acquired_at: new Date().toISOString(),
             });
 
@@ -2176,15 +2190,39 @@ export function createTeamSession(
               windowIndex,
               hudPaneId,
             );
-            // Persist both prospective hook slots before their first CAS. A failed
-            // CAS remains recovery evidence rather than a reason to discard metadata.
+            // Persist every append-only hook receipt before registration. The exact
+            // command and server-assigned slot are recovery diagnostics, never mutation authority.
             options.journalResource?.({ kind: 'hook', id: hookName, created: true, command: options.hookGeneration, acquired_at: new Date().toISOString() });
             options.journalResource?.({ kind: 'hook', id: clientAttachedHookName, created: true, command: options.hookGeneration, acquired_at: new Date().toISOString() });
-            if (registerHudHooksTransactionally(hookTarget, hookName, clientAttachedHookName, hudPaneId, options.hookGeneration)) {
+            const hookSessionBirth = runTmux(['show-options', '-qv', '-t', sessionName, OMX_INSTANCE_OPTION]);
+            const hookEvidence = createdHudPaneBirth && options.hookGeneration && hookSessionBirth.ok && hookSessionBirth.stdout.trim()
+              ? {
+                  sessionName,
+                  windowIndex,
+                  sessionBirth: hookSessionBirth.stdout.trim(),
+                  hudPaneId,
+                  hudPaneBirth: createdHudPaneBirth,
+                  ownerId: teamPaneOwnerId,
+                }
+              : null;
+            if (hookEvidence && registerHudHooksTransactionally(hookTarget, hookName, clientAttachedHookName, hudPaneId, options.hookGeneration, hookEvidence)) {
               resizeHookTarget = hookTarget;
               resizeHookName = hookName;
               registeredResizeHook = { name: resizeHookName, target: resizeHookTarget };
               registeredClientAttachedHook = { name: clientAttachedHookName, target: hookTarget };
+              registeredHudPaneId = hudPaneId;
+              for (const [event, hookCommand, hookId] of [
+                ['client-resized', buildRegisterResizeHookArgs(hookTarget, hookName, hudPaneId, HUD_TMUX_TEAM_HEIGHT_LINES, options.hookGeneration, hookEvidence)[5] ?? '', hookName],
+                ['client-attached', buildRegisterClientAttachedReconcileArgs(hookTarget, clientAttachedHookName, hudPaneId, HUD_TMUX_TEAM_HEIGHT_LINES, options.hookGeneration, hookEvidence)[5] ?? '', clientAttachedHookName],
+              ] as const) {
+                const observed = runTmux(['show-hooks', '-t', hookTarget, event]);
+                const receipt = observed.ok
+                  ? observed.stdout.split('\n').find((line) => line.includes(hookCommand))?.trim()
+                  : undefined;
+                // The appended record retains tmux's assigned numeric slot plus exact
+                // command for diagnosis only; teardown never consumes it as authority.
+                if (receipt) options.journalResource?.({ kind: 'hook', id: `${hookId}:${receipt.split(/\s+/, 1)[0]}`, created: true, command: receipt, acquired_at: new Date().toISOString() });
+              }
             } else {
               console.warn(
                 `[omx] tmux HUD hooks unavailable, occupied, or changed during registration for ${hookTarget}; `
@@ -2217,6 +2255,8 @@ export function createTeamSession(
       enableMouseScrolling(sessionName);
     }
 
+    const sessionBirth = runTmux(['show-options', '-qv', '-t', sessionName, OMX_INSTANCE_OPTION]);
+    if (!sessionBirth.ok || !sessionBirth.stdout.trim()) throw new Error(`failed to capture immutable tmux session birth for ${sessionName}`);
     return {
       name: teamTarget,
       workerCount,
@@ -2229,29 +2269,41 @@ export function createTeamSession(
         const birth = rollbackPaneBirths.get(paneId);
         return birth ? [[paneId, birth]] : [];
       })),
+      workerPaneCommands: Object.fromEntries(workerPaneIds.flatMap((paneId) => {
+        const command = workerPaneCommands.get(paneId);
+        return command ? [[paneId, command]] : [];
+      })),
       hudPaneBirth: createdHudPaneBirth,
+      hudPaneCommand: createdHudPaneCommand,
       resizeHookTarget,
       teamPaneOwnerId,
+      tmuxSessionName: sessionName,
+      tmuxSessionBirth: sessionBirth.stdout.trim(),
+      tmuxContext: teamTarget,
     };
   } catch (error) {
-    if (registeredClientAttachedHook) {
-      runTmux(
-        buildUnregisterClientAttachedReconcileArgs(
-          registeredClientAttachedHook.target,
-          registeredClientAttachedHook.name,
-        ),
+    if (registeredResizeHook && registeredClientAttachedHook && registeredHudPaneId) {
+      const removed = unregisterHudHooksTransactionally(
+        registeredResizeHook.target,
+        registeredResizeHook.name,
+        registeredClientAttachedHook.name,
+        registeredHudPaneId,
+        options.hookGeneration,
       );
-    }
-    if (registeredResizeHook) {
-      runTmux(buildUnregisterResizeHookArgs(registeredResizeHook.target, registeredResizeHook.name));
+      if (!removed) {
+        // Never issue an unconditional unset against a potentially newer hook generation.
+        console.warn('[omx] preserving Team HUD hook recovery metadata after rollback CAS failure');
+      }
     }
     // Every rollback candidate was tagged and read back before being journaled.
     // Revalidate its exact Team ownership and opaque per-pane birth in tmux itself;
     // a failed conditional kill deliberately retains the pane for recovery.
     for (const paneId of rollbackPaneIds) {
       const paneBirth = rollbackPaneBirths.get(paneId);
-      if (!rollbackOwnerSessionId || !rollbackTeamPaneOwnerId || !paneBirth) continue;
-      const condition = `#{&&:#{==:#{pane_id},${paneId}},#{==:#{@omx_pane_instance_id},${rollbackOwnerSessionId}},#{==:#{@omx_instance_id},${rollbackOwnerSessionId}},#{==:#{@omx_team_pane_owner_id},${rollbackTeamPaneOwnerId}},#{==:#{@omx_team_pane_birth},${paneBirth}}}`;
+      const role = rollbackPaneRoles.get(paneId);
+      const command = workerPaneCommands.get(paneId) ?? (role === 'hud' ? createdHudPaneCommand : null);
+      if (!rollbackOwnerSessionId || !rollbackTeamPaneOwnerId || !paneBirth || !role || !command) continue;
+      const condition = `#{&&:#{==:#{pane_id},${paneId}},#{==:#{pane_start_command},${command}},#{==:#{@omx_pane_instance_id},${rollbackOwnerSessionId}},#{==:#{@omx_instance_id},${rollbackOwnerSessionId}},#{==:#{@omx_team_pane_owner_id},${rollbackTeamPaneOwnerId}},#{==:#{@omx_team_pane_birth},${paneBirth}},#{==:#{@omx_team_pane_role},${role}}}`;
       runTmux(['if-shell', '-t', paneId, '-F', condition, `kill-pane -t ${paneId}`, '']);
     }
     throw error;
@@ -3107,9 +3159,11 @@ export interface PaneTeardownOptions {
   leaderPaneId?: string | null;
   hudPaneId?: string | null;
   graceMs?: number;
-  /** Team generation identity required for destructive worker cleanup. */
+  /** Only append-only lifecycle receipts may authorize a pane kill. */
+  workerReceipts?: Readonly<Record<string, TeamLifecycleResource>>;
   teamPaneOwnerId?: string | null;
   sessionName?: string | null;
+  sessionBirth?: string | null;
 }
 
 
@@ -3381,20 +3435,18 @@ export async function teardownWorkerPanes(
 
   const sessionName = options.sessionName?.trim().split(':')[0] ?? '';
   const teamOwnerId = options.teamPaneOwnerId?.trim() ?? '';
+  const sessionBirth = options.sessionBirth?.trim() ?? '';
   for (const paneId of killablePaneIds) {
-    // Snapshot opaque births, then have tmux compare every identity in the same
-    // server command that performs the kill. Re-used pane ids fail closed.
-    const paneBirth = readTeamPaneBirth(paneId);
-    const sessionBirthResult = sessionName
-      ? runTmux(['show-options', '-qv', '-t', sessionName, OMX_INSTANCE_OPTION])
-      : null;
-    const sessionBirth = sessionBirthResult?.ok ? sessionBirthResult.stdout.trim() : '';
-    if (!paneBirth || !sessionBirth || !sessionName || !teamOwnerId) {
+    // Do not turn a current observation into destruction authority: only the
+    // append-only receipt captured at creation is accepted.
+    const receipt = options.workerReceipts?.[paneId];
+    if (!receipt || receipt.kind !== 'worker' || receipt.id !== paneId || receipt.role !== 'worker'
+      || !receipt.pane_birth || !receipt.command || !sessionBirth || !sessionName || !teamOwnerId) {
       summary.kill.failed += 1;
       await sleep(perPaneGrace);
       continue;
     }
-    const condition = `#{&&:#{==:#{pane_id},${paneId}},#{==:#{session_name},${sessionName}},#{==:#{@omx_instance_id},${sessionBirth}},#{==:#{@omx_team_pane_owner_id},${teamOwnerId}},#{==:#{@omx_team_pane_birth},${paneBirth}},#{==:#{@omx_team_pane_role},worker}}`;
+    const condition = `#{&&:#{==:#{pane_id},${paneId}},#{==:#{pane_start_command},${receipt.command}},#{==:#{session_name},${sessionName}},#{==:#{@omx_instance_id},${sessionBirth}},#{==:#{@omx_team_pane_owner_id},${teamOwnerId}},#{==:#{@omx_team_pane_birth},${receipt.pane_birth}},#{==:#{@omx_team_pane_role},worker}}`;
     const result = await runTmuxAsync(['if-shell', '-t', paneId, '-F', condition, `kill-pane -t ${paneId}`, '']);
     if (result.ok) summary.kill.succeeded += 1;
     else summary.kill.failed += 1;

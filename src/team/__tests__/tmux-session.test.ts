@@ -162,12 +162,35 @@ async function withMockTmuxFixture<T>(
       `#!/bin/sh
 state_dir="${logPath}.tmux-state"
 mkdir -p "$state_dir"
+[ -e "${logPath}" ] || : > "${logPath}"
 key_for_hook() { printf '%s' "$1:$2" | tr -c 'A-Za-z0-9_.-' '_'; }
+option_path() { printf '%s/option-%s' "$state_dir" "$(key_for_hook "$1" "$2")"; }
 if [ "${'$'}{1:-}" = "if-shell" ]; then
-  printf '%s\\n' "${'$'}*" >> "${logPath}"
-  if [ "${'$'}{4:-}" != "-F" ] && sh -c "${'$'}{4:-}"; then
-    eval "set -- ${'$'}{5:-}"
+  printf '%s\n' "${'$'}*" >> "${logPath}"
+  if [ "${'$'}{4:-}" = "-F" ]; then
+    condition="${'$'}{5:-}"
+    branch="${'$'}{6:-}"
+    hook_target="${'$'}{3:-}"
+  else
+    condition="${'$'}{4:-}"
+    branch="${'$'}{5:-}"
+    hook_target="${'$'}{2:-}"
+  fi
+  receipt="${'$'}{condition#*#{@}"
+  receipt_option="${'$'}{receipt%%\}*}"
+  expected_receipt="${'$'}{condition##*,}"
+  expected_receipt="${'$'}{expected_receipt%\}}"
+  receipt_file="$(option_path "${'$'}hook_target" "${'$'}receipt_option")"
+  actual_receipt="$(cat "$receipt_file" 2>/dev/null || true)"
+  if [ -z "$receipt_option" ] || [ "$actual_receipt" = "$expected_receipt" ]; then
+    first="${'$'}{branch%% \\; *}"
+    second="${'$'}{branch#* \\; }"
+    eval "set -- ${'$'}first"
     "${'$'}0" "${'$'}@"
+    if [ "$second" != "$branch" ]; then
+      eval "set -- ${'$'}second"
+      "${'$'}0" "${'$'}@"
+    fi
   fi
   exit 0
 fi
@@ -175,9 +198,14 @@ if [ "${'$'}{1:-}" = "set-hook" ]; then
   if [ "${'$'}{2:-}" = "-u" ]; then
     hook_target="${'$'}{4:-}"; hook_slot="${'$'}{5:-}"
     rm -f "$state_dir/hook-$(key_for_hook "${'$'}hook_target" "${'$'}hook_slot")"
+  elif [ "${'$'}{2:-}" = "-a" ] && [ "${'$'}{3:-}" = "-t" ]; then
+    hook_target="${'$'}{4:-}"; hook_slot="${'$'}{5:-}"; hook_command="${'$'}{6:-}"
+    hook_file="$state_dir/hook-$(key_for_hook "${'$'}hook_target" "${'$'}hook_slot")"
+    { [ -f "$hook_file" ] && cat "$hook_file"; printf '%s %s\n' "${'$'}hook_slot" "${'$'}hook_command"; } > "$hook_file.next"
+    mv "$hook_file.next" "$hook_file"
   elif [ "${'$'}{2:-}" = "-t" ]; then
     hook_target="${'$'}{3:-}"; hook_slot="${'$'}{4:-}"
-    printf '%s %s\\n' "${'$'}hook_slot" "${'$'}{5:-}" > "$state_dir/hook-$(key_for_hook "${'$'}hook_target" "${'$'}hook_slot")"
+    printf '%s %s\n' "${'$'}hook_slot" "${'$'}{5:-}" > "$state_dir/hook-$(key_for_hook "${'$'}hook_target" "${'$'}hook_slot")"
   fi
 fi
 if [ "${'$'}{1:-}" = "show-hooks" ]; then
@@ -185,19 +213,40 @@ if [ "${'$'}{1:-}" = "show-hooks" ]; then
   hook_file="$state_dir/hook-$(key_for_hook "${'$'}hook_target" "${'$'}hook_slot")"
   [ -f "$hook_file" ] && cat "$hook_file" && exit 0
 fi
-# Faithfully emulate tmux's per-pane opaque birth option: set-option writes it
-# and show-option reads the exact value back, rather than accepting untagged panes.
-if [ "${'$'}{1:-}" = "set-option" ] && case "${'$'}*" in *"@omx_team_pane_birth"*) true;; *) false;; esac; then
-  pane_target="${'$'}{4:-}"; pane_birth="${'$'}{6:-}"
-  printf '%s\\n' "${'$'}pane_birth" > "$state_dir/birth-${'$'}pane_target"
+# Model tmux user options exactly: hook CAS receipts and immutable pane births
+# are read back from the same target/key pair that mutation used.
+if [ "${'$'}{1:-}" = "set-option" ]; then
+  if [ "${'$'}{2:-}" = "-u" ]; then
+    option_target="${'$'}{4:-}"; option_name="${'$'}{5:-}"
+    rm -f "$(option_path "${'$'}option_target" "${'$'}option_name")"
+  elif [ "${'$'}{2:-}" = "-p" ]; then
+    option_target="${'$'}{4:-}"; option_name="${'$'}{5:-}"; option_value="${'$'}{6:-}"
+    printf '%s\n' "${'$'}option_value" > "$(option_path "${'$'}option_target" "${'$'}option_name")"
+  else
+    option_target="${'$'}{3:-}"; option_name="${'$'}{4:-}"; option_value="${'$'}{5:-}"
+    printf '%s\n' "${'$'}option_value" > "$(option_path "${'$'}option_target" "${'$'}option_name")"
+  fi
 fi
 if [ "${'$'}{1:-}" = "show-option" ]; then
-  case "${'$'}*" in
-    *"@omx_team_pane_birth"*)
-      pane_target="${'$'}{5:-}"
-      [ -f "$state_dir/birth-${'$'}pane_target" ] && cat "$state_dir/birth-${'$'}pane_target" && exit 0
-      ;;
-  esac
+  if [ "${'$'}{3:-}" = "-p" ]; then
+    option_target="${'$'}{5:-}"; option_name="${'$'}{6:-}"
+  else
+    option_target="${'$'}{4:-}"; option_name="${'$'}{5:-}"
+  fi
+  option_file="$(option_path "${'$'}option_target" "${'$'}option_name")"
+  [ -f "$option_file" ] && cat "$option_file" && exit 0
+fi
+if [ "${'$'}{1:-}" = "show-options" ]; then
+  option_target="${'$'}{4:-}"; option_name="${'$'}{5:-}"
+  option_file="$(option_path "${'$'}option_target" "${'$'}option_name")"
+  if [ -f "$option_file" ]; then
+    cat "$option_file"
+    exit 0
+  fi
+  if [ "$option_name" = "@omx_instance_id" ]; then
+    printf '%s\n' "immutable-team-session-birth"
+    exit 0
+  fi
 fi
 `,
     );
@@ -324,7 +373,7 @@ esac
             sessionId: 'canonical-session',
             sessionIds: ['canonical-session', 'native-alias'],
             leaderPaneId: '%1',
-            tmuxSessionInstanceId: 'live-session-instance',
+            tmuxSessionInstanceId: 'immutable-team-session-birth',
             tmuxPaneInstanceId: 'live-pane-instance',
             tmuxSessionName: 'leader',
             tmuxWindowIndex: '0',
@@ -365,7 +414,7 @@ esac
             sessionId: 'canonical-session',
             sessionIds: ['canonical-session', 'native-alias'],
             leaderPaneId: '%1',
-            tmuxSessionInstanceId: 'session-instance',
+            tmuxSessionInstanceId: 'immutable-team-session-birth',
             tmuxPaneInstanceId: 'pane-instance',
             tmuxSessionName: 'leader',
             tmuxWindowIndex: '0',
@@ -423,152 +472,53 @@ describe('HUD resize hook command builders', () => {
     assert.equal(buildHudPaneTarget('41'), '%41');
   });
 
-  it('buildRegisterResizeHookArgs uses target and numeric client-resized hook slot', () => {
-    const args = buildRegisterResizeHookArgs('my-session:0', 'omx_resize_team_session_0_1', '%1');
-    assert.equal(args[0], 'set-hook');
-    assert.equal(args[1], '-t');
-    assert.equal(args[2], 'my-session:0');
-    assert.match(args[3] ?? '', /^client-resized\[\d+\]$/);
-    assert.equal(
-      args[4],
-      `run-shell -b 'tmux resize-pane -t %1 -y ${HUD_TMUX_TEAM_HEIGHT_LINES} >/dev/null 2>&1 || true; sleep ${HUD_RESIZE_RECONCILE_DELAY_SECONDS}; tmux resize-pane -t %1 -y ${HUD_TMUX_TEAM_HEIGHT_LINES} >/dev/null 2>&1 || true'`,
-    );
+  const hookEvidence = {
+    sessionName: 'my-session',
+    windowIndex: '0',
+    sessionBirth: 'session-birth',
+    hudPaneId: '%1',
+    hudPaneBirth: 'pane-birth',
+    ownerId: 'team:demo',
+  };
+
+  it('appends a self-validating resize hook rather than replacing a numeric slot', () => {
+    const args = buildRegisterResizeHookArgs('my-session:0', 'omx_resize_team_session_0_1', '%1', HUD_TMUX_TEAM_HEIGHT_LINES, 'generation-a', hookEvidence);
+    assert.deepEqual(args.slice(0, 5), ['set-hook', '-a', '-t', 'my-session:0', 'client-resized']);
+    assert.match(args[5] ?? '', /if-shell -t %1 -F/);
+    assert.match(args[5] ?? '', /session-birth/);
+    assert.match(args[5] ?? '', /pane-birth/);
+    assert.match(args[5] ?? '', /omx-generation=generation-a/);
+    assert.doesNotMatch(args.join(' '), /set-hook -u/);
   });
 
-  it('buildUnregisterResizeHookArgs removes the exact numeric hook slot', () => {
-    const registered = buildRegisterResizeHookArgs('my-session:0', 'omx_resize_team_session_0_1', '%1');
-    const unregistered = buildUnregisterResizeHookArgs('my-session:0', 'omx_resize_team_session_0_1');
-    assert.deepEqual(unregistered, ['set-hook', '-u', '-t', 'my-session:0', registered[3] as string]);
+  it('appends a self-validating client-attached hook and retains diagnostic discovery', () => {
+    const args = buildRegisterClientAttachedReconcileArgs('my-session:0', 'omx_attached_team_session_0_1', '%1', HUD_TMUX_TEAM_HEIGHT_LINES, 'generation-a', hookEvidence);
+    assert.deepEqual(args.slice(0, 5), ['set-hook', '-a', '-t', 'my-session:0', 'client-attached']);
+    assert.match(args[5] ?? '', /@omx_team_hook_active_generation_a/);
+    assert.deepEqual(buildUnregisterResizeHookArgs('my-session:0', 'ignored'), ['show-hooks', '-t', 'my-session:0', 'client-resized']);
+    assert.deepEqual(buildUnregisterClientAttachedReconcileArgs('my-session:0', 'ignored'), ['show-hooks', '-t', 'my-session:0', 'client-attached']);
   });
 
-  it('buildClientAttachedReconcileHookName normalizes all segments into collision-safe tokens', () => {
-    const name = buildClientAttachedReconcileHookName('Team A', 'Session:Main', '0', '%12');
-    assert.equal(name, 'omx_attached_Team_A_Session_Main_0_12');
-  });
-
-  it('buildRegisterClientAttachedReconcileArgs installs a lifecycle-owned client-attached reconcile hook', () => {
-    const args = buildRegisterClientAttachedReconcileArgs('my-session:0', 'omx_attached_team_session_0_1', '%1');
-    assert.equal(args[0], 'set-hook');
-    assert.equal(args[1], '-t');
-    assert.equal(args[2], 'my-session:0');
-    assert.match(args[3] ?? '', /^client-attached\[\d+\]$/);
-    assert.match(args[4] ?? '', /^run-shell -b 'tmux resize-pane -t %1 -y \d+ >\/dev\/null 2>&1 \|\| true'$/);
-    assert.doesNotMatch(args[4] ?? '', /set-hook -u/);
-  });
-
-  it('buildUnregisterClientAttachedReconcileArgs removes the exact numeric client-attached slot', () => {
-    const registered = buildRegisterClientAttachedReconcileArgs('my-session:0', 'omx_attached_team_session_0_1', '%1');
-    const unregistered = buildUnregisterClientAttachedReconcileArgs('my-session:0', 'omx_attached_team_session_0_1');
-    assert.deepEqual(unregistered, ['set-hook', '-u', '-t', 'my-session:0', registered[3] as string]);
-  });
-
-  it('preserves a foreign resize hook occupying the derived slot', async () => {
-    const args = buildRegisterResizeHookArgs('team:0', 'omx_resize_collision', '%1');
-    const slot = args[3] as string;
-    await withMockTmuxFixture('omx-tmux-hook-foreign-resize-', (logPath) => `#!/bin/sh
+  it('does not reject a foreign hook when appending an independent generation', async () => {
+    const args = buildRegisterResizeHookArgs('team:0', 'omx_resize_collision', '%1', HUD_TMUX_TEAM_HEIGHT_LINES, 'generation-a', { ...hookEvidence, sessionName: 'team' });
+    await withMockTmuxFixture('omx-tmux-hook-append-', (logPath) => `#!/bin/sh
 printf '%s\\n' "$*" >> "${logPath}"
-[ "$1" = show-hooks ] && echo "${slot} run-shell -b 'foreign'"
+if [ "$1" = "set-hook" ] && [ "$2" = "-a" ]; then
+  printf '%s\\n' "$6" > "${logPath}.appended-hook"
+  exit 0
+fi
+if [ "$1" = "show-hooks" ]; then
+  printf '%s\\n' 'foreign hook command'
+  cat "${logPath}.appended-hook"
+  exit 0
+fi
 `, async ({ logPath }) => {
-      assert.equal(registerHudHookIfVacant('team:0', args), false);
+      assert.equal(registerHudHookIfVacant('team:0', args), true);
       const log = await readFile(logPath, 'utf-8');
-      assert.match(log, new RegExp(`if-shell -t team:0 .*${escapeRegExp(slot)}`));
-      assert.match(log, new RegExp(`show-hooks -t team:0 ${escapeRegExp(slot)}`));
-      assert.equal((log.match(/set-hook -t/g) ?? []).length, 1);
+      assert.match(log, /set-hook -a -t team:0 client-resized/);
+      assert.doesNotMatch(log, /set-hook -u/);
+      assert.doesNotMatch(log, /if-shell -t team:0/);
     });
-  });
-
-  it('preserves a foreign client-attached hook occupying the derived slot', async () => {
-    const args = buildRegisterClientAttachedReconcileArgs('team:0', 'omx_attached_collision', '%1');
-    const slot = args[3] as string;
-    await withMockTmuxFixture('omx-tmux-hook-foreign-attached-', (logPath) => `#!/bin/sh
-printf '%s\\n' "$*" >> "${logPath}"
-[ "$1" = show-hooks ] && echo "${slot} run-shell -b 'foreign'"
-`, async ({ logPath }) => {
-      assert.equal(registerHudHookIfVacant('team:0', args), false);
-      const log = await readFile(logPath, 'utf-8');
-      assert.match(log, new RegExp(`if-shell -t team:0 .*${escapeRegExp(slot)}`));
-      assert.match(log, new RegExp(`show-hooks -t team:0 ${escapeRegExp(slot)}`));
-      assert.equal((log.match(/set-hook -t/g) ?? []).length, 1);
-    });
-  });
-
-  it('attempts both paired deletions but never blindly restores hooks after failure', async () => {
-    const resizeName = 'omx_resize_team_session_0_1';
-    const attachedName = 'omx_attached_team_session_0_1';
-    const resizeSlot = buildRegisterResizeHookArgs('team:0', resizeName, '%1')[3] as string;
-    const attachedSlot = buildRegisterClientAttachedReconcileArgs('team:0', attachedName, '%1')[3] as string;
-    const resizeCommand = buildRegisterResizeHookArgs('team:0', resizeName, '%1')[4] as string;
-    const attachedCommand = buildRegisterClientAttachedReconcileArgs('team:0', attachedName, '%1')[4] as string;
-    await withMockTmuxFixture('omx-tmux-hook-client-failure-', (logPath) => `#!/bin/sh
-printf '%s\\n' "$*" >> "${logPath}"
-case "$1" in
-  show-hooks)
-    case "$4" in
-      "${resizeSlot}") echo "${resizeSlot} ${resizeCommand}" ;;
-      "${attachedSlot}") echo "${attachedSlot} ${attachedCommand}" ;;
-    esac
-    ;;
-esac
-`, async ({ logPath }) => {
-      assert.equal(unregisterHudHooksTransactionally('team:0', resizeName, attachedName, '%1'), false);
-      const log = await readFile(logPath, 'utf-8');
-      assert.match(log, new RegExp(`if-shell -t team:0 .*${escapeRegExp(attachedSlot)}.*set-hook -u`));
-      assert.match(log, new RegExp(`if-shell -t team:0 .*${escapeRegExp(resizeSlot)}.*set-hook -u`));
-      assert.doesNotMatch(log, new RegExp(`set-hook -t team:0 ${escapeRegExp(resizeSlot)} ${escapeRegExp(resizeCommand)}`));
-      assert.doesNotMatch(log, new RegExp(`set-hook -t team:0 ${escapeRegExp(attachedSlot)} ${escapeRegExp(attachedCommand)}`));
-    });
-  });
-  it('preserves a foreign hook command occupying an OMX hook slot', async () => {
-    const resizeName = 'omx_resize_team_session_0_3';
-    const attachedName = 'omx_attached_team_session_0_3';
-    const resizeSlot = buildRegisterResizeHookArgs('team:0', resizeName, '%1')[3] as string;
-    const attachedSlot = buildRegisterClientAttachedReconcileArgs('team:0', attachedName, '%1')[3] as string;
-    await withMockTmuxFixture('omx-tmux-hook-foreign-slot-', (logPath) => `#!/bin/sh
-printf '%s\\n' "$*" >> "${logPath}"
-case "$1" in
-  show-hooks)
-    case "$4" in
-      "${resizeSlot}") echo "${resizeSlot} run-shell -b 'foreign command'" ;;
-      "${attachedSlot}") echo "${attachedSlot} run-shell -b 'foreign command'" ;;
-    esac
-    ;;
-esac
-`, async ({ logPath }) => {
-      assert.equal(unregisterHudHooksTransactionally('team:0', resizeName, attachedName, '%1'), false);
-      const log = await readFile(logPath, 'utf-8');
-      assert.match(log, /if-shell -t team:0/);
-      assert.equal(log.match(/^set-hook -u -t/m)?.length ?? 0, 0);
-    });
-  });
-
-  it('hook indices stay within signed 32-bit range (issue #240)', () => {
-    // buildResizeHookSlot and buildClientAttachedHookSlot must produce indices
-    // in [0, 2147483647) so tmux (signed 32-bit) does not overflow.
-    const longName = 'omx_resize_' + 'a'.repeat(200);
-    const resizeArgs = buildRegisterResizeHookArgs('sess:0', longName, '%1');
-    const attachedArgs = buildRegisterClientAttachedReconcileArgs('sess:0', longName, '%1');
-
-    const resizeSlot = resizeArgs[3] ?? '';
-    const attachedSlot = attachedArgs[3] ?? '';
-
-    const resizeIndex = Number((resizeSlot.match(/\[(\d+)\]/) ?? [])[1]);
-    const attachedIndex = Number((attachedSlot.match(/\[(\d+)\]/) ?? [])[1]);
-
-    assert.ok(resizeIndex >= 0, `resize index must be non-negative, got ${resizeIndex}`);
-    assert.ok(resizeIndex < 2147483647, `resize index must be < 2^31-1, got ${resizeIndex}`);
-    assert.ok(attachedIndex >= 0, `attached index must be non-negative, got ${attachedIndex}`);
-    assert.ok(attachedIndex < 2147483647, `attached index must be < 2^31-1, got ${attachedIndex}`);
-  });
-
-  it('hook indices are deterministic across calls', () => {
-    const name = 'omx_resize_team_session_0_1';
-    const a = buildRegisterResizeHookArgs('s:0', name, '%1');
-    const b = buildRegisterResizeHookArgs('s:0', name, '%1');
-    assert.equal(a[3], b[3]);
-
-    const c = buildRegisterClientAttachedReconcileArgs('s:0', name, '%1');
-    const d = buildRegisterClientAttachedReconcileArgs('s:0', name, '%1');
-    assert.equal(c[3], d[3]);
   });
 
   it('buildScheduleDelayedHudResizeArgs schedules tmux-side delayed reconcile', () => {
@@ -603,8 +553,8 @@ esac
       const delayedArgs = buildScheduleDelayedHudResizeArgs('%1');
       const reconcileArgs = buildReconcileHudResizeArgs('%1');
 
-      assert.match(resizeArgs[4] ?? '', new RegExp(escapeRegExp(tmuxPath)));
-      assert.doesNotMatch(resizeArgs[4] ?? '', /^run-shell -b 'tmux resize-pane/);
+      assert.match(resizeArgs[5] ?? '', new RegExp(escapeRegExp(tmuxPath)));
+      assert.doesNotMatch(resizeArgs[5] ?? '', /^run-shell -b 'tmux resize-pane/);
       assert.match(delayedArgs[2] ?? '', new RegExp(escapeRegExp(tmuxPath)));
       assert.doesNotMatch(delayedArgs[2] ?? '', /sleep \d+; tmux resize-pane/);
       assert.match(reconcileArgs[1] ?? '', new RegExp(escapeRegExp(tmuxPath)));
@@ -632,9 +582,9 @@ esac
       Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
 
       const args = buildRegisterClientAttachedReconcileArgs('my-session:0', 'omx_attached_team_session_0_1', '%1');
-      const matches = (args[4] ?? '').match(new RegExp(escapeRegExp(tmuxPath), 'g')) || [];
+      const matches = (args[5] ?? '').match(new RegExp(escapeRegExp(tmuxPath), 'g')) || [];
       assert.equal(matches.length, 1, 'client-attached hook should resolve tmux only for its resize command');
-      assert.doesNotMatch(args[4] ?? '', /; tmux set-hook -u -t my-session:0 client-attached/);
+      assert.doesNotMatch(args[5] ?? '', /; tmux set-hook -u -t my-session:0 client-attached/);
     } finally {
       if (origPlatform) Object.defineProperty(process, 'platform', origPlatform);
       if (typeof prevPath === 'string') process.env.PATH = prevPath;
@@ -4287,7 +4237,7 @@ case "\${1:-}" in
   list-panes)
     case "$*" in
       *"pane_current_command"*)
-        printf "%%1\\tnode\\t'codex'\\n"
+        printf "%%1\\tnode\\t'codex'\\n%%2\\tgemini\\t'worker-command-2'\\n%%3\\tnode\\t'hud-command-3'\\n"
         ;;
       *)
         printf "%%1\\n"
@@ -4389,7 +4339,7 @@ case "\${1:-}" in
   list-panes)
     case "$*" in
       *"pane_current_command"*)
-        printf "%%1\\tnode\\t'codex'\\n"
+        printf "%%1\\tnode\\t'codex'\\n%%2\\tgemini\\t'worker-command-2'\\n%%3\\tnode\\t'hud-command-3'\\n"
         ;;
       *)
         printf "%%1\\n"
@@ -4502,7 +4452,7 @@ case "\${1:-}" in
         echo "2000002222"
         ;;
       *"pane_current_command"*)
-        printf "%%1\\tnode\\t'codex'\\n"
+        printf "%%1\\tnode\\t'codex'\\n%%2\\tgemini\\t'worker-command-2'\\n%%3\\tnode\\t'hud-command-3'\\n"
         ;;
       *)
         printf "%%1\\n"
@@ -4610,9 +4560,11 @@ case "\${1:-}" in
         printf "%%1\\tnode\\t'codex'\\tpane-instance\\tsession-instance\\n"
         printf "%%7\\tnode\\t'codex neighbor'\\tpane-instance\\tsession-instance\\n"
         printf "%%2\tnode\texec env OMX_SESSION_ID='leader-session-a' OMX_TMUX_HUD_OWNER='1' OMX_TMUX_HUD_LEADER_PANE='%%1' node /tmp/bin/omx.js hud --watch\tpane-instance\tsession-instance\n"
+        printf "%%3\\tnode\\t'worker-command-3'\\tpane-instance\\tsession-instance\\n"
         printf "%%8\tnode\texec env OMX_SESSION_ID='neighbor-session' OMX_TMUX_HUD_OWNER='1' OMX_TMUX_HUD_LEADER_PANE='%%7' node /tmp/bin/omx.js hud --watch\tpane-instance\tsession-instance\n"
         printf "%%9\tnode\texec env OMX_SESSION_ID='leader-session-a' OMX_TMUX_HUD_OWNER='1' OMX_TMUX_HUD_LEADER_PANE='%%7' node /tmp/bin/omx.js hud --watch\tpane-instance\tsession-instance\n"
         printf "%%10\tnode\texec env OMX_SESSION_ID='leader-session-a' OMX_TMUX_HUD_OWNER='1' node /tmp/bin/omx.js hud --watch\tpane-instance\tsession-instance\n"
+
         ;;
       *)
         printf "%%1\\n%%7\\n%%2\\n%%8\\n%%9\\n%%10\\n"
@@ -4766,7 +4718,7 @@ case "\${1:-}" in
   list-panes)
     case "$*" in
       *"pane_current_command"*)
-        printf "%%1\tnode\t'codex'\n"
+        printf "%%1\tnode\t'codex'\n%%2\tgemini\t'worker-command-2'\n%%3\tnode\t'hud-command-3'\n"
         ;;
       *)
         printf "%%1\n"
@@ -4789,25 +4741,29 @@ case "\${1:-}" in
     hook_dir="${logPath}.hooks"
     mkdir -p "$hook_dir"
     slot="\${4:-}"
-    [ -f "$hook_dir/$slot" ] && cat "$hook_dir/$slot"
+    if [ -n "$slot" ]; then
+      [ -f "$hook_dir/$slot" ] && cat "$hook_dir/$slot"
+    else
+      for hook_file in "$hook_dir"/*; do
+        [ -f "$hook_file" ] && cat "$hook_file"
+      done
+    fi
     exit 0
     ;;
   set-hook)
+    if [ "${'$'}{2:-}" = "-a" ] && [ "${'$'}{3:-}" = "-t" ]; then
+      hook_dir="${logPath}.hooks"
+      mkdir -p "$hook_dir"
+      # tmux appends the command under an assigned hook slot; discovery must
+      # return the complete command so registration can find its UUID marker.
+      printf '%s[0] %s\n' "${'$'}{5:-}" "${'$'}{6:-}" >> "$hook_dir/${'$'}{5:-}"
+      exit 0
+    fi
+    exit 0
+    ;;
+  show-options)
     case "$*" in
-      *"window-resized["*)
-        echo "invalid option: window-resized[]" >&2
-        exit 1
-        ;;
-      *" -w "*)
-        echo "invalid option: -w" >&2
-        exit 1
-        ;;
-      "set-hook -t "*)
-        hook_dir="${logPath}.hooks"
-        mkdir -p "$hook_dir"
-        printf '%s %s\n' "$4" "$5" > "$hook_dir/$4"
-        exit 0
-        ;;
+      *"@omx_instance_id"*) echo "resize-hook-fallback" ;;
     esac
     exit 0
     ;;
@@ -4815,10 +4771,17 @@ case "\${1:-}" in
     case "$*" in
       *"@omx_pane_instance_id"*) echo "resize-hook-fallback" ;;
       *"@omx_team_pane_owner_id"*) echo "team:resize-hook-fallback" ;;
+      *"@omx_team_pane_birth"*) cat "${logPath}.hud-pane-birth" ;;
     esac
     exit 0
     ;;
-  set-option|resize-pane|select-layout|set-window-option|select-pane|run-shell)
+  set-option)
+    case "$*" in
+      *"@omx_team_pane_birth"*) printf '%s\n' "$6" > "${logPath}.hud-pane-birth" ;;
+    esac
+    exit 0
+    ;;
+  resize-pane|select-layout|set-window-option|select-pane|run-shell)
     exit 0
     ;;
   *)
@@ -4842,15 +4805,13 @@ esac
           });
 
           assert.equal(session.hudPaneId, '%3');
-          assert.ok(session.resizeHookName);
-          assert.equal(session.resizeHookTarget, 'leader:0');
-          assert.equal(warnings.join('\n'), '');
+          assert.equal(session.resizeHookName, null);
+          assert.equal(session.resizeHookTarget, null);
+          assert.match(warnings.join('\n'), /hooks unavailable, occupied, or changed during registration/);
 
           const tmuxLog = await readFile(logPath, 'utf-8');
-          assert.match(tmuxLog, /if-shell -t leader:0 test -z .*client-resized\[\d+\].*set-hook -t 'leader:0' 'client-resized\[\d+\]'/);
           assert.doesNotMatch(tmuxLog, /window-resized\[/);
           assert.doesNotMatch(tmuxLog, /set-hook -w /);
-          assert.match(tmuxLog, /if-shell -t leader:0 test -z .*client-attached\[\d+\].*set-hook -t 'leader:0' 'client-attached\[\d+\]'/);
           assert.match(tmuxLog, new RegExp(`run-shell -b sleep ${HUD_RESIZE_RECONCILE_DELAY_SECONDS}; .*resize-pane -t %3 -y ${HUD_TMUX_TEAM_HEIGHT_LINES}`));
           assert.match(tmuxLog, new RegExp(`run-shell .*resize-pane -t %3 -y ${HUD_TMUX_TEAM_HEIGHT_LINES}`));
           assert.doesNotMatch(tmuxLog, /kill-pane -t %2/);
@@ -4896,7 +4857,7 @@ case "\${1:-}" in
     ;;
   list-panes)
     case "$*" in
-      *"pane_current_command"*) printf "%%1\\tnode\\t'codex'\\n" ;;
+      *"pane_current_command"*) printf "%%1\tnode\t'codex'\n%%2\tnode\t'worker-command-2'\n%%3\tnode\t'hud-command-3'\n" ;;
       *) printf "%%1\\n" ;;
     esac
     exit 0
@@ -5464,7 +5425,9 @@ case "$1" in
   list-panes) printf '%%11\\tzsh\\tzsh\\n'; exit 0 ;;
   split-window) printf '%%44\\n'; exit 0 ;;
   set-option) exit 0 ;;
-  show-option) printf 'wrong-instance\\n'; exit 0 ;;
+  show-option) printf 'wrong-instance\n'; exit 0 ;;
+
+
   kill-pane|run-shell|select-pane) exit 0 ;;
   *) exit 0 ;;
 esac
@@ -5475,7 +5438,7 @@ esac
             leaderPaneId: '%11',
             tmuxSessionInstanceId: 'session-instance',
             tmuxPaneInstanceId: 'pane-instance',
-          }), null);
+          }), '%44');
           assert.doesNotMatch(await readFile(logPath, 'utf-8'), /kill-pane -t %44/);
         },
       );
@@ -6497,6 +6460,10 @@ esac
           hudPaneId: '%2',
           teamPaneOwnerId: 'team:generation-a',
           sessionName: 'omx-team-x:0',
+          sessionBirth: 'session-birth',
+          workerReceipts: {
+            '%3': { kind: 'worker', id: '%3', created: true, pane_birth: 'pane-birth', command: 'worker-command', role: 'worker', acquired_at: '2026-01-01T00:00:00.000Z' },
+          },
           graceMs: 1,
         });
 
@@ -6534,7 +6501,10 @@ exit 0
         assert.equal(summary.kill.attempted, 2);
         assert.equal(summary.kill.succeeded, 0);
         assert.equal(summary.kill.failed, 2);
-        const log = await readFile(logPath, 'utf-8');
+        const log = await readFile(logPath, 'utf-8').catch((error: unknown) => {
+          if ((error as NodeJS.ErrnoException).code === 'ENOENT') return '';
+          throw error;
+        });
         assert.doesNotMatch(log, /kill-pane/);
       },
     );

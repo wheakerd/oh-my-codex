@@ -57,11 +57,11 @@ describe('exact HUD pane destruction', () => {
       paneInstanceId: 'pane-birth',
       sessionInstanceId: 'session-birth',
       sessionName: 'managed',
-    }, (args) => { calls.push(args); return ''; }), true);
+    }, (args) => { calls.push(args); return '__omx_hud_pane_kill_applied__\n'; }), true);
     assert.deepEqual(calls, [[
       'if-shell', '-t', '%2', '-F',
       `#{&&:#{==:#{pane_id},%2},#{==:#{pane_current_command},node},#{==:#{pane_start_command},${startCommand}},#{==:#{@omx_pane_instance_id},pane-birth},#{==:#{@omx_instance_id},session-birth},#{==:#{session_name},managed}}`,
-      'kill-pane -t %2', '',
+      'kill-pane -t %2 \\; display-message -p __omx_hud_pane_kill_applied__', 'display-message -p __omx_hud_pane_kill_rejected__',
     ]]);
   });
 
@@ -77,6 +77,19 @@ describe('exact HUD pane destruction', () => {
       sessionName: 'managed',
     }, (args) => { calls.push(args); return ''; }), false);
     assert.deepEqual(calls, []);
+  });
+
+  it('reports a server-side false branch as no destruction', () => {
+    const startCommand = `exec env OMX_SESSION_ID='session-a' OMX_TMUX_HUD_OWNER='1' ${OMX_TMUX_HUD_LEADER_PANE_ENV}='%1' node /repo/omx.js hud --watch`;
+    assert.equal(killExactHudPane({
+      paneId: '%2',
+      currentCommand: 'node',
+      startCommand,
+      owner: { sessionId: 'session-a', leaderPaneId: '%1' },
+      paneInstanceId: 'pane-birth',
+      sessionInstanceId: 'session-birth',
+      sessionName: 'managed',
+    }, () => '__omx_hud_pane_kill_rejected__\n'), false);
   });
 });
 describe('HUD resize hook helpers', () => {
@@ -121,154 +134,56 @@ describe('HUD resize hook helpers', () => {
     assert.equal(parseHudResizeHookContext('$7\t@3\n', '%1; touch /tmp/owned'), null);
   });
 
-  function statefulHooks(options: {
-    failSlot?: string;
-    beforeConditionalMutation?: (slot: string, hooks: Map<string, string>) => void;
-  } = {}) {
-    const hooks = new Map<string, string>();
+  function appendOnlyHooks() {
+    const hooks = new Map<string, string[]>();
     const calls: string[][] = [];
-    const parseTmuxCommand = (command: string): string[] => {
-      const parts: string[] = [];
-      let part = '';
-      let tokenStarted = false;
-      let quote: "'" | '"' | null = null;
-      for (let index = 0; index < command.length; index += 1) {
-        const char = command[index]!;
-        if (quote) {
-          if (char === quote) {
-            quote = null;
-          } else if (char === '\\' && quote === '"' && command[index + 1] !== undefined) {
-            part += command[index + 1]!;
-            index += 1;
-          } else {
-            part += char;
-          }
-        } else if (char === "'" || char === '"') {
-          quote = char;
-          tokenStarted = true;
-        } else if (char === '\\' && command[index + 1] !== undefined) {
-          part += command[index + 1]!;
-          tokenStarted = true;
-          index += 1;
-        } else if (/\s/.test(char)) {
-          if (tokenStarted) parts.push(part);
-          part = '';
-          tokenStarted = false;
-        } else {
-          part += char;
-          tokenStarted = true;
-        }
-      }
-      if (tokenStarted) parts.push(part);
-      return parts;
-    };
     const exec = (args: string[]): string => {
       calls.push(args);
-      if (args[0] === 'display-message') return '$7\t@3\n';
-      if (args[0] === 'show-hooks') {
-        const command = hooks.get(args[3]!);
-        return command ? `${args[3]} ${command}\n` : '';
+      if (args[0] === 'display-message' && args.at(-1) === '#{session_id}\t#{window_id}') return '$7\t@3\n';
+      if (args[0] === 'display-message' && args.at(-1) === '#{@omx_pane_instance_id}\t#{@omx_instance_id}\t#{session_name}') return 'pane-birth\tsession-birth\tmanaged\n';
+      if (args[0] === 'set-hook' && args[1] === '-a') {
+        const event = args[4]!;
+        hooks.set(event, [...(hooks.get(event) ?? []), args[5]!]);
+        return '';
       }
-      if (args[0] === 'if-shell') {
-        const condition = parseTmuxCommand(args[3]!);
-        const mutation = parseTmuxCommand(args[4]!);
-        const slot = mutation[mutation[1] === '-u' ? 4 : 3]!;
-        options.beforeConditionalMutation?.(slot, hooks);
-        if (slot === options.failSlot) throw new Error('injected hook failure');
-        const expectedOutput = condition.at(-1);
-        const actualOutput = hooks.has(slot) ? `${slot} ${hooks.get(slot)!}` : '';
-        if (expectedOutput !== actualOutput) return '';
-        if (mutation[1] === '-u') {
-          hooks.delete(slot);
-        } else {
-          hooks.set(slot, mutation[4]!);
-        }
-      }
+      if (args[0] === 'show-hooks') return (hooks.get(args[3]!) ?? []).map((command, index) => `${args[3]}[${index}] ${command}`).join('\n');
       return '';
     };
     return { hooks, calls, exec };
   }
 
-  it('installs a vacant paired hook set with mandatory readback and exact pane commands', () => {
-    const fixture = statefulHooks();
+  it('appends a self-validating paired hook generation without touching existing hooks', () => {
+    const fixture = appendOnlyHooks();
+    fixture.hooks.set('client-resized', ['run-shell -b foreign']);
     assert.equal(registerHudResizeHook('%9', '%1', 3, { cwd: '/repo', env: { TMUX: '/tmp/tmux' } }, fixture.exec), true);
-    const resizeSlot = buildHudResizeHookSlot('omx_hud_resize_7_3_1');
-    const layoutSlot = buildHudLayoutHookSlot('omx_hud_resize_7_3_1');
-    assert.match(fixture.hooks.get(resizeSlot) ?? '', /resize-pane.*%9/);
-    assert.match(fixture.hooks.get(layoutSlot) ?? '', /--reconcile-tmux/);
-    assert.ok(fixture.calls.some((args) => args[0] === 'show-hooks' && args[3] === resizeSlot));
-    assert.ok(fixture.calls.some((args) => args[0] === 'show-hooks' && args[3] === layoutSlot));
+    assert.equal(fixture.hooks.get('client-resized')?.[0], 'run-shell -b foreign');
+    assert.equal(fixture.hooks.get('client-resized')?.length, 2);
+    assert.equal(fixture.hooks.get('window-layout-changed')?.length, 1);
+    const command = fixture.hooks.get('client-resized')?.[1] ?? '';
+    assert.match(command, /if-shell -t %9 -F/);
+    assert.match(command, /pane-birth/);
+    assert.match(command, /session-birth/);
+    assert.match(command, /omx-hud-owned:[0-9a-f-]{36}/);
+    assert.ok(fixture.calls.some((args) => args[0] === 'set-hook' && args[1] === '-a'));
+    assert.equal(fixture.calls.some((args) => args[0] === 'set-hook' && args.includes('-u')), false);
   });
 
-  it('rolls back both hook slots when paired install fails', () => {
-    const layoutSlot = buildHudLayoutHookSlot('omx_hud_resize_7_3_1');
-    const fixture = statefulHooks({ failSlot: layoutSlot });
-    assert.equal(registerHudResizeHook('%9', '%1', 3, { cwd: '/repo', env: { TMUX: '/tmp/tmux' } }, fixture.exec), false);
-    assert.equal(fixture.hooks.size, 0);
-  });
-
-  it('preserves a foreign insertion that races vacant-slot registration', () => {
-    const resizeSlot = buildHudResizeHookSlot('omx_hud_resize_7_3_1');
-    const fixture = statefulHooks({
-      beforeConditionalMutation: (slot, hooks) => {
-        if (slot === resizeSlot && !hooks.has(slot)) hooks.set(slot, 'run-shell -b foreign');
-      },
-    });
-    assert.equal(registerHudResizeHook('%9', '%1', 3, { cwd: '/repo', env: { TMUX: '/tmp/tmux' } }, fixture.exec), false);
-    assert.equal(fixture.hooks.get(resizeSlot), 'run-shell -b foreign');
-    assert.ok(fixture.calls.some((args) => args[0] === 'if-shell'));
-    assert.equal(fixture.calls.some((args) => args[0] === 'set-hook'), false);
-  });
-
-  it('preserves a foreign replacement that races stale rollback', () => {
-    const resizeSlot = buildHudResizeHookSlot('omx_hud_resize_7_3_1');
-    const layoutSlot = buildHudLayoutHookSlot('omx_hud_resize_7_3_1');
-    const fixture = statefulHooks({
-      failSlot: layoutSlot,
-      beforeConditionalMutation: (slot, hooks) => {
-        if (slot === resizeSlot && hooks.has(slot)) hooks.set(slot, 'run-shell -b foreign replacement');
-      },
-    });
-    assert.equal(registerHudResizeHook('%9', '%1', 3, { cwd: '/repo', env: { TMUX: '/tmp/tmux' } }, fixture.exec), false);
-    assert.equal(fixture.hooks.get(resizeSlot), 'run-shell -b foreign replacement');
-    assert.equal(fixture.hooks.has(layoutSlot), false);
-  });
-
-  it('tears down only the exact owned hook generations through conditional mutation', () => {
-    const fixture = statefulHooks();
-    const resizeSlot = buildHudResizeHookSlot('omx_hud_resize_7_3_1');
-    const layoutSlot = buildHudLayoutHookSlot('omx_hud_resize_7_3_1');
+  it('retains a partial pair and makes every retained generation inert on teardown', () => {
+    const fixture = appendOnlyHooks();
     assert.equal(registerHudResizeHook('%9', '%1', 3, { cwd: '/repo', env: { TMUX: '/tmp/tmux' } }, fixture.exec), true);
-    assert.match(fixture.hooks.get(resizeSlot) ?? '', /# omx-hud-owned:.*:[0-9a-f-]{36}$/);
     assert.equal(unregisterHudResizeHook('%1', fixture.exec), true);
-    assert.equal(fixture.hooks.has(resizeSlot), false);
-    assert.equal(fixture.hooks.has(layoutSlot), false);
-    assert.equal(fixture.calls.some((args) => args[0] === 'set-hook'), false);
-    assert.ok(fixture.calls.filter((args) => args[0] === 'if-shell').length >= 4);
+    assert.ok(fixture.calls.some((args) => args[0] === 'set-option' && args.at(-1) === '0'));
+    assert.equal(fixture.calls.some((args) => args[0] === 'set-hook' && args.includes('-u')), false);
+    assert.equal(fixture.hooks.get('client-resized')?.length, 1);
+    assert.equal(fixture.hooks.get('window-layout-changed')?.length, 1);
   });
 
-  it('preserves a foreign replacement while safely removing the remaining owned slot', () => {
-    const fixture = statefulHooks();
-    const resizeSlot = buildHudResizeHookSlot('omx_hud_resize_7_3_1');
-    const layoutSlot = buildHudLayoutHookSlot('omx_hud_resize_7_3_1');
+  it('does not require or mutate a derived hook slot during foreign replacement races', () => {
+    const fixture = appendOnlyHooks();
+    fixture.hooks.set('window-layout-changed', ['run-shell -b foreign replacement']);
     assert.equal(registerHudResizeHook('%9', '%1', 3, { cwd: '/repo', env: { TMUX: '/tmp/tmux' } }, fixture.exec), true);
-    fixture.hooks.set(layoutSlot, 'run-shell -b foreign');
-    assert.equal(unregisterHudResizeHook('%1', fixture.exec), true);
-    assert.equal(fixture.hooks.has(resizeSlot), false);
-    assert.equal(fixture.hooks.get(layoutSlot), 'run-shell -b foreign');
-  });
-
-  it('uses leader-scoped slots and treats an absent pair as completed cleanup', () => {
-    const first = statefulHooks();
-    const second = statefulHooks();
-    assert.equal(registerHudResizeHook('%9', '%1', 3, { cwd: '/repo', env: { TMUX: '/tmp/tmux' } }, first.exec), true);
-    assert.equal(registerHudResizeHook('%10', '%2', 3, { cwd: '/repo', env: { TMUX: '/tmp/tmux' } }, second.exec), true);
-    assert.notEqual(
-      buildHudResizeHookSlot('omx_hud_resize_7_3_1'),
-      buildHudResizeHookSlot('omx_hud_resize_7_3_2'),
-    );
-    const absent = statefulHooks();
-    assert.equal(unregisterHudResizeHook('%1', absent.exec), true);
+    assert.equal(fixture.hooks.get('window-layout-changed')?.[0], 'run-shell -b foreign replacement');
+    assert.equal(fixture.calls.some((args) => args[0] === 'if-shell'), false);
   });
 });
 
@@ -516,6 +431,7 @@ describe('HUD pane ownership helpers', () => {
           '#{window_height}',
           '#{@omx_pane_instance_id}',
           '#{@omx_instance_id}',
+          '#{session_name}',
           '#{pane_start_command}',
           '#{pane_current_path}',
         ].join('\x1f'),
@@ -577,7 +493,7 @@ describe('dead HUD pane reaper', () => {
     );
 
     const result = reapDeadHudPanes(panes, {
-      killPane: () => {
+      killExactPane: () => {
         throw new Error('team ACK command should not be classified as a HUD watch pane');
       },
     });
@@ -586,7 +502,7 @@ describe('dead HUD pane reaper', () => {
     assert.deepEqual(result, { reaped: [], preserved: [] });
   });
 
-  it('kills HUD panes whose leader pane is not present in the snapshot', () => {
+  it('preserves a stale HUD when the snapshot lacks immutable pane identity', () => {
     const panes = parseTmuxPaneSnapshot(
       [
         '%1\tcodex\tcodex',
@@ -596,14 +512,35 @@ describe('dead HUD pane reaper', () => {
     const killed: string[] = [];
 
     const result = reapDeadHudPanes(panes, {
-      killPane: (paneId) => {
-        killed.push(paneId);
+      killExactPane: (candidate) => {
+        killed.push(candidate.paneId);
         return true;
       },
     });
 
-    assert.deepEqual(killed, ['%2']);
-    assert.deepEqual(result, { reaped: ['%2'], preserved: [] });
+    assert.deepEqual(killed, []);
+    assert.deepEqual(result, { reaped: [], preserved: ['%2'] });
+  });
+
+  it('passes only a complete immutable candidate to the reaper callback', () => {
+    const startCommand = `exec env OMX_SESSION_ID='doctor-smoke' OMX_TMUX_HUD_OWNER='1' ${OMX_TMUX_HUD_LEADER_PANE_ENV}='%9' node /repo/omx.js hud --watch`;
+    const candidates: unknown[] = [];
+    const result = reapDeadHudPanes([{
+      paneId: '%2',
+      currentCommand: 'node',
+      startCommand,
+      paneInstanceId: 'pane-birth',
+      sessionInstanceId: 'session-birth',
+      sessionName: 'managed',
+      currentPath: '/missing (deleted)',
+    }], {
+      killExactPane: (candidate) => {
+        candidates.push(candidate);
+        return false;
+      },
+    });
+    assert.equal(candidates.length, 1);
+    assert.deepEqual(result, { reaped: [], preserved: ['%2'] });
   });
 
   it('preserves HUD panes whose leader pane is alive', () => {
@@ -615,7 +552,7 @@ describe('dead HUD pane reaper', () => {
     );
 
     const result = reapDeadHudPanes(panes, {
-      killPane: () => {
+      killExactPane: () => {
         throw new Error('live leader HUD should not be killed');
       },
     });
@@ -632,7 +569,7 @@ describe('dead HUD pane reaper', () => {
     );
 
     const result = reapDeadHudPanes(panes, {
-      killPane: () => {
+      killExactPane: () => {
         throw new Error('legacy untagged HUD should not be killed');
       },
     });
@@ -640,7 +577,7 @@ describe('dead HUD pane reaper', () => {
     assert.deepEqual(result, { reaped: [], preserved: ['%2'] });
   });
 
-  it('kills untagged HUD panes whose tmux cwd has been deleted', () => {
+  it('preserves deleted-cwd HUD panes without immutable identity', () => {
     const deletedPath = join(tmpdir(), `omx-doctor-native-hook-dist-${process.pid}-${Date.now()} (deleted)`);
     rmSync(deletedPath, { recursive: true, force: true });
     const panes = parseTmuxPaneSnapshot(
@@ -652,17 +589,17 @@ describe('dead HUD pane reaper', () => {
     const killed: string[] = [];
 
     const result = reapDeadHudPanes(panes, {
-      killPane: (paneId) => {
-        killed.push(paneId);
+      killExactPane: (candidate) => {
+        killed.push(candidate.paneId);
         return true;
       },
     });
 
-    assert.deepEqual(killed, ['%2']);
-    assert.deepEqual(result, { reaped: ['%2'], preserved: [] });
+    assert.deepEqual(killed, []);
+    assert.deepEqual(result, { reaped: [], preserved: ['%2'] });
   });
 
-  it('kills deleted-cwd doctor-smoke HUD panes even when an old owner tag points at a live leader', () => {
+  it('preserves doctor-smoke HUD panes without immutable identity', () => {
     const deletedPath = join(tmpdir(), `omx-doctor-plugin-hook-${process.pid}-${Date.now()} (deleted)`);
     rmSync(deletedPath, { recursive: true, force: true });
     const panes = parseTmuxPaneSnapshot(
@@ -674,17 +611,17 @@ describe('dead HUD pane reaper', () => {
     const killed: string[] = [];
 
     const result = reapDeadHudPanes(panes, {
-      killPane: (paneId) => {
-        killed.push(paneId);
+      killExactPane: (candidate) => {
+        killed.push(candidate.paneId);
         return true;
       },
     });
 
-    assert.deepEqual(killed, ['%2']);
-    assert.deepEqual(result, { reaped: ['%2'], preserved: [] });
+    assert.deepEqual(killed, []);
+    assert.deepEqual(result, { reaped: [], preserved: ['%2'] });
   });
 
-  it('kills doctor-smoke HUD panes even if a literal deleted-marker cwd was materialized', () => {
+  it('preserves doctor-smoke panes with a materialized marker unless identity is complete', () => {
     const parent = mkdtempSync(join(tmpdir(), 'omx-doctor-plugin-hook-live-marker-'));
     const materializedDeletedPath = join(parent, 'smoke (deleted)');
     mkdirSync(materializedDeletedPath);
@@ -698,14 +635,14 @@ describe('dead HUD pane reaper', () => {
 
     try {
       const result = reapDeadHudPanes(panes, {
-        killPane: (paneId) => {
-          killed.push(paneId);
+        killExactPane: (candidate) => {
+          killed.push(candidate.paneId);
           return true;
         },
       });
 
-      assert.deepEqual(killed, ['%2']);
-      assert.deepEqual(result, { reaped: ['%2'], preserved: [] });
+      assert.deepEqual(killed, []);
+      assert.deepEqual(result, { reaped: [], preserved: ['%2'] });
     } finally {
       rmSync(parent, { recursive: true, force: true });
     }
@@ -722,7 +659,7 @@ describe('dead HUD pane reaper', () => {
     );
 
     const result = reapDeadHudPanes(panes, {
-      killPane: () => {
+      killExactPane: () => {
         throw new Error('live leader HUD with stale launch cwd should not be killed');
       },
     });
@@ -730,7 +667,7 @@ describe('dead HUD pane reaper', () => {
     assert.deepEqual(result, { reaped: [], preserved: ['%2'] });
   });
 
-  it('kills deleted-cwd HUD panes when their owner leader is no longer live', () => {
+  it('preserves stale-owner HUD panes unless immutable identity is complete', () => {
     const deletedPath = join(tmpdir(), `omx-dead-leader-deleted-cwd-${process.pid}-${Date.now()} (deleted)`);
     rmSync(deletedPath, { recursive: true, force: true });
     const panes = parseTmuxPaneSnapshot(
@@ -742,14 +679,14 @@ describe('dead HUD pane reaper', () => {
     const killed: string[] = [];
 
     const result = reapDeadHudPanes(panes, {
-      killPane: (paneId) => {
-        killed.push(paneId);
+      killExactPane: (candidate) => {
+        killed.push(candidate.paneId);
         return true;
       },
     });
 
-    assert.deepEqual(killed, ['%2']);
-    assert.deepEqual(result, { reaped: ['%2'], preserved: [] });
+    assert.deepEqual(killed, []);
+    assert.deepEqual(result, { reaped: [], preserved: ['%2'] });
   });
 
   it('preserves HUD panes in an existing cwd whose name ends with the deleted marker text', () => {
@@ -765,7 +702,7 @@ describe('dead HUD pane reaper', () => {
 
     try {
       const result = reapDeadHudPanes(panes, {
-        killPane: () => {
+        killExactPane: () => {
           throw new Error('live cwd with literal marker suffix should not be killed');
         },
       });
@@ -795,7 +732,7 @@ describe('dead HUD pane reaper', () => {
 
     try {
       const result = reapDeadHudPanes(panes, {
-        killPane: () => {
+        killExactPane: () => {
           throw new Error('live tab cwd with literal marker suffix should not be killed');
         },
       });
@@ -817,7 +754,7 @@ describe('dead HUD pane reaper', () => {
     );
 
     const result = reapDeadHudPanes(panes, {
-      killPane: () => {
+      killExactPane: () => {
         throw new Error('misleading non-OMX HUD text should not be killed');
       },
     });
@@ -834,7 +771,7 @@ describe('dead HUD pane reaper', () => {
     );
 
     const result = reapDeadHudPanes(panes, {
-      killPane: () => {
+      killExactPane: () => {
         throw new Error('non-HUD panes should not be killed');
       },
     });
@@ -854,13 +791,13 @@ describe('dead HUD pane reaper', () => {
 
     const result = reapDeadHudPanes(panes, {
       isLivePane: (paneId) => paneId === '%9',
-      killPane: (paneId) => {
-        killed.push(paneId);
+      killExactPane: (candidate) => {
+        killed.push(candidate.paneId);
         return true;
       },
     });
 
-    assert.deepEqual(killed, ['%2']);
-    assert.deepEqual(result, { reaped: ['%2'], preserved: ['%3'] });
+    assert.deepEqual(killed, []);
+    assert.deepEqual(result, { reaped: [], preserved: ['%2', '%3'] });
   });
 });
