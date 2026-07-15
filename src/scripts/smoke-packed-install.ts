@@ -1,4 +1,5 @@
 import {
+  chmodSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -26,6 +27,42 @@ import {
 import {
   ensureReusableNodeModules,
 } from '../utils/repo-deps.js';
+import { writeSessionStart } from '../hooks/session.js';
+import {
+  initializeStateAuthority,
+  mintStateAuthorityTransportCapability,
+  resolveStateAuthorityForGuard,
+} from '../state/authority.js';
+import { buildStateAuthorityTransportEnv } from '../state/transport-env.js';
+
+async function buildAuthenticatedPackedRegressionEnvironment(
+  cwd: string,
+  sessionId: string,
+  baseEnv: NodeJS.ProcessEnv,
+): Promise<NodeJS.ProcessEnv> {
+  const omxDir = join(cwd, '.omx');
+  const stateDir = join(omxDir, 'state');
+  mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+  chmodSync(omxDir, 0o700);
+  chmodSync(stateDir, 0o700);
+  await initializeStateAuthority({
+    startup_cwd: cwd,
+    observed_cwd: cwd,
+    launch_id: `packed-regression-${sessionId}`,
+    session_binding: { canonical_session_id: sessionId },
+  });
+  await writeSessionStart(cwd, sessionId, { nativeSessionId: sessionId });
+  const authority = await resolveStateAuthorityForGuard({
+    startup_cwd: cwd,
+    observed_cwd: cwd,
+    session_id: sessionId,
+  });
+  await mintStateAuthorityTransportCapability(authority);
+  return buildStateAuthorityTransportEnv(authority, {
+    ...baseEnv,
+    OMX_SESSION_ID: sessionId,
+  });
+}
 
 
 export {
@@ -1363,8 +1400,8 @@ export function buildNativeHookSmokePayload(
   }
 }
 
-function smokeInstalledNativeHookDist(prefixDir: string): void {
-function runPackedTransportRegressions(hookScript: string, smokeCwd: string): void {
+async function smokeInstalledNativeHookDist(prefixDir: string): Promise<void> {
+async function runPackedTransportRegressions(hookScript: string, smokeCwd: string): Promise<void> {
   const invoke = (cwd: string, environment: NodeJS.ProcessEnv, payload: Record<string, unknown>) => run(process.execPath, [realpathSync(hookScript)], {
     cwd, env: environment, input: JSON.stringify(payload),
   });
@@ -1377,6 +1414,14 @@ function runPackedTransportRegressions(hookScript: string, smokeCwd: string): vo
   const g1bThread = 'g1bu-thread';
   const g1bPriorTurn = 'g1bu-turn-old';
   const g1bTurn = 'g1bu-turn-new';
+  const g1bEnv = {
+    ...(await buildAuthenticatedPackedRegressionEnvironment(
+      g1bCwd,
+      g1bSession,
+      buildPackedRegressionEnvironment({ name: 'g1bu' }),
+    )),
+    OMX_TEAM_MODE: 'disabled',
+  };
   const g1bStateDir = join(g1bCwd, '.omx', 'state');
   const g1bSessionDir = join(g1bStateDir, 'sessions', g1bSession);
   mkdirSync(g1bSessionDir, { recursive: true });
@@ -1392,7 +1437,7 @@ function runPackedTransportRegressions(hookScript: string, smokeCwd: string): vo
   ] as const) {
     writeFileSync(path, JSON.stringify({ active: false, mode: 'autopilot', current_phase: 'complete', session_id: g1bSession, thread_id: g1bThread, turn_id: g1bPriorTurn, marker }));
   }
-  const g1bEnv = { ...buildPackedRegressionEnvironment({ name: 'g1bu' }), OMX_TEAM_MODE: 'disabled' };
+
   const g1bPrompt = '$team $autopilot restart — café';
   const g1bPayload = { hook_event_name: 'UserPromptSubmit', cwd: g1bCwd, session_id: g1bSession, thread_id: g1bThread, turn_id: g1bTurn, prompt: g1bPrompt };
   validateHookStdout('UserPromptSubmit', String(invoke(g1bCwd, g1bEnv, g1bPayload).stdout || ''));
@@ -1547,7 +1592,11 @@ function runPackedTransportRegressions(hookScript: string, smokeCwd: string): vo
       const caseCwd = join(smokeCwd, testCase.name);
       const sessionId = `packed-regression-${caseIndex}`;
       mkdirSync(caseCwd, { recursive: true });
-      const environment = buildPackedRegressionEnvironment(testCase);
+      const environment = await buildAuthenticatedPackedRegressionEnvironment(
+        caseCwd,
+        sessionId,
+        buildPackedRegressionEnvironment(testCase),
+      );
       const promptPayload = {
         hook_event_name: 'UserPromptSubmit',
         cwd: caseCwd,
@@ -1593,7 +1642,7 @@ function runPackedTransportRegressions(hookScript: string, smokeCwd: string): vo
         throw new Error(`packed regression ${testCase.name} blocked Stop: ${JSON.stringify(stopOutput)}`);
       }
     }
-    runPackedTransportRegressions(hookScript, smokeCwd);
+    await runPackedTransportRegressions(hookScript, smokeCwd);
   } finally {
     rmSync(smokeCwd, { recursive: true, force: true });
   }
@@ -2146,7 +2195,7 @@ async function main(): Promise<void> {
     for (const argv of PACKED_INSTALL_SMOKE_CORE_COMMANDS) {
       run(omxPath, argv, { cwd: repoRoot });
     }
-    smokeInstalledNativeHookDist(prefixDir);
+    await smokeInstalledNativeHookDist(prefixDir);
     const lifecycle = await smokePackedHookTrustLifecycle(omxPath);
     console.log(
       lifecycle.codexVersion !== null
