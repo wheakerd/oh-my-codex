@@ -185,11 +185,11 @@ export const PACKED_INSTALL_NATIVE_HOOK_REGRESSION_PROMPTS = [
   { name: 'division-slash-suffix', prompt: '$ralplan∕config', expectedSkill: null, expectedStopBlock: false },
   { name: 'unclosed-prompts-quote', prompt: '"Use /prompts:architect\n$ralplan plan it', expectedSkill: null, expectedStopBlock: false },
   { name: 'malformed-prompts-suffix', prompt: '/prompts:architect한글\n$ralplan plan it', expectedSkill: null, expectedStopBlock: false },
-  { name: 'g1a-packed-primary-order', prompt: '$ralplan plan it\n$autopilot build it', expectedSkill: 'ralplan', expectedStopBlock: true, expectedDeferredSkills: [] },
-  { name: 'g1c-packed-dedup-order', prompt: '$ralplan plan it\n$ralplan plan it', expectedSkill: 'ralplan', expectedStopBlock: true, expectedDeferredSkills: [] },
-  { name: 'b3-packed-fence-marker-identity', prompt: '```text\n$ralplan plan it\n~~~\n$autopilot build it', expectedSkill: null, expectedStopBlock: false },
-  { name: 'b4-packed-fence-reverse-identity', prompt: '~~~text\n$ralplan plan it\n```\n$autopilot build it', expectedSkill: null, expectedStopBlock: false },
-  { name: 'b5-packed-list-fence-identity', prompt: '- ~~~\n  $ralplan plan it\n  ```\n$autopilot build it', expectedSkill: null, expectedStopBlock: false },
+  { name: 'g1a-ordered-multi-skill', prompt: '$ralplan $autopilot build it', expectedSkill: 'ralplan', expectedStopBlock: true, expectedDeferredSkills: ['autopilot'], expectedActiveSkills: ['ralplan'] },
+  { name: 'g1c-duplicate-alias', prompt: '$autopilot $oh-my-codex:autopilot build it', expectedSkill: 'autopilot', expectedStopBlock: true, expectedDeferredSkills: [], expectedActiveSkills: ['autopilot'] },
+  { name: 'b3-longer-valid-fence', prompt: '````text\n$ralplan plan it\n````\n$autopilot build it', expectedSkill: 'autopilot', expectedStopBlock: true },
+  { name: 'b4-shorter-invalid-fence', prompt: '````text\n$ralplan plan it\n```\n$autopilot build it', expectedSkill: null, expectedStopBlock: false },
+  { name: 'b5-different-marker-invalid-fence', prompt: '```text\n$ralplan plan it\n~~~\n$autopilot build it', expectedSkill: null, expectedStopBlock: false },
 ] as const;
 
 export function buildPackedRegressionEnvironment(
@@ -1373,25 +1373,56 @@ function runPackedTransportRegressions(hookScript: string, smokeCwd: string): vo
   };
 
   const g1bCwd = join(smokeCwd, 'g1bu');
-  const g1bSession = 'g1bu-new';
-  mkdirSync(g1bCwd, { recursive: true });
-  seedTerminal(g1bCwd, 'g1bu-old', 'g1bu');
+  const g1bSession = 'g1bu';
+  const g1bThread = 'g1bu-thread';
+  const g1bPriorTurn = 'g1bu-turn-old';
+  const g1bTurn = 'g1bu-turn-new';
+  const g1bStateDir = join(g1bCwd, '.omx', 'state');
+  const g1bSessionDir = join(g1bStateDir, 'sessions', g1bSession);
+  mkdirSync(g1bSessionDir, { recursive: true });
+  for (const [path, marker] of [
+    [join(g1bStateDir, 'skill-active-state.json'), 'root-skill'],
+    [join(g1bSessionDir, 'skill-active-state.json'), 'session-skill'],
+  ] as const) {
+    writeFileSync(path, JSON.stringify({ active: true, skill: 'autopilot', phase: 'completing', session_id: g1bSession, thread_id: g1bThread, turn_id: g1bPriorTurn, marker, active_skills: [{ skill: 'autopilot', phase: 'completing', active: true, session_id: g1bSession, thread_id: g1bThread, turn_id: g1bPriorTurn }] }));
+  }
+  for (const [path, marker] of [
+    [join(g1bStateDir, 'autopilot-state.json'), 'root-autopilot'],
+    [join(g1bSessionDir, 'autopilot-state.json'), 'session-autopilot'],
+  ] as const) {
+    writeFileSync(path, JSON.stringify({ active: false, mode: 'autopilot', current_phase: 'complete', session_id: g1bSession, thread_id: g1bThread, turn_id: g1bPriorTurn, marker }));
+  }
   const g1bEnv = { ...buildPackedRegressionEnvironment({ name: 'g1bu' }), OMX_TEAM_MODE: 'disabled' };
   const g1bPrompt = '$team $autopilot restart — café';
-  const g1bPayload = { hook_event_name: 'UserPromptSubmit', cwd: g1bCwd, session_id: g1bSession, thread_id: 'g1bu-thread', turn_id: 'g1bu-turn', prompt: g1bPrompt };
+  const g1bPayload = { hook_event_name: 'UserPromptSubmit', cwd: g1bCwd, session_id: g1bSession, thread_id: g1bThread, turn_id: g1bTurn, prompt: g1bPrompt };
   validateHookStdout('UserPromptSubmit', String(invoke(g1bCwd, g1bEnv, g1bPayload).stdout || ''));
-  const g1bState = JSON.parse(readFileSync(join(g1bCwd, '.omx', 'state', 'sessions', g1bSession, 'skill-active-state.json'), 'utf-8')) as { active?: boolean; skill?: string };
-  if (!g1bState.active || g1bState.skill !== 'autopilot' || existsSync(join(g1bCwd, '.omx', 'state', 'sessions', g1bSession, 'team-state.json'))) throw new Error('packed G1b-U did not activate Autopilot without Team');
-  if (Buffer.compare(Buffer.from(g1bPayload.prompt, 'utf-8'), Buffer.from('$team $autopilot restart — café', 'utf-8')) !== 0) throw new Error('packed G1b-U did not retain UTF-8 prompt identity at the hook boundary');
+  const g1bState = JSON.parse(readFileSync(join(g1bSessionDir, 'skill-active-state.json'), 'utf-8')) as { active?: boolean; skill?: string; session_id?: string; thread_id?: string; turn_id?: string; active_skills?: Array<{ active?: boolean; skill?: string; session_id?: string; thread_id?: string; turn_id?: string }> };
+  const [g1bActiveSkill] = g1bState.active_skills ?? [];
+  if (!g1bState.active || g1bState.skill !== 'autopilot' || g1bState.session_id !== g1bSession || g1bState.thread_id !== g1bThread || g1bState.turn_id !== g1bTurn || g1bState.active_skills?.length !== 1 || !g1bActiveSkill?.active || g1bActiveSkill.skill !== 'autopilot' || g1bActiveSkill.session_id !== g1bSession || g1bActiveSkill.thread_id !== g1bThread || g1bActiveSkill.turn_id !== g1bTurn) throw new Error('packed G1b-U did not persist singleton Autopilot ownership for the new turn');
+  const g1bAutopilotState = JSON.parse(readFileSync(join(g1bSessionDir, 'autopilot-state.json'), 'utf-8')) as { active?: boolean; current_phase?: string; session_id?: string; thread_id?: string; turn_id?: string; state?: { handoff_artifacts?: { context_snapshot?: { path?: string } } } };
+  const g1bContextSnapshot = g1bAutopilotState.state?.handoff_artifacts?.context_snapshot?.path;
+  if (!g1bAutopilotState.active || g1bAutopilotState.current_phase !== 'deep-interview' || g1bAutopilotState.session_id !== g1bSession || g1bAutopilotState.thread_id !== g1bThread || g1bAutopilotState.turn_id !== g1bTurn || !g1bContextSnapshot || !readFileSync(resolve(g1bCwd, g1bContextSnapshot)).includes(Buffer.from(g1bPrompt, 'utf-8'))) throw new Error('packed G1b-U did not restart Autopilot with its UTF-8 context snapshot');
+  if (existsSync(join(g1bStateDir, 'team-state.json')) || existsSync(join(g1bSessionDir, 'team-state.json'))) throw new Error('packed G1b-U created Team state');
   if (stopDecision(g1bCwd, g1bEnv, g1bPayload) !== 'block') throw new Error('packed G1b-U did not block Stop');
 
   const g2aCwd = join(smokeCwd, 'g2a');
-  mkdirSync(g2aCwd, { recursive: true });
+  const g2aSession = 'g2a-stale-predecessor';
+  const g2aStateDir = join(g2aCwd, '.omx', 'state');
+  const g2aSessionDir = join(g2aStateDir, 'sessions', g2aSession);
+  const g2aFiles = [join(g2aStateDir, 'skill-active-state.json'), join(g2aStateDir, 'autopilot-state.json'), join(g2aSessionDir, 'skill-active-state.json'), join(g2aSessionDir, 'autopilot-state.json'), join(g2aStateDir, 'session.json')];
+  mkdirSync(g2aSessionDir, { recursive: true });
+  writeFileSync(g2aFiles[0]!, JSON.stringify({ active: false, skill: 'ralplan', marker: 'root-skill' }));
+  writeFileSync(g2aFiles[1]!, JSON.stringify({ active: false, mode: 'autopilot', current_phase: 'complete', marker: 'root-autopilot' }));
+  writeFileSync(g2aFiles[2]!, JSON.stringify({ active: false, skill: 'ralplan', marker: 'session-skill' }));
+  writeFileSync(g2aFiles[3]!, JSON.stringify({ active: false, mode: 'autopilot', current_phase: 'complete', marker: 'session-autopilot' }));
+  writeFileSync(g2aFiles[4]!, JSON.stringify({ session_id: g2aSession, native_session_id: 'native-g2a', cwd: g2aCwd, marker: 'session-pointer' }));
+  const g2aBefore = g2aFiles.map((file) => readFileSync(file));
   const g2aEnv = buildPackedRegressionEnvironment({ name: 'g2a' });
-  const g2aPayload = { hook_event_name: 'UserPromptSubmit', cwd: g2aCwd, session_id: 'g2a', thread_id: 'g2a-thread', turn_id: 'g2a-turn', prompt: 'use $ralplan is the consensus-planning command' };
+  const g2aPayload = { hook_event_name: 'UserPromptSubmit', cwd: g2aCwd, session_id: g2aSession, thread_id: 'g2a-thread', turn_id: 'g2a-turn', prompt: 'use $ralplan is the consensus-planning command' };
   validateHookStdout('UserPromptSubmit', String(invoke(g2aCwd, g2aEnv, g2aPayload).stdout || ''));
-  if (existsSync(join(g2aCwd, '.omx', 'state', 'sessions', 'g2a', 'skill-active-state.json'))) throw new Error('packed G2a stale predecessor created workflow state');
+  for (const [index, file] of g2aFiles.entries()) if (Buffer.compare(readFileSync(file), g2aBefore[index]!) !== 0) throw new Error(`packed G2a stale predecessor mutated state ${file}`);
   if (stopDecision(g2aCwd, g2aEnv, g2aPayload) === 'block') throw new Error('packed G2a stale predecessor blocked Stop');
+  for (const [index, file] of g2aFiles.entries()) if (Buffer.compare(readFileSync(file), g2aBefore[index]!) !== 0) throw new Error(`packed G2a stale predecessor mutated state after Stop ${file}`);
 
   const g2bCwd = join(smokeCwd, 'g2b');
   mkdirSync(g2bCwd, { recursive: true });
@@ -1451,12 +1482,15 @@ function runPackedTransportRegressions(hookScript: string, smokeCwd: string): vo
         if (existsSync(skillStatePath)) throw new Error(`packed regression ${testCase.name} created workflow state`);
       } else {
         if (!existsSync(skillStatePath)) throw new Error(`packed regression ${testCase.name} did not create workflow state`);
-        const skillState = JSON.parse(readFileSync(skillStatePath, 'utf-8')) as { active?: boolean; skill?: string; deferred_skills?: string[] };
+        const skillState = JSON.parse(readFileSync(skillStatePath, 'utf-8')) as { active?: boolean; skill?: string; deferred_skills?: string[]; active_skills?: Array<{ skill?: string }> };
         if (!skillState.active || skillState.skill !== testCase.expectedSkill) {
           throw new Error(`packed regression ${testCase.name} persisted unexpected workflow state`);
         }
         if ('expectedDeferredSkills' in testCase && JSON.stringify(skillState.deferred_skills ?? []) !== JSON.stringify(testCase.expectedDeferredSkills)) {
           throw new Error(`packed regression ${testCase.name} persisted unexpected deferred workflows`);
+        }
+        if ('expectedActiveSkills' in testCase && JSON.stringify(skillState.active_skills?.map((entry) => entry.skill) ?? []) !== JSON.stringify(testCase.expectedActiveSkills)) {
+          throw new Error(`packed regression ${testCase.name} persisted unexpected active workflows`);
         }
       }
 

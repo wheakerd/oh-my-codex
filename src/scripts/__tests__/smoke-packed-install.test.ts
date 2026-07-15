@@ -958,11 +958,11 @@ test('packed install smoke covers directive activation and terminal false-activa
     { name: 'division-slash-suffix', prompt: '$ralplan∕config', expectedSkill: null, expectedStopBlock: false },
     { name: 'unclosed-prompts-quote', prompt: '"Use /prompts:architect\n$ralplan plan it', expectedSkill: null, expectedStopBlock: false },
     { name: 'malformed-prompts-suffix', prompt: '/prompts:architect한글\n$ralplan plan it', expectedSkill: null, expectedStopBlock: false },
-    { name: 'g1a-packed-primary-order', prompt: '$ralplan plan it\n$autopilot build it', expectedSkill: 'ralplan', expectedStopBlock: true, expectedDeferredSkills: [] },
-    { name: 'g1c-packed-dedup-order', prompt: '$ralplan plan it\n$ralplan plan it', expectedSkill: 'ralplan', expectedStopBlock: true, expectedDeferredSkills: [] },
-    { name: 'b3-packed-fence-marker-identity', prompt: '```text\n$ralplan plan it\n~~~\n$autopilot build it', expectedSkill: null, expectedStopBlock: false },
-    { name: 'b4-packed-fence-reverse-identity', prompt: '~~~text\n$ralplan plan it\n```\n$autopilot build it', expectedSkill: null, expectedStopBlock: false },
-    { name: 'b5-packed-list-fence-identity', prompt: '- ~~~\n  $ralplan plan it\n  ```\n$autopilot build it', expectedSkill: null, expectedStopBlock: false },
+    { name: 'g1a-ordered-multi-skill', prompt: '$ralplan $autopilot build it', expectedSkill: 'ralplan', expectedStopBlock: true, expectedDeferredSkills: ['autopilot'], expectedActiveSkills: ['ralplan'] },
+    { name: 'g1c-duplicate-alias', prompt: '$autopilot $oh-my-codex:autopilot build it', expectedSkill: 'autopilot', expectedStopBlock: true, expectedDeferredSkills: [], expectedActiveSkills: ['autopilot'] },
+    { name: 'b3-longer-valid-fence', prompt: '````text\n$ralplan plan it\n````\n$autopilot build it', expectedSkill: 'autopilot', expectedStopBlock: true },
+    { name: 'b4-shorter-invalid-fence', prompt: '````text\n$ralplan plan it\n```\n$autopilot build it', expectedSkill: null, expectedStopBlock: false },
+    { name: 'b5-different-marker-invalid-fence', prompt: '```text\n$ralplan plan it\n~~~\n$autopilot build it', expectedSkill: null, expectedStopBlock: false },
   ]);
 });
 
