@@ -2078,8 +2078,7 @@ export function createTeamSession(
       tagTeamPaneBirth(paneId, paneBirth);
       rollbackPaneBirths.set(paneId, paneBirth);
       tagTeamPaneRole(paneId, 'worker');
-      const paneCommand = listPanes(teamTarget).find((pane) => pane.paneId === paneId)?.startCommand ?? '';
-      if (!paneCommand) throw new Error(`failed to capture immutable worker command for ${paneId}`);
+      const paneCommand = cmd;
       workerPaneCommands.set(paneId, paneCommand);
       rollbackPaneRoles.set(paneId, 'worker');
       options.journalResource?.({
@@ -2156,8 +2155,7 @@ export function createTeamSession(
             rollbackPaneBirths.set(id, paneBirth);
             createdHudPaneBirth = paneBirth;
             tagTeamPaneRole(id, 'hud');
-            const paneCommand = listPanes(teamTarget).find((pane) => pane.paneId === id)?.startCommand ?? '';
-            if (!paneCommand) throw new Error(`failed to capture immutable HUD command for ${id}`);
+            const paneCommand = hudCmd;
             createdHudPaneCommand = paneCommand;
             rollbackPaneRoles.set(id, 'hud');
             options.journalResource?.({

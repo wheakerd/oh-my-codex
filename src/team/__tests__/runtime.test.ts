@@ -511,9 +511,12 @@ if [ "${'$'}{1:-}" = "set-hook" ]; then
   if [ "${'$'}{2:-}" = "-u" ]; then
     hook_target="${'$'}{4:-}"; hook_slot="${'$'}{5:-}"
     rm -f "$state_dir/hook-$(key_for_hook "${'$'}hook_target" "${'$'}hook_slot")"
+  elif [ "${'$'}{2:-}" = "-a" ]; then
+    hook_target="${'$'}{4:-}"; hook_slot="${'$'}{5:-}"
+    printf '%s %s\n' "${'$'}hook_slot" "${'$'}{6:-}" >> "$state_dir/hook-$(key_for_hook "${'$'}hook_target" "${'$'}hook_slot")"
   elif [ "${'$'}{2:-}" = "-t" ]; then
     hook_target="${'$'}{3:-}"; hook_slot="${'$'}{4:-}"
-    printf '%s %s\\n' "${'$'}hook_slot" "${'$'}{5:-}" > "$state_dir/hook-$(key_for_hook "${'$'}hook_target" "${'$'}hook_slot")"
+    printf '%s %s\n' "${'$'}hook_slot" "${'$'}{5:-}" > "$state_dir/hook-$(key_for_hook "${'$'}hook_target" "${'$'}hook_slot")"
   fi
 fi
 if [ "${'$'}{1:-}" = "show-hooks" ]; then
@@ -521,16 +524,20 @@ if [ "${'$'}{1:-}" = "show-hooks" ]; then
   hook_file="$state_dir/hook-$(key_for_hook "${'$'}hook_target" "${'$'}hook_slot")"
   [ -f "$hook_file" ] && cat "$hook_file" && exit 0
 fi
-if [ "${'$'}{1:-}" = "set-option" ] && case "${'$'}*" in *"@omx_team_pane_birth"*) true;; *) false;; esac; then
-  pane_target="${'$'}{4:-}"; pane_birth="${'$'}{6:-}"
-  printf '%s\\n' "${'$'}pane_birth" > "$state_dir/birth-${'$'}pane_target"
+if [ "${'$'}{1:-}" = "set-option" ]; then
+  case "${'$'}*" in
+    *"@omx_team_pane_birth"*) pane_target="${'$'}{4:-}"; pane_birth="${'$'}{6:-}"; printf '%s\n' "${'$'}pane_birth" > "$state_dir/birth-${'$'}pane_target" ;;
+    *"@omx_instance_id"*) session_target="${'$'}{3:-}"; session_birth="${'$'}{5:-}"; printf '%s\n' "${'$'}session_birth" > "$state_dir/session-birth-${'$'}session_target" ;;
+  esac
 fi
 if [ "${'$'}{1:-}" = "show-option" ]; then
   case "${'$'}*" in
-    *"@omx_team_pane_birth"*)
-      pane_target="${'$'}{5:-}"
-      [ -f "$state_dir/birth-${'$'}pane_target" ] && cat "$state_dir/birth-${'$'}pane_target" && exit 0
-      ;;
+    *"@omx_team_pane_birth"*) pane_target="${'$'}{5:-}"; [ -f "$state_dir/birth-${'$'}pane_target" ] && cat "$state_dir/birth-${'$'}pane_target" && exit 0 ;;
+  esac
+fi
+if [ "${'$'}{1:-}" = "show-options" ]; then
+  case "${'$'}*" in
+    *"@omx_instance_id"*) session_target="${'$'}{4:-}"; [ -f "$state_dir/session-birth-${'$'}session_target" ] && cat "$state_dir/session-birth-${'$'}session_target" && exit 0 ;;
   esac
 fi
 `,
@@ -1997,7 +2004,10 @@ sleep 5
       await mkdir(victim, { recursive: true });
       await writeFile(join(victim, 'keep.txt'), 'keep');
 
-      await shutdownTeam('../../victim', cwd, { force: true });
+      await assert.rejects(
+        shutdownTeam('../../victim', cwd, { force: true }),
+        /Team victim not found/,
+      );
       assert.equal(existsSync(join(victim, 'keep.txt')), true);
     } finally {
       await rm(cwd, { recursive: true, force: true });
@@ -2175,6 +2185,10 @@ case "\${1:-}" in
     esac
     exit 0
     ;;
+  show-options)
+    echo "live-session-birth"
+    exit 0
+    ;;
   list-panes)
     case "$*" in
       *"-t %2 -F #{pane_pid}"*)
@@ -2216,6 +2230,7 @@ esac
             OMX_SESSION_ID: undefined,
             CODEX_SESSION_ID: undefined,
             SESSION_ID: undefined,
+            OMX_TMUX_SESSION_INSTANCE_ID: 'live-session-birth',
           },
         },
         async ({ tmuxLogPath }) => {
@@ -4827,8 +4842,8 @@ exit 0
           // The first lifecycle generation owns the retained hooks. When shutdown
           // cannot prove exact hook cleanup, relaunch must preserve them rather
           // than overwrite their occupied slots with a newer generation.
-          assert.equal(tmuxLog.match(/if-shell -t leader:0 test -z .*client-resized\[\d+\].*set-hook -t 'leader:0' 'client-resized\[\d+\]'/g)?.length ?? 0, 2);
-          assert.equal(tmuxLog.match(/if-shell -t leader:0 test -z .*client-attached\[\d+\].*set-hook -t 'leader:0' 'client-attached\[\d+\]'/g)?.length ?? 0, 1);
+          assert.equal(tmuxLog.match(/set-hook -a -t leader:0 client-resized/g)?.length ?? 0, 1);
+          assert.equal(tmuxLog.match(/set-hook -a -t leader:0 client-attached/g)?.length ?? 0, 1);
           assert.equal(tmuxLog.match(/run-shell -b sleep \d+; tmux resize-pane -t %3 -y \d+ >/g)?.length ?? 0, 2);
           assert.equal(tmuxLog.match(/run-shell tmux resize-pane -t %3 -y \d+ >/g)?.length ?? 0, 2);
           assert.ok((tmuxLog.match(/select-layout -t leader:0 main-vertical/g)?.length ?? 0) >= 2);
@@ -6713,12 +6728,12 @@ esac
 
           await shutdownTeam('team-shutdown-dead-pane', cwd, { force: true });
           const teamRoot = join(cwd, '.omx', 'state', 'team', 'team-shutdown-dead-pane');
-          assert.equal(existsSync(teamRoot), false);
+          assert.equal(existsSync(teamRoot), true);
 
           const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
           assert.doesNotMatch(tmuxLog, /kill-pane -t %404/);
           assert.doesNotMatch(tmuxLog, /kill-pane -t %405/);
-          assert.match(tmuxLog, /kill-session -t omx-team-team-shutdown-dead-pane/);
+          assert.doesNotMatch(tmuxLog, /kill-session -t omx-team-team-shutdown-dead-pane/);
         },
       );
     } finally {
@@ -6932,7 +6947,7 @@ esac
           await shutdownTeam(teamName, cwd, { force: true });
 
           const teamRoot = join(cwd, '.omx', 'state', 'team', teamName);
-          assert.equal(existsSync(teamRoot), false);
+          assert.equal(existsSync(teamRoot), true);
           assert.equal(await readMonitorSnapshot(teamName, cwd), null);
 
           const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
@@ -7439,7 +7454,7 @@ esac
             await shutdownTeam('team-shutdown-win32-split', cwd, { force: true });
 
             const teamRoot = join(cwd, '.omx', 'state', 'team', 'team-shutdown-win32-split');
-            assert.equal(existsSync(teamRoot), false);
+            assert.equal(existsSync(teamRoot), true);
             assert.equal(await readMonitorSnapshot('team-shutdown-win32-split', cwd), null);
 
             const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
@@ -7530,7 +7545,7 @@ esac
             await shutdownTeam(teamName, cwd, { force: true });
 
             const teamRoot = join(cwd, '.omx', 'state', 'team', teamName);
-            assert.equal(existsSync(teamRoot), false);
+            assert.equal(existsSync(teamRoot), true);
             assert.equal(await readMonitorSnapshot(teamName, cwd), null);
 
             const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
@@ -7620,7 +7635,7 @@ esac
           await shutdownTeam('team-shutdown-shared-session', cwd, { force: true });
 
           const teamRoot = join(cwd, '.omx', 'state', 'team', 'team-shutdown-shared-session');
-          assert.equal(existsSync(teamRoot), false);
+          assert.equal(existsSync(teamRoot), true);
           assert.equal(await readMonitorSnapshot('team-shutdown-shared-session', cwd), null);
 
           const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
