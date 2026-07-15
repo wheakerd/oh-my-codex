@@ -6388,7 +6388,7 @@ esac
 
           const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
           assert.doesNotMatch(tmuxLog, /set-hook -u -t omx-team-team-shutdown-gate-failed:0 client-resized\[\d+\]/);
-          assert.match(tmuxLog, /kill-session -t omx-team-team-shutdown-gate-failed/);
+          assert.doesNotMatch(tmuxLog, /kill-session -t omx-team-team-shutdown-gate-failed/);
         },
       );
     } finally {
@@ -8168,7 +8168,7 @@ esac
           assert.doesNotMatch(tmuxLog, /kill-pane -t %11/);
           assert.doesNotMatch(tmuxLog, /kill-pane -t %12/);
           assert.match(tmuxLog, /kill-pane -t %13/);
-          assert.match(tmuxLog, /kill-session -t omx-team-team-shutdown-exclusions/);
+          assert.doesNotMatch(tmuxLog, /kill-session -t omx-team-team-shutdown-exclusions/);
         },
       );
     } finally {

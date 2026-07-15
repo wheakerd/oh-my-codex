@@ -109,6 +109,27 @@ describe('reconcileHudForPromptSubmit', () => {
     assert.equal(created, false);
   });
 
+  it('fails closed for a mixed pane/session pair from a broader resolver alias set', async () => {
+    let listed = false;
+    let mutated = false;
+    const result = await reconcileHudForPromptSubmit('/repo', {
+      env: { TMUX: '1', TMUX_PANE: '%1', OMX_SESSION_ID: 'canonical', [OMX_TMUX_HUD_OWNER_ENV]: '1' },
+      sessionIds: ['canonical', 'native-a', 'native-b'],
+      probeTmuxInstance: async () => ({
+        paneTarget: '%1', sessionName: 'managed', paneInstanceId: 'native-a', sessionInstanceId: 'native-b',
+        instanceId: 'native-a', source: 'pane', paneTagStatus: 'present', sessionTagStatus: 'present',
+        sessionId: '$1', windowId: '@1', contextStable: true,
+      }),
+      listCurrentWindowPanes: () => { listed = true; return []; },
+      createHudWatchPane: () => { mutated = true; return '%2'; },
+      resolveOmxCliEntryPath: () => '/repo/dist/cli/omx.js',
+    });
+
+    assert.equal(result.status, 'skipped_not_omx_owned_tmux');
+    assert.equal(listed, false);
+    assert.equal(mutated, false);
+  });
+
   it('skips recreating a missing HUD in explicit OMX-owned tmux without a session id', async () => {
     const created: Array<{ cwd: string; cmd: string; options?: { heightLines?: number; targetPaneId?: string } }> = [];
     const resized: Array<{ paneId: string; heightLines: number }> = [];
@@ -2263,6 +2284,32 @@ describe('teardownManagedHudPane', () => {
           { paneId: '%1', currentCommand: 'codex', startCommand: 'codex', paneInstanceId: 'stale', sessionInstanceId: 'session-a' },
           { paneId: '%2', currentCommand: 'node', startCommand: "exec env OMX_SESSION_ID='session-a' OMX_TMUX_HUD_OWNER='1' OMX_TMUX_HUD_LEADER_PANE='%1' node omx.js hud --watch", paneInstanceId: 'session-a', sessionInstanceId: 'session-a' },
         ],
+        killTmuxPane: (paneId) => { killed.push(paneId); return true; },
+      });
+      assert.equal(result.status, 'skipped_not_omx_owned_tmux');
+      assert.deepEqual(killed, []);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves every pane when teardown evidence mixes a broader alias set', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-hud-teardown-mixed-alias-'));
+    const killed: string[] = [];
+    try {
+      const result = await teardownManagedHudPane(cwd, {
+        env: { TMUX: '1', TMUX_PANE: '%1', OMX_SESSION_ID: 'canonical', [OMX_TMUX_HUD_OWNER_ENV]: '1' },
+        sessionId: 'canonical',
+        sessionIds: ['canonical', 'native-a', 'native-b'],
+        resolveDomain: async () => testReconcileDomain(cwd, {
+          sessionId: 'canonical', sessionIds: ['canonical', 'native-a', 'native-b'], env: { TMUX_PANE: '%1' },
+        }),
+        probeTmuxInstance: async () => ({
+          paneTarget: '%1', sessionName: 'managed', paneInstanceId: 'native-a', sessionInstanceId: 'native-b',
+          instanceId: 'native-a', source: 'pane', paneTagStatus: 'present', sessionTagStatus: 'present',
+          sessionId: '$1', windowId: '@1', contextStable: true,
+        }),
+        listCurrentWindowPanes: () => { assert.fail('mixed authority must not enumerate panes'); return []; },
         killTmuxPane: (paneId) => { killed.push(paneId); return true; },
       });
       assert.equal(result.status, 'skipped_not_omx_owned_tmux');
