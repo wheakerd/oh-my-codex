@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { delimiter, isAbsolute, join, relative, resolve as resolvePath } from 'path';
 import { existsSync, realpathSync } from 'fs';
-import { readFile, readdir, mkdir, rename, stat, unlink, writeFile } from 'fs/promises';
+import { readFile, readdir, mkdir, rename, unlink, writeFile } from 'fs/promises';
 import {
   isSessionStateUsable,
   readUsableSessionState,
@@ -94,19 +94,6 @@ function hudTmuxBirthLineagePath(baseStateDir: string, sessionId: string): strin
   return join(baseStateDir, HUD_TMUX_BIRTH_LINEAGE_DIR, `${createHash('sha256').update(sessionId).digest('hex')}.json`);
 }
 
-const HUD_TMUX_BIRTH_LINEAGE_STALE_MS = 24 * 60 * 60 * 1000;
-const HUD_TMUX_BIRTH_LINEAGE_MAX_FILES = 256;
-
-async function cleanupStaleHudTmuxBirthLineage(baseStateDir: string, nowMs: number): Promise<void> {
-  const directory = join(baseStateDir, HUD_TMUX_BIRTH_LINEAGE_DIR);
-  const entries = await readdir(directory, { withFileTypes: true }).catch(() => []);
-  const files = entries.filter((entry) => entry.isFile() && entry.name.endsWith('.json')).slice(0, HUD_TMUX_BIRTH_LINEAGE_MAX_FILES);
-  await Promise.all(files.map(async (entry) => {
-    const path = join(directory, entry.name);
-    const info = await stat(path).catch(() => null);
-    if (info && nowMs - info.mtimeMs > HUD_TMUX_BIRTH_LINEAGE_STALE_MS) await unlink(path).catch(() => undefined);
-  }));
-}
 
 export async function writeHudTmuxBirthLineage(
   domain: Pick<ResolvedHudControlPlaneDomain, 'baseStateDir'>,
@@ -124,15 +111,17 @@ export async function writeHudTmuxBirthLineage(
   const temporary = `${target}.${record.nonce}.tmp`;
   await writeFile(temporary, `${JSON.stringify(record)}\n`, { mode: 0o600 });
   await rename(temporary, target);
-  void cleanupStaleHudTmuxBirthLineage(domain.baseStateDir, nowMs);
 }
 
 export async function deleteHudTmuxBirthLineage(
   domain: Pick<ResolvedHudControlPlaneDomain, 'baseStateDir'>,
-  sessionId: string,
+  lineage: Required<Pick<HudTmuxBirthLineage, 'sessionId' | 'tmuxSessionName' | 'tmuxSessionInstanceId' | 'tmuxPaneInstanceId' | 'createdAtMs' | 'nonce'>>,
 ): Promise<boolean> {
+  const path = hudTmuxBirthLineagePath(domain.baseStateDir, lineage.sessionId);
   try {
-    await unlink(hudTmuxBirthLineagePath(domain.baseStateDir, sessionId));
+    const current: unknown = JSON.parse(await readFile(path, 'utf-8'));
+    if (JSON.stringify(current) !== JSON.stringify(lineage)) return false;
+    await unlink(path);
     return true;
   } catch (error: unknown) {
     return (error as NodeJS.ErrnoException).code === 'ENOENT';

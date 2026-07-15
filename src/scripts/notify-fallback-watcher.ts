@@ -26,7 +26,7 @@ import {
   maybeNudgeTeamLeader,
   resolveLeaderStalenessThresholdMs,
 } from './notify-hook/team-leader-nudge.js';
-import { resolveManagedPaneFromAnchor, resolveManagedSessionPane } from './notify-hook/managed-tmux.js';
+import { probeActualTmuxInstanceEvidence, resolveManagedPaneFromAnchor, resolveManagedSessionPane } from './notify-hook/managed-tmux.js';
 import { DEFAULT_MARKER } from './tmux-hook-engine.js';
 import { isTerminalPhase } from './notify-hook/utils.js';
 import { isSessionStale, isSessionStateAuthoritativeForCwd, readSessionState } from '../hooks/session.js';
@@ -2070,6 +2070,43 @@ function isHudAuthorityLeaseRecord(value: unknown): value is HudAuthorityLeaseRe
     && parseIsoMillis(lease.heartbeatAt) !== null;
 }
 
+interface HudAuthorityClaimant {
+  sessionId: string;
+  leaderPaneId: string;
+  tmuxSessionName: string;
+  tmuxSessionInstanceId: string;
+  tmuxPaneInstanceId: string;
+}
+
+function parseHudAuthorityClaimant(value: string): HudAuthorityClaimant | null {
+  try {
+    const claimant: unknown = JSON.parse(value);
+    if (!claimant || typeof claimant !== 'object') return null;
+    const record = claimant as Partial<HudAuthorityClaimant>;
+    return typeof record.sessionId === 'string' && record.sessionId.trim()
+      && typeof record.leaderPaneId === 'string' && record.leaderPaneId.trim()
+      && typeof record.tmuxSessionName === 'string' && record.tmuxSessionName.trim()
+      && typeof record.tmuxSessionInstanceId === 'string' && record.tmuxSessionInstanceId.trim()
+      && typeof record.tmuxPaneInstanceId === 'string' && record.tmuxPaneInstanceId.trim()
+      ? record as HudAuthorityClaimant
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+async function hasExactLiveHudAuthorityClaimant(domain: Awaited<ReturnType<typeof resolveHudControlPlaneDomain>>, claimant: HudAuthorityClaimant): Promise<boolean> {
+  if (JSON.stringify(domain.claimant) !== JSON.stringify(claimant)) return false;
+  const evidence = await probeActualTmuxInstanceEvidence(claimant.leaderPaneId);
+  return evidence.contextStable
+    && evidence.paneTarget === claimant.leaderPaneId
+    && evidence.sessionName === claimant.tmuxSessionName
+    && evidence.paneTagStatus === 'present'
+    && evidence.sessionTagStatus === 'present'
+    && evidence.paneInstanceId === claimant.tmuxPaneInstanceId
+    && evidence.sessionInstanceId === claimant.tmuxSessionInstanceId;
+}
+
 async function isAdmittedHudAuthorityWatcher(): Promise<boolean> {
   if (!authorityOnly) return true;
   const expectedDomainKey = safeString(process.env.OMX_HUD_AUTHORITY_DOMAIN_KEY);
@@ -2081,13 +2118,18 @@ async function isAdmittedHudAuthorityWatcher(): Promise<boolean> {
   const expectedPid = parsePositivePid(process.env.OMX_HUD_AUTHORITY_OWNER_PID);
   const expectedPlatform = safeString(process.env.OMX_HUD_AUTHORITY_OWNER_PLATFORM);
   const expectedStartIdentity = safeString(process.env.OMX_HUD_AUTHORITY_OWNER_START_IDENTITY);
+  const expectedClaimant = safeString(process.env.OMX_HUD_AUTHORITY_CLAIMANT);
   if (!expectedDomainKey || !expectedBaseStateDir || !expectedRootSource || !expectedLeasePath
-    || !expectedToken || !expectedGeneration || !expectedPid || !expectedPlatform || !expectedStartIdentity) return false;
+    || !expectedToken || !expectedGeneration || !expectedPid || !expectedPlatform || !expectedStartIdentity || !expectedClaimant) return false;
   const domain = await resolveHudControlPlaneDomain({ cwd, env: process.env }).catch(() => null);
   if (!domain || domain.domainKey !== expectedDomainKey || !sameFilePath(domain.baseStateDir, expectedBaseStateDir)
     || domain.rootSource !== expectedRootSource || !sameFilePath(domain.authorityLeasePath, expectedLeasePath)) return false;
   const lease = await readFile(expectedLeasePath, 'utf8').then((text) => JSON.parse(text) as unknown).catch(() => null);
-  if (!isHudAuthorityLeaseRecord(lease)) return false;
+  if (!isHudAuthorityLeaseRecord(lease) || lease.claimant !== expectedClaimant) return false;
+  if (domain.managed) {
+    const claimant = parseHudAuthorityClaimant(expectedClaimant);
+    if (!claimant || !(await hasExactLiveHudAuthorityClaimant(domain, claimant).catch(() => false))) return false;
+  }
   return lease.domainKey === domain.domainKey
     && sameFilePath(lease.baseStateDir, domain.baseStateDir)
     && lease.rootSource === domain.rootSource

@@ -388,10 +388,12 @@ function tagNewHudPaneOrRollback(
       && (!teamOwnerId || readNewPaneTeamOwnerTag(paneId) === teamOwnerId);
     if (tagsMatch) return true;
   } catch {
-    // Roll back only the pane created by this transaction.
+    // The split may have succeeded but its ownership tags could not be verified.
+    // Pane ids are reusable, so an untagged pane must be preserved rather than
+    // killed by a stale id during rollback.
   }
-  runTmux(['kill-pane', '-t', paneId]);
   return false;
+
 }
 
 export function tagPaneTeamOwner(paneTarget: string, teamOwnerId: string): void {
@@ -563,9 +565,10 @@ export function killExactTeamHudPane(
 ): boolean {
   if (!findExactTeamHudPaneIds(target, candidate).includes(paneId)) return false;
   const sessionName = candidate.tmuxSessionName ?? target.split(':')[0] ?? '';
-  const ownerCondition = teamOwnerId ? `,#{==:#{@omx_team_pane_owner},${teamOwnerId}}` : '';
-  const condition = `#{&&:#{==:#{pane_id},${paneId}},#{==:#{@omx_pane_instance_id},${candidate.tmuxPaneInstanceId}},#{==:#{session_name},${sessionName}}${ownerCondition}}`;
+  const ownerCondition = teamOwnerId ? `,#{==:#{@omx_team_pane_owner_id},${teamOwnerId}}` : '';
+  const condition = `#{&&:#{==:#{pane_id},${paneId}},#{==:#{@omx_pane_instance_id},${candidate.tmuxPaneInstanceId}},#{==:#{@omx_instance_id},${candidate.tmuxSessionInstanceId}},#{==:#{session_name},${sessionName}}${ownerCondition}}`;
   const result = runTmux(['if-shell', '-t', paneId, '-F', condition, `kill-pane -t ${paneId}`, '']);
+
   return result.ok && !findExactTeamHudPaneIds(target, candidate).includes(paneId);
 }
 
@@ -1981,6 +1984,9 @@ export function createTeamSession(
   let registeredResizeHook: { name: string; target: string } | null = null;
   let registeredClientAttachedHook: { name: string; target: string } | null = null;
   const rollbackPaneIds: string[] = [];
+  let rollbackOwnerSessionId = '';
+  let rollbackTeamPaneOwnerId = '';
+
   try {
     const tmuxPaneTarget = process.env.TMUX_PANE;
     const displayArgs = tmuxPaneTarget
@@ -1999,6 +2005,9 @@ export function createTeamSession(
     const teamTarget = `${sessionName}:${windowIndex}`;
     const ownerSessionId = (options.ownerSessionId ?? process.env.OMX_SESSION_ID ?? '').trim();
     const teamPaneOwnerId = (options.teamPaneOwnerId ?? `team:${safeTeamName}`).trim();
+    rollbackOwnerSessionId = ownerSessionId;
+    rollbackTeamPaneOwnerId = teamPaneOwnerId;
+
     const panes = listPanes(teamTarget);
     const leaderPaneId = chooseTeamLeaderPaneId(panes, detectedLeaderPaneId);
     const hudExactCandidate = normalizeExactTeamHudCandidate(options.hudExactCandidate);
@@ -2221,8 +2230,13 @@ export function createTeamSession(
     if (registeredResizeHook) {
       runTmux(buildUnregisterResizeHookArgs(registeredResizeHook.target, registeredResizeHook.name));
     }
+    // Every rollback candidate was tagged and read back before being journaled.
+    // Revalidate its exact Team ownership and both opaque births in tmux itself;
+    // a failed conditional kill deliberately retains the pane for recovery.
     for (const paneId of rollbackPaneIds) {
-      runTmux(['kill-pane', '-t', paneId]);
+      if (!rollbackOwnerSessionId || !rollbackTeamPaneOwnerId) continue;
+      const condition = `#{&&:#{==:#{pane_id},${paneId}},#{==:#{@omx_pane_instance_id},${rollbackOwnerSessionId}},#{==:#{@omx_instance_id},${rollbackOwnerSessionId}},#{==:#{@omx_team_pane_owner_id},${rollbackTeamPaneOwnerId}}}`;
+      runTmux(['if-shell', '-t', paneId, '-F', condition, `kill-pane -t ${paneId}`, '']);
     }
     throw error;
   }

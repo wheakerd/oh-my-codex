@@ -26,7 +26,6 @@ import {
   isWorkerAlive,
   isWorkerPaneOpen,
   getWorkerPanePid,
-  killWorkerByPaneIdAsync,
   paneHasOmxInstanceTag,
   readPaneTeamOwnerTagResult,
   restoreStandaloneHudPane,
@@ -2702,8 +2701,7 @@ export async function startTeam(
   const overlay = generateWorkerOverlay(sanitized);
   let workerInstructionsPath: string | null = null;
   let sessionCreated = false;
-  const createdWorkerPaneIds: string[] = [];
-  let createdLeaderPaneId: string | undefined;
+
   let config: TeamConfig | null = null;
   const workerReadyTimeoutMs = resolveWorkerReadyTimeoutMs(launchEnv);
   const workerStartupEvidenceTimeoutMs = resolveWorkerStartupEvidenceTimeoutMs(
@@ -3067,8 +3065,6 @@ export async function startTeam(
         // persisting lineage so a persistence failure enters the existing exact rollback.
         sessionName = createdSession.name;
         sessionCreated = true;
-        createdWorkerPaneIds.push(...createdSession.workerPaneIds);
-        createdLeaderPaneId = createdSession.leaderPaneId;
         applyCreatedInteractiveSessionToConfig(config, createdSession, workerPaneIds);
         const revalidatedHudCandidate = hudExactCandidate
           ? probeExactTeamHudCandidate({
@@ -3354,29 +3350,15 @@ export async function startTeam(
         rollbackErrors.push('preserving HUD metadata and container because hook cleanup was uncertain');
       }
 
-      // In split-pane topology, we must not kill the entire tmux session; kill only created panes.
+      // Startup rollback has no immutable per-resource birth journal at this layer.
+      // Pane ids and standalone session names are reusable, so retain all Team
+      // resources and recovery metadata rather than risking an ABA teardown.
       if (sessionName.includes(':')) {
-        for (const paneId of createdWorkerPaneIds) {
-          try {
-            await killWorkerByPaneIdAsync(paneId, createdLeaderPaneId);
-          } catch (err) {
-            process.stderr.write(`[team/runtime] operation failed: ${err}\n`);
-          }
-        }
-        if (config?.hud_pane_id && hookCleanupCertain) {
-          try {
-            await killWorkerByPaneIdAsync(config.hud_pane_id, createdLeaderPaneId);
-          } catch (err) {
-            process.stderr.write(`[team/runtime] operation failed: ${err}\n`);
-          }
-        }
-      } else if (hookCleanupCertain) {
-        try {
-          destroyTeamSession(sessionName);
-        } catch (cleanupError) {
-          rollbackErrors.push(`destroyTeamSession: ${String(cleanupError)}`);
-        }
+        rollbackErrors.push('preserving split-pane resources and Team metadata: exact pane birth journal unavailable');
+      } else {
+        rollbackErrors.push('preserving standalone session and Team metadata: exact session birth journal unavailable');
       }
+
     }
     if (workerLaunchMode === 'prompt' && config) {
       const promptTeardownFailures: string[] = [];
@@ -3421,10 +3403,12 @@ export async function startTeam(
     }
     restoreTeamModelInstructionsFile(sanitized);
 
-    try {
-      await cleanupTeamState(sanitized, leaderCwd);
-    } catch (cleanupError) {
-      rollbackErrors.push(`cleanupTeamState: ${String(cleanupError)}`);
+    if (rollbackErrors.length === 0) {
+      try {
+        await cleanupTeamState(sanitized, leaderCwd);
+      } catch (cleanupError) {
+        rollbackErrors.push(`cleanupTeamState: ${String(cleanupError)}`);
+      }
     }
     if (provisionedWorktrees.length > 0) {
       try {
