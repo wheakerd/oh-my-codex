@@ -3423,6 +3423,51 @@ esac
     }
   });
 
+  it("fails closed after a second birth write fails and exact compensation rejects a concurrent replacement", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-tmux-birth-compensation-"));
+    const bin = join(cwd, "bin");
+    const tmux = join(bin, "tmux");
+    const log = join(cwd, "tmux.log");
+    const replacement = join(cwd, "replacement");
+    const previousPath = process.env.PATH;
+    try {
+      await mkdir(bin, { recursive: true });
+      await writeFile(tmux, `#!/bin/sh
+printf '%s\\n' "$*" >> "${log}"
+case "$1" in
+  display-message) printf 'leader\\t$1\\t@1\\t%%1\\n' ;;
+  show-option|show-options) ;;
+  if-shell)
+    case "$*" in
+      *__omx_birth_established_*) : > "${replacement}"; exit 99 ;;
+      *__omx_birth_compensation_*)
+        for arg in "$@"; do
+          case "$arg" in *__omx_birth_compensation_rejected_*) receipt="${'$'}{arg#*display-message -p }" ;; esac
+        done
+        printf '%s\\n' "$receipt"
+        ;;
+    esac
+    ;;
+esac
+`);
+      await chmod(tmux, 0o755);
+      process.env.PATH = `${bin}:${previousPath ?? ""}`;
+      await assert.rejects(
+        () => establishCurrentTmuxInstanceBinding("logical-session", "%1"),
+        /exact compensation was rejected/,
+      );
+      assert.equal(existsSync(replacement), true, "concurrent replacement must survive compensation");
+      const calls = await readFile(log, "utf-8");
+      assert.match(calls, /@omx_instance_id/);
+      assert.match(calls, /@omx_pane_instance_id/);
+      assert.doesNotMatch(calls, /logical-session.*set-option/);
+    } finally {
+      if (typeof previousPath === "string") process.env.PATH = previousPath;
+      else delete process.env.PATH;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("rejects mixed birth evidence without attempting to repair an uncertain pair", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-tmux-birth-partial-"));
     const bin = join(cwd, "bin");
@@ -5408,6 +5453,10 @@ exit 0
     assert.match(rollback.args[5]!, /kill-session -t 'omx-demo'/);
     assert.match(rollback.args[5]!, /__omx_detached_session_rollback_applied_/);
     assert.match(rollback.args[6]!, /__omx_detached_session_rollback_rejected_/);
+    assert.equal(typeof rollback.appliedReceipt, "string");
+    assert.equal(typeof rollback.rejectedReceipt, "string");
+    assert.match(rollback.appliedReceipt!, /^__omx_detached_session_rollback_applied_/);
+    assert.match(rollback.rejectedReceipt!, /^__omx_detached_session_rollback_rejected_/);
   });
 
   it("buildDetachedSessionRollbackSteps preserves uncertain sessions without an opaque birth", () => {
@@ -5419,6 +5468,15 @@ exit 0
       null,
     );
     assert.deepEqual(steps, []);
+  });
+
+  it("consumes detached rollback receipts before allowing fallback or recovery-record deletion", async () => {
+    const source = await readFile(join(repoRoot, "src", "cli", "index.ts"), "utf8");
+    assert.match(source, /rollbackApplied = receipt\.includes\(rollbackStep\.appliedReceipt\)/);
+    assert.match(source, /detached tmux rollback was rejected; preserving recovery state/);
+    assert.match(source, /detached tmux rollback returned no receipt; preserving recovery state/);
+    assert.match(source, /if \(!rollbackApplied\) \{\s*throw new TmuxLifecycleAuthorityError\("detached tmux rollback lacks applied evidence; preserving recovery state"\);\s*\}\s*}\s*if \(detachedParentEnvFilePath\)/);
+    assert.match(source, /err instanceof TmuxLifecycleAuthorityError\) \{\s*throw err;\s*}\s*logCliOperationFailure\(err\);[\s\S]*runCodexBlocking/);
   });
 });
 

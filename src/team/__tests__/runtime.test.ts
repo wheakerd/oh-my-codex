@@ -2615,7 +2615,8 @@ esac
           assert.doesNotMatch(tmuxLog, /set-option -t leader @omx_instance_id live-session-instance/);
           assert.doesNotMatch(tmuxLog, /set-option -p -t %1 @omx_pane_instance_id live-pane-instance/);
           assert.match(tmuxLog, /set-option -p -t %2 @omx_pane_instance_id logical-session-from-env/);
-          assert.match(tmuxLog, /set-option -p -t %3 @omx_pane_instance_id live-pane-instance/);
+          assert.match(tmuxLog, /set-option -p -t %3 @omx_pane_instance_id [0-9a-f-]{36}/);
+          assert.doesNotMatch(tmuxLog, /set-option -p -t %3 @omx_pane_instance_id (?:live-pane-instance|logical-session-from-env)/);
 
           assert.match(tmuxLog, /set-option -p -t %1 @omx_team_pane_owner_id team:pane-owner-env-isolat-[a-f0-9]{8}/);
           assert.match(tmuxLog, /set-option -p -t %2 @omx_team_pane_owner_id team:pane-owner-env-isolat-[a-f0-9]{8}/);

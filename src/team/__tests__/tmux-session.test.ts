@@ -182,7 +182,7 @@ if [ "${'$'}{1:-}" = "if-shell" ]; then
     hook_target="${'$'}{2:-}"
   fi
   case "${'$'}branch" in
-    *__omx_*_teardown_applied_*|*__omx_birth_established_*)
+    *__omx_*_teardown_applied_*|*__omx_birth_established_*|*__omx_birth_compensated_*)
       selected="${'$'}branch"
       [ -f "$state_dir/if-shell-reject" ] && selected="${'$'}rejected_branch"
       receipt="${'$'}{selected##*display-message -p }"
@@ -203,7 +203,19 @@ if [ "${'$'}{1:-}" = "if-shell" ]; then
             pane_birth="${'$'}{pane_birth%% *}"
             pane_birth="${'$'}{pane_birth#\'}"; pane_birth="${'$'}{pane_birth%\'}"
             printf '%s\n' "${'$'}session_birth" > "$(option_path "${'$'}session_target" '@omx_instance_id')"
+            if [ -f "$state_dir/if-shell-second-birth-write-fails" ]; then
+              if [ -f "$state_dir/if-shell-concurrent-replacement" ]; then
+                printf 'concurrent-session-birth\n' > "$(option_path "${'$'}session_target" '@omx_instance_id')"
+                printf 'concurrent-pane-birth\n' > "$(option_path "${'$'}pane_target" '@omx_pane_instance_id')"
+              fi
+              exit 0
+            fi
             printf '%s\n' "${'$'}pane_birth" > "$(option_path "${'$'}pane_target" '@omx_pane_instance_id')"
+            ;;
+          *__omx_birth_compensated_*)
+            if [ ! -f "$state_dir/if-shell-concurrent-replacement" ]; then
+              rm -f "$(option_path leader '@omx_instance_id')" "$(option_path %1 '@omx_pane_instance_id')"
+            fi
             ;;
         esac
       fi
@@ -487,6 +499,36 @@ esac
         assert.match(log, /__omx_birth_established_/);
         assert.match(log, /__omx_birth_rejected_/);
         assert.equal((log.match(/^if-shell /gm) ?? []).length, 1);
+      });
+    } finally {
+      if (typeof previousPane === 'string') process.env.TMUX_PANE = previousPane;
+      else delete process.env.TMUX_PANE;
+    }
+  });
+
+  it('compensates an exact partial birth publication without widening authority', async () => {
+    const previousPane = process.env.TMUX_PANE;
+    try {
+      process.env.TMUX_PANE = '%1';
+      await withMockTmuxFixture('omx-partial-birth-compensation-', (logPath) => `#!/bin/sh
+printf '%s\\n' "$*" >> "${logPath}"
+case "$1" in
+  display-message) printf 'leader:0 %%1\\n' ;;
+  *) exit 0 ;;
+esac
+`, async ({ logPath }) => {
+        const stateDir = `${logPath}.tmux-state`;
+        await mkdir(stateDir, { recursive: true });
+        await writeFile(`${stateDir}/births-empty`, '1');
+        await writeFile(`${stateDir}/if-shell-second-birth-write-fails`, '1');
+
+        assert.equal(establishExactTeamHudCandidate({ sessionId: 'canonical-session', expectedLeaderPaneId: '%1' }), null);
+        assert.equal(await readFile(`${stateDir}/option-leader__omx_instance_id`, 'utf-8').catch(() => ''), '');
+        assert.equal(await readFile(`${stateDir}/option-_1__omx_pane_instance_id`, 'utf-8').catch(() => ''), '');
+
+        const log = await readFile(logPath, 'utf-8');
+        assert.match(log, /__omx_birth_compensated_/);
+        assert.match(log, /__omx_birth_compensation_rejected_/);
       });
     } finally {
       if (typeof previousPane === 'string') process.env.TMUX_PANE = previousPane;
@@ -4554,7 +4596,8 @@ esac
           assert.doesNotMatch(tmuxLog, /set-option -t shared @omx_instance_id omx-pane-scope/);
           assert.doesNotMatch(tmuxLog, /set-option -p -t %1 @omx_pane_instance_id omx-pane-scope/);
           assert.match(tmuxLog, /set-option -p -t %2 @omx_pane_instance_id omx-pane-scope/);
-          assert.match(tmuxLog, /set-option -p -t %3 @omx_pane_instance_id omx-pane-scope/);
+          assert.match(tmuxLog, /set-option -p -t %3 @omx_pane_instance_id [0-9a-f-]{36}/);
+          assert.doesNotMatch(tmuxLog, /set-option -p -t %3 @omx_pane_instance_id omx-pane-scope/);
           assert.match(tmuxLog, /set-option -p -t %1 @omx_team_pane_owner_id team:pane-tags/);
           assert.match(tmuxLog, /set-option -p -t %2 @omx_team_pane_owner_id team:pane-tags/);
           assert.match(tmuxLog, /set-option -p -t %3 @omx_team_pane_owner_id team:pane-tags/);
@@ -4965,6 +5008,12 @@ esac
     }
   });
 
+
+  it('journals retained HUD panes as borrowed resources and excludes them from rollback', async () => {
+    const source = await readFile(join(process.cwd(), 'src/team/tmux-session.ts'), 'utf-8');
+    assert.match(source, /if \(retainedHudPaneId\)[\s\S]*kind: 'hud',[\s\S]*created: false/);
+    assert.match(source, /if \(!retainedHudPaneId\) rollbackPaneIds\.push\(id\)/);
+  });
 
   it('fails closed before worker provisioning when exact Team HUD duplicates lack lifecycle receipts', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-team-duplicate-hud-'));
@@ -5749,7 +5798,7 @@ esac
           assert.equal(splitCount, 1);
           assert.doesNotMatch(tmuxLog, /kill-pane -t %44/);
           assert.match(tmuxLog, /list-panes -t %11 -F #\{pane_id\}\t#\{pane_current_command\}\t#\{pane_start_command\}\t#\{@omx_pane_instance_id\}\t#\{@omx_instance_id\}/);
-          assert.match(tmuxLog, /set-option -p -t %44 @omx_pane_instance_id pane-instance/);
+          assert.match(tmuxLog, /set-option -p -t %44 @omx_pane_instance_id [0-9a-f-]{36}/);
         },
       );
     } finally {

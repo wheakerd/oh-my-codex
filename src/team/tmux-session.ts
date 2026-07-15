@@ -236,6 +236,7 @@ export interface RestoreStandaloneHudPaneOptions {
   cwd?: string | null;
   /** Canonical state-root metadata resolved by the HUD control-plane resolver. */
   hudRuntime?: Pick<HudRuntimeEnvInput, 'omxRoot' | 'omxStateRoot' | 'omxTeamStateRoot' | 'rootSource'>;
+  onCreatedPane?: (evidence: { paneId: string; paneInstanceId: string; command: string }) => void;
 }
 
 const INJECTION_MARKER = '[OMX_TMUX_INJECT]';
@@ -376,21 +377,36 @@ function establishTmuxBirths(sessionName: string, leaderPaneId: string): Establi
     'if-shell', '-t', leaderPaneId, '-F', condition, publish,
     `display-message -p ${rejectedReceipt}`,
   ]);
-  if (!result.ok) return null;
-
-  const received = result.stdout.split('\n').map((line) => line.trim());
+  const received = result.ok ? result.stdout.split('\n').map((line) => line.trim()) : [];
   if (received.includes(appliedReceipt)) return { sessionBirth, paneBirth };
-  if (!received.includes(rejectedReceipt)) return null;
+  if (received.includes(rejectedReceipt)) {
+    // A concurrent publisher won the exact same conditional. It is safe to use
+    // only a complete pair that tmux now exposes for this still-revalidated pane.
+    const concurrentSessionTag = runTmux(['show-options', '-qv', '-t', sessionName, OMX_INSTANCE_OPTION]);
+    const concurrentPaneTag = runTmux(['show-option', '-qv', '-p', '-t', leaderPaneId, OMX_PANE_INSTANCE_OPTION]);
+    const concurrentSessionBirth = concurrentSessionTag.ok ? concurrentSessionTag.stdout.trim() : '';
+    const concurrentPaneBirth = concurrentPaneTag.ok ? concurrentPaneTag.stdout.trim() : '';
+    return concurrentSessionBirth && concurrentPaneBirth
+      ? { sessionBirth: concurrentSessionBirth, paneBirth: concurrentPaneBirth }
+      : null;
+  }
 
-  // A concurrent publisher won the exact same conditional. It is safe to use
-  // only a complete pair that tmux now exposes for this still-revalidated pane.
-  const concurrentSessionTag = runTmux(['show-options', '-qv', '-t', sessionName, OMX_INSTANCE_OPTION]);
-  const concurrentPaneTag = runTmux(['show-option', '-qv', '-p', '-t', leaderPaneId, OMX_PANE_INSTANCE_OPTION]);
-  const concurrentSessionBirth = concurrentSessionTag.ok ? concurrentSessionTag.stdout.trim() : '';
-  const concurrentPaneBirth = concurrentPaneTag.ok ? concurrentPaneTag.stdout.trim() : '';
-  return concurrentSessionBirth && concurrentPaneBirth
-    ? { sessionBirth: concurrentSessionBirth, paneBirth: concurrentPaneBirth }
-    : null;
+  // tmux can report a command failure after the first write has committed. Undo
+  // only our exact pair (or exact half-pair) in one server-side CAS; a changed
+  // value is a concurrent replacement and must survive recovery.
+  const compensationApplied = `__omx_birth_compensated_${randomUUID()}__`;
+  const compensationRejected = `__omx_birth_compensation_rejected_${randomUUID()}__`;
+  const compensationCondition = `#{||:#{&&:#{==:#{${OMX_INSTANCE_OPTION}},${escapeTmuxFormatLiteral(sessionBirth)}},#{==:#{${OMX_PANE_INSTANCE_OPTION}},}},#{&&:#{==:#{${OMX_INSTANCE_OPTION}},},#{==:#{${OMX_PANE_INSTANCE_OPTION}},${escapeTmuxFormatLiteral(paneBirth)}}},#{&&:#{==:#{${OMX_INSTANCE_OPTION}},${escapeTmuxFormatLiteral(sessionBirth)}},#{==:#{${OMX_PANE_INSTANCE_OPTION}},${escapeTmuxFormatLiteral(paneBirth)}}}}`;
+  const compensation = [
+    `set-option -u -t ${shellQuoteSingle(sessionName)} ${OMX_INSTANCE_OPTION}`,
+    `set-option -u -p -t ${shellQuoteSingle(leaderPaneId)} ${OMX_PANE_INSTANCE_OPTION}`,
+    `display-message -p ${compensationApplied}`,
+  ].join(' \\; ');
+  runTmux([
+    'if-shell', '-t', leaderPaneId, '-F', compensationCondition, compensation,
+    `display-message -p ${compensationRejected}`,
+  ]);
+  return null;
 }
 
 function appendNoUnderlineStyleFlags(style: string): string {
@@ -634,14 +650,13 @@ function findExactTeamHudPaneIds(target: string, candidate: ExactTeamHudCandidat
   if (!candidate) return [];
   return listPanes(target)
     .filter((pane) => pane.paneId !== candidate.leaderPaneId)
-    .filter((pane) => hudPaneMatchesExactCandidate(pane, {
+    .filter((pane) => hudPaneMatchesOwner(pane, {
       sessionId: candidate.sessionId,
       sessionIds: candidate.sessionIds,
       leaderPaneId: candidate.leaderPaneId,
-    }, {
-      tmuxSessionInstanceId: candidate.tmuxSessionInstanceId,
-      tmuxPaneInstanceId: candidate.tmuxPaneInstanceId,
-    }))
+    })
+      && Boolean(pane.paneInstanceId?.trim())
+      && pane.sessionInstanceId === candidate.tmuxSessionInstanceId)
     .map((pane) => pane.paneId);
 }
 
@@ -2116,10 +2131,6 @@ export function createTeamSession(
     const panes = listPanes(teamTarget);
     const leaderPaneId = chooseTeamLeaderPaneId(panes, detectedLeaderPaneId);
     const hudExactCandidate = normalizeExactTeamHudCandidate(options.hudExactCandidate);
-    const hudExactCandidateWasProvided = Object.prototype.hasOwnProperty.call(
-      options,
-      'hudExactCandidate',
-    );
     // Capture the session's persisted opaque birth before creating any rollback
     // candidates. The logical owner/session id is only an alias and must never
     // authorize destruction of panes in a later session generation.
@@ -2138,9 +2149,6 @@ export function createTeamSession(
       && hudExactCandidate.leaderPaneId === leaderPaneId
       && hudEvidenceStillMatches,
     );
-    if (!hudExactCandidate && !hudExactCandidateWasProvided) {
-      tagPaneInstance(leaderPaneId, ownerSessionId);
-    }
     tagPaneTeamOwner(leaderPaneId, teamPaneOwnerId);
     options.journalResource?.({
       kind: 'leader',
@@ -2157,6 +2165,30 @@ export function createTeamSession(
     // than silently running multiple HUD actors.
     if (duplicateHudPaneIds.length > 0) {
       throw new Error(`duplicate_exact_team_hud_without_receipts:${duplicateHudPaneIds.join(',')}`);
+    }
+    if (retainedHudPaneId) {
+      const retainedHudPane = listPanes(teamTarget).find((pane) => pane.paneId === retainedHudPaneId);
+      const retainedHudPaneBirth = readTeamPaneBirth(retainedHudPaneId);
+      const retainedHudPaneRole = readTeamPaneRole(retainedHudPaneId);
+      if (
+        !retainedHudPane?.startCommand.trim()
+        || !retainedHudPane.paneInstanceId?.trim()
+        || retainedHudPane.sessionInstanceId !== hudExactCandidate?.tmuxSessionInstanceId
+        || !retainedHudPaneBirth
+        || retainedHudPaneRole !== 'hud'
+        || readNewPaneTeamOwnerTag(retainedHudPaneId) !== teamPaneOwnerId
+      ) {
+        throw new Error(`failed to capture exact retained HUD receipt for ${retainedHudPaneId}`);
+      }
+      options.journalResource?.({
+        kind: 'hud',
+        id: retainedHudPaneId,
+        created: false,
+        pane_birth: retainedHudPaneBirth,
+        command: retainedHudPane.startCommand,
+        role: 'hud',
+        acquired_at: new Date().toISOString(),
+      });
     }
     const omxEntry = resolveOmxCliEntryPath();
     const canRecreateTeamHud = hasExactHudAuthority && Boolean(omxEntry && omxEntry.trim() !== '');
@@ -2271,39 +2303,14 @@ export function createTeamSession(
       if (hudPaneId || hudResult?.ok) {
         const id = hudPaneId ?? (hudResult && hudResult.ok ? hudResult.stdout.split('\n')[0]?.trim() ?? '' : '');
         if (id.startsWith('%')) {
-          if (retainedHudPaneId) {
-            const retainedHudPane = panes.find((pane) => pane.paneId === id);
-            const retainedHudPaneBirth = readTeamPaneBirth(id);
-            const retainedHudPaneRole = readTeamPaneRole(id);
-            if (
-              retainedHudPane?.startCommand.trim()
-              && retainedHudPaneBirth
-              && retainedHudPaneRole === 'hud'
-              && readNewPaneTeamOwnerTag(id) === teamPaneOwnerId
-            ) {
-              options.journalResource?.({
-                kind: 'hud',
-                id,
-                created: false,
-                pane_birth: retainedHudPaneBirth,
-                command: retainedHudPane.startCommand,
-                role: 'hud',
-                acquired_at: new Date().toISOString(),
-              });
-            }
-          }
           if (!retainedHudPaneId) rollbackPaneIds.push(id);
           if (isNativeWindows() && !waitForPaneToRemainPresent(teamTarget, id)) {
             throw new Error(`HUD pane did not remain present after tmux split-window returned ${id}`);
           }
           if (!retainedHudPaneId) {
             const paneBirth = randomUUID();
-            if (!tagNewHudPaneOrRollback(
-              id,
-              hudExactCandidate?.tmuxPaneInstanceId ?? ownerSessionId,
-              teamPaneOwnerId,
-            )) {
-              if (rollbackPaneIds[rollbackPaneIds.length - 1] === id) rollbackPaneIds.pop();
+            const paneInstanceBirth = randomUUID();
+            if (!tagNewHudPaneOrRollback(id, paneInstanceBirth, teamPaneOwnerId)) {
               throw new Error(`failed to tag and verify HUD pane ${id}`);
             }
             tagTeamPaneBirth(id, paneBirth);
@@ -2480,7 +2487,6 @@ export function restoreStandaloneHudPane(
   options: RestoreStandaloneHudPaneOptions = {},
 ): string | null {
   const normalizedLeaderPaneId = normalizePaneTarget(leaderPaneId);
-  const tmuxPaneInstanceId = options.tmuxPaneInstanceId?.trim();
   if (!normalizedLeaderPaneId) return null;
 
   const omxEntry = resolveOmxCliEntryPath();
@@ -2536,7 +2542,9 @@ export function restoreStandaloneHudPane(
 
   const paneId = hudResult.stdout.split('\n')[0]?.trim() ?? '';
   if (!paneId.startsWith('%')) return null;
-  if (tmuxPaneInstanceId && !tagNewHudPaneOrRollback(paneId, tmuxPaneInstanceId)) return null;
+  const restoredPaneInstanceId = randomUUID();
+  options.onCreatedPane?.({ paneId, paneInstanceId: restoredPaneInstanceId, command: hudCmd });
+  if (!tagNewHudPaneOrRollback(paneId, restoredPaneInstanceId)) return null;
 
   // A restored standalone pane is not resize-authorized until a complete
   // immutable hook generation exists.

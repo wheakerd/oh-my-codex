@@ -3461,7 +3461,10 @@ export async function startTeam(
       }
     }
 
-    if (config) {
+    const preserveInteractiveRecovery = workerLaunchMode === 'interactive'
+      && interactiveSessionCreationAttempted
+      && Boolean(lifecycleCertificate);
+    if (config && !preserveInteractiveRecovery) {
       for (const worker of config.workers) {
         if (!worker.worktree_path || !worker.team_state_root) continue;
         try {
@@ -3476,16 +3479,16 @@ export async function startTeam(
         }
       }
     }
-    if (workerInstructionsPath) {
+    if (workerInstructionsPath && !preserveInteractiveRecovery) {
       try {
         await removeTeamWorkerInstructionsFile(sanitized, leaderCwd);
       } catch (cleanupError) {
         rollbackErrors.push(`removeTeamWorkerInstructionsFile: ${String(cleanupError)}`);
       }
     }
-    restoreTeamModelInstructionsFile(sanitized);
+    if (!preserveInteractiveRecovery) restoreTeamModelInstructionsFile(sanitized);
 
-    if (rollbackErrors.length === 0) {
+    if (rollbackErrors.length === 0 && provisionedWorktrees.length === 0 && !preserveInteractiveRecovery) {
       try {
         await cleanupTeamState(sanitized, leaderCwd);
       } catch (cleanupError) {
@@ -3493,14 +3496,17 @@ export async function startTeam(
       }
     }
     if (provisionedWorktrees.length > 0) {
-      try {
-        await rollbackProvisionedWorktrees(provisionedWorktrees, {
-          skipBranchDeletion: false,
-        });
-      } catch (cleanupError) {
-        rollbackErrors.push(`rollbackProvisionedWorktrees: ${String(cleanupError)}`);
+      if (preserveInteractiveRecovery) {
+        rollbackErrors.push('preserving provisioned worktrees: startup rollback release receipts are unavailable');
+      } else {
+        try {
+          await rollbackProvisionedWorktrees(provisionedWorktrees, { skipBranchDeletion: false });
+        } catch (cleanupError) {
+          rollbackErrors.push(`rollbackProvisionedWorktrees: ${String(cleanupError)}`);
+        }
       }
     }
+
 
     if (rollbackErrors.length > 0) {
       const message = error instanceof Error ? error.message : String(error);
@@ -4123,6 +4129,14 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
     && resource.pane_birth
     && resource.command);
   const hasCompleteBorrowedHudRecoveryMetadata = Boolean(borrowedHudReceipt);
+  const createdWorkerReceiptIds = lifecycleResources
+    .filter((resource) => resource.kind === 'worker' && resource.created === true)
+    .map((resource) => resource.id);
+  const hasCreatedHudReceipt = lifecycleResources.some((resource) => resource.kind === 'hud' && resource.created === true);
+  const hasCreatedHookReceipt = lifecycleResources.some((resource) => resource.kind === 'hook' && resource.created === true);
+  let createdHudPaneReleased = !hasCreatedHudReceipt;
+  let createdRuntimeResourcesReleased = config.worker_launch_mode !== 'interactive';
+
 
   if (config.worker_launch_mode === 'interactive') {
     const sharedSessionTopology = sessionName.includes(':')
@@ -4331,12 +4345,16 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
         tmuxPaneOwnerId,
         hudReceipt,
       );
+      createdHudPaneReleased = killedHudPane;
+
       if (!killedHudPane) {
         retainHudContainer = true;
         retainHudLifecycleState = true;
         console.warn(`[team shutdown] ${sanitized}: preserving Team HUD metadata because final tmux authority revalidation failed`);
       }
       if (killedHudPane && sessionName.includes(':') && freshHudRestoreDomain) {
+        const paneIdsBeforeRestore = new Set(listPaneIds(sessionName));
+        const restoredCreatedPaneEvidence: { value: { paneId: string; paneInstanceId: string; command: string } | null } = { value: null };
         restoredHudPaneId = restoreStandaloneHudPane(trustedHudRestoreLeaderPaneId, cwd, {
           sessionId: freshHudRestoreDomain.claimant.sessionId,
           sessionIds: freshHudRestoreDomain.session?.equivalentIds,
@@ -4344,8 +4362,23 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
           tmuxSessionInstanceId: freshHudRestoreDomain.claimant.tmuxSessionInstanceId,
           tmuxPaneInstanceId: freshHudRestoreDomain.claimant.tmuxPaneInstanceId,
           hudRuntime: projectHudRuntimeRootEnv(freshHudRestoreDomain.rootSource, process.env),
+          onCreatedPane: (evidence) => { restoredCreatedPaneEvidence.value = evidence; },
         });
         if (!restoredHudPaneId) {
+          const unverifiedReplacementPaneIds = restoredCreatedPaneEvidence.value
+            ? [restoredCreatedPaneEvidence.value.paneId]
+            : listPaneIds(sessionName).filter((paneId) => !paneIdsBeforeRestore.has(paneId));
+          if (unverifiedReplacementPaneIds.length > 0) {
+            retainHudContainer = true;
+            retainHudLifecycleState = true;
+            await appendTeamEvent(sanitized, {
+              worker: 'system',
+              type: 'shutdown_gate_forced',
+              reason: restoredCreatedPaneEvidence.value
+                ? `standalone_hud_restore_unverified:${restoredCreatedPaneEvidence.value.paneId}:${restoredCreatedPaneEvidence.value.paneInstanceId}:${Buffer.from(restoredCreatedPaneEvidence.value.command).toString('base64url')}`
+                : `standalone_hud_restore_unverified:${unverifiedReplacementPaneIds.join(',')}`,
+            }, cwd);
+          }
           console.warn(`[team shutdown] ${sanitized}: failed to restore standalone HUD pane`);
         }
       }
@@ -4390,6 +4423,17 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
       retainHudContainer = true;
       console.warn(`[team shutdown] ${sanitized}: preserving lifecycle metadata because ${workerTeardown.kill.failed} worker pane teardown CAS operation(s) were uncertain`);
     }
+    const releasedEveryCreatedWorker = createdWorkerReceiptIds.every((paneId) => shutdownPaneIds.includes(paneId))
+      && workerTeardown.kill.failed === 0
+      && workerTeardown.kill.succeeded === shutdownPaneIds.length;
+    const releasedCreatedHooks = !hasCreatedHookReceipt || hooksRemoved;
+    createdRuntimeResourcesReleased = releasedEveryCreatedWorker && createdHudPaneReleased && releasedCreatedHooks;
+    if (!createdRuntimeResourcesReleased) {
+      retainHudLifecycleState = true;
+      retainHudContainer = true;
+      console.warn(`[team shutdown] ${sanitized}: preserving worktrees and recovery metadata because one or more created runtime resource release receipts were rejected or unavailable`);
+    }
+
     } finally {
       if (hudLifecycleLock?.status === 'acquired' && hudLifecycleLock.lock) {
         await releaseHudLifecycleLock(hudLifecycleLock.lock);
@@ -4404,6 +4448,8 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
         lifecycleCertificate?.tmux_session_birth ?? '',
       );
       if (!destroyedSession) {
+        createdRuntimeResourcesReleased = false;
+
         retainHudContainer = true;
         retainHudLifecycleState = true;
         console.warn(`[team shutdown] ${sanitized}: preserving lifecycle metadata because standalone session teardown CAS was rejected or unconfirmed`);
@@ -4507,7 +4553,8 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
 
   const cleanupErrors: string[] = [];
   const provisionedWorktrees = collectProvisionedShutdownWorktrees(config);
-  if (provisionedWorktrees.length > 0) {
+  if (provisionedWorktrees.length > 0 && createdRuntimeResourcesReleased) {
+
     try {
       await rollbackProvisionedWorktrees(provisionedWorktrees, {
         skipBranchDeletion: false,
@@ -4521,7 +4568,8 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
   // teardown receipt completed. Any missing/rejected receipt leaves the config
   // and immutable journal in place for recovery.
   let teamStateCleaned = false;
-  if (config.worker_launch_mode === 'interactive' && lifecycleCertificate && !retainHudLifecycleState) {
+  if (config.worker_launch_mode === 'interactive' && lifecycleCertificate && !retainHudLifecycleState && createdRuntimeResourcesReleased) {
+
     if (lifecycleCertificate.status === 'cleanup_complete') {
       // A prior exact cleanup persisted its completion before process exit.
     } else if (!lifecycleAuthority) {
@@ -4539,7 +4587,7 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
       }
     }
   }
-  if (!retainHudLifecycleState) {
+  if (!retainHudLifecycleState && createdRuntimeResourcesReleased) {
     try {
       await cleanupTeamState(sanitized, cwd);
       teamStateCleaned = true;

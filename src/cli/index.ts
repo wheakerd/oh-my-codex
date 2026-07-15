@@ -1935,6 +1935,8 @@ export function prependOmxRuntimeCommandShimToEnv(
 export interface DetachedSessionTmuxStep {
   name: string;
   args: string[];
+  appliedReceipt?: string;
+  rejectedReceipt?: string;
 }
 
 export function buildHudPaneCleanupTargets(
@@ -3573,6 +3575,10 @@ function escapeTmuxFormatLiteral(value: string): string {
   return value.replace(/[#{},:]/g, (character) => `#${character}`);
 }
 
+class TmuxLifecycleAuthorityError extends Error {
+  readonly failClosed = true;
+}
+
 /**
  * Establishes opaque tmux births exactly once. The logical Codex session id is
  * deliberately not a tmux birth: it can be replayed after tmux has recycled a
@@ -3610,28 +3616,59 @@ export async function establishCurrentTmuxInstanceBinding(
         `set-option -p -t ${quoteShellArg(paneTarget)} ${OMX_PANE_INSTANCE_OPTION} ${quoteShellArg(paneBirth)}`,
         `display-message -p ${appliedReceipt}`,
       ].join(" \\; ");
-      const receipt = execFileSync("tmux", [
-        "if-shell", "-t", paneTarget, "-F", condition, publish,
-        `display-message -p ${rejectedReceipt}`,
-      ], {
-        encoding: "utf-8",
-        stdio: ["ignore", "pipe", "ignore"],
-        timeout: 2000,
-      }).split("\n").map((line) => line.trim());
-      if (receipt.includes(appliedReceipt)) {
-        // This invocation published its complete opaque pair.
-      } else if (receipt.includes(rejectedReceipt)) {
-        const winning = await probeActualTmuxInstanceEvidence(paneTarget);
-        if (!winning.contextStable || winning.paneTarget !== paneTarget
-          || winning.sessionName !== sessionName
-          || winning.sessionId !== before.sessionId
-          || winning.windowId !== before.windowId
-          || !winning.sessionInstanceId || !winning.paneInstanceId
-          || winning.sessionInstanceId === winning.paneInstanceId
-          || winning.sessionTagStatus !== "present" || winning.paneTagStatus !== "present") return null;
-        sessionBirth = winning.sessionInstanceId;
-        paneBirth = winning.paneInstanceId;
-      } else return null;
+      try {
+        const receipt = execFileSync("tmux", [
+          "if-shell", "-t", paneTarget, "-F", condition, publish,
+          `display-message -p ${rejectedReceipt}`,
+        ], {
+          encoding: "utf-8",
+          stdio: ["ignore", "pipe", "ignore"],
+          timeout: 2000,
+        }).split("\n").map((line) => line.trim());
+        if (receipt.includes(appliedReceipt)) {
+          // This invocation published its complete opaque pair.
+        } else if (receipt.includes(rejectedReceipt)) {
+          const winning = await probeActualTmuxInstanceEvidence(paneTarget);
+          if (!winning.contextStable || winning.paneTarget !== paneTarget
+            || winning.sessionName !== sessionName
+            || winning.sessionId !== before.sessionId
+            || winning.windowId !== before.windowId
+            || !winning.sessionInstanceId || !winning.paneInstanceId
+            || winning.sessionInstanceId === winning.paneInstanceId
+            || winning.sessionTagStatus !== "present" || winning.paneTagStatus !== "present") return null;
+          sessionBirth = winning.sessionInstanceId;
+          paneBirth = winning.paneInstanceId;
+        } else {
+          throw new TmuxLifecycleAuthorityError("tmux birth publication returned no receipt");
+        }
+      } catch (error) {
+        if (error instanceof TmuxLifecycleAuthorityError) throw error;
+        const compensationAppliedReceipt = `__omx_birth_compensation_applied_${randomUUID()}__`;
+        const compensationRejectedReceipt = `__omx_birth_compensation_rejected_${randomUUID()}__`;
+        const compensationCondition = `#{&&:#{==:#{session_name},${escapeTmuxFormatLiteral(sessionName)}},#{==:#{${OMX_INSTANCE_OPTION}},${escapeTmuxFormatLiteral(sessionBirth)}},#{==:#{${OMX_PANE_INSTANCE_OPTION}},}}`;
+        let compensationReceipt: string[];
+        try {
+          compensationReceipt = execFileSync("tmux", [
+            "if-shell", "-t", paneTarget, "-F", compensationCondition,
+            `set-option -u -t ${quoteShellArg(sessionName)} ${OMX_INSTANCE_OPTION} \\; display-message -p ${compensationAppliedReceipt}`,
+            `display-message -p ${compensationRejectedReceipt}`,
+          ], {
+            encoding: "utf-8",
+            stdio: ["ignore", "pipe", "ignore"],
+            timeout: 2000,
+          }).split("\n").map((line) => line.trim());
+        } catch {
+          throw new TmuxLifecycleAuthorityError("tmux birth publication failed and exact compensation is uncertain");
+        }
+        if (!compensationReceipt.includes(compensationAppliedReceipt)) {
+          throw new TmuxLifecycleAuthorityError(
+            compensationReceipt.includes(compensationRejectedReceipt)
+              ? "tmux birth publication failed and exact compensation was rejected"
+              : "tmux birth publication failed and compensation returned no receipt",
+          );
+        }
+        throw new TmuxLifecycleAuthorityError("tmux birth publication failed and was compensated");
+      }
     }
 
     const after = await probeActualTmuxInstanceEvidence(paneTarget);
@@ -3646,7 +3683,8 @@ export async function establishCurrentTmuxInstanceBinding(
       || after.sessionTagStatus !== "present"
       || after.paneTagStatus !== "present") return null;
     return after;
-  } catch {
+  } catch (error) {
+    if (error instanceof TmuxLifecycleAuthorityError) throw error;
     return null;
   }
 }
@@ -4580,6 +4618,8 @@ export function buildDetachedSessionRollbackSteps(
         `kill-session -t ${quoteShellArg(sessionName)} \\; display-message -p ${appliedReceipt}`,
         `display-message -p ${rejectedReceipt}`,
       ],
+      appliedReceipt,
+      rejectedReceipt,
     });
   }
   return steps;
@@ -5379,7 +5419,7 @@ async function runCodex(
         return { postLaunchHandledExternally: true };
       }
       if (activeRecordPath && activeRecord) {
-        rmSync(activeRecordPath, { force: true });
+        throw new TmuxLifecycleAuthorityError("madmax detached recovery record is not reusable; preserving it without exact release evidence");
       }
 
       let detachedSessionBindingWrite: Promise<unknown> = Promise.resolve();
@@ -5527,12 +5567,7 @@ async function runCodex(
         }
         return { postLaunchHandledExternally: !nativeWindows };
       } catch (err) {
-        if (detachedParentEnvFilePath) {
-          rmSync(detachedParentEnvFilePath, { force: true });
-        }
-        if (activeRecordPath) {
-          rmSync(activeRecordPath, { force: true });
-        }
+        let rollbackApplied = !createdDetachedSession;
         if (createdDetachedSession) {
           const rollbackSteps = buildDetachedSessionRollbackSteps(
             sessionName,
@@ -5543,12 +5578,36 @@ async function runCodex(
           );
           for (const rollbackStep of rollbackSteps) {
             try {
-              execTmuxFileSync(rollbackStep.args, { stdio: "ignore" });
+              const output = execTmuxFileSync(rollbackStep.args, {
+                stdio: rollbackStep.appliedReceipt ? "pipe" : "ignore",
+                encoding: rollbackStep.appliedReceipt ? "utf-8" : undefined,
+              });
+              if (rollbackStep.appliedReceipt) {
+                const receipt = (output || "").split("\n").map((line) => line.trim());
+                rollbackApplied = receipt.includes(rollbackStep.appliedReceipt);
+                if (!rollbackApplied) {
+                  throw new TmuxLifecycleAuthorityError(
+                    receipt.includes(rollbackStep.rejectedReceipt ?? "")
+                      ? "detached tmux rollback was rejected; preserving recovery state"
+                      : "detached tmux rollback returned no receipt; preserving recovery state",
+                  );
+                }
+              }
             } catch (rollbackErr) {
               logCliOperationFailure(rollbackErr);
-              // best-effort rollback only
+              if (rollbackErr instanceof TmuxLifecycleAuthorityError) throw rollbackErr;
+              throw new TmuxLifecycleAuthorityError("detached tmux rollback is uncertain; preserving recovery state");
             }
           }
+          if (!rollbackApplied) {
+            throw new TmuxLifecycleAuthorityError("detached tmux rollback lacks applied evidence; preserving recovery state");
+          }
+        }
+        if (detachedParentEnvFilePath) {
+          rmSync(detachedParentEnvFilePath, { force: true });
+        }
+        if (activeRecordPath) {
+          rmSync(activeRecordPath, { force: true });
         }
         throw err;
       }
@@ -5562,11 +5621,11 @@ async function runCodex(
       }
       return await launchDetachedSession();
     } catch (err) {
-      if (err instanceof MadmaxDetachedReuseError || err instanceof MadmaxDetachedGuardError) {
+      if (err instanceof MadmaxDetachedReuseError || err instanceof MadmaxDetachedGuardError || err instanceof TmuxLifecycleAuthorityError) {
         throw err;
       }
       logCliOperationFailure(err);
-      // tmux not available or failed, just run codex directly
+      // tmux not available or failed before creating a managed session, just run codex directly
       runCodexBlocking(cwd, launchArgs, codexEnvWithNotify);
       return { postLaunchHandledExternally: false };
     }
