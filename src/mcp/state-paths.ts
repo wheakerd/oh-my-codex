@@ -80,25 +80,47 @@ export interface ResolvedHudControlPlaneDomain {
 }
 
 export interface HudTmuxBirthLineage {
+  version: 1;
   sessionId: string;
   tmuxSessionName: string;
   tmuxSessionInstanceId: string;
   tmuxPaneInstanceId: string;
-  createdAtMs?: number;
-  nonce?: string;
+  createdAtMs: number;
+  nonce: string;
+}
+
+export interface HudTmuxBirthLineageReceipt {
+  version: 1;
+  nonce: string;
+  births: {
+    tmuxSessionInstanceId: string;
+    tmuxPaneInstanceId: string;
+  };
 }
 
 const HUD_TMUX_BIRTH_LINEAGE_DIR = 'hud-tmux-birth-lineage';
+const HUD_TMUX_BIRTH_LINEAGE_VERSION = 1 as const;
 
 function hudTmuxBirthLineagePath(baseStateDir: string, sessionId: string): string {
   return join(baseStateDir, HUD_TMUX_BIRTH_LINEAGE_DIR, `${createHash('sha256').update(sessionId).digest('hex')}.json`);
 }
 
+function isHudTmuxBirthLineage(value: unknown, sessionId: string): value is HudTmuxBirthLineage {
+  if (!value || typeof value !== 'object') return false;
+  const candidate = value as Partial<HudTmuxBirthLineage>;
+  return candidate.version === HUD_TMUX_BIRTH_LINEAGE_VERSION
+    && candidate.sessionId === sessionId
+    && typeof candidate.tmuxSessionName === 'string' && candidate.tmuxSessionName.trim() !== ''
+    && typeof candidate.tmuxSessionInstanceId === 'string' && candidate.tmuxSessionInstanceId.trim() !== ''
+    && typeof candidate.tmuxPaneInstanceId === 'string' && candidate.tmuxPaneInstanceId.trim() !== ''
+    && typeof candidate.createdAtMs === 'number' && Number.isFinite(candidate.createdAtMs)
+    && typeof candidate.nonce === 'string' && candidate.nonce.trim() !== '';
+}
 
 export async function writeHudTmuxBirthLineage(
   domain: Pick<ResolvedHudControlPlaneDomain, 'baseStateDir'>,
-  lineage: HudTmuxBirthLineage,
-): Promise<void> {
+  lineage: Omit<HudTmuxBirthLineage, 'version' | 'createdAtMs' | 'nonce'>,
+): Promise<HudTmuxBirthLineageReceipt> {
   const values = [lineage.sessionId, lineage.tmuxSessionName, lineage.tmuxSessionInstanceId, lineage.tmuxPaneInstanceId];
   if (values.some((value) => typeof value !== 'string' || value.trim() === '')) {
     throw new Error('HUD tmux birth lineage requires complete evidence');
@@ -106,21 +128,41 @@ export async function writeHudTmuxBirthLineage(
   const directory = join(domain.baseStateDir, HUD_TMUX_BIRTH_LINEAGE_DIR);
   await mkdir(directory, { recursive: true });
   const nowMs = Date.now();
+  const record: HudTmuxBirthLineage = {
+    ...lineage,
+    version: HUD_TMUX_BIRTH_LINEAGE_VERSION,
+    createdAtMs: nowMs,
+    nonce: `${process.pid}-${nowMs}-${Math.random().toString(36).slice(2)}`,
+  };
   const target = hudTmuxBirthLineagePath(domain.baseStateDir, lineage.sessionId);
-  const record = { ...lineage, createdAtMs: nowMs, nonce: `${process.pid}-${nowMs}-${Math.random().toString(36).slice(2)}` };
   const temporary = `${target}.${record.nonce}.tmp`;
   await writeFile(temporary, `${JSON.stringify(record)}\n`, { mode: 0o600 });
   await rename(temporary, target);
+  return {
+    version: record.version,
+    nonce: record.nonce,
+    births: {
+      tmuxSessionInstanceId: record.tmuxSessionInstanceId,
+      tmuxPaneInstanceId: record.tmuxPaneInstanceId,
+    },
+  };
 }
 
 export async function deleteHudTmuxBirthLineage(
   domain: Pick<ResolvedHudControlPlaneDomain, 'baseStateDir'>,
-  lineage: Required<Pick<HudTmuxBirthLineage, 'sessionId' | 'tmuxSessionName' | 'tmuxSessionInstanceId' | 'tmuxPaneInstanceId' | 'createdAtMs' | 'nonce'>>,
+  lineage: HudTmuxBirthLineage,
+  receipt: HudTmuxBirthLineageReceipt,
 ): Promise<boolean> {
+  if (
+    lineage.version !== receipt.version
+    || lineage.nonce !== receipt.nonce
+    || lineage.tmuxSessionInstanceId !== receipt.births.tmuxSessionInstanceId
+    || lineage.tmuxPaneInstanceId !== receipt.births.tmuxPaneInstanceId
+  ) return false;
   const path = hudTmuxBirthLineagePath(domain.baseStateDir, lineage.sessionId);
   try {
     const current: unknown = JSON.parse(await readFile(path, 'utf-8'));
-    if (JSON.stringify(current) !== JSON.stringify(lineage)) return false;
+    if (!isHudTmuxBirthLineage(current, lineage.sessionId) || JSON.stringify(current) !== JSON.stringify(lineage)) return false;
     await unlink(path);
     return true;
   } catch (error: unknown) {
@@ -128,19 +170,11 @@ export async function deleteHudTmuxBirthLineage(
   }
 }
 
-async function readHudTmuxBirthLineage(baseStateDir: string, sessionId: string | undefined): Promise<HudTmuxBirthLineage | null> {
+export async function readHudTmuxBirthLineage(baseStateDir: string, sessionId: string | undefined): Promise<HudTmuxBirthLineage | null> {
   if (!sessionId) return null;
   try {
     const value: unknown = JSON.parse(await readFile(hudTmuxBirthLineagePath(baseStateDir, sessionId), 'utf-8'));
-    if (!value || typeof value !== 'object') return null;
-    const candidate = value as Partial<HudTmuxBirthLineage>;
-    if (
-      candidate.sessionId !== sessionId
-      || typeof candidate.tmuxSessionName !== 'string' || candidate.tmuxSessionName.trim() === ''
-      || typeof candidate.tmuxSessionInstanceId !== 'string' || candidate.tmuxSessionInstanceId.trim() === ''
-      || typeof candidate.tmuxPaneInstanceId !== 'string' || candidate.tmuxPaneInstanceId.trim() === ''
-    ) return null;
-    return candidate as HudTmuxBirthLineage;
+    return isHudTmuxBirthLineage(value, sessionId) ? value : null;
   } catch {
     return null;
   }

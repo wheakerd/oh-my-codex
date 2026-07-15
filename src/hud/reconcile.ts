@@ -143,7 +143,6 @@ function tmuxSnapshotBindsCandidate(
   const paneInstanceId = pane.paneInstanceId?.trim() ?? '';
   const sessionInstanceId = pane.sessionInstanceId?.trim() ?? '';
   const candidateIds = [...new Set(candidateSessionIds.map((candidate) => candidate.trim()).filter(Boolean))];
-  if (candidateIds.length > 2) return false;
   const evidence: ActualTmuxInstanceEvidence = {
     paneTarget: pane.paneId,
     sessionName: '',

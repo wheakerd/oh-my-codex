@@ -16,6 +16,9 @@ import {
   readCurrentSessionId,
   resolveRuntimeStateScope,
   resolveHudControlPlaneDomain,
+  writeHudTmuxBirthLineage,
+  readHudTmuxBirthLineage,
+  deleteHudTmuxBirthLineage,
   resolveStateScope,
   resolveWritableStateScope,
   resolveWorkingDirectoryForState,
@@ -755,6 +758,31 @@ describe('HUD control-plane domains', () => {
       assert.equal(alias.domainKey, canonical.domainKey);
       assert.equal(alias.claimant.sessionId, 'omx-canonical');
       assert.equal(alias.managed, true);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+  it('requires versioned nonce receipts to read and delete opaque tmux birth lineage', async () => {
+    const cwd = await mkRealTemp('omx-hud-lineage-receipt-');
+    try {
+      const domain = await resolveHudControlPlaneDomain({ cwd, requestedSessionId: 'session-receipt' });
+      const receipt = await writeHudTmuxBirthLineage(domain, {
+        sessionId: 'session-receipt',
+        tmuxSessionName: 'tmux-session',
+        tmuxSessionInstanceId: 'session-birth',
+        tmuxPaneInstanceId: 'pane-birth',
+      });
+      const lineage = await readHudTmuxBirthLineage(domain.baseStateDir, 'session-receipt');
+      assert.ok(lineage);
+      assert.equal(lineage.version, 1);
+      assert.equal(lineage.nonce, receipt.nonce);
+      assert.equal(
+        await deleteHudTmuxBirthLineage(domain, lineage, { ...receipt, nonce: 'replacement-receipt' }),
+        false,
+      );
+      assert.ok(await readHudTmuxBirthLineage(domain.baseStateDir, 'session-receipt'));
+      assert.equal(await deleteHudTmuxBirthLineage(domain, lineage, receipt), true);
+      assert.equal(await readHudTmuxBirthLineage(domain.baseStateDir, 'session-receipt'), null);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
