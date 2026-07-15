@@ -20,6 +20,7 @@ import { parse as parseToml } from "@iarna/toml";
 import {
 	decideWindowsNativeHookShimReference,
 	setNativeHookTransactionFailureInjectorForTest,
+	setSetupLatePhaseFailureInjectorForTest,
 	setNativeHookTransactionPlatformForTest,
 	setNativeHookTransactionTemporaryPathForTest,
 	setup,
@@ -5588,6 +5589,44 @@ describe("omx setup install mode behavior", () => {
 			});
 		} finally {
 			resetFailureInjector?.();
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("late setup failure transaction boundary", () => {
+	it("does not commit config or hooks when a later setup phase fails", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-setup-late-failure-"));
+		let resetLateFailure: (() => void) | undefined;
+		try {
+			await withIsolatedUserHome(wd, async (codexHomeDir) => {
+				await withTempCwd(wd, async () => {
+					const hooksPath = join(codexHomeDir, "hooks.json");
+					const configPath = join(codexHomeDir, "config.toml");
+					const hooksBefore = Buffer.from('{"hooks":{"FutureEvent":[{"hooks":[{"type":"prompt","prompt":"keep"}]}]}}\n');
+					const configBefore = Buffer.from('[features]\nhooks = true\n');
+					await mkdir(codexHomeDir, { recursive: true });
+					await writeFile(hooksPath, hooksBefore);
+					await writeFile(configPath, configBefore);
+					resetLateFailure = setSetupLatePhaseFailureInjectorForTest(() => {
+						throw new Error("injected late setup phase failure");
+					});
+					await assert.rejects(
+						setup({
+							scope: "user",
+							installMode: "legacy",
+							skipNativeAgentRefresh: true,
+							codexFeaturesProbe: () => null,
+							codexVersionProbe: () => null,
+						}),
+						/injected late setup phase failure/,
+					);
+					assert.deepEqual(await readFile(hooksPath), hooksBefore);
+					assert.deepEqual(await readFile(configPath), configBefore);
+				});
+			});
+		} finally {
+			resetLateFailure?.();
 			await rm(wd, { recursive: true, force: true });
 		}
 	});

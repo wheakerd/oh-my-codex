@@ -2,11 +2,18 @@
  * omx uninstall - Remove oh-my-codex configuration and installed artifacts
  */
 
-import { chmod, link, lstat, open, readFile, readdir, rename, rm } from "fs/promises";
+import { chmod, copyFile, lstat, open, readFile, readdir, rename, rm, writeFile } from "fs/promises";
 
-import { existsSync } from "fs";
+import { constants, existsSync } from "fs";
 import { join, basename, dirname, isAbsolute, relative } from "path";
 import { randomUUID } from "crypto";
+import {
+  clearNativeHookClaimJournal,
+  persistNativeHookClaimJournal,
+  recoverNativeHookClaimJournal,
+  syncNativeHookClaimParent,
+  restoreNativeHookClaimNoClobber,
+} from "./native-hook-claim-journal.js";
 import {
   formatTomlStringArray,
   getRootTomlArray,
@@ -40,7 +47,11 @@ import {
 
 import { resolveCodexHookFeatureFlagForCli } from "./codex-feature-probe.js";
 import { readPersistedSetupScope } from "./index.js";
-import { isOmxGeneratedAgentsMd } from "../utils/agents-md.js";
+import {
+  isOmxGeneratedAgentsMd,
+  OMX_MANAGED_AGENTS_END_MARKER,
+  OMX_MANAGED_AGENTS_START_MARKER,
+} from "../utils/agents-md.js";
 import { OMX_FIRST_PARTY_MCP_SERVER_NAMES } from "../config/omx-first-party-mcp.js";
 import TOML from "@iarna/toml";
 
@@ -770,6 +781,17 @@ async function removeAgentsMd(
 
   try {
     const content = await readFile(agentsMdPath, "utf-8");
+    const startIndex = content.indexOf(OMX_MANAGED_AGENTS_START_MARKER);
+    const endIndex = content.indexOf(OMX_MANAGED_AGENTS_END_MARKER);
+    if (startIndex >= 0 && endIndex > startIndex) {
+      const blockEnd = endIndex + OMX_MANAGED_AGENTS_END_MARKER.length;
+      const preserved = `${content.slice(0, startIndex).trimEnd()}\n${content.slice(blockEnd).trimStart()}`.trim();
+      if (preserved) {
+        if (!options.dryRun) await writeFile(agentsMdPath, `${preserved}\n`, "utf-8");
+        if (options.verbose) console.log("  Removed OMX-managed AGENTS.md sections and preserved user guidance.");
+        return false;
+      }
+    }
     if (!isOmxGeneratedAgentsMd(content)) {
       if (options.verbose)
         console.log("  AGENTS.md is not OMX-generated, skipping.");
@@ -847,6 +869,10 @@ function transactionClaimPath(path: string): string {
     dirname(path),
     `.${basename(path)}.omx-uninstall-claim-${process.pid}-${randomUUID()}.tmp`,
   );
+}
+
+async function restoreUninstallClaim(claimPath: string, destinationPath: string): Promise<void> {
+  await restoreNativeHookClaimNoClobber(claimPath, destinationPath);
 }
 
 
@@ -983,8 +1009,7 @@ async function removeOwnedTemporary(
       await assertSnapshotAtPath(claimPath, snapshot, `${description} cleanup claim`);
     } catch (error) {
       try {
-        await link(claimPath, path);
-        await rm(claimPath);
+        await restoreUninstallClaim(claimPath, path);
       } catch (recoveryError) {
         throw new Error(
           `${error instanceof Error ? error.message : String(error)}; preserved claim ${claimPath} for manual recovery: ${recoveryError instanceof Error ? recoveryError.message : String(recoveryError)}`,
@@ -1023,6 +1048,7 @@ async function atomicReplaceFile(
   let temporarySnapshot: FileSnapshot | undefined;
   let claimPath: string | undefined;
   let claimCreated = false;
+  let journaledClaim = false;
   try {
     await options.transactionFailureInjector?.(
       stage === "write" ? "before-temp-write" : "before-rollback",
@@ -1059,52 +1085,79 @@ async function atomicReplaceFile(
         ? "after-final-rename-validation"
         : "after-final-restore-validation",
     );
-    await assertSnapshotCurrent(temporarySnapshot);
-
-    if (expectedCurrent.bytes !== null) {
-      claimPath = transactionClaimPath(mutation.snapshot.path);
-
-
+    if (!temporarySnapshot) {
+      throw new Error(`Replacement temporary ${temporaryPath} was not fully captured before install.`);
+    }
+    claimPath = transactionClaimPath(mutation.snapshot.path);
+    const controlledRoot = mutation.snapshot.topology?.root;
+    if (expectedCurrent.bytes !== null && controlledRoot) {
+      await persistNativeHookClaimJournal(controlledRoot, {
+        canonicalPath: mutation.snapshot.path,
+        claimPath,
+        before: expectedCurrent.bytes,
+        after: content,
+      });
+      journaledClaim = true;
       await rename(mutation.snapshot.path, claimPath);
       claimCreated = true;
+      await syncNativeHookClaimParent(claimPath);
       await assertSnapshotAtPath(claimPath, expectedCurrent, "replacement claim");
     }
-    // link() is a no-overwrite claim of the now-absent destination. It fails
-    // rather than replacing anything concurrently created at that coordinate.
-    await link(temporaryPath, mutation.snapshot.path);
+    await copyFile(temporaryPath, mutation.snapshot.path, constants.COPYFILE_EXCL);
+    await chmod(mutation.snapshot.path, mutation.snapshot.mode);
+    const installedHandle = await open(mutation.snapshot.path, "r");
+    try {
+      await installedHandle.sync();
+    } finally {
+      await installedHandle.close();
+    }
+    await syncNativeHookClaimParent(mutation.snapshot.path);
+    const actual = await captureCurrentSnapshot(mutation.snapshot);
+    if (actual.bytes === null || actual.mode !== mutation.snapshot.mode || !actual.bytes.equals(content)) {
+      throw new Error(`Read-back verification failed for replacement ${mutation.snapshot.path}.`);
+    }
+    if (claimCreated && claimPath) {
+      await rm(claimPath);
+      await syncNativeHookClaimParent(claimPath);
+      claimCreated = false;
+    }
+    if (journaledClaim && controlledRoot) {
+      await clearNativeHookClaimJournal(controlledRoot);
+      journaledClaim = false;
+    }
+    await rm(temporaryPath);
+    temporaryCreated = false;
     const ownership = renamedDestinationOwnership(
-      temporarySnapshot,
+      actual,
       mutation.snapshot.path,
       mutation.snapshot.topology,
     );
     onRename(ownership);
-    await rm(temporaryPath);
-    temporaryCreated = false;
-    if (claimPath) {
-      await rm(claimPath);
-      claimCreated = false;
-    }
 
     if (stage === "write") {
       await options.transactionFailureInjector?.("after-rename");
     }
 
-    const actual = await captureRenamedDestinationOwnership(ownership);
+    const verified = await captureRenamedDestinationOwnership(ownership);
     if (stage === "write" && mutation.validate) {
-      mutation.validate(decodeStrictUtf8(mutation.snapshot.path, actual.bytes!));
+      mutation.validate(decodeStrictUtf8(mutation.snapshot.path, verified.bytes!));
     }
-    return actual;
+    return verified;
   } catch (error) {
     await handle?.close().catch(() => undefined);
     if (claimCreated && claimPath) {
       try {
-        await link(claimPath, mutation.snapshot.path);
-        await rm(claimPath);
+        await restoreUninstallClaim(claimPath, mutation.snapshot.path);
+        await syncNativeHookClaimParent(mutation.snapshot.path);
         claimCreated = false;
+        const controlledRoot = mutation.snapshot.topology?.root;
+        if (journaledClaim && controlledRoot) {
+          await clearNativeHookClaimJournal(controlledRoot);
+          journaledClaim = false;
+        }
       } catch (recoveryError) {
-        const message = error instanceof Error ? error.message : String(error);
         throw new Error(
-          `Uninstall replacement failed (${message}) and preserved claim ${claimPath} for manual recovery: ${recoveryError instanceof Error ? recoveryError.message : String(recoveryError)}`,
+          `Uninstall replacement failed (${error instanceof Error ? error.message : String(error)}) and preserved ${claimPath} for manual recovery: ${recoveryError instanceof Error ? recoveryError.message : String(recoveryError)}`,
         );
       }
     }
@@ -1166,7 +1219,17 @@ async function stageAndRemoveFile(
     const claimPath = transactionClaimPath(mutation.snapshot.path);
 
 
+    const controlledRoot = mutation.snapshot.topology?.root;
+    if (controlledRoot && mutation.snapshot.bytes !== null) {
+      await persistNativeHookClaimJournal(controlledRoot, {
+        canonicalPath: mutation.snapshot.path,
+        claimPath,
+        before: mutation.snapshot.bytes,
+        after: null,
+      });
+    }
     await rename(mutation.snapshot.path, claimPath);
+    if (controlledRoot) await syncNativeHookClaimParent(claimPath);
     execution.appliedSnapshot = {
       path: mutation.snapshot.path,
       content: null,
@@ -1182,8 +1245,9 @@ async function stageAndRemoveFile(
       await assertSnapshotAtPath(claimPath, mutation.snapshot, "removal claim");
     } catch (error) {
       try {
-        await link(claimPath, mutation.snapshot.path);
-        await rm(claimPath);
+        await restoreUninstallClaim(claimPath, mutation.snapshot.path);
+        if (controlledRoot) await syncNativeHookClaimParent(mutation.snapshot.path);
+        if (controlledRoot) await clearNativeHookClaimJournal(controlledRoot);
         execution.appliedSnapshot = undefined;
         execution.phase = "prepared";
       } catch (recoveryError) {
@@ -1194,6 +1258,8 @@ async function stageAndRemoveFile(
       throw error;
     }
     await rm(claimPath);
+    if (controlledRoot) await syncNativeHookClaimParent(claimPath);
+    if (controlledRoot) await clearNativeHookClaimJournal(controlledRoot);
     await options.transactionFailureInjector?.("after-remove");
     await assertControlledTopologyCurrent(mutation.snapshot.topology);
     const absent = await captureCurrentSnapshot(mutation.snapshot);
@@ -1306,8 +1372,7 @@ async function restoreFileSnapshot(
       await assertSnapshotAtPath(claimPath, appliedSnapshot, "rollback removal claim");
     } catch (error) {
       try {
-        await link(claimPath, mutation.snapshot.path);
-        await rm(claimPath);
+        await restoreUninstallClaim(claimPath, mutation.snapshot.path);
       } catch (recoveryError) {
         throw new Error(
           `Uninstall rollback removal claim failed (${error instanceof Error ? error.message : String(error)}) and preserved ${claimPath} for manual recovery: ${recoveryError instanceof Error ? recoveryError.message : String(recoveryError)}`,
@@ -1366,8 +1431,7 @@ async function cleanupStagedDeletions(
       await assertSnapshotAtPath(claimPath, stagedDeletion, "staged deletion cleanup claim");
     } catch (error) {
       try {
-        await link(claimPath, stagedDeletion.path);
-        await rm(claimPath);
+        await restoreUninstallClaim(claimPath, stagedDeletion.path);
       } catch (recoveryError) {
         throw new Error(
           `Uninstall staged deletion cleanup claim failed (${error instanceof Error ? error.message : String(error)}) and preserved ${claimPath} for manual recovery: ${recoveryError instanceof Error ? recoveryError.message : String(recoveryError)}`,
@@ -1658,6 +1722,9 @@ export async function uninstall(options: UninstallOptions = {}): Promise<void> {
   // Resolve scope (explicit --scope overrides persisted scope)
   const scope = options.scope ?? readPersistedSetupScope(projectRoot) ?? "user";
   const scopeDirs = resolveScopeDirectories(scope, projectRoot);
+  if (!dryRun) {
+    await recoverNativeHookClaimJournal(scopeDirs.codexHomeDir);
+  }
   const transactionPlatform = options.transactionPlatform ?? process.platform;
 
   // Precompute and validate every artifact before the first uninstall write.

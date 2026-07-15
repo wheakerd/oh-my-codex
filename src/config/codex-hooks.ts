@@ -2501,7 +2501,7 @@ export function scanManagedCodexHookTrustStateFromContent(
   return trustFromDocument(validation, hooksPath, options);
 }
 
-function hasExecutableForeignCommandInUnknownEvent(
+function hasExecutableForeignHandlerInUnknownEvent(
   event: JsonProperty,
   platform: HookCommandPlatform,
 ): boolean {
@@ -2511,7 +2511,10 @@ function hasExecutableForeignCommandInUnknownEvent(
     const hooks = objectProperty(group, "hooks")?.value;
     if (hooks?.kind !== "array") continue;
     for (const handler of hooks.elements) {
-      if (handler.kind !== "object" || stringProperty(handler, "type") !== "command") continue;
+      if (handler.kind !== "object") continue;
+      const type = stringProperty(handler, "type");
+      if (type === "prompt" || type === "agent") return true;
+      if (type !== "command") continue;
       const asynchronous = objectProperty(handler, "async");
       if (asynchronous?.value.kind === "boolean" && asynchronous.value.value) continue;
       const command = platform === "win32"
@@ -2530,7 +2533,7 @@ function foreignHooksInDocument(document: StrictDocument, options: ManagedCodexH
   return ownership instanceof ManagedCodexHooksPlanError ||
     ownership.groups.some((group) => group.foreign) ||
     document.hooksNode?.properties.some((event) =>
-      hasExecutableForeignCommandInUnknownEvent(event, options.platform ?? process.platform)) === true;
+      hasExecutableForeignHandlerInUnknownEvent(event, options.platform ?? process.platform)) === true;
 }
 
 function finalizePlan(

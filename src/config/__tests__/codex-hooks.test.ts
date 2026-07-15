@@ -1613,34 +1613,34 @@ describe("codex hooks helpers", () => {
     assert.equal(Object.hasOwn(cleaned.hooks ?? {}, "state"), false);
   });
 
-  it("preserves executable foreign future-event hooks and reports them after managed removal", () => {
-    const futureEvent = [{
-      matcher: "future-source",
-      hooks: [{
-        type: "command",
-        command: "echo future-hook",
-        statusMessage: "future hook",
-        timeout: 42,
-      }],
-    }];
-    const source = JSON.stringify({
-      hooks: {
-        ...buildManagedCodexHooksConfig("/repo").hooks,
-        FutureEvent: futureEvent,
-      },
-    });
-    const plan = planManagedCodexHooksRemoval(source, "/hooks.json");
+  for (const handler of [
+    { type: "prompt", prompt: "Review the future event." },
+    { type: "agent", prompt: "Handle the future event." },
+  ]) {
+    it(`preserves executable foreign future-event ${handler.type} handlers after managed removal`, () => {
+      const futureEvent = [{
+        matcher: "future-source",
+        hooks: [handler],
+      }];
+      const source = JSON.stringify({
+        hooks: {
+          ...buildManagedCodexHooksConfig("/repo").hooks,
+          FutureEvent: futureEvent,
+        },
+      });
+      const plan = planManagedCodexHooksRemoval(source, "/hooks.json");
 
-    assert.equal(plan.ok, true);
-    if (!plan.ok) return;
-    assert.equal(plan.hasForeignHooks, true);
-    assert.ok(plan.finalContent);
-    assert.deepEqual(
-      (JSON.parse(plan.finalContent) as { hooks?: Record<string, unknown> }).hooks?.FutureEvent,
-      futureEvent,
-    );
-    assert.equal(hasUserCodexHooksAfterManagedRemoval(source), true);
-  });
+      assert.equal(plan.ok, true);
+      if (!plan.ok) return;
+      assert.equal(plan.hasForeignHooks, true);
+      assert.ok(plan.finalContent);
+      assert.deepEqual(
+        (JSON.parse(plan.finalContent) as { hooks?: Record<string, unknown> }).hooks?.FutureEvent,
+        futureEvent,
+      );
+      assert.equal(hasUserCodexHooksAfterManagedRemoval(source), true);
+    });
+  }
 
   it("detects user hooks that remain after managed wrapper removal", () => {
     const managedOnly = JSON.stringify(buildManagedCodexHooksConfig("/repo"));

@@ -379,6 +379,124 @@ test('packed lifecycle treats only the production command grammar as managed own
     /Expected exactly one OMX SessionStart hook from Codex, received 0/,
   );
 });
+test('packed lifecycle resolves Windows npm shims through safe command specs for version probes and app-server', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'omx-codex-windows-shim-'));
+  const fakeChild = () => {
+    const child = Object.assign(new EventEmitter(), {
+      stdin: new PassThrough(),
+      stdout: new PassThrough(),
+      stderr: new PassThrough(),
+      kill: () => {
+        queueMicrotask(() => child.emit('close', 0, null));
+        return true;
+      },
+    });
+    child.stdin.once('finish', () => queueMicrotask(() => child.emit('close', 0, null)));
+    queueMicrotask(() => child.emit('spawn'));
+    return child;
+  };
+
+  try {
+    for (const extension of ['.cmd', '.ps1']) {
+      const bin = join(root, extension.slice(1));
+      const codexPath = join(bin, `codex${extension}`);
+      const powershellPath = join(bin, 'powershell.exe');
+      await mkdir(bin, { recursive: true });
+      await Promise.all([writeFile(codexPath, ''), writeFile(powershellPath, '')]);
+
+      const versionSpawns: Array<{ command: string; args: string[]; options: Record<string, unknown> }> = [];
+      const appSpawns: Array<{ command: string; args: string[]; options: Record<string, unknown> }> = [];
+      const seam = {
+        platform: 'win32' as const,
+        spawnSyncImpl: ((command: string, args: string[], options: Record<string, unknown>) => {
+          versionSpawns.push({ command, args, options });
+          return { status: 0, stdout: 'codex-cli 0.142.5\n', stderr: '', error: undefined };
+        }) as never,
+        spawnImpl: ((command: string, args: string[], options: Record<string, unknown>) => {
+          appSpawns.push({ command, args, options });
+          return fakeChild();
+        }) as never,
+      };
+      const env = { PATH: bin, PATHEXT: extension.toUpperCase() };
+
+      assert.equal(probeCodexVersion(root, env, seam), 'codex-cli 0.142.5');
+      const server = await CodexAppServer.start({ cwd: root, env, commandSeam: seam });
+      await server.close();
+
+      assert.equal(versionSpawns.length, 2);
+      assert.deepEqual(versionSpawns.map(({ command, args, options }) => ({ command, args, options })),
+        extension === '.cmd'
+          ? [
+            {
+              command: 'cmd.exe',
+              args: ['/d', '/s', '/c', `""${codexPath}" "--version""`],
+              options: {
+                cwd: root,
+                env,
+                encoding: 'utf-8',
+                timeout: CODEX_APP_SERVER_TIMEOUTS.versionProbeMs,
+                killSignal: 'SIGKILL',
+                windowsHide: true,
+                windowsVerbatimArguments: true,
+              },
+            },
+            {
+              command: 'cmd.exe',
+              args: ['/d', '/s', '/c', `""${codexPath}" "--version""`],
+              options: {
+                cwd: root,
+                env,
+                encoding: 'utf-8',
+                timeout: CODEX_APP_SERVER_TIMEOUTS.versionProbeMs,
+                killSignal: 'SIGKILL',
+                windowsHide: true,
+                windowsVerbatimArguments: true,
+              },
+            },
+          ]
+          : [
+            {
+              command: powershellPath,
+              args: ['-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', codexPath, '--version'],
+              options: {
+                cwd: root,
+                env,
+                encoding: 'utf-8',
+                timeout: CODEX_APP_SERVER_TIMEOUTS.versionProbeMs,
+                killSignal: 'SIGKILL',
+                windowsHide: true,
+              },
+            },
+            {
+              command: powershellPath,
+              args: ['-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', codexPath, '--version'],
+              options: {
+                cwd: root,
+                env,
+                encoding: 'utf-8',
+                timeout: CODEX_APP_SERVER_TIMEOUTS.versionProbeMs,
+                killSignal: 'SIGKILL',
+                windowsHide: true,
+              },
+            },
+          ],
+      );
+      assert.deepEqual(appSpawns, extension === '.cmd'
+        ? [{
+          command: 'cmd.exe',
+          args: ['/d', '/s', '/c', `""${codexPath}" "app-server" "--stdio""`],
+          options: { cwd: root, env, stdio: 'pipe', windowsHide: true, windowsVerbatimArguments: true },
+        }]
+        : [{
+          command: powershellPath,
+          args: ['-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', codexPath, 'app-server', '--stdio'],
+          options: { cwd: root, env, stdio: 'pipe', windowsHide: true },
+        }]);
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 test('packed lifecycle bypasses an unrelated codex binary shadowing the pinned CLI', async () => {
   if (process.platform === 'win32') return;
@@ -707,9 +825,25 @@ test('packed lifecycle and native hook smoke share the seven managed event names
   assert.deepEqual(MANAGED_CODEX_HOOK_EVENTS, PACKED_INSTALL_NATIVE_HOOK_SMOKE_EVENTS);
 });
 
-test('packed install native hook stdout validation allows empty or JSON output only', () => {
+test('packed install native hook stdout validation enforces event output contracts', () => {
   assert.doesNotThrow(() => validateHookStdout('PostCompact', ''));
   assert.doesNotThrow(() => validateHookStdout('Stop', '{}\n'));
+  assert.throws(
+    () => validateHookStdout('PostCompact', '{}\n'),
+    /PostCompact must emit empty stdout/,
+  );
+  for (const value of ['\n', ' ', ' \r\n']) {
+    assert.throws(
+      () => validateHookStdout('PostCompact', value),
+      /PostCompact must emit empty stdout/,
+    );
+  }
+  for (const value of ['null', '[]', '"text"', '1']) {
+    assert.throws(
+      () => validateHookStdout('Stop', value),
+      /non-object JSON stdout payload/,
+    );
+  }
   assert.throws(
     () => validateHookStdout('UserPromptSubmit', '{not json'),
     /native hook UserPromptSubmit emitted invalid JSON stdout/,

@@ -1,4 +1,5 @@
 import {
+  existsSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -17,6 +18,10 @@ import { TextDecoder } from 'node:util';
 
 import TOML from '@iarna/toml';
 import { isManagedCodexHookCommand, planManagedCodexHooksRemoval } from '../config/codex-hooks.js';
+import {
+  spawnPlatformCommand,
+  spawnPlatformCommandSync,
+} from '../utils/platform-command.js';
 
 import {
   ensureReusableNodeModules,
@@ -214,11 +219,18 @@ function versionProbeDeadlineError(): Error {
   );
 }
 
-function* streamPathEntries(pathValue: string, deadline: number): Iterable<string> {
+export interface CodexCommandSpawnSeam {
+  platform?: NodeJS.Platform;
+  spawnSyncImpl?: typeof spawnSync;
+  spawnImpl?: typeof spawn;
+}
+
+function* streamPathEntries(pathValue: string, deadline: number, platform: NodeJS.Platform): Iterable<string> {
+  const pathDelimiter = platform === 'win32' ? ';' : delimiter;
   let start = 0;
   for (let index = 0; index < pathValue.length; index += 1) {
     if ((index & 0x3ff) === 0 && Date.now() >= deadline) throw versionProbeDeadlineError();
-    if (pathValue[index] !== delimiter) continue;
+    if (pathValue[index] !== pathDelimiter) continue;
     yield pathValue.slice(start, index);
     start = index + 1;
   }
@@ -226,26 +238,36 @@ function* streamPathEntries(pathValue: string, deadline: number): Iterable<strin
   yield pathValue.slice(start);
 }
 
+function codexCandidatePaths(pathEntry: string, env: NodeJS.ProcessEnv, platform: NodeJS.Platform): string[] {
+  if (platform !== 'win32') return [join(pathEntry, 'codex')];
+  const pathext = String(env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD;.PS1')
+    .split(';')
+    .map((extension) => extension.trim().toLowerCase())
+    .filter(Boolean);
+  return [...new Set([...pathext.map((extension) => join(pathEntry, `codex${extension}`)), join(pathEntry, 'codex')])];
+}
+
 function resolvePinnedCodexExecutable(
   cwd: string,
   env: NodeJS.ProcessEnv,
+  seam: CodexCommandSpawnSeam = {},
 ): { executable: string; version: string } {
+  const platform = seam.platform ?? process.platform;
   const deadline = Date.now() + CODEX_VERSION_PROBE_DEADLINE_MS;
   const pathValue = env.PATH ?? env.Path ?? '';
   const observed: string[] = [];
-  const seenExecutables = new Set<string>();
+  const seenPathEntries = new Set<string>();
 
-  for (const entry of streamPathEntries(pathValue, deadline)) {
+  for (const entry of streamPathEntries(pathValue, deadline, platform)) {
     if (Date.now() >= deadline) throw versionProbeDeadlineError();
     const pathEntry = resolve(cwd, entry || '.');
-    const executable = join(pathEntry, 'codex');
-    if (seenExecutables.has(executable)) continue;
-    if (seenExecutables.size === CODEX_VERSION_PROBE_CANDIDATE_BUDGET) {
+    if (seenPathEntries.has(pathEntry)) continue;
+    if (seenPathEntries.size === CODEX_VERSION_PROBE_CANDIDATE_BUDGET) {
       throw new Error(
         `Codex version resolution exceeded the ${CODEX_VERSION_PROBE_CANDIDATE_BUDGET}-candidate PATH budget`,
       );
     }
-    seenExecutables.add(executable);
+    seenPathEntries.add(pathEntry);
     const remainingMs = deadline - Date.now();
     if (remainingMs <= 0) throw versionProbeDeadlineError();
 
@@ -263,11 +285,20 @@ function resolvePinnedCodexExecutable(
       continue;
     }
 
-    let before = inspectCodexCandidate(executable);
-    if (before.kind === 'absent') {
-      before = inspectCodexCandidate(executable);
-      if (before.kind === 'absent') continue;
+    let selected: { executable: string; before: CodexCandidateInspection } | null = null;
+    for (const executable of codexCandidatePaths(pathEntry, env, platform)) {
+      if (Date.now() >= deadline) throw versionProbeDeadlineError();
+      let before = inspectCodexCandidate(executable);
+      if (before.kind === 'absent') {
+        before = inspectCodexCandidate(executable);
+        if (before.kind === 'absent') continue;
+      }
+      selected = { executable, before };
+      break;
     }
+    if (!selected) continue;
+
+    const { executable, before } = selected;
     if (before.kind === 'dangling') {
       observed.push(`${executable}: candidate exists but its target is unavailable (dangling or changed during probe)`);
       continue;
@@ -277,13 +308,13 @@ function resolvePinnedCodexExecutable(
       continue;
     }
 
-    const result = spawnSync(executable, ['--version'], {
+    const { result } = spawnPlatformCommandSync(executable, ['--version'], {
       cwd,
       env,
       encoding: 'utf-8',
       timeout: Math.max(1, Math.min(CODEX_APP_SERVER_TIMEOUTS.versionProbeMs, remainingMs)),
       killSignal: 'SIGKILL',
-    });
+    }, platform, env, undefined, seam.spawnSyncImpl ?? spawnSync);
     if (Date.now() >= deadline) throw versionProbeDeadlineError();
     if (isNodeErrorWithCode(result.error, 'ENOENT')) {
       const after = inspectCodexCandidate(executable);
@@ -374,15 +405,18 @@ export class CodexAppServer {
   static async start(options: {
     cwd: string;
     env: NodeJS.ProcessEnv;
+    commandSeam?: CodexCommandSpawnSeam;
   }): Promise<CodexAppServer> {
-    const { executable } = resolvePinnedCodexExecutable(options.cwd, options.env);
-    const child = spawn(executable, ['app-server', '--stdio'], {
+    const seam = options.commandSeam;
+    const platform = seam?.platform ?? process.platform;
+    const { executable } = resolvePinnedCodexExecutable(options.cwd, options.env, seam);
+    const { child } = spawnPlatformCommand(executable, ['app-server', '--stdio'], {
       cwd: options.cwd,
       env: options.env,
       stdio: 'pipe',
-    });
+    }, platform, options.env, undefined, seam?.spawnImpl ?? spawn);
 
-    const server = new CodexAppServer(child);
+    const server = new CodexAppServer(child as ChildProcessWithoutNullStreams);
     try {
       await server.waitForStartup();
     } catch (error) {
@@ -982,8 +1016,12 @@ export function assertForeignHookGroupsPreserved(
 }
 
 
-export function probeCodexVersion(cwd: string, env: NodeJS.ProcessEnv): string {
-  return resolvePinnedCodexExecutable(cwd, env).version;
+export function probeCodexVersion(
+  cwd: string,
+  env: NodeJS.ProcessEnv,
+  seam?: CodexCommandSpawnSeam,
+): string {
+  return resolvePinnedCodexExecutable(cwd, env, seam).version;
 }
 
 function usage(): string {
@@ -1082,14 +1120,22 @@ function resolveGlobalNodeModules(prefixDir: string): string {
 }
 
 export function validateHookStdout(eventName: string, stdout: string): void {
+  if (eventName === 'PostCompact') {
+    if (stdout.length === 0) return;
+    throw new Error('native hook PostCompact must emit empty stdout');
+  }
   const trimmed = stdout.trim();
   if (!trimmed) return;
+  let parsed: unknown;
   try {
-    JSON.parse(trimmed);
+    parsed = JSON.parse(trimmed);
   } catch (error) {
     throw new Error(
       `native hook ${eventName} emitted invalid JSON stdout: ${error instanceof Error ? error.message : String(error)}`,
     );
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new Error(`native hook ${eventName} emitted a non-object JSON stdout payload`);
   }
 }
 
@@ -1384,6 +1430,8 @@ export async function smokePackedHookTrustLifecycle(
   const hooksPath = join(projectDir, '.codex', 'hooks.json');
   const configPath = join(projectDir, '.codex', 'config.toml');
   const marker = 'omx-packed-foreign';
+  const agentsPath = join(projectDir, 'AGENTS.md');
+  const foreignAgentsContent = '# User project instructions\n\nPreserve this packed lifecycle guidance.\n';
   const env = isolatedSmokeEnv(home, codexHome);
 
   try {
@@ -1392,6 +1440,7 @@ export async function smokePackedHookTrustLifecycle(
     mkdirSync(codexHome, { recursive: true });
     mkdirSync(join(projectDir, '.codex'), { recursive: true });
     writeFileSync(join(codexHome, 'config.toml'), trustedProjectConfig(projectDir), 'utf-8');
+    writeFileSync(agentsPath, foreignAgentsContent, 'utf-8');
 
     // Pre-seed foreign groups so uninstall may safely remove OMX's appended suffix.
     writeFileSync(
@@ -1448,10 +1497,15 @@ export async function smokePackedHookTrustLifecycle(
       );
     }
 
-    run(omxPath, ['setup', '--scope', 'project', '--merge-agents', '--legacy'], {
+    const setupResult = run(omxPath, ['setup', '--scope', 'project', '--merge-agents', '--legacy'], {
       cwd: projectDir,
       env,
     });
+    if (!existsSync(agentsPath) || !readFileSync(agentsPath, 'utf-8').includes(foreignAgentsContent.trim())) {
+      throw new Error(
+        `packed setup --merge-agents did not preserve pre-existing user AGENTS.md guidance; stdout=${JSON.stringify(String(setupResult.stdout || ''))} stderr=${JSON.stringify(String(setupResult.stderr || ''))}`,
+      );
+    }
 
     const initialHooksContent = readFileSync(hooksPath, 'utf-8');
     assertForeignHookGroupsPreserved(preSetupForeignSnapshot, initialHooksContent, marker);
@@ -1563,6 +1617,10 @@ export async function smokePackedHookTrustLifecycle(
         throw new Error('third packed setup changed Codex hook metadata or display order');
       }
     }
+    run(omxPath, ['doctor', '--verbose'], { cwd: projectDir, env });
+    if (!existsSync(agentsPath) || !readFileSync(agentsPath, 'utf-8').includes(foreignAgentsContent.trim())) {
+      throw new Error('packed doctor lifecycle did not preserve pre-existing user AGENTS.md guidance');
+    }
 
     run(omxPath, ['uninstall'], { cwd: projectDir, env });
     const afterUninstallHooksContent = readFileSync(hooksPath, 'utf-8');
@@ -1571,6 +1629,9 @@ export async function smokePackedHookTrustLifecycle(
     }
     assertNoEmptyManagedEventGroups(afterUninstallHooksContent);
     assertForeignHookGroupsPreserved(foreignSnapshot, afterUninstallHooksContent, marker);
+    if (!existsSync(agentsPath) || !readFileSync(agentsPath, 'utf-8').includes(foreignAgentsContent.trim())) {
+      throw new Error('packed uninstall removed pre-existing user AGENTS.md guidance');
+    }
     const afterUninstallConfig = readFileSync(configPath, 'utf-8');
     assertNoSetupOwnedTrustKeys(afterUninstallConfig, generatedTrust);
     assertNativeHooksEnabledForForeignGroups(afterUninstallConfig);

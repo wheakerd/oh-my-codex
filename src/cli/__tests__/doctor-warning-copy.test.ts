@@ -2218,6 +2218,79 @@ command = "node"
 		}
 	});
 
+	it("preserves a failed PostCompact smoke result when cleanup retains the smoke directory", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-doctor-postcompact-smoke-cleanup-failure-"));
+		let smokeCwd: string | null = null;
+		try {
+			const codexDir = join(wd, ".codex");
+			const hooksPath = join(codexDir, "hooks.json");
+			const hooksDir = join(codexDir, "hooks");
+			const shimPath = join(hooksDir, "omx-native-hook-windows-shim.ps1");
+			const command = buildWindowsShimCommand(shimPath);
+			await mkdir(hooksDir, { recursive: true });
+			await writeFile(hooksPath, buildWindowsShimHooksJson(shimPath, codexDir));
+			await writeFile(shimPath, buildManagedCodexNativeHookWindowsShimContent(repoRoot()), "utf-8");
+
+			const check = await checkNativePostCompactHookRuntime(hooksPath, wd, codexDir, {
+				platform: "win32",
+				expectedCommand: command,
+				beforeWindowsShimSmoke: ({ smokeCwd: currentSmokeCwd }) => {
+					smokeCwd = currentSmokeCwd;
+				},
+				runner: (() => {
+					if (smokeCwd === null) {
+						throw new Error("Windows smoke root was not captured before execution");
+					}
+					writeFileSync(join(smokeCwd, "retained-sentinel.txt"), "retained smoke root\n");
+					return { status: 1, stdout: "", stderr: "hook failure" };
+				}) as unknown as typeof spawnSync,
+			});
+
+			assert.equal(check?.status, "fail");
+			assert.match(check?.message ?? "", /PostCompact hook smoke validation exited 1: hook failure/);
+			assert.match(check?.message ?? "", /temporary PostCompact smoke directory could not be removed without recursive deletion/);
+			if (smokeCwd === null) assert.fail("Windows smoke root was not captured");
+			assert.equal(readFileSync(join(smokeCwd, "retained-sentinel.txt"), "utf-8"), "retained smoke root\n");
+		} finally {
+			if (smokeCwd !== null) await rm(smokeCwd, { recursive: true, force: true });
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
+
+	it("preserves a thrown PostCompact smoke error when cleanup also fails", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-doctor-postcompact-smoke-thrown-cleanup-"));
+		let smokeCwd: string | null = null;
+		try {
+			const codexDir = join(wd, ".codex");
+			const hooksPath = join(codexDir, "hooks.json");
+			const hooksDir = join(codexDir, "hooks");
+			const shimPath = join(hooksDir, "omx-native-hook-windows-shim.ps1");
+			const command = buildWindowsShimCommand(shimPath);
+			await mkdir(hooksDir, { recursive: true });
+			await writeFile(hooksPath, buildWindowsShimHooksJson(shimPath, codexDir));
+			await writeFile(shimPath, buildManagedCodexNativeHookWindowsShimContent(repoRoot()), "utf-8");
+
+			await assert.rejects(
+				checkNativePostCompactHookRuntime(hooksPath, wd, codexDir, {
+					platform: "win32",
+					expectedCommand: command,
+					beforeWindowsShimSmoke: ({ smokeCwd: currentSmokeCwd }) => {
+						smokeCwd = currentSmokeCwd;
+					},
+					runner: (() => {
+						if (smokeCwd === null) throw new Error("Windows smoke root was not captured before execution");
+						writeFileSync(join(smokeCwd, "retained-sentinel.txt"), "retained smoke root\n");
+						throw new Error("primary spawn failure");
+					}) as unknown as typeof spawnSync,
+				}),
+				/primary spawn failure; temporary PostCompact smoke directory could not be removed without recursive deletion/,
+			);
+		} finally {
+			if (smokeCwd !== null) await rm(smokeCwd, { recursive: true, force: true });
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
+
 	it("reports exact nested legacy hook trust state as migration-required without modifying hooks.json", async () => {
 		const wd = await mkdtemp(join(tmpdir(), "omx-doctor-hooks-legacy-trust-"));
 		try {

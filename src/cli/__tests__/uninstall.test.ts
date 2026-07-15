@@ -2631,6 +2631,28 @@ describe('omx uninstall', () => {
     }
   });
 
+  it('removes OMX-managed AGENTS sections while preserving project guidance', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-uninstall-merged-agents-'));
+    try {
+      const home = join(wd, 'home');
+      await mkdir(home, { recursive: true });
+      await mkdir(join(wd, '.omx'), { recursive: true });
+      await writeFile(join(wd, '.omx', 'setup-scope.json'), JSON.stringify({ scope: 'project' }));
+      const userGuidance = '# User project instructions\n\nPreserve this guidance.\n';
+      await writeFile(
+        join(wd, 'AGENTS.md'),
+        `${userGuidance}\n<!-- OMX:AGENTS:START -->\n<!-- omx:generated:agents-md -->\n# oh-my-codex - Intelligent Multi-Agent Orchestration\n<!-- OMX:AGENTS:END -->\n`,
+      );
+
+      const res = runOmx(wd, ['uninstall', '--keep-config'], { HOME: home });
+      if (shouldSkipForSpawnPermissions(res.error)) return;
+      assert.equal(res.status, 0, res.stderr || res.stdout);
+      assert.equal(await readFile(join(wd, 'AGENTS.md'), 'utf-8'), userGuidance);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
   it('removes managed user-scope AGENTS.md from CODEX_HOME', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-uninstall-'));
     try {
@@ -3012,7 +3034,7 @@ describe('omx uninstall', () => {
               renameSync(foreignPath, configPath);
             },
           }),
-          /replacement claim.*not the planned artifact/,
+          /(?:replacement claim.*not the planned artifact|planned artifact .* changed)/,
         );
         assert.ok(foreignInode);
         assert.equal(lstatSync(configPath).ino, foreignInode);

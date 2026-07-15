@@ -2,6 +2,7 @@
  * omx doctor - Validate oh-my-codex installation
  */
 
+import { recoverNativeHookClaimJournal } from "./native-hook-claim-journal.js";
 import { constants, existsSync, readFileSync, type Stats } from "fs";
 import { access, chown, lstat, mkdtemp, readdir, readFile, rmdir, rm } from "fs/promises";
 import { spawnSync } from "child_process";
@@ -265,6 +266,7 @@ export async function doctor(options: DoctorOptions = {}): Promise<void> {
 	const cwd = process.cwd();
 	const scopeResolution = await resolveDoctorScope(cwd);
 	const paths = resolveDoctorPaths(cwd, scopeResolution.scope);
+	await recoverNativeHookClaimJournal(paths.codexHomeDir);
 	const scopeSourceMessage =
 		scopeResolution.source === "persisted"
 			? " (from .omx/setup-scope.json)"
@@ -2509,7 +2511,10 @@ export async function checkNativePostCompactHookRuntime(
 			"temporary PostCompact smoke directory could not be validated; doctor preserved it for manual recovery and skipped execution for safety",
 		);
 	}
+	let primaryResult: Check | null = null;
+	let primaryError: Error | null = null;
 	try {
+		primaryResult = await (async (): Promise<Check> => {
 		const revalidatedIntegrity = await checkExistingNativeHooks(hooksPath, {
 			codexHomeDir,
 			platform,
@@ -2646,10 +2651,22 @@ export async function checkNativePostCompactHookRuntime(
 			message:
 				"verbose smoke validation confirmed the effective PostCompact hook exits successfully with no stdout",
 		};
+		})();
+	} catch (error) {
+		primaryError = error instanceof Error ? error : new Error(String(error));
+		throw primaryError;
 	} finally {
 		const cleanupCheck = await cleanupSmokeDirectoryIfUnchanged(smokeCwd, smokeDirectory);
-		if (cleanupCheck) return cleanupCheck;
+		if (cleanupCheck) {
+			if (primaryResult) {
+				if (primaryResult.status === "pass") primaryResult.status = cleanupCheck.status;
+				primaryResult.message = `${primaryResult.message}; ${cleanupCheck.message}`;
+			} else if (primaryError) {
+				primaryError.message = `${primaryError.message}; ${cleanupCheck.message}`;
+			}
+		}
 	}
+	return primaryResult;
 }
 
 async function checkNativeHookRuntimeMirrors(
