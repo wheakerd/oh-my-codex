@@ -981,8 +981,10 @@ function readTmuxHookSnapshot(hookTarget: string, slot: string): TmuxHookSnapsho
 }
 
 function restoreTmuxHookSnapshot(hookTarget: string, snapshot: TmuxHookSnapshot): boolean {
-  if (snapshot.command === null) return true;
-  return runTmux(['set-hook', '-t', hookTarget, snapshot.slot, snapshot.command]).ok;
+  const result = snapshot.command === null
+    ? runTmux(['set-hook', '-u', '-t', hookTarget, snapshot.slot])
+    : runTmux(['set-hook', '-t', hookTarget, snapshot.slot, snapshot.command]);
+  return result.ok && tmuxHookMatchesSnapshot(hookTarget, snapshot);
 }
 
 function tmuxHookMatchesSnapshot(hookTarget: string, expected: TmuxHookSnapshot): boolean {
@@ -1044,8 +1046,12 @@ function restoreHudHookSnapshots(
   clientAttachedSnapshot: TmuxHookSnapshot,
   resizeSnapshot: TmuxHookSnapshot,
 ): boolean {
-  return restoreTmuxHookSnapshot(hookTarget, clientAttachedSnapshot)
-    && restoreTmuxHookSnapshot(hookTarget, resizeSnapshot)
+  // Always attempt and verify both restores. A failed first restore must not
+  // leave the other slot in a transaction-created state.
+  const clientAttachedRestored = restoreTmuxHookSnapshot(hookTarget, clientAttachedSnapshot);
+  const resizeRestored = restoreTmuxHookSnapshot(hookTarget, resizeSnapshot);
+  return clientAttachedRestored
+    && resizeRestored
     && tmuxHookMatchesSnapshot(hookTarget, clientAttachedSnapshot)
     && tmuxHookMatchesSnapshot(hookTarget, resizeSnapshot);
 }
@@ -1067,19 +1073,18 @@ export function unregisterHudHooksTransactionally(
   const resizeSnapshot = readTmuxHookSnapshot(hookTarget, resizeSlot);
   const expectedResizeCommand = buildRegisterResizeHookArgs(hookTarget, resizeHookName, hudPaneId)[4];
   const expectedClientAttachedCommand = buildRegisterClientAttachedReconcileArgs(hookTarget, clientAttachedHookName, hudPaneId)[4];
+  if (!clientAttachedSnapshot || !resizeSnapshot) return false;
+  if (clientAttachedSnapshot.command === null && resizeSnapshot.command === null) return true;
   if (
-    !clientAttachedSnapshot
-    || !resizeSnapshot
-    || clientAttachedSnapshot.command !== expectedClientAttachedCommand
-    || resizeSnapshot.command !== expectedResizeCommand
+    (clientAttachedSnapshot.command !== null && clientAttachedSnapshot.command !== expectedClientAttachedCommand)
+    || (resizeSnapshot.command !== null && resizeSnapshot.command !== expectedResizeCommand)
   ) return false;
 
-  if (!runTmux(['set-hook', '-u', '-t', hookTarget, clientAttachedSlot]).ok) return false;
-  if (!tmuxHookIsAbsent(hookTarget, clientAttachedSlot)) {
-    restoreHudHookSnapshots(hookTarget, clientAttachedSnapshot, resizeSnapshot);
-    return false;
-  }
-  if (!runTmux(['set-hook', '-u', '-t', hookTarget, resizeSlot]).ok || !tmuxHookIsAbsent(hookTarget, resizeSlot)) {
+  const remove = (slot: string, installed: boolean): boolean => !installed
+    || (runTmux(['set-hook', '-u', '-t', hookTarget, slot]).ok && tmuxHookIsAbsent(hookTarget, slot));
+  const clientRemoved = remove(clientAttachedSlot, clientAttachedSnapshot.command !== null);
+  const resizeRemoved = remove(resizeSlot, resizeSnapshot.command !== null);
+  if (!clientRemoved || !resizeRemoved) {
     restoreHudHookSnapshots(hookTarget, clientAttachedSnapshot, resizeSnapshot);
     return false;
   }

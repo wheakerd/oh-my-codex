@@ -31,7 +31,6 @@ import {
   readPaneTeamOwnerTagResult,
   restoreStandaloneHudPane,
   teardownWorkerPanes,
-  unregisterResizeHook,
   unregisterHudHooksTransactionally,
   buildClientAttachedReconcileHookName,
   destroyTeamSession,
@@ -3320,25 +3319,36 @@ export async function startTeam(
     const rollbackErrors: string[] = [];
 
     if (sessionCreated) {
-      if (config?.resize_hook_name && config.resize_hook_target) {
+      let hookCleanupCertain = true;
+      if (config?.resize_hook_name && config.resize_hook_target && config.hud_pane_id) {
+        const windowIndex = config.resize_hook_target.slice(config.resize_hook_target.lastIndexOf(':') + 1);
+        const clientHookName = windowIndex
+          ? buildClientAttachedReconcileHookName(sanitized, sessionName.split(':')[0] ?? sessionName, windowIndex, config.hud_pane_id)
+          : '';
         try {
-          const unregistered = unregisterResizeHook(config.resize_hook_target, config.resize_hook_name);
-          if (!unregistered) {
-            rollbackErrors.push('unregisterResizeHook: returned false');
-          }
+          hookCleanupCertain = Boolean(
+            clientHookName
+            && unregisterHudHooksTransactionally(config.resize_hook_target, config.resize_hook_name, clientHookName, config.hud_pane_id),
+          );
+          if (!hookCleanupCertain) rollbackErrors.push('unregisterHudHooksTransactionally: returned false');
         } catch (cleanupError) {
-          rollbackErrors.push(`unregisterResizeHook: ${String(cleanupError)}`);
+          hookCleanupCertain = false;
+          rollbackErrors.push(`unregisterHudHooksTransactionally: ${String(cleanupError)}`);
         }
       }
 
-      if (config) {
+      if (config && hookCleanupCertain) {
         config.resize_hook_name = null;
         config.resize_hook_target = null;
         try {
           await saveTeamConfig(config, leaderCwd);
         } catch (cleanupError) {
+          hookCleanupCertain = false;
           rollbackErrors.push(`saveTeamConfig(clear resize hook): ${String(cleanupError)}`);
         }
+      }
+      if (!hookCleanupCertain) {
+        rollbackErrors.push('preserving HUD metadata and container because hook cleanup was uncertain');
       }
 
       // In split-pane topology, we must not kill the entire tmux session; kill only created panes.
@@ -3350,14 +3360,14 @@ export async function startTeam(
             process.stderr.write(`[team/runtime] operation failed: ${err}\n`);
           }
         }
-        if (config?.hud_pane_id) {
+        if (config?.hud_pane_id && hookCleanupCertain) {
           try {
             await killWorkerByPaneIdAsync(config.hud_pane_id, createdLeaderPaneId);
           } catch (err) {
             process.stderr.write(`[team/runtime] operation failed: ${err}\n`);
           }
         }
-      } else {
+      } else if (hookCleanupCertain) {
         try {
           destroyTeamSession(sessionName);
         } catch (cleanupError) {
@@ -4121,6 +4131,7 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
       }).catch(() => null)
       : null;
     const ownsHudLifecycleLock = hudLifecycleLock?.status === 'acquired' && hudLifecycleLock.lock;
+    try {
     const freshHudCandidate = ownsHudLifecycleLock && hudRestoreDomain && effectiveLeaderPaneId
       ? probeExactTeamHudCandidate({
         sessionId: hudRestoreDomain.claimant.sessionId,
@@ -4178,23 +4189,23 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
       console.warn(`[team shutdown] ${sanitized}: preserving Team HUD pane, hooks, and metadata because fresh exact HUD authority evidence or lifecycle lock was unavailable`);
     }
 
+    const persistedHudPaneId = hudPaneId;
+    const hasPersistedHudHooks = Boolean(config.resize_hook_name && config.resize_hook_target);
     const ownsHudHookTeardownAuthority = Boolean(
       ownsHudLifecycleLock
       && hasFreshHudRestoreEvidence
-      && config.resize_hook_name
-      && config.resize_hook_target
-      && hudPaneId,
+      && persistedHudPaneId,
     );
-    const clientHookTarget = ownsHudHookTeardownAuthority ? config.resize_hook_target : null;
-    let hooksRemoved = false;
-    if (clientHookTarget && config.resize_hook_name && hudPaneId) {
+    const clientHookTarget = ownsHudHookTeardownAuthority && hasPersistedHudHooks ? config.resize_hook_target : null;
+    let hooksRemoved = ownsHudHookTeardownAuthority && !hasPersistedHudHooks;
+    if (clientHookTarget && config.resize_hook_name && persistedHudPaneId) {
       const windowIndex = clientHookTarget.slice(clientHookTarget.lastIndexOf(':') + 1);
       const clientHookName = windowIndex
-        ? buildClientAttachedReconcileHookName(sanitized, sessionName.split(':')[0] ?? sessionName, windowIndex, hudPaneId)
+        ? buildClientAttachedReconcileHookName(sanitized, sessionName.split(':')[0] ?? sessionName, windowIndex, persistedHudPaneId)
         : '';
       hooksRemoved = Boolean(
         clientHookName
-        && unregisterHudHooksTransactionally(clientHookTarget, config.resize_hook_name, clientHookName, hudPaneId)
+        && unregisterHudHooksTransactionally(clientHookTarget, config.resize_hook_name, clientHookName, persistedHudPaneId)
       );
       if (!hooksRemoved) {
         console.warn(`[team shutdown] ${sanitized}: preserving Team HUD pane and metadata because authorized HUD hook cleanup failed; hook state may have changed`);
@@ -4205,7 +4216,6 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
       }
     }
 
-    try {
     let restoredHudPaneId: string | null = null;
     if (lockedHudPaneId && ownsHudTeardownAuthority && hooksRemoved) {
       await killWorkerByPaneIdAsync(lockedHudPaneId, effectiveLeaderPaneId ?? undefined);
