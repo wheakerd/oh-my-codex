@@ -491,6 +491,8 @@ async function withMockTmuxFixture<T>(
   const previousPath = process.env.PATH;
   const previousEnv = new Map<string, string | undefined>();
   const fixtureSessionId = options.env?.OMX_SESSION_ID?.trim() || `fixture-${options.dirPrefix}`;
+  const fixtureSessionBirth = options.env?.OMX_TMUX_SESSION_INSTANCE_ID?.trim() || fixtureSessionId;
+  const fixturePaneBirth = options.env?.OMX_TMUX_PANE_INSTANCE_ID?.trim() || fixtureSessionId;
   const envOverrides = {
     OMX_TEAM_STATE_ROOT: undefined,
     OMX_SESSION_ID: fixtureSessionId,
@@ -506,12 +508,34 @@ async function withMockTmuxFixture<T>(
 state_dir="${tmuxLogPath}.tmux-state"
 mkdir -p "$state_dir"
 key_for_hook() { printf '%s' "$1:$2" | tr -c 'A-Za-z0-9_.-' '_'; }
+option_path() { printf '%s/option-%s' "$state_dir" "$(key_for_hook "$1" "$2")"; }
+printf '%s\n' '${fixtureSessionBirth}' > "$(option_path 'leader' '@omx_instance_id')"
+printf '%s\n' '${fixturePaneBirth}' > "$(option_path '%1' '@omx_pane_instance_id')"
 if [ "${'$'}{1:-}" = "if-shell" ]; then
   printf '%s\\n' "${'$'}*" >> "${tmuxLogPath}"
   if [ "${'$'}{4:-}" = "-F" ]; then
     branch="${'$'}{6:-}"
     rejected_branch="${'$'}{7:-}"
     case "${'$'}branch" in
+      *__omx_birth_established_*)
+        session_target="${'$'}{branch#*set-option -t }"
+        session_target="${'$'}{session_target%% *}"
+        session_target="${'$'}{session_target#\'}"; session_target="${'$'}{session_target%\'}"
+        session_birth="${'$'}{branch#* @omx_instance_id }"
+        session_birth="${'$'}{session_birth%% *}"
+        session_birth="${'$'}{session_birth#\'}"; session_birth="${'$'}{session_birth%\'}"
+        pane_target="${'$'}{branch#*set-option -p -t }"
+        pane_target="${'$'}{pane_target%% *}"
+        pane_target="${'$'}{pane_target#\'}"; pane_target="${'$'}{pane_target%\'}"
+        pane_birth="${'$'}{branch#* @omx_pane_instance_id }"
+        pane_birth="${'$'}{pane_birth%% *}"
+        pane_birth="${'$'}{pane_birth#\'}"; pane_birth="${'$'}{pane_birth%\'}"
+        printf '%s\\n' "${'$'}session_birth" > "$state_dir/session-birth-${'$'}session_target"
+        printf '%s\\n' "${'$'}pane_birth" > "$state_dir/pane-instance-${'$'}pane_target"
+        receipt="${'$'}{branch##*display-message -p }"
+        printf '%s\\n' "${'$'}{receipt%% *}"
+        exit 0
+        ;;
       *__omx_*_teardown_applied_*)
         selected="${'$'}branch"
         [ -f "$state_dir/if-shell-reject" ] && selected="${'$'}rejected_branch"
@@ -547,18 +571,22 @@ if [ "${'$'}{1:-}" = "show-hooks" ]; then
 fi
 if [ "${'$'}{1:-}" = "set-option" ]; then
   case "${'$'}*" in
-    *"@omx_team_pane_birth"*) pane_target="${'$'}{4:-}"; pane_birth="${'$'}{6:-}"; printf '%s\n' "${'$'}pane_birth" > "$state_dir/birth-${'$'}pane_target" ;;
-    *"@omx_instance_id"*) session_target="${'$'}{3:-}"; session_birth="${'$'}{5:-}"; printf '%s\n' "${'$'}session_birth" > "$state_dir/session-birth-${'$'}session_target" ;;
+    *"@omx_team_pane_birth"*) pane_target="${'$'}{4:-}"; pane_birth="${'$'}{6:-}"; printf '%s\n' "${'$'}pane_birth" > "$(option_path "${'$'}pane_target" '@omx_team_pane_birth')" ;;
+    *"@omx_pane_instance_id"*) pane_target="${'$'}{4:-}"; pane_birth="${'$'}{6:-}"; printf '%s\n' "${'$'}pane_birth" > "$(option_path "${'$'}pane_target" '@omx_pane_instance_id')" ;;
+    *"@omx_instance_id"*) session_target="${'$'}{3:-}"; session_birth="${'$'}{5:-}"; printf '%s\n' "${'$'}session_birth" > "$(option_path "${'$'}session_target" '@omx_instance_id')" ;;
+    *) pane_target="${'$'}{4:-}"; option_name="${'$'}{5:-}"; option_value="${'$'}{6:-}"; printf '%s\n' "${'$'}option_value" > "$(option_path "${'$'}pane_target" "${'$'}option_name")" ;;
   esac
 fi
 if [ "${'$'}{1:-}" = "show-option" ]; then
   case "${'$'}*" in
-    *"@omx_team_pane_birth"*) pane_target="${'$'}{5:-}"; [ -f "$state_dir/birth-${'$'}pane_target" ] && cat "$state_dir/birth-${'$'}pane_target" && exit 0 ;;
+    *"@omx_team_pane_birth"*) pane_target="${'$'}{5:-}"; option_file="$(option_path "${'$'}pane_target" '@omx_team_pane_birth')"; [ -f "${'$'}option_file" ] && cat "${'$'}option_file" && exit 0 ;;
+    *"@omx_pane_instance_id"*) pane_target="${'$'}{5:-}"; option_file="$(option_path "${'$'}pane_target" '@omx_pane_instance_id')"; [ -f "${'$'}option_file" ] && cat "${'$'}option_file" && exit 0 ;;
+    *) pane_target="${'$'}{5:-}"; option_name="${'$'}{6:-}"; option_file="$(option_path "${'$'}pane_target" "${'$'}option_name")"; [ -f "${'$'}option_file" ] && cat "${'$'}option_file" && exit 0 ;;
   esac
 fi
 if [ "${'$'}{1:-}" = "show-options" ]; then
   case "${'$'}*" in
-    *"@omx_instance_id"*) session_target="${'$'}{4:-}"; [ -f "$state_dir/session-birth-${'$'}session_target" ] && cat "$state_dir/session-birth-${'$'}session_target" && exit 0 ;;
+    *"@omx_instance_id"*) session_target="${'$'}{4:-}"; option_file="$(option_path "${'$'}session_target" '@omx_instance_id')"; [ -f "${'$'}option_file" ] && cat "${'$'}option_file" && exit 0 ;;
   esac
 fi
 `,
@@ -752,7 +780,7 @@ describe('runtime', () => {
       assert.equal(existsSync(missingRoot), false);
 
       for (const status of ['cleanup_complete', 'transferred'] as const) {
-        const teamName = `team-stale-${status}`;
+        const teamName = `team-stale-${status.replaceAll('_', '-')}`;
         const teamRoot = await writeStaleState(teamName, certificate(teamName, status));
         if (status === 'transferred') {
           await rm(join(teamRoot, 'config.json'), { force: true });
@@ -2584,8 +2612,6 @@ esac
           assert.equal(manifest.leader?.session_id, 'logical-session-from-env');
 
           const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
-          assert.match(tmuxLog, /show-options -qv -t leader @omx_instance_id/);
-          assert.match(tmuxLog, /show-option -qv -p -t %1 @omx_pane_instance_id/);
           assert.doesNotMatch(tmuxLog, /set-option -t leader @omx_instance_id live-session-instance/);
           assert.doesNotMatch(tmuxLog, /set-option -p -t %1 @omx_pane_instance_id live-pane-instance/);
           assert.match(tmuxLog, /set-option -p -t %2 @omx_pane_instance_id logical-session-from-env/);

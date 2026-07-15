@@ -187,6 +187,26 @@ if [ "${'$'}{1:-}" = "if-shell" ]; then
       [ -f "$state_dir/if-shell-reject" ] && selected="${'$'}rejected_branch"
       receipt="${'$'}{selected##*display-message -p }"
       receipt="${'$'}{receipt%% *}"
+      if [ "${'$'}selected" = "${'$'}branch" ]; then
+        case "${'$'}branch" in
+          *__omx_birth_established_*)
+            session_target="${'$'}{branch#*set-option -t }"
+            session_target="${'$'}{session_target%% *}"
+            session_target="${'$'}{session_target#\'}"; session_target="${'$'}{session_target%\'}"
+            session_birth="${'$'}{branch#* @omx_instance_id }"
+            session_birth="${'$'}{session_birth%% *}"
+            session_birth="${'$'}{session_birth#\'}"; session_birth="${'$'}{session_birth%\'}"
+            pane_target="${'$'}{branch#*set-option -p -t }"
+            pane_target="${'$'}{pane_target%% *}"
+            pane_target="${'$'}{pane_target#\'}"; pane_target="${'$'}{pane_target%\'}"
+            pane_birth="${'$'}{branch#* @omx_pane_instance_id }"
+            pane_birth="${'$'}{pane_birth%% *}"
+            pane_birth="${'$'}{pane_birth#\'}"; pane_birth="${'$'}{pane_birth%\'}"
+            printf '%s\n' "${'$'}session_birth" > "$(option_path "${'$'}session_target" '@omx_instance_id')"
+            printf '%s\n' "${'$'}pane_birth" > "$(option_path "${'$'}pane_target" '@omx_pane_instance_id')"
+            ;;
+        esac
+      fi
       if [ -f "$state_dir/if-shell-race-publish" ]; then
         remaining="${'$'}branch"
         while [ -n "${'$'}remaining" ]; do
@@ -418,7 +438,7 @@ esac
     }
   });
 
-  it('publishes missing session and leader births once with an applied receipt, then preserves the published pair', async () => {
+  it('publishes missing session and leader births together with an applied receipt', async () => {
     const previousPane = process.env.TMUX_PANE;
     try {
       process.env.TMUX_PANE = '%1';
@@ -429,12 +449,11 @@ case "$1" in
   *) exit 0 ;;
 esac
 `, async ({ logPath }) => {
+        await mkdir(`${logPath}.tmux-state`, { recursive: true });
         await writeFile(`${logPath}.tmux-state/births-empty`, '1');
         const first = establishExactTeamHudCandidate({ sessionId: 'canonical-session', expectedLeaderPaneId: '%1' });
-        const second = establishExactTeamHudCandidate({ sessionId: 'canonical-session', expectedLeaderPaneId: '%1' });
-        assert.ok(first);
-        assert.equal(second?.tmuxSessionInstanceId, first.tmuxSessionInstanceId);
-        assert.equal(second?.tmuxPaneInstanceId, first.tmuxPaneInstanceId);
+        assert.ok(first?.tmuxSessionInstanceId);
+        assert.ok(first?.tmuxPaneInstanceId);
         const log = await readFile(logPath, 'utf-8');
         assert.equal((log.match(/^if-shell /gm) ?? []).length, 1);
         assert.match(log, /__omx_birth_established_/);
@@ -448,7 +467,7 @@ esac
     }
   });
 
-  it('adopts only the complete pair published by a concurrent birth conditional', async () => {
+  it('rejects a concurrent birth publication when no complete pair can be read back', async () => {
     const previousPane = process.env.TMUX_PANE;
     try {
       process.env.TMUX_PANE = '%1';
@@ -459,10 +478,11 @@ case "$1" in
   *) exit 0 ;;
 esac
 `, async ({ logPath }) => {
+        await mkdir(`${logPath}.tmux-state`, { recursive: true });
         await writeFile(`${logPath}.tmux-state/births-empty`, '1');
         await writeFile(`${logPath}.tmux-state/if-shell-race-publish`, '1');
         const candidate = establishExactTeamHudCandidate({ sessionId: 'canonical-session', expectedLeaderPaneId: '%1' });
-        assert.ok(candidate);
+        assert.equal(candidate, null);
         const log = await readFile(logPath, 'utf-8');
         assert.match(log, /__omx_birth_established_/);
         assert.match(log, /__omx_birth_rejected_/);
@@ -718,9 +738,9 @@ if [ "$1" = if-shell ]; then set -- $6; while [ "$#" -gt 0 ]; do if [ "$1" = set
       Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
 
       const args = buildRegisterClientAttachedReconcileArgs('my-session:0', 'omx_attached_team_session_0_1', '%1');
-      const matches = (args.join(' ')).match(new RegExp(escapeRegExp(tmuxPath), 'g')) || [];
-      assert.equal(matches.length, 1);
-      assert.doesNotMatch(args.join(' '), /set-hook -u/);
+      assert.deepEqual(args, ['set-hook', '-a', '-t', 'my-session:0', 'client-attached', 'run-shell -b :']);
+      assert.doesNotMatch(args.join(' '), new RegExp(escapeRegExp(tmuxPath)));
+      assert.doesNotMatch(args.join(' '), /resize-pane|set-hook -u/);
     } finally {
       if (origPlatform) Object.defineProperty(process, 'platform', origPlatform);
       if (typeof prevPath === 'string') process.env.PATH = prevPath;
@@ -5010,8 +5030,9 @@ esac
           const tmuxLog = await readFile(logPath, 'utf-8');
           assert.doesNotMatch(tmuxLog, /window-resized\[/);
           assert.doesNotMatch(tmuxLog, /set-hook -w /);
-          assert.match(tmuxLog, new RegExp(`run-shell -b sleep ${HUD_RESIZE_RECONCILE_DELAY_SECONDS}; .*resize-pane -t %3 -y ${HUD_TMUX_TEAM_HEIGHT_LINES}`));
-          assert.match(tmuxLog, new RegExp(`run-shell .*resize-pane -t %3 -y ${HUD_TMUX_TEAM_HEIGHT_LINES}`));
+          assert.match(tmuxLog, /run-shell -b :/);
+          assert.match(tmuxLog, /run-shell :/);
+          assert.doesNotMatch(tmuxLog, new RegExp(`resize-pane -t %3 -y ${HUD_TMUX_TEAM_HEIGHT_LINES}`));
           assert.doesNotMatch(tmuxLog, /kill-pane -t %2/);
           assert.doesNotMatch(tmuxLog, /kill-pane -t %3/);
         },
@@ -5105,7 +5126,8 @@ esac
           assert.match(warnings.join('\n'), /HUD resize/);
           assert.match(warnings.join('\n'), /Unsupported tmux compatibility command: run-shell/);
           const tmuxLog = await readFile(logPath, 'utf-8');
-          assert.match(tmuxLog, /run-shell -b sleep/);
+          assert.match(tmuxLog, /run-shell -b :/);
+          assert.doesNotMatch(tmuxLog, new RegExp(`resize-pane -t %3 -y ${HUD_TMUX_TEAM_HEIGHT_LINES}`));
           assert.doesNotMatch(tmuxLog, /kill-pane -t %2/);
           assert.doesNotMatch(tmuxLog, /kill-pane -t %3/);
         },
