@@ -2139,6 +2139,11 @@ PY`,
       { name: "directive-resume-ralplan", prompt: "resume $ralplan plan this", expectedSkill: "ralplan" },
       { name: "directive-continue-code-review", prompt: "continue $code-review", expectedSkill: "code-review", expectedStopBlock: false },
       { name: "directive-documentation", prompt: "use $ralplan is the consensus-planning command", expectedSkill: null },
+      { name: "g1a-ordered-multi-skill", prompt: "$ralplan $autopilot build it", expectedSkill: "ralplan", expectedDeferredSkills: ["autopilot"], expectedActiveSkills: ["ralplan"] },
+      { name: "g1c-duplicate-alias", prompt: "$autopilot $oh-my-codex:autopilot build it", expectedSkill: "autopilot", expectedDeferredSkills: [], expectedActiveSkills: ["autopilot"] },
+      { name: "b3-longer-valid-fence", prompt: "````text\n$ralplan plan it\n````\n$autopilot build it", expectedSkill: "autopilot" },
+      { name: "b4-shorter-invalid-fence", prompt: "````text\n$ralplan plan it\n```\n$autopilot build it", expectedSkill: null },
+      { name: "b5-different-marker-invalid-fence", prompt: "```text\n$ralplan plan it\n~~~\n$autopilot build it", expectedSkill: null },
       { name: "directive-non-leading-prose", prompt: "The docs say use $ralplan plan this", expectedSkill: null },
       { name: "nested-bounded-child-unbounded-parent", prompt: "\"`x`\n$ralplan plan it", expectedSkill: null },
       { name: "first-contiguous-block-terminal", prompt: "$ralplan plan it\n\"x\"\n$autopilot build it", expectedSkill: "ralplan", expectedDeferredSkills: [] },
@@ -2388,11 +2393,14 @@ PY`,
         if (testCase.expectedSkill === null) {
           assert.equal(existsSync(skillStatePath), false, testCase.name);
         } else {
-          const skillState = JSON.parse(await readFile(skillStatePath, "utf-8")) as { active?: boolean; skill?: string; deferred_skills?: string[] };
+          const skillState = JSON.parse(await readFile(skillStatePath, "utf-8")) as { active?: boolean; skill?: string; deferred_skills?: string[]; active_skills?: Array<{ skill?: string }> };
           assert.equal(skillState.active, true, testCase.name);
           assert.equal(skillState.skill, testCase.expectedSkill, testCase.name);
           if ("expectedDeferredSkills" in testCase) {
             assert.deepEqual(skillState.deferred_skills ?? [], testCase.expectedDeferredSkills, testCase.name);
+          }
+          if ("expectedActiveSkills" in testCase) {
+            assert.deepEqual(skillState.active_skills?.map((entry) => entry.skill) ?? [], testCase.expectedActiveSkills, testCase.name);
           }
         }
 
@@ -2556,6 +2564,11 @@ PY`,
       { name: "directive-resume-ralplan", prompt: "resume $ralplan plan this", expectedSkill: "ralplan" },
       { name: "directive-continue-code-review", prompt: "continue $code-review", expectedSkill: "code-review", expectedStopBlock: false },
       { name: "directive-documentation", prompt: "use $ralplan is the consensus-planning command", expectedSkill: null },
+      { name: "g1a-ordered-multi-skill", prompt: "$ralplan $autopilot build it", expectedSkill: "ralplan", expectedDeferredSkills: ["autopilot"], expectedActiveSkills: ["ralplan"] },
+      { name: "g1c-duplicate-alias", prompt: "$autopilot $oh-my-codex:autopilot build it", expectedSkill: "autopilot", expectedDeferredSkills: [], expectedActiveSkills: ["autopilot"] },
+      { name: "b3-longer-valid-fence", prompt: "````text\n$ralplan plan it\n````\n$autopilot build it", expectedSkill: "autopilot" },
+      { name: "b4-shorter-invalid-fence", prompt: "````text\n$ralplan plan it\n```\n$autopilot build it", expectedSkill: null },
+      { name: "b5-different-marker-invalid-fence", prompt: "```text\n$ralplan plan it\n~~~\n$autopilot build it", expectedSkill: null },
       { name: "directive-non-leading-prose", prompt: "The docs say use $ralplan plan this", expectedSkill: null },
       { name: "nested-bounded-child-unbounded-parent", prompt: "\"`x`\n$ralplan plan it", expectedSkill: null },
       { name: "first-contiguous-block-terminal", prompt: "$ralplan plan it\n\"x\"\n$autopilot build it", expectedSkill: "ralplan", expectedDeferredSkills: [] },
@@ -2856,11 +2869,15 @@ PY`,
             active?: boolean;
             skill?: string;
             deferred_skills?: string[];
+            active_skills?: Array<{ skill?: string }>;
           };
           assert.equal(skillState.active, true, testCase.name);
           assert.equal(skillState.skill, testCase.expectedSkill, testCase.name);
           if ("expectedDeferredSkills" in testCase) {
             assert.deepEqual(skillState.deferred_skills ?? [], testCase.expectedDeferredSkills, testCase.name);
+          }
+          if ("expectedActiveSkills" in testCase) {
+            assert.deepEqual(skillState.active_skills?.map((entry) => entry.skill) ?? [], testCase.expectedActiveSkills, testCase.name);
           }
         }
 
@@ -2941,6 +2958,134 @@ PY`,
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
+  });
+
+  async function assertG2PromptPreservesFiveStateFiles(
+    transport: "raw" | "compiled",
+    name: string,
+    prompt: string,
+  ): Promise<void> {
+    const cwd = await mkdtemp(join(tmpdir(), `omx-native-${transport}-${name}-`));
+    const sessionId = `sess-${name}`;
+    const threadId = `thread-${name}`;
+    const stateDir = join(cwd, ".omx", "state");
+    const sessionDir = join(stateDir, "sessions", sessionId);
+    const paths = [
+      join(stateDir, "skill-active-state.json"),
+      join(stateDir, "autopilot-state.json"),
+      join(sessionDir, "skill-active-state.json"),
+      join(sessionDir, "autopilot-state.json"),
+      join(stateDir, "session.json"),
+    ];
+    const env = { ...process.env, OMX_ROOT: "", OMX_STATE_ROOT: "", OMX_TEAM_MODE: "" };
+    try {
+      await writeJson(join(cwd, ".omx", "setup-scope.json"), { scope: "project", teamMode: "disabled" });
+      await writeJson(paths[0], { active: false, skill: "ralplan", marker: "root-skill" });
+      await writeJson(paths[1], { active: false, mode: "autopilot", current_phase: "complete", marker: "root-autopilot" });
+      await writeJson(paths[2], { active: false, skill: "ralplan", marker: "session-skill" });
+      await writeJson(paths[3], { active: false, mode: "autopilot", current_phase: "complete", marker: "session-autopilot" });
+      await writeJson(paths[4], { session_id: sessionId, native_session_id: `native-${name}`, cwd, marker: "session-pointer" });
+      const before = await Promise.all(paths.map((path) => readFile(path)));
+      const payload = { hook_event_name: "UserPromptSubmit" as const, cwd, source: "codex-app", session_id: sessionId, thread_id: threadId, turn_id: `turn-${name}`, prompt };
+      if (transport === "raw") {
+        const submit = await dispatchCodexNativeHook(payload, { cwd });
+        assert.equal(submit.skillState, null, name);
+        assert.equal(submit.outputJson, null, name);
+      } else {
+        assert.deepEqual(parseSingleJsonStdout(runNativeHookCli(payload, { cwd, env })), {}, name);
+      }
+      assert.deepEqual(await Promise.all(paths.map((path) => readFile(path))), before, name);
+      const stopPayload = { ...payload, hook_event_name: "Stop" as const, turn_id: `stop-${name}` };
+      if (transport === "raw") {
+        assert.equal((await dispatchCodexNativeHook(stopPayload, { cwd })).outputJson, null, name);
+      } else {
+        const stop = parseSingleJsonStdout(runNativeHookCli(stopPayload, { cwd, env }));
+        assert.notEqual(stop.decision, "block", name);
+      }
+      assert.deepEqual(await Promise.all(paths.map((path) => readFile(path))), before, name);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  }
+
+  it("keeps G2a stale predecessor state byte-identical through raw UserPromptSubmit", async () => {
+    await assertG2PromptPreservesFiveStateFiles("raw", "g2a-raw", "use $ralplan is the consensus-planning command");
+  });
+
+  it("keeps G2a stale predecessor state byte-identical through compiled UserPromptSubmit", async () => {
+    await assertG2PromptPreservesFiveStateFiles("compiled", "g2a-compiled", "use $ralplan is the consensus-planning command");
+  });
+
+  it("keeps G2b negated terminal root/session conflict byte-identical through raw UserPromptSubmit", async () => {
+    await assertG2PromptPreservesFiveStateFiles("raw", "g2b-raw", "do not start $autopilot — café");
+  });
+
+  it("keeps G2b negated terminal root/session conflict byte-identical through compiled UserPromptSubmit", async () => {
+    await assertG2PromptPreservesFiveStateFiles("compiled", "g2b-compiled", "do not start $autopilot — café");
+  });
+
+  async function assertG1bURestart(transport: "raw" | "compiled"): Promise<void> {
+    const cwd = await mkdtemp(join(tmpdir(), `omx-native-${transport}-g1bu-restart-`));
+    const sessionId = `sess-g1bu-${transport}`;
+    const threadId = `thread-g1bu-${transport}`;
+    const priorTurnId = `turn-g1bu-${transport}-old`;
+    const turnId = `turn-g1bu-${transport}-new`;
+    const prompt = "$team $autopilot restart — café";
+    const stateDir = join(cwd, ".omx", "state");
+    const sessionDir = join(stateDir, "sessions", sessionId);
+    const sessionSkillPath = join(sessionDir, "skill-active-state.json");
+    const sessionAutopilotPath = join(sessionDir, "autopilot-state.json");
+    const env = { ...process.env, OMX_ROOT: "", OMX_STATE_ROOT: "", OMX_TEAM_MODE: "", TMUX: "", TMUX_PANE: "" };
+    try {
+      await writeJson(join(cwd, ".omx", "setup-scope.json"), { scope: "project", teamMode: "disabled" });
+      await writeJson(join(stateDir, "skill-active-state.json"), { active: true, skill: "autopilot", phase: "completing", session_id: sessionId, thread_id: threadId, turn_id: priorTurnId, marker: "root-skill", active_skills: [{ skill: "autopilot", phase: "completing", active: true, session_id: sessionId, thread_id: threadId, turn_id: priorTurnId }] });
+      await writeJson(join(stateDir, "autopilot-state.json"), { active: false, mode: "autopilot", current_phase: "complete", session_id: sessionId, thread_id: threadId, turn_id: priorTurnId, marker: "root-autopilot" });
+      await writeJson(sessionSkillPath, { active: true, skill: "autopilot", phase: "completing", session_id: sessionId, thread_id: threadId, turn_id: priorTurnId, marker: "session-skill", active_skills: [{ skill: "autopilot", phase: "completing", active: true, session_id: sessionId, thread_id: threadId, turn_id: priorTurnId }] });
+      await writeJson(sessionAutopilotPath, { active: false, mode: "autopilot", current_phase: "complete", session_id: sessionId, thread_id: threadId, turn_id: priorTurnId, marker: "session-autopilot" });
+      const payload = { hook_event_name: "UserPromptSubmit" as const, cwd, source: "codex-app", session_id: sessionId, thread_id: threadId, turn_id: turnId, prompt };
+      let output: Record<string, unknown> | null;
+      if (transport === "raw") {
+        const result = await dispatchCodexNativeHook(payload, { cwd });
+        assert.equal(result.skillState?.skill, "autopilot");
+        assert.equal(result.skillState?.active, true);
+        output = result.outputJson;
+      } else {
+        const input = Buffer.from(JSON.stringify(payload), "utf-8");
+        assert.equal(input.toString("utf-8"), JSON.stringify(payload));
+        output = parseSingleJsonStdout(runNativeHookCli(input.toString("utf-8"), { cwd, env }));
+      }
+      assert.doesNotMatch(JSON.stringify(output), /\$team" -> team/);
+      assert.doesNotMatch(JSON.stringify(output), /\$team" -> team/);
+      const skillState = JSON.parse(await readFile(sessionSkillPath, "utf-8")) as { active?: boolean; skill?: string; turn_id?: string; active_skills?: Array<{ skill?: string }> };
+      assert.equal(skillState.active, true);
+      assert.equal(skillState.skill, "autopilot");
+      assert.equal(skillState.turn_id, turnId);
+      assert.deepEqual(skillState.active_skills?.map((entry) => entry.skill), ["autopilot"]);
+      const autopilotState = JSON.parse(await readFile(sessionAutopilotPath, "utf-8")) as { active?: boolean; current_phase?: string; turn_id?: string; state?: { handoff_artifacts?: { context_snapshot?: { path?: string } } } };
+      assert.equal(autopilotState.active, true);
+      assert.equal(autopilotState.current_phase, "deep-interview");
+      assert.equal(autopilotState.turn_id, turnId);
+      const contextSnapshotPath = autopilotState.state?.handoff_artifacts?.context_snapshot?.path;
+      assert.ok(contextSnapshotPath);
+      assert.ok((await readFile(resolve(cwd, contextSnapshotPath))).includes(Buffer.from(prompt, "utf-8")));
+      assert.equal(existsSync(join(stateDir, "team-state.json")), false);
+      const stopPayload = { ...payload, hook_event_name: "Stop" as const, turn_id: `stop-g1bu-${transport}` };
+      if (transport === "raw") {
+        assert.equal((await dispatchCodexNativeHook(stopPayload, { cwd })).outputJson?.decision, "block");
+      } else {
+        assert.equal(parseSingleJsonStdout(runNativeHookCli(stopPayload, { cwd, env })).decision, "block");
+      }
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  }
+
+  it("restarts terminal Autopilot through disabled-Team raw UserPromptSubmit for G1b-U", async () => {
+    await assertG1bURestart("raw");
+  });
+
+  it("restarts terminal Autopilot through disabled-Team compiled UserPromptSubmit for G1b-U", async () => {
+    await assertG1bURestart("compiled");
   });
 
   it("does not crash Stop hook dispatch when the exec follow-up queue is malformed", async () => {

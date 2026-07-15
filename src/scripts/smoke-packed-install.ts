@@ -185,6 +185,11 @@ export const PACKED_INSTALL_NATIVE_HOOK_REGRESSION_PROMPTS = [
   { name: 'division-slash-suffix', prompt: '$ralplan∕config', expectedSkill: null, expectedStopBlock: false },
   { name: 'unclosed-prompts-quote', prompt: '"Use /prompts:architect\n$ralplan plan it', expectedSkill: null, expectedStopBlock: false },
   { name: 'malformed-prompts-suffix', prompt: '/prompts:architect한글\n$ralplan plan it', expectedSkill: null, expectedStopBlock: false },
+  { name: 'g1a-packed-primary-order', prompt: '$ralplan plan it\n$autopilot build it', expectedSkill: 'ralplan', expectedStopBlock: true, expectedDeferredSkills: [] },
+  { name: 'g1c-packed-dedup-order', prompt: '$ralplan plan it\n$ralplan plan it', expectedSkill: 'ralplan', expectedStopBlock: true, expectedDeferredSkills: [] },
+  { name: 'b3-packed-fence-marker-identity', prompt: '```text\n$ralplan plan it\n~~~\n$autopilot build it', expectedSkill: null, expectedStopBlock: false },
+  { name: 'b4-packed-fence-reverse-identity', prompt: '~~~text\n$ralplan plan it\n```\n$autopilot build it', expectedSkill: null, expectedStopBlock: false },
+  { name: 'b5-packed-list-fence-identity', prompt: '- ~~~\n  $ralplan plan it\n  ```\n$autopilot build it', expectedSkill: null, expectedStopBlock: false },
 ] as const;
 
 export function buildPackedRegressionEnvironment(
@@ -1347,6 +1352,58 @@ export function buildNativeHookSmokePayload(
 }
 
 function smokeInstalledNativeHookDist(prefixDir: string): void {
+function runPackedTransportRegressions(hookScript: string, smokeCwd: string): void {
+  const invoke = (cwd: string, environment: NodeJS.ProcessEnv, payload: Record<string, unknown>) => run(process.execPath, [realpathSync(hookScript)], {
+    cwd, env: environment, input: JSON.stringify(payload),
+  });
+  const stopDecision = (cwd: string, environment: NodeJS.ProcessEnv, payload: Record<string, unknown>) => (
+    JSON.parse(String(invoke(cwd, environment, { ...payload, hook_event_name: 'Stop' }).stdout || '{}')) as { decision?: string }
+  ).decision;
+  const seedTerminal = (root: string, sessionId: string, detail: string): string[] => {
+    const stateDir = join(root, '.omx', 'state');
+    const sessionDir = join(stateDir, 'sessions', sessionId);
+    mkdirSync(sessionDir, { recursive: true });
+    const files = [join(stateDir, 'skill-active-state.json'), join(stateDir, 'autopilot-state.json'), join(sessionDir, 'skill-active-state.json'), join(sessionDir, 'autopilot-state.json'), join(stateDir, 'session.json')];
+    writeFileSync(files[0]!, JSON.stringify({ active: false, skill: 'autopilot', phase: 'complete', marker: `root-${detail}` }));
+    writeFileSync(files[1]!, JSON.stringify({ active: false, mode: 'autopilot', current_phase: 'complete', marker: `root-${detail}` }));
+    writeFileSync(files[2]!, JSON.stringify({ active: false, skill: 'autopilot', phase: 'complete', marker: `session-${detail}`, session_id: sessionId }));
+    writeFileSync(files[3]!, JSON.stringify({ active: false, mode: 'autopilot', current_phase: 'complete', marker: `session-${detail}`, session_id: sessionId }));
+    writeFileSync(files[4]!, JSON.stringify({ session_id: sessionId, cwd: root, marker: detail }));
+    return files;
+  };
+
+  const g1bCwd = join(smokeCwd, 'g1bu');
+  const g1bSession = 'g1bu-new';
+  mkdirSync(g1bCwd, { recursive: true });
+  seedTerminal(g1bCwd, 'g1bu-old', 'g1bu');
+  const g1bEnv = { ...buildPackedRegressionEnvironment({ name: 'g1bu' }), OMX_TEAM_MODE: 'disabled' };
+  const g1bPrompt = '$team $autopilot restart — café';
+  const g1bPayload = { hook_event_name: 'UserPromptSubmit', cwd: g1bCwd, session_id: g1bSession, thread_id: 'g1bu-thread', turn_id: 'g1bu-turn', prompt: g1bPrompt };
+  validateHookStdout('UserPromptSubmit', String(invoke(g1bCwd, g1bEnv, g1bPayload).stdout || ''));
+  const g1bState = JSON.parse(readFileSync(join(g1bCwd, '.omx', 'state', 'sessions', g1bSession, 'skill-active-state.json'), 'utf-8')) as { active?: boolean; skill?: string };
+  if (!g1bState.active || g1bState.skill !== 'autopilot' || existsSync(join(g1bCwd, '.omx', 'state', 'sessions', g1bSession, 'team-state.json'))) throw new Error('packed G1b-U did not activate Autopilot without Team');
+  if (Buffer.compare(Buffer.from(g1bPayload.prompt, 'utf-8'), Buffer.from('$team $autopilot restart — café', 'utf-8')) !== 0) throw new Error('packed G1b-U did not retain UTF-8 prompt identity at the hook boundary');
+  if (stopDecision(g1bCwd, g1bEnv, g1bPayload) !== 'block') throw new Error('packed G1b-U did not block Stop');
+
+  const g2aCwd = join(smokeCwd, 'g2a');
+  mkdirSync(g2aCwd, { recursive: true });
+  const g2aEnv = buildPackedRegressionEnvironment({ name: 'g2a' });
+  const g2aPayload = { hook_event_name: 'UserPromptSubmit', cwd: g2aCwd, session_id: 'g2a', thread_id: 'g2a-thread', turn_id: 'g2a-turn', prompt: '> quoted context\nProse\n$ralplan implement this' };
+  validateHookStdout('UserPromptSubmit', String(invoke(g2aCwd, g2aEnv, g2aPayload).stdout || ''));
+  if (existsSync(join(g2aCwd, '.omx', 'state', 'sessions', 'g2a', 'skill-active-state.json'))) throw new Error('packed G2a stale predecessor created workflow state');
+  if (stopDecision(g2aCwd, g2aEnv, g2aPayload) === 'block') throw new Error('packed G2a stale predecessor blocked Stop');
+
+  const g2bCwd = join(smokeCwd, 'g2b');
+  mkdirSync(g2bCwd, { recursive: true });
+  const g2bFiles = seedTerminal(g2bCwd, 'g2b-old', 'g2b');
+  const g2bBefore = g2bFiles.map((file) => readFileSync(file));
+  const g2bEnv = buildPackedRegressionEnvironment({ name: 'g2b' });
+  const g2bPayload = { hook_event_name: 'UserPromptSubmit', cwd: g2bCwd, session_id: 'g2b-new', thread_id: 'g2b-thread', turn_id: 'g2b-turn', prompt: 'Do not use $team $autopilot restart — café' };
+  validateHookStdout('UserPromptSubmit', String(invoke(g2bCwd, g2bEnv, g2bPayload).stdout || ''));
+  for (const [index, file] of g2bFiles.entries()) if (Buffer.compare(readFileSync(file), g2bBefore[index]!) !== 0) throw new Error(`packed G2b mutated terminal state ${file}`);
+  if (stopDecision(g2bCwd, g2bEnv, g2bPayload) === 'block') throw new Error('packed G2b negated prompt blocked Stop');
+}
+
   const globalNodeModules = resolveGlobalNodeModules(prefixDir);
   const packageRoot = join(globalNodeModules, 'oh-my-codex');
   const hookScript = join(packageRoot, 'dist', 'scripts', 'codex-native-hook.js');
@@ -1416,6 +1473,7 @@ function smokeInstalledNativeHookDist(prefixDir: string): void {
         throw new Error(`packed regression ${testCase.name} blocked Stop: ${JSON.stringify(stopOutput)}`);
       }
     }
+    runPackedTransportRegressions(hookScript, smokeCwd);
   } finally {
     rmSync(smokeCwd, { recursive: true, force: true });
   }
