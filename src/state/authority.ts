@@ -6130,8 +6130,7 @@ function assertLaunchTransportJournal(
     || journal.binding_id !== publication.binding_id
     || journal.binding_revision !== publication.binding_revision
     || journal.workspace_identity_digest !== publication.workspace_identity_digest
-    || journal.expected_anchor_revision !== publication.anchor_revision
-    || journal.fencing_token < publication.fencing_token
+    || journal.expected_anchor_revision > publication.anchor_revision
     || journal.effects_digest !== effectsDigest
 
     || journal.status === 'aborted'

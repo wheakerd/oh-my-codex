@@ -2322,6 +2322,10 @@ describe('state authority foundation', () => {
         /authority tuple changed|root fingerprint/i,
       );
       await mintStateAuthorityTransportCapability(context);
+      await validateCommittedStateAuthorityLaunchTransportJournal(context, {
+        operation_id: publication.operation_id,
+        effects_digest: journal.effects_digest,
+      });
       await assert.rejects(
         () => validateCommittedStateAuthorityLaunchTransportPublication(context, publication),
         /authority tuple changed/i,
