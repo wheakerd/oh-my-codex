@@ -185,11 +185,11 @@ export const PACKED_INSTALL_NATIVE_HOOK_REGRESSION_PROMPTS = [
   { name: 'division-slash-suffix', prompt: '$ralplan∕config', expectedSkill: null, expectedStopBlock: false },
   { name: 'unclosed-prompts-quote', prompt: '"Use /prompts:architect\n$ralplan plan it', expectedSkill: null, expectedStopBlock: false },
   { name: 'malformed-prompts-suffix', prompt: '/prompts:architect한글\n$ralplan plan it', expectedSkill: null, expectedStopBlock: false },
-  { name: 'g1a-ordered-multi-skill', prompt: '$ralplan $autopilot build it', expectedSkill: 'ralplan', expectedStopBlock: true, expectedDeferredSkills: ['autopilot'], expectedActiveSkills: ['ralplan'] },
+  { name: 'g1a-ordered-multi-skill', prompt: '$ralplan, $autopilot; $team', expectedSkill: 'ralplan', expectedStopBlock: true, expectedDeferredSkills: ['autopilot', 'team'], expectedActiveSkills: ['ralplan'], insideTmux: true },
   { name: 'g1c-duplicate-alias', prompt: '$autopilot $oh-my-codex:autopilot build it', expectedSkill: 'autopilot', expectedStopBlock: true, expectedDeferredSkills: [], expectedActiveSkills: ['autopilot'] },
-  { name: 'b3-longer-valid-fence', prompt: '````text\n$ralplan plan it\n````\n$autopilot build it', expectedSkill: 'autopilot', expectedStopBlock: true },
-  { name: 'b4-shorter-invalid-fence', prompt: '````text\n$ralplan plan it\n```\n$autopilot build it', expectedSkill: null, expectedStopBlock: false },
-  { name: 'b5-different-marker-invalid-fence', prompt: '```text\n$ralplan plan it\n~~~\n$autopilot build it', expectedSkill: null, expectedStopBlock: false },
+  { name: 'b3-longer-valid-fence', prompt: '```text\n$autopilot build it\n````\n$ralplan plan it', expectedSkill: 'ralplan', expectedStopBlock: true },
+  { name: 'b4-shorter-invalid-fence', prompt: '````text\n$autopilot build it\n```\n$ralplan plan it', expectedSkill: null, expectedStopBlock: false },
+  { name: 'b5-different-marker-invalid-fence', prompt: '```text\n$autopilot build it\n~~~\n$ralplan plan it', expectedSkill: null, expectedStopBlock: false },
 ] as const;
 
 export function buildPackedRegressionEnvironment(
@@ -1359,18 +1359,6 @@ function runPackedTransportRegressions(hookScript: string, smokeCwd: string): vo
   const stopDecision = (cwd: string, environment: NodeJS.ProcessEnv, payload: Record<string, unknown>) => (
     JSON.parse(String(invoke(cwd, environment, { ...payload, hook_event_name: 'Stop' }).stdout || '{}')) as { decision?: string }
   ).decision;
-  const seedTerminal = (root: string, sessionId: string, detail: string): string[] => {
-    const stateDir = join(root, '.omx', 'state');
-    const sessionDir = join(stateDir, 'sessions', sessionId);
-    mkdirSync(sessionDir, { recursive: true });
-    const files = [join(stateDir, 'skill-active-state.json'), join(stateDir, 'autopilot-state.json'), join(sessionDir, 'skill-active-state.json'), join(sessionDir, 'autopilot-state.json'), join(stateDir, 'session.json')];
-    writeFileSync(files[0]!, JSON.stringify({ active: false, skill: 'autopilot', phase: 'complete', marker: `root-${detail}` }));
-    writeFileSync(files[1]!, JSON.stringify({ active: false, mode: 'autopilot', current_phase: 'complete', marker: `root-${detail}` }));
-    writeFileSync(files[2]!, JSON.stringify({ active: false, skill: 'autopilot', phase: 'complete', marker: `session-${detail}`, session_id: sessionId }));
-    writeFileSync(files[3]!, JSON.stringify({ active: false, mode: 'autopilot', current_phase: 'complete', marker: `session-${detail}`, session_id: sessionId }));
-    writeFileSync(files[4]!, JSON.stringify({ session_id: sessionId, cwd: root, marker: detail }));
-    return files;
-  };
 
   const g1bCwd = join(smokeCwd, 'g1bu');
   const g1bSession = 'g1bu';
@@ -1410,29 +1398,33 @@ function runPackedTransportRegressions(hookScript: string, smokeCwd: string): vo
   const g2aStateDir = join(g2aCwd, '.omx', 'state');
   const g2aSessionDir = join(g2aStateDir, 'sessions', g2aSession);
   const g2aFiles = [join(g2aStateDir, 'skill-active-state.json'), join(g2aStateDir, 'autopilot-state.json'), join(g2aSessionDir, 'skill-active-state.json'), join(g2aSessionDir, 'autopilot-state.json'), join(g2aStateDir, 'session.json')];
-  mkdirSync(g2aSessionDir, { recursive: true });
-  writeFileSync(g2aFiles[0]!, JSON.stringify({ active: false, skill: 'ralplan', marker: 'root-skill' }));
-  writeFileSync(g2aFiles[1]!, JSON.stringify({ active: false, mode: 'autopilot', current_phase: 'complete', marker: 'root-autopilot' }));
-  writeFileSync(g2aFiles[2]!, JSON.stringify({ active: false, skill: 'ralplan', marker: 'session-skill' }));
-  writeFileSync(g2aFiles[3]!, JSON.stringify({ active: false, mode: 'autopilot', current_phase: 'complete', marker: 'session-autopilot' }));
-  writeFileSync(g2aFiles[4]!, JSON.stringify({ session_id: g2aSession, native_session_id: 'native-g2a', cwd: g2aCwd, marker: 'session-pointer' }));
-  const g2aBefore = g2aFiles.map((file) => readFileSync(file));
+  mkdirSync(g2aCwd, { recursive: true });
+  if (g2aFiles.some((file) => existsSync(file))) throw new Error('packed G2a fixture unexpectedly contains state');
   const g2aEnv = buildPackedRegressionEnvironment({ name: 'g2a' });
   const g2aPayload = { hook_event_name: 'UserPromptSubmit', cwd: g2aCwd, session_id: g2aSession, thread_id: 'g2a-thread', turn_id: 'g2a-turn', prompt: 'use $ralplan is the consensus-planning command' };
   validateHookStdout('UserPromptSubmit', String(invoke(g2aCwd, g2aEnv, g2aPayload).stdout || ''));
-  for (const [index, file] of g2aFiles.entries()) if (Buffer.compare(readFileSync(file), g2aBefore[index]!) !== 0) throw new Error(`packed G2a stale predecessor mutated state ${file}`);
+  if (g2aFiles.some((file) => existsSync(file))) throw new Error('packed G2a stale predecessor created skill/detail state');
   if (stopDecision(g2aCwd, g2aEnv, g2aPayload) === 'block') throw new Error('packed G2a stale predecessor blocked Stop');
-  for (const [index, file] of g2aFiles.entries()) if (Buffer.compare(readFileSync(file), g2aBefore[index]!) !== 0) throw new Error(`packed G2a stale predecessor mutated state after Stop ${file}`);
+  if (g2aFiles.some((file) => existsSync(file))) throw new Error('packed G2a stale predecessor created skill/detail state after Stop');
 
   const g2bCwd = join(smokeCwd, 'g2b');
-  mkdirSync(g2bCwd, { recursive: true });
-  const g2bFiles = seedTerminal(g2bCwd, 'g2b-old', 'g2b');
-  const g2bBefore = g2bFiles.map((file) => readFileSync(file));
+  const g2bSession = 'g2b-terminal-session';
+  const g2bStateDir = join(g2bCwd, '.omx', 'state');
+  const g2bSessionDir = join(g2bStateDir, 'sessions', g2bSession);
+  const g2bFiles = [join(g2bStateDir, 'skill-active-state.json'), join(g2bStateDir, 'autopilot-state.json'), join(g2bSessionDir, 'skill-active-state.json'), join(g2bSessionDir, 'autopilot-state.json'), join(g2bStateDir, 'session.json')];
+  mkdirSync(g2bSessionDir, { recursive: true });
+  writeFileSync(g2bFiles[0]!, JSON.stringify({ version: 1, active: false, skill: 'autopilot', phase: 'complete', completed_at: '2026-06-01T00:00:01.001Z', session_id: 'g2b-root-session', thread_id: 'g2b-root-thread', turn_id: 'g2b-root-skill-turn', marker: 'g2b-root-skill' }));
+  writeFileSync(g2bFiles[1]!, JSON.stringify({ mode: 'autopilot', active: false, current_phase: 'complete', completed_at: '2026-06-01T00:00:02.002Z', session_id: 'g2b-root-session', thread_id: 'g2b-root-thread', turn_id: 'g2b-root-detail-turn', marker: 'g2b-root-detail' }));
+  writeFileSync(g2bFiles[2]!, JSON.stringify({ version: 1, active: false, skill: 'autopilot', phase: 'complete', completed_at: '2026-06-01T00:00:03.003Z', session_id: g2bSession, thread_id: 'g2b-session-thread', turn_id: 'g2b-session-skill-turn', marker: 'g2b-session-skill' }));
+  writeFileSync(g2bFiles[3]!, JSON.stringify({ mode: 'autopilot', active: false, current_phase: 'complete', completed_at: '2026-06-01T00:00:04.004Z', session_id: g2bSession, thread_id: 'g2b-session-thread', turn_id: 'g2b-session-detail-turn', marker: 'g2b-session-detail' }));
+  writeFileSync(g2bFiles[4]!, JSON.stringify({ session_id: g2bSession, cwd: g2bCwd, created_at: '2026-06-01T00:00:05.005Z', updated_at: '2026-06-01T00:00:06.006Z', last_turn_id: 'g2b-session-json-turn', marker: 'g2b-session-json' }));
+  const g2bBefore: Buffer[] = g2bFiles.map((file) => readFileSync(file));
   const g2bEnv = buildPackedRegressionEnvironment({ name: 'g2b' });
-  const g2bPayload = { hook_event_name: 'UserPromptSubmit', cwd: g2bCwd, session_id: 'g2b-old', thread_id: 'g2b-thread', turn_id: 'g2b-turn-new', prompt: 'do not start $autopilot — café' };
+  const g2bPayload = { hook_event_name: 'UserPromptSubmit', cwd: g2bCwd, session_id: g2bSession, thread_id: 'g2b-prompt-thread', turn_id: 'g2b-prompt-turn', prompt: 'do not start $autopilot — café' };
   validateHookStdout('UserPromptSubmit', String(invoke(g2bCwd, g2bEnv, g2bPayload).stdout || ''));
-  for (const [index, file] of g2bFiles.entries()) if (Buffer.compare(readFileSync(file), g2bBefore[index]!) !== 0) throw new Error(`packed G2b mutated terminal state ${file}`);
+  for (const [index, file] of g2bFiles.entries()) if (Buffer.compare(readFileSync(file), g2bBefore[index]!) !== 0) throw new Error(`packed G2b negated prompt mutated terminal state ${file}`);
   if (stopDecision(g2bCwd, g2bEnv, g2bPayload) === 'block') throw new Error('packed G2b negated prompt blocked Stop');
+  for (const [index, file] of g2bFiles.entries()) if (Buffer.compare(readFileSync(file), g2bBefore[index]!) !== 0) throw new Error(`packed G2b negated prompt mutated terminal state after Stop ${file}`);
 }
 
   const globalNodeModules = resolveGlobalNodeModules(prefixDir);
