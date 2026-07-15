@@ -468,7 +468,8 @@ esac
       assert.equal(unregisterHudHooksTransactionally('team:0', resizeName, attachedName, '%1'), false);
       const log = await readFile(logPath, 'utf-8');
       assert.match(log, new RegExp(`set-hook -u -t team:0 ${escapeRegExp(attachedSlot)}`));
-      assert.doesNotMatch(log, new RegExp(`set-hook -u -t team:0 ${escapeRegExp(resizeSlot)}`));
+      assert.match(log, new RegExp(`set-hook -u -t team:0 ${escapeRegExp(resizeSlot)}`));
+      assert.match(log, new RegExp(`set-hook -t team:0 ${escapeRegExp(resizeSlot)} ${escapeRegExp(resizeCommand)}`));
     });
   });
 

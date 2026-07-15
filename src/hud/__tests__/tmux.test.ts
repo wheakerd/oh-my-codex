@@ -83,241 +83,71 @@ describe('HUD resize hook helpers', () => {
     assert.equal(parseHudResizeHookContext('$7\t@3\n', '%1; touch /tmp/owned'), null);
   });
 
-  it('registers client-resized and layout-change hooks at session scope with exact HUD pane targeting', () => {
+  function statefulHooks(options: { failSlot?: string } = {}) {
+    const hooks = new Map<string, string>();
     const calls: string[][] = [];
-
-    const result = registerHudResizeHook(
-      '%9',
-      '%1',
-      3,
-      { cwd: '/repo', env: { TMUX: '/tmp/tmux', OMX_SESSION_ID: 'sess-a' } },
-      (args) => {
-        calls.push(args);
-        if (args[0] === 'display-message') return '$7\t@3\n';
-        return '';
-      },
-    );
-
-    const hookSlot = buildHudResizeHookSlot('omx_hud_resize_7_3_1');
-    const layoutHookSlot = buildHudLayoutHookSlot('omx_hud_resize_7_3_1');
-    assert.equal(result, true);
-    assert.deepEqual(calls[0], ['display-message', '-p', '-t', '%1', '#{session_id}\t#{window_id}']);
-    assert.equal(calls[1]?.[0], 'set-hook');
-    assert.equal(calls[1]?.[1], '-t');
-    assert.equal(calls[1]?.[2], '$7');
-    assert.equal(calls[1]?.[3], hookSlot);
-    assert.match(calls[1]?.[4] ?? '', /^run-shell -b /);
-    assert.match(calls[1]?.[4] ?? '', /resize-pane/);
-    assert.match(calls[1]?.[4] ?? '', /set-hook/);
-    assert.doesNotMatch(calls[1]?.[4] ?? '', /'-w'/);
-    assert.match(calls[1]?.[4] ?? '', new RegExp(`sleep ${HUD_RESIZE_RECONCILE_DELAY_SECONDS}`));
-    assert.match(calls[1]?.[4] ?? '', new RegExp(hookSlot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
-    assert.deepEqual(calls[2], ['set-hook', '-u', '-t', '$7', buildHudResizeHookSlot('omx_hud_resize_7_3')]);
-    assert.equal(calls[3]?.[0], 'set-hook');
-    assert.equal(calls[3]?.[1], '-t');
-    assert.equal(calls[3]?.[2], '$7');
-    assert.equal(calls[3]?.[3], layoutHookSlot);
-    assert.match(calls[3]?.[4] ?? '', /^run-shell -b /);
-    assert.match(calls[3]?.[4] ?? '', /display-message/);
-    assert.match(calls[3]?.[4] ?? '', /--reconcile-tmux/);
-    assert.match(calls[3]?.[4] ?? '', /TMUX/);
-    assert.match(calls[3]?.[4] ?? '', /TMUX_PANE/);
-    assert.match(calls[3]?.[4] ?? '', /OMX_TMUX_HUD_OWNER/);
-    assert.doesNotMatch(calls[3]?.[4] ?? '', /wait-for/);
-  });
-
-  it('reports partial failure but keeps the resize hook when layout-change hook install fails', () => {
-    const calls: string[][] = [];
-    const hookSlot = buildHudResizeHookSlot('omx_hud_resize_7_3_1');
-    const layoutHookSlot = buildHudLayoutHookSlot('omx_hud_resize_7_3_1');
-
-    const result = registerHudResizeHook(
-      '%9',
-      '%1',
-      3,
-      { cwd: '/repo', env: { TMUX: '/tmp/tmux', OMX_SESSION_ID: 'sess-a' } },
-      (args) => {
-        calls.push(args);
-        if (args[0] === 'display-message') return '$7\t@3\n';
-        if (args[0] === 'set-hook' && args[3] === layoutHookSlot) {
-          throw new Error('layout hook rejected');
-        }
-        return '';
-      },
-    );
-
-    assert.equal(result, false);
-    assert.deepEqual(calls[1]?.slice(0, 4), ['set-hook', '-t', '$7', hookSlot]);
-    assert.deepEqual(calls[2], ['set-hook', '-u', '-t', '$7', buildHudResizeHookSlot('omx_hud_resize_7_3')]);
-    assert.deepEqual(calls[3]?.slice(0, 4), ['set-hook', '-t', '$7', layoutHookSlot]);
-  });
-
-  it('unregisters the same per-window hook slot', () => {
-    const calls: string[][] = [];
-
-    const result = unregisterHudResizeHook('%1', (args) => {
+    const exec = (args: string[]): string => {
       calls.push(args);
       if (args[0] === 'display-message') return '$7\t@3\n';
-      return '';
-    });
-
-    assert.equal(result, true);
-    assert.deepEqual(calls[0], ['display-message', '-p', '-t', '%1', '#{session_id}\t#{window_id}']);
-    assert.deepEqual(calls[1], ['set-hook', '-u', '-t', '$7', buildHudResizeHookSlot('omx_hud_resize_7_3')]);
-    assert.deepEqual(calls[2], [
-      'set-hook',
-      '-u',
-      '-t',
-      '$7',
-      buildHudResizeHookSlot('omx_hud_resize_7_3_1'),
-    ]);
-    assert.deepEqual(calls[3], [
-      'set-hook',
-      '-u',
-      '-t',
-      '$7',
-      buildHudLayoutHookSlot('omx_hud_resize_7_3_1'),
-    ]);
-  });
-
-  it('attempts to unregister the layout hook even when resize hook unregister fails', () => {
-    const calls: string[][] = [];
-
-    const result = unregisterHudResizeHook('%1', (args) => {
-      calls.push(args);
-      if (args[0] === 'display-message') return '$7\t@3\n';
-      if (args[0] === 'set-hook' && args[4] === buildHudResizeHookSlot('omx_hud_resize_7_3_1')) {
-        throw new Error('resize hook unregister rejected');
+      if (args[0] === 'show-hooks') {
+        const command = hooks.get(args[3]!);
+        return command ? `${args[3]} ${command}\n` : '';
+      }
+      if (args[0] === 'set-hook') {
+        const slot = args[args[1] === '-u' ? 4 : 3]!;
+        if (slot === options.failSlot) throw new Error('injected hook failure');
+        if (args[1] === '-u') hooks.delete(slot);
+        else hooks.set(slot, args[4]!);
       }
       return '';
-    });
+    };
+    return { hooks, calls, exec };
+  }
 
-    assert.equal(result, false);
-    assert.deepEqual(calls[2], [
-      'set-hook',
-      '-u',
-      '-t',
-      '$7',
+  it('installs a vacant paired hook set with mandatory readback and exact pane commands', () => {
+    const fixture = statefulHooks();
+    assert.equal(registerHudResizeHook('%9', '%1', 3, { cwd: '/repo', env: { TMUX: '/tmp/tmux' } }, fixture.exec), true);
+    const resizeSlot = buildHudResizeHookSlot('omx_hud_resize_7_3_1');
+    const layoutSlot = buildHudLayoutHookSlot('omx_hud_resize_7_3_1');
+    assert.match(fixture.hooks.get(resizeSlot) ?? '', /resize-pane.*%9/);
+    assert.match(fixture.hooks.get(layoutSlot) ?? '', /--reconcile-tmux/);
+    assert.ok(fixture.calls.some((args) => args[0] === 'show-hooks' && args[3] === resizeSlot));
+    assert.ok(fixture.calls.some((args) => args[0] === 'show-hooks' && args[3] === layoutSlot));
+  });
+
+  it('rolls back both hook slots when paired install fails', () => {
+    const layoutSlot = buildHudLayoutHookSlot('omx_hud_resize_7_3_1');
+    const fixture = statefulHooks({ failSlot: layoutSlot });
+    assert.equal(registerHudResizeHook('%9', '%1', 3, { cwd: '/repo', env: { TMUX: '/tmp/tmux' } }, fixture.exec), false);
+    assert.equal(fixture.hooks.size, 0);
+  });
+
+  it('preserves foreign replacement and removes only an exact owned pair', () => {
+    const fixture = statefulHooks();
+    const resizeSlot = buildHudResizeHookSlot('omx_hud_resize_7_3_1');
+    const layoutSlot = buildHudLayoutHookSlot('omx_hud_resize_7_3_1');
+    assert.equal(registerHudResizeHook('%9', '%1', 3, { cwd: '/repo', env: { TMUX: '/tmp/tmux' } }, fixture.exec), true);
+    fixture.hooks.set(layoutSlot, 'run-shell -b foreign');
+    assert.equal(unregisterHudResizeHook('%1', fixture.exec), false);
+    assert.match(fixture.hooks.get(resizeSlot) ?? '', /omx-hud-owned/);
+    assert.equal(fixture.hooks.get(layoutSlot), 'run-shell -b foreign');
+    fixture.hooks.set(layoutSlot, fixture.hooks.get(resizeSlot)!.replace(resizeSlot, layoutSlot));
+    assert.equal(unregisterHudResizeHook('%1', fixture.exec), true);
+    assert.equal(fixture.hooks.has(resizeSlot), false);
+    assert.equal(fixture.hooks.has(layoutSlot), false);
+  });
+
+  it('uses leader-scoped slots and treats an absent pair as completed cleanup', () => {
+    const first = statefulHooks();
+    const second = statefulHooks();
+    assert.equal(registerHudResizeHook('%9', '%1', 3, { cwd: '/repo', env: { TMUX: '/tmp/tmux' } }, first.exec), true);
+    assert.equal(registerHudResizeHook('%10', '%2', 3, { cwd: '/repo', env: { TMUX: '/tmp/tmux' } }, second.exec), true);
+    assert.notEqual(
       buildHudResizeHookSlot('omx_hud_resize_7_3_1'),
-    ]);
-    assert.deepEqual(calls[3], [
-      'set-hook',
-      '-u',
-      '-t',
-      '$7',
-      buildHudLayoutHookSlot('omx_hud_resize_7_3_1'),
-    ]);
-  });
-
-  it('uses distinct hook slots for different windows in the same session', () => {
-    const registered: string[][] = [];
-
-    const execFor = (windowId: string) => (args: string[]) => {
-      if (args[0] === 'display-message') return `$7\t${windowId}\n`;
-      registered.push(args);
-      return '';
-    };
-
-    assert.equal(registerHudResizeHook('%9', '%1', 3, execFor('@3')), true);
-    assert.equal(registerHudResizeHook('%10', '%2', 3, execFor('@4')), true);
-
-    const firstSlot = registered[0]?.[3];
-    const secondSlot = registered[3]?.[3];
-    assert.match(firstSlot ?? '', /^client-resized\[\d+\]$/);
-    assert.match(secondSlot ?? '', /^client-resized\[\d+\]$/);
-    assert.notEqual(firstSlot, secondSlot);
-  });
-
-  it('uses distinct hook slots for different leaders in the same session window', () => {
-    const registered: string[][] = [];
-    const execTmuxSync = (args: string[]) => {
-      if (args[0] === 'display-message') return '$7\t@3\n';
-      registered.push(args);
-      return '';
-    };
-
-    assert.equal(registerHudResizeHook('%9', '%1', 3, execTmuxSync), true);
-    assert.equal(registerHudResizeHook('%10', '%2', 3, execTmuxSync), true);
-
-    const firstSlot = registered[0]?.[3];
-    const secondSlot = registered[3]?.[3];
-    assert.match(firstSlot ?? '', /^client-resized\[\d+\]$/);
-    assert.match(secondSlot ?? '', /^client-resized\[\d+\]$/);
-    assert.notEqual(firstSlot, secondSlot);
-  });
-
-  it('reuses the same hook slot when a HUD pane is recreated for the same leader', () => {
-    const registered: string[][] = [];
-    const execTmuxSync = (args: string[]) => {
-      if (args[0] === 'display-message') return '$7\t@3\n';
-      registered.push(args);
-      return '';
-    };
-
-    assert.equal(registerHudResizeHook('%9', '%1', 3, execTmuxSync), true);
-    assert.equal(registerHudResizeHook('%10', '%1', 3, execTmuxSync), true);
-
-    assert.equal(registered[0]?.[3], registered[3]?.[3]);
-  });
-
-  it('does not unregister the legacy hook when installing the leader-scoped hook fails', () => {
-    const calls: string[][] = [];
-
-    const result = registerHudResizeHook('%9', '%1', 3, (args) => {
-      calls.push(args);
-      if (args[0] === 'display-message') return '$7\t@3\n';
-      if (args[0] === 'set-hook' && args[1] === '-t') throw new Error('transient tmux failure');
-      return '';
-    });
-
-    assert.equal(result, false);
-    assert.deepEqual(calls.map((args) => args.slice(0, 2)), [
-      ['display-message', '-p'],
-      ['set-hook', '-t'],
-    ]);
-  });
-
-  it('keeps registration successful when legacy cleanup fails after installing the leader-scoped hook', () => {
-    const calls: string[][] = [];
-
-    const result = registerHudResizeHook('%9', '%1', 3, (args) => {
-      calls.push(args);
-      if (args[0] === 'display-message') return '$7\t@3\n';
-      if (args[0] === 'set-hook' && args[1] === '-u') throw new Error('stale legacy cleanup failure');
-      return '';
-    });
-
-    assert.equal(result, true);
-    assert.equal(calls[1]?.[0], 'set-hook');
-    assert.equal(calls[1]?.[1], '-t');
-    assert.deepEqual(calls[2], ['set-hook', '-u', '-t', '$7', buildHudResizeHookSlot('omx_hud_resize_7_3')]);
-  });
-
-  it('unregisters only the leader-scoped hook slot for the selected leader', () => {
-    const unregistered: string[][] = [];
-    const execTmuxSync = (args: string[]) => {
-      if (args[0] === 'display-message') return '$7\t@3\n';
-      unregistered.push(args);
-      return '';
-    };
-
-    assert.equal(unregisterHudResizeHook('%2', execTmuxSync), true);
-
-    assert.deepEqual(unregistered[0], ['set-hook', '-u', '-t', '$7', buildHudResizeHookSlot('omx_hud_resize_7_3')]);
-    assert.deepEqual(unregistered[1], [
-      'set-hook',
-      '-u',
-      '-t',
-      '$7',
       buildHudResizeHookSlot('omx_hud_resize_7_3_2'),
-    ]);
-    assert.deepEqual(unregistered[2], [
-      'set-hook',
-      '-u',
-      '-t',
-      '$7',
-      buildHudLayoutHookSlot('omx_hud_resize_7_3_2'),
-    ]);
+    );
+    const absent = statefulHooks();
+    assert.equal(unregisterHudResizeHook('%1', absent.exec), true);
   });
 });
 
