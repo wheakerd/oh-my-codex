@@ -4771,6 +4771,13 @@ case "\${1:-}" in
     esac
     exit 0
     ;;
+  show-hooks)
+    hook_dir="${logPath}.hooks"
+    mkdir -p "$hook_dir"
+    slot="\${4:-}"
+    [ -f "$hook_dir/$slot" ] && cat "$hook_dir/$slot"
+    exit 0
+    ;;
   set-hook)
     case "$*" in
       *"window-resized["*)
@@ -4781,10 +4788,14 @@ case "\${1:-}" in
         echo "invalid option: -w" >&2
         exit 1
         ;;
-      *)
+      "set-hook -t "*)
+        hook_dir="${logPath}.hooks"
+        mkdir -p "$hook_dir"
+        printf '%s %s\n' "$4" "$5" > "$hook_dir/$4"
         exit 0
         ;;
     esac
+    exit 0
     ;;
   show-option)
     case "$*" in
@@ -6479,7 +6490,7 @@ exit 0
   });
 
   it('uses pane-id-direct kill semantics without liveness-gated helper calls', async () => {
-    const source = await readFile(new URL('../tmux-session.js', import.meta.url), 'utf-8');
+    const source = await readFile(join(process.cwd(), 'src/team/tmux-session.ts'), 'utf-8');
     const primitiveBlock = source.split('export async function teardownWorkerPanes')[1] ?? '';
     assert.equal(primitiveBlock.includes('isWorkerAlive'), false);
     assert.equal(primitiveBlock.includes('killWorker('), false);

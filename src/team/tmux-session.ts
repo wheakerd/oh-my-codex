@@ -169,12 +169,10 @@ export function probeExactTeamHudCandidate(
     .map((value) => value.trim())
     .filter(Boolean))];
   const expectedLeaderPaneId = normalizePaneTarget(options.expectedLeaderPaneId);
-  if (!sessionId || sessionIds.length === 0) return null;
+  if (!sessionId || sessionIds.length === 0 || !expectedLeaderPaneId) return null;
 
-  const paneTarget = normalizePaneTarget(process.env.TMUX_PANE);
-  const displayArgs = paneTarget
-    ? ['display-message', '-p', '-t', paneTarget, '#{session_name}:#{window_index} #{pane_id}']
-    : ['display-message', '-p', '#{session_name}:#{window_index} #{pane_id}'];
+  const paneTarget = expectedLeaderPaneId;
+  const displayArgs = ['display-message', '-p', '-t', paneTarget, '#{session_name}:#{window_index} #{pane_id}'];
   const readContext = (): { sessionName: string; windowIndex: string; leaderPaneId: string } | null => {
     const context = runTmux(displayArgs);
     if (!context.ok) return null;
@@ -1005,6 +1003,40 @@ export function registerHudHookIfVacant(hookTarget: string, args: string[]): boo
   if (!snapshot || (snapshot.command !== null && snapshot.command !== command)) return false;
   if (snapshot.command === command) return true;
   return runTmux(args).ok;
+}
+
+/** Installs the paired Team HUD hooks atomically, preserving foreign hook slots. */
+export function registerHudHooksTransactionally(
+  hookTarget: string,
+  resizeHookName: string,
+  clientAttachedHookName: string,
+  hudPaneId: string,
+): boolean {
+  const resizeArgs = buildRegisterResizeHookArgs(hookTarget, resizeHookName, hudPaneId);
+  const clientAttachedArgs = buildRegisterClientAttachedReconcileArgs(hookTarget, clientAttachedHookName, hudPaneId);
+  const resizeSlot = resizeArgs[3]!;
+  const clientAttachedSlot = clientAttachedArgs[3]!;
+  const resizeSnapshot = readTmuxHookSnapshot(hookTarget, resizeSlot);
+  const clientAttachedSnapshot = readTmuxHookSnapshot(hookTarget, clientAttachedSlot);
+  if (!resizeSnapshot || !clientAttachedSnapshot) return false;
+  if (
+    (resizeSnapshot.command !== null && resizeSnapshot.command !== resizeArgs[4])
+    || (clientAttachedSnapshot.command !== null && clientAttachedSnapshot.command !== clientAttachedArgs[4])
+  ) return false;
+  if (resizeSnapshot.command === null && !runTmux(resizeArgs).ok) return false;
+  if (!tmuxHookMatchesSnapshot(hookTarget, { slot: resizeSlot, command: resizeArgs[4]! })) {
+    restoreHudHookSnapshots(hookTarget, clientAttachedSnapshot, resizeSnapshot);
+    return false;
+  }
+  if (clientAttachedSnapshot.command === null && !runTmux(clientAttachedArgs).ok) {
+    restoreHudHookSnapshots(hookTarget, clientAttachedSnapshot, resizeSnapshot);
+    return false;
+  }
+  if (!tmuxHookMatchesSnapshot(hookTarget, { slot: clientAttachedSlot, command: clientAttachedArgs[4]! })) {
+    restoreHudHookSnapshots(hookTarget, clientAttachedSnapshot, resizeSnapshot);
+    return false;
+  }
+  return true;
 }
 
 function restoreHudHookSnapshots(
@@ -2096,39 +2128,21 @@ export function createTeamSession(
           } else {
             const hookTarget = buildResizeHookTarget(sessionName, windowIndex);
             const hookName = buildResizeHookName(safeTeamName, sessionName, windowIndex, hudPaneId);
-            const registerHook = registerHudHookIfVacant(hookTarget, buildRegisterResizeHookArgs(hookTarget, hookName, hudPaneId));
             const clientAttachedHookName = buildClientAttachedReconcileHookName(
               safeTeamName,
               sessionName,
               windowIndex,
               hudPaneId,
             );
-            if (registerHook) {
+            if (registerHudHooksTransactionally(hookTarget, hookName, clientAttachedHookName, hudPaneId)) {
               resizeHookTarget = hookTarget;
               resizeHookName = hookName;
               registeredResizeHook = { name: resizeHookName, target: resizeHookTarget };
-            } else {
-              // tmux versions/builds that reject indexed client-resized hooks should not
-              // abort madmax/team startup after panes were successfully created. Keep the
-              // fallback narrow: skip only the long-lived resize hook metadata, then
-              // still try the one-shot client-attached reconcile plus the explicit
-              // delayed/direct resize checks below so real tmux/run-shell failures
-              // still surface.
-              console.warn(
-                `[omx] tmux resize hook unavailable or occupied for ${hookTarget} (${hookName}); `
-                  + 'continuing with best-effort HUD resize fallback.',
-              );
-            }
-            const registerClientAttachedHook = registerHudHookIfVacant(
-              hookTarget,
-              buildRegisterClientAttachedReconcileArgs(hookTarget, clientAttachedHookName, hudPaneId),
-            );
-            if (registerClientAttachedHook) {
               registeredClientAttachedHook = { name: clientAttachedHookName, target: hookTarget };
             } else {
               console.warn(
-                `[omx] tmux client-attached resize fallback unavailable or occupied for ${hookTarget} `
-                  + `(${clientAttachedHookName}); continuing with delayed HUD resize fallback.`,
+                `[omx] tmux HUD hooks unavailable, occupied, or changed during registration for ${hookTarget}; `
+                  + 'continuing with delayed HUD resize fallback.',
               );
             }
 

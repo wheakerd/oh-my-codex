@@ -4662,6 +4662,10 @@ case "\${1:-}" in
     exit 0
     ;;
   show-hooks)
+    hook_dir="${tmuxLogPath}.hooks"
+    mkdir -p "$hook_dir"
+    slot="\${4:-}"
+    [ -f "$hook_dir/$slot" ] && cat "$hook_dir/$slot"
     exit 0
     ;;
   show-option)
@@ -4687,7 +4691,20 @@ case "\${1:-}" in
     esac
     exit 0
     ;;
-  set-hook|run-shell|select-layout|set-window-option|select-pane|send-keys|kill-session)
+  set-hook)
+    case "$*" in
+      "set-hook -t "*)
+        hook_dir="${tmuxLogPath}.hooks"
+        mkdir -p "$hook_dir"
+        printf '%s %s\n' "$4" "$5" > "$hook_dir/$4"
+        ;;
+      "set-hook -u -t "*)
+        rm -f "${tmuxLogPath}.hooks/$4"
+        ;;
+    esac
+    exit 0
+    ;;
+  run-shell|select-layout|set-window-option|select-pane|send-keys|kill-session)
     exit 0
     ;;
   *)

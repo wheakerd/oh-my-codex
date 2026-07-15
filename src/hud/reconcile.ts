@@ -711,11 +711,13 @@ export async function teardownManagedHudPane(
         identity,
       )))
       .map((pane) => pane.paneId);
+    const hooksUnregistered = (deps.unregisterHudResizeHook ?? unregisterHudResizeHook)(currentPaneId);
+    if (!hooksUnregistered) {
+      return { status: 'unchanged', removedPaneIds: [] };
+    }
     if (exactHudPaneIds.length === 0) {
       return { status: 'unchanged', removedPaneIds: [] };
     }
-
-    (deps.unregisterHudResizeHook ?? unregisterHudResizeHook)(currentPaneId);
     const removedPaneIds: string[] = [];
     const killPane = deps.killTmuxPane ?? killTmuxPane;
     for (const paneId of exactHudPaneIds) {

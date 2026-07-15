@@ -336,7 +336,7 @@ export async function resolveManagedSessionContext(
         authoritativeSessionCwd,
         canonicalSessionId || invocationSessionId,
       );
-    const evidence = await probeActualTmuxInstanceEvidence(paneTarget);
+    const evidence = await probeActualTmuxInstanceEvidence(paneTarget || undefined);
     const birthDomain = await resolveHudControlPlaneDomain({
       cwd: authoritativeSessionCwd,
       requestedSessionId: canonicalSessionId || invocationSessionId,
@@ -348,6 +348,7 @@ export async function resolveManagedSessionContext(
       && evidence.paneTagStatus === 'present'
       && evidence.sessionTagStatus === 'present'
       && evidence.sessionName === birthDomain.claimant.tmuxSessionName
+      && evidence.paneInstanceId === birthDomain.claimant.tmuxPaneInstanceId
       && evidence.paneInstanceId === birthDomain.claimant.tmuxPaneInstanceId
       && evidence.sessionInstanceId === birthDomain.claimant.tmuxSessionInstanceId,
     );
@@ -368,6 +369,24 @@ export async function resolveManagedSessionContext(
         currentTmuxPaneInstanceId,
         currentTmuxInstanceId: evidence.sessionInstanceId,
         taggedTmuxSessionName: currentTmuxSessionName,
+      };
+    }
+    const hasDurableBirthLineage = Boolean(
+      birthDomain?.claimant.tmuxSessionName
+      && birthDomain.claimant.tmuxSessionInstanceId
+      && birthDomain.claimant.tmuxPaneInstanceId,
+    );
+    if (hasDurableBirthLineage) {
+      return {
+        managed: false,
+        reason: 'tmux_birth_lineage_mismatch',
+        invocationSessionId,
+        sessionState,
+        expectedTmuxSessionName,
+        currentTmuxSessionName,
+        currentTmuxPaneTarget,
+        currentTmuxPaneInstanceId,
+        taggedTmuxSessionName: '',
       };
     }
     if (currentTmuxPaneInstanceId && currentTmuxPaneInstanceId !== invocationSessionId) {
