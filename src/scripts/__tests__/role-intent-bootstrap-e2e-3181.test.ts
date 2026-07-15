@@ -65,4 +65,47 @@ describe('#3181 end-to-end fresh App turn bootstrap', () => {
       await rm(cwd, { recursive: true, force: true });
     }
   });
+
+  it('PreToolUse (leader turn) bootstraps the pointer + attestation when SessionStart did not, so the first role-intent write succeeds', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-3181-e2e-pretool-'));
+    const priorEnv = { OMX_SESSION_ID: process.env.OMX_SESSION_ID, CODEX_SESSION_ID: process.env.CODEX_SESSION_ID, SESSION_ID: process.env.SESSION_ID };
+    try {
+      delete process.env.OMX_SESSION_ID;
+      delete process.env.CODEX_SESSION_ID;
+      delete process.env.SESSION_ID;
+      const nativeSessionId = 'codex-native-exec-leader';
+
+      // Fresh exec turn where the first event reaching OMX is a leader PreToolUse (no
+      // prior SessionStart pointer). The leader turn carries thread_id == session_id.
+      await dispatchCodexNativeHook(
+        {
+          hook_event_name: 'PreToolUse',
+          cwd,
+          session_id: nativeSessionId,
+          thread_id: nativeSessionId,
+          tool_name: 'Bash',
+          tool_use_id: 'tool-exec-first',
+          tool_input: { command: 'omx ralplan role-intent write --role architect --parent-thread "$CODEX_THREAD_ID" --json' },
+        },
+        { cwd, sessionOwnerPid: process.pid },
+      );
+
+      const afterPreTool = await readSubagentTrackingState(cwd);
+      const attested = afterPreTool.sessions[nativeSessionId];
+      assert.equal(attested?.leader_thread_id, nativeSessionId);
+      assert.equal(attested?.leader_attest_source, 'native-pretooluse');
+
+      const res = await invokeRoleIntent(cwd, ['role-intent', 'write', '--role', 'architect', '--parent-thread', nativeSessionId, '--json']);
+      assert.equal(res.exitCode, undefined);
+      const receipt = JSON.parse(res.stdout.join('\n')) as { ok: boolean; intent: { role: string } };
+      assert.equal(receipt.ok, true);
+      assert.equal(receipt.intent.role, 'architect');
+      assert.equal((await readSubagentTrackingState(cwd)).pending_role_intents.length, 1);
+    } finally {
+      if (priorEnv.OMX_SESSION_ID !== undefined) process.env.OMX_SESSION_ID = priorEnv.OMX_SESSION_ID;
+      if (priorEnv.CODEX_SESSION_ID !== undefined) process.env.CODEX_SESSION_ID = priorEnv.CODEX_SESSION_ID;
+      if (priorEnv.SESSION_ID !== undefined) process.env.SESSION_ID = priorEnv.SESSION_ID;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
 });

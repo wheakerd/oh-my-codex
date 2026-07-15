@@ -3340,6 +3340,22 @@ function isTypedAgentRolePayload(payload: CodexHookPayload): boolean {
   return agentRole !== "" && resolveInstalledRoleName(agentRole) !== null;
 }
 
+// #3181: detect a runtime-set native subagent PreToolUse. The thread_spawn provenance
+// is set by the runtime (not agent-controlled tool arguments), so its presence marks a
+// child/subagent turn that must never be attested as the session leader.
+function hasSubagentThreadSpawnProvenance(payload: CodexHookPayload): boolean {
+  const source = safeObject(payload.source);
+  const subagent = safeObject(source?.subagent);
+  const threadSpawn = safeObject(subagent?.thread_spawn);
+  const parentThreadId = safeString(
+    threadSpawn?.parent_thread_id
+      ?? threadSpawn?.parentThreadId
+      ?? threadSpawn?.leader_thread_id
+      ?? threadSpawn?.leaderThreadId,
+  ).trim();
+  return parentThreadId !== "";
+}
+
 function buildNativeUnknownRolePreToolUseOutput(
   payload: CodexHookPayload,
 ): Record<string, unknown> | null {
@@ -10552,6 +10568,44 @@ export async function dispatchCodexNativeHook(
       };
     }
   } else if (hookEventName === "PreToolUse") {
+    // #3181 Phase-1 (PreToolUse): this hook fires before the shell tool call that runs
+    // the first in-turn `omx ralplan role-intent write`. On a fresh App/outside-tmux
+    // turn where SessionStart did not establish the pointer, reconcile the canonical
+    // pointer and attest the leader here so the first command can bootstrap. Strictly
+    // gated to a fresh (absent-pointer) LEADER turn: no canonical session yet, a present
+    // native session id, a leader-shaped thread (absent or equal to the native session
+    // id), and no subagent/typed-role provenance. Best-effort; never blocks PreToolUse.
+    if (
+      allowImplicitSessionSideEffects
+      && !canonicalSessionId
+      && nativeSessionId
+      && !isTypedAgentRolePayload(payload)
+      && !hasSubagentThreadSpawnProvenance(payload)
+    ) {
+      const preToolUseLeaderThreadId = readPayloadThreadId(payload);
+      if (preToolUseLeaderThreadId && preToolUseLeaderThreadId === nativeSessionId) {
+        try {
+          const ownerOmxSessionId = await resolveVerifiedOwnerOmxSessionId();
+          const sessionState = await reconcileNativeSessionStart(cwd, nativeSessionId, {
+            context: pointerContext,
+            pid: options.sessionOwnerPid ?? resolveSessionOwnerPid(payload),
+            ...(ownerOmxSessionId ? { ownerOmxSessionId, ownerAliasVerified: true } : {}),
+          });
+          const bootstrapSessionId = safeString(sessionState.session_id).trim();
+          const bootstrapLeaderThreadId = safeString(sessionState.native_session_id).trim() || nativeSessionId;
+          if (bootstrapSessionId && bootstrapLeaderThreadId) {
+            canonicalSessionId = bootstrapSessionId;
+            attestLeaderThread(cwd, {
+              sessionId: bootstrapSessionId,
+              leaderThreadId: bootstrapLeaderThreadId,
+              source: 'native-pretooluse',
+            });
+          }
+        } catch {
+          // Best-effort bootstrap; PreToolUse must never fail on this.
+        }
+      }
+    }
     const payloadSessionId = readPayloadSessionId(payload);
     const rootPointerConflict = await readLiveRootSessionPointerConflict(stateDir, payloadSessionId);
     const preToolUseSessionId = payloadSessionId
