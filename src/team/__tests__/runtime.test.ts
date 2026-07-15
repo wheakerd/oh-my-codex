@@ -4661,6 +4661,9 @@ case "\${1:-}" in
     echo "live-session-instance"
     exit 0
     ;;
+  show-hooks)
+    exit 0
+    ;;
   show-option)
     case "$*" in
       *"@omx_pane_instance_id"*)
