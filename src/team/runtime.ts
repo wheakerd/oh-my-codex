@@ -40,6 +40,7 @@ import {
   establishExactTeamHudCandidate,
   probeExactTeamHudCandidate,
   findExactTeamHudPane,
+  killExactTeamHudPane,
 } from './tmux-session.js';
 import { acquireHudLifecycleLock, releaseHudLifecycleLock } from '../hud/lifecycle-lock.js';
 import { normalizeSessionId, resolveHudControlPlaneDomain, writeHudTmuxBirthLineage } from '../mcp/state-paths.js';
@@ -3043,12 +3044,12 @@ export async function startTeam(
         throw new Error(`hud_lifecycle_lock_${hudLifecycleLock.status}`);
       }
       let createdSession!: TeamSession;
-      const hudExactCandidate = establishExactTeamHudCandidate({
-        sessionId: hudDomain.claimant.sessionId,
-        sessionIds: hudDomain.session?.equivalentIds,
-        expectedLeaderPaneId: hudDomain.claimant.leaderPaneId,
-      });
       try {
+        const hudExactCandidate = establishExactTeamHudCandidate({
+          sessionId: hudDomain.claimant.sessionId,
+          sessionIds: hudDomain.session?.equivalentIds,
+          expectedLeaderPaneId: hudDomain.claimant.leaderPaneId,
+        });
         createdSession = createTeamSession(
           sanitized,
           workerCount,
@@ -3062,6 +3063,13 @@ export async function startTeam(
             hudExactCandidate,
           },
         );
+        // The session owns real panes as soon as tmux returns. Mark that fact before
+        // persisting lineage so a persistence failure enters the existing exact rollback.
+        sessionName = createdSession.name;
+        sessionCreated = true;
+        createdWorkerPaneIds.push(...createdSession.workerPaneIds);
+        createdLeaderPaneId = createdSession.leaderPaneId;
+        applyCreatedInteractiveSessionToConfig(config, createdSession, workerPaneIds);
         const revalidatedHudCandidate = hudExactCandidate
           ? probeExactTeamHudCandidate({
             sessionId: hudExactCandidate.sessionId,
@@ -3087,11 +3095,6 @@ export async function startTeam(
       } finally {
         await releaseHudLifecycleLock(hudLifecycleLock.lock);
       }
-      sessionName = createdSession.name;
-      sessionCreated = true;
-      createdWorkerPaneIds.push(...createdSession.workerPaneIds);
-      createdLeaderPaneId = createdSession.leaderPaneId;
-      applyCreatedInteractiveSessionToConfig(config, createdSession, workerPaneIds);
       for (const [index, paneId] of createdSession.workerPaneIds.entries()) {
         startupTiming.mark('split_returned', { worker: `worker-${index + 1}`, pane_id: paneId });
       }
@@ -4218,8 +4221,18 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
 
     let restoredHudPaneId: string | null = null;
     if (lockedHudPaneId && ownsHudTeardownAuthority && hooksRemoved) {
-      await killWorkerByPaneIdAsync(lockedHudPaneId, effectiveLeaderPaneId ?? undefined);
-      if (sessionName.includes(':') && freshHudRestoreDomain) {
+      const killedHudPane = killExactTeamHudPane(
+        sessionName,
+        lockedHudPaneId,
+        freshHudCandidate!,
+        tmuxPaneOwnerId,
+      );
+      if (!killedHudPane) {
+        retainHudContainer = !sessionName.includes(':');
+        retainHudLifecycleState = !sessionName.includes(':');
+        console.warn(`[team shutdown] ${sanitized}: preserving Team HUD metadata because final tmux authority revalidation failed`);
+      }
+      if (killedHudPane && sessionName.includes(':') && freshHudRestoreDomain) {
         restoredHudPaneId = restoreStandaloneHudPane(trustedHudRestoreLeaderPaneId, cwd, {
           sessionId: freshHudRestoreDomain.claimant.sessionId,
           sessionIds: freshHudRestoreDomain.session?.equivalentIds,

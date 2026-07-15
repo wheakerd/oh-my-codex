@@ -431,32 +431,24 @@ function buildHudResizeHookCommand(
   tmuxBin: string,
   hudPaneId: string,
   height: string,
-  context: HudResizeHookContext,
   tmuxEnv?: string,
 ): string {
   const resize = buildNestedTmuxCommand(tmuxBin, ['resize-pane', '-t', hudPaneId, '-y', height], tmuxEnv);
-  const unregister = buildHudHookUnregisterCommand(tmuxBin, context, tmuxEnv);
-  const resizeOrUnregister = `${resize} >/dev/null 2>&1 || (${unregister})`;
-  return `${resizeOrUnregister}; sleep ${HUD_RESIZE_RECONCILE_DELAY_SECONDS}; ${resizeOrUnregister}`;
-}
-
-function buildHudHookUnregisterCommand(tmuxBin: string, context: HudResizeHookContext, tmuxEnv?: string): string {
-  const unregisterResize = buildNestedTmuxCommand(tmuxBin, ['set-hook', '-u', '-t', context.sessionId, context.hookSlot], tmuxEnv);
-  const unregisterLayout = buildNestedTmuxCommand(tmuxBin, ['set-hook', '-u', '-t', context.sessionId, context.layoutHookSlot], tmuxEnv);
-  return `${unregisterResize} >/dev/null 2>&1 || true; ${unregisterLayout} >/dev/null 2>&1 || true`;
+  // Hook cleanup is lifecycle-owned. A delayed callback cannot prove slot ownership
+  // after it was queued, so it must never unset potentially replaced hooks.
+  const resizeBestEffort = `${resize} >/dev/null 2>&1 || true`;
+  return `${resizeBestEffort}; sleep ${HUD_RESIZE_RECONCILE_DELAY_SECONDS}; ${resizeBestEffort}`;
 }
 
 function buildHudLayoutReconcileHookCommand(
   tmuxBin: string,
   omxBin: string,
   leaderPaneId: string,
-  context: HudResizeHookContext,
   options: RegisterHudResizeHookOptions = {},
 ): string {
   const env = options.env ?? process.env;
   const cwd = options.cwd?.trim() || process.cwd();
   const leaderAlive = buildNestedTmuxCommand(tmuxBin, ['display-message', '-p', '-t', leaderPaneId, '#{pane_id}'], env.TMUX);
-  const unregister = buildHudHookUnregisterCommand(tmuxBin, context, env.TMUX);
   const reconcileEnv = buildEnvPrefix({
     TMUX: env.TMUX,
     TMUX_PANE: leaderPaneId,
@@ -475,7 +467,7 @@ function buildHudLayoutReconcileHookCommand(
     'hud',
     '--reconcile-tmux',
   ].join(' ');
-  return `${leaderAlive} >/dev/null 2>&1 && (${unregister}; ${reconcile} >/dev/null 2>&1; status=$?; exit $status) || (${unregister})`;
+  return `${leaderAlive} >/dev/null 2>&1 && (${reconcile} >/dev/null 2>&1; status=$?; exit $status) || true`;
 }
 
 
@@ -710,11 +702,11 @@ export function registerHudResizeHook(
   if (!context) return false;
   const tmuxBin = resolveTmuxBinaryForPlatform() || 'tmux';
   const height = String(Math.max(1, Math.floor(heightLines)));
-  const resizeCmd = shellEscapeSingle(buildHudResizeHookCommand(tmuxBin, hudPaneId, height, context, options.env?.TMUX));
+  const resizeCmd = shellEscapeSingle(buildHudResizeHookCommand(tmuxBin, hudPaneId, height, options.env?.TMUX));
   const omxBin = resolveOmxCliEntryPath({ cwd: options.cwd, env: options.env });
   if (!omxBin || !leaderPaneId?.startsWith('%')) return false;
   const reconcileCmd = shellEscapeSingle(
-    buildHudLayoutReconcileHookCommand(tmuxBin, omxBin, leaderPaneId, context, options),
+    buildHudLayoutReconcileHookCommand(tmuxBin, omxBin, leaderPaneId, options),
   );
   const ownershipMarker = ` # omx-hud-owned:${context.hookSlot}:${context.layoutHookSlot}`;
   return registerHudHookPair(
@@ -755,8 +747,16 @@ function hookMatches(context: HudResizeHookContext, snapshot: TmuxHookSnapshot, 
   return readTmuxHookSnapshot(context, snapshot.slot, execTmuxSync)?.command === snapshot.command;
 }
 
-function restoreHudHookPair(context: HudResizeHookContext, resize: TmuxHookSnapshot, layout: TmuxHookSnapshot, execTmuxSync: TmuxExecSync): boolean {
-  const restore = (snapshot: TmuxHookSnapshot): boolean => {
+function restoreHudHookPair(
+  context: HudResizeHookContext,
+  resize: TmuxHookSnapshot,
+  layout: TmuxHookSnapshot,
+  expectedResizeCurrent: string | null,
+  expectedLayoutCurrent: string | null,
+  execTmuxSync: TmuxExecSync,
+): boolean {
+  const restore = (snapshot: TmuxHookSnapshot, expectedCurrent: string | null): boolean => {
+    if (!hookMatches(context, { slot: snapshot.slot, command: expectedCurrent }, execTmuxSync)) return false;
     try {
       if (snapshot.command === null) execTmuxSync(['set-hook', '-u', '-t', context.sessionId, snapshot.slot]);
       else execTmuxSync(['set-hook', '-t', context.sessionId, snapshot.slot, snapshot.command]);
@@ -765,8 +765,8 @@ function restoreHudHookPair(context: HudResizeHookContext, resize: TmuxHookSnaps
     }
     return hookMatches(context, snapshot, execTmuxSync);
   };
-  const resizeRestored = restore(resize);
-  const layoutRestored = restore(layout);
+  const resizeRestored = restore(resize, expectedResizeCurrent);
+  const layoutRestored = restore(layout, expectedLayoutCurrent);
   return resizeRestored && layoutRestored;
 }
 
@@ -781,7 +781,7 @@ function registerHudHookPair(context: HudResizeHookContext, resizeCommand: strin
     if (!hookMatches(context, { slot: layout.slot, command: layoutCommand }, execTmuxSync)) throw new Error('layout hook verification failed');
     return true;
   } catch {
-    restoreHudHookPair(context, resize, layout, execTmuxSync);
+    restoreHudHookPair(context, resize, layout, resizeCommand, layoutCommand, execTmuxSync);
     return false;
   }
 }
@@ -790,22 +790,25 @@ function unregisterHudHookPair(context: HudResizeHookContext, execTmuxSync: Tmux
   const resize = readTmuxHookSnapshot(context, context.hookSlot, execTmuxSync);
   const layout = readTmuxHookSnapshot(context, context.layoutHookSlot, execTmuxSync);
   if (!resize || !layout) return false;
-  if (resize.command === null && layout.command === null) return true;
   const ownershipMarker = `# omx-hud-owned:${context.hookSlot}:${context.layoutHookSlot}`;
-  if (!resize.command?.endsWith(ownershipMarker) || !layout.command?.endsWith(ownershipMarker)) return false;
-  const remove = (snapshot: TmuxHookSnapshot): boolean => {
+  const removeOwnedOrPreserveForeign = (snapshot: TmuxHookSnapshot): boolean => {
+    const current = readTmuxHookSnapshot(context, snapshot.slot, execTmuxSync);
+    if (!current) return false;
+    // A concurrent removal or replacement has already made this transaction's
+    // owned hook harmless; preserve it and treat this slot as safely handled.
+    if (current.command === null || !current.command.endsWith(ownershipMarker)) return true;
+    if (snapshot.command === null || current.command !== snapshot.command) return false;
     try {
       execTmuxSync(['set-hook', '-u', '-t', context.sessionId, snapshot.slot]);
     } catch {
       return false;
     }
-    return hookMatches(context, { slot: snapshot.slot, command: null }, execTmuxSync);
+    const after = readTmuxHookSnapshot(context, snapshot.slot, execTmuxSync);
+    return after === null || after.command === null || !after.command.endsWith(ownershipMarker);
   };
-  const resizeRemoved = remove(resize);
-  const layoutRemoved = remove(layout);
-  if (!resizeRemoved || !layoutRemoved) {
-    restoreHudHookPair(context, resize, layout, execTmuxSync);
-    return false;
-  }
-  return true;
+  // Attempt both slots even when one cannot be safely handled. Never restore a
+  // removed owned hook: that could overwrite a concurrent replacement.
+  const resizeHandled = removeOwnedOrPreserveForeign(resize);
+  const layoutHandled = removeOwnedOrPreserveForeign(layout);
+  return resizeHandled && layoutHandled;
 }

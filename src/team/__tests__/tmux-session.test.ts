@@ -402,16 +402,14 @@ describe('HUD resize hook command builders', () => {
     assert.equal(name, 'omx_attached_Team_A_Session_Main_0_12');
   });
 
-  it('buildRegisterClientAttachedReconcileArgs installs one-shot client-attached reconcile hook', () => {
+  it('buildRegisterClientAttachedReconcileArgs installs a lifecycle-owned client-attached reconcile hook', () => {
     const args = buildRegisterClientAttachedReconcileArgs('my-session:0', 'omx_attached_team_session_0_1', '%1');
     assert.equal(args[0], 'set-hook');
     assert.equal(args[1], '-t');
     assert.equal(args[2], 'my-session:0');
     assert.match(args[3] ?? '', /^client-attached\[\d+\]$/);
-    assert.match(
-      args[4] ?? '',
-      /^run-shell -b 'tmux resize-pane -t %1 -y \d+ >\/dev\/null 2>&1 \|\| true; tmux set-hook -u -t my-session:0 client-attached\[\d+\]'$/,
-    );
+    assert.match(args[4] ?? '', /^run-shell -b 'tmux resize-pane -t %1 -y \d+ >\/dev\/null 2>&1 \|\| true'$/);
+    assert.doesNotMatch(args[4] ?? '', /set-hook -u/);
   });
 
   it('buildUnregisterClientAttachedReconcileArgs removes the exact numeric client-attached slot', () => {
@@ -444,7 +442,7 @@ printf '%s\\n' "$*" >> "${logPath}"
     });
   });
 
-  it('does not remove the resize hook when client-attached hook deletion fails', async () => {
+  it('attempts both paired deletions but never blindly restores hooks after failure', async () => {
     const resizeName = 'omx_resize_team_session_0_1';
     const attachedName = 'omx_attached_team_session_0_1';
     const resizeSlot = buildRegisterResizeHookArgs('team:0', resizeName, '%1')[3] as string;
@@ -469,41 +467,8 @@ esac
       const log = await readFile(logPath, 'utf-8');
       assert.match(log, new RegExp(`set-hook -u -t team:0 ${escapeRegExp(attachedSlot)}`));
       assert.match(log, new RegExp(`set-hook -u -t team:0 ${escapeRegExp(resizeSlot)}`));
-      assert.match(log, new RegExp(`set-hook -t team:0 ${escapeRegExp(resizeSlot)} ${escapeRegExp(resizeCommand)}`));
-    });
-  });
-
-  it('restores client-attached hook when resize hook deletion fails after it', async () => {
-    const resizeName = 'omx_resize_team_session_0_2';
-    const attachedName = 'omx_attached_team_session_0_2';
-    const resizeSlot = buildRegisterResizeHookArgs('team:0', resizeName, '%1')[3] as string;
-    const attachedSlot = buildRegisterClientAttachedReconcileArgs('team:0', attachedName, '%1')[3] as string;
-    const resizeCommand = buildRegisterResizeHookArgs('team:0', resizeName, '%1')[4] as string;
-    const attachedCommand = buildRegisterClientAttachedReconcileArgs('team:0', attachedName, '%1')[4] as string;
-    await withMockTmuxFixture('omx-tmux-hook-resize-failure-', (logPath) => `#!/bin/sh
-printf '%s\\n' "$*" >> "${logPath}"
-state="${logPath}.attached-removed"
-case "$1" in
-  show-hooks)
-    case "$4" in
-      "${resizeSlot}") echo "${resizeSlot} ${resizeCommand}" ;;
-      "${attachedSlot}") [ ! -f "$state" ] && echo "${attachedSlot} ${attachedCommand}" ;;
-    esac
-    true
-    ;;
-  set-hook)
-    if [ "$2" = '-u' ] && [ "$5" = '${attachedSlot}' ]; then touch "$state"; fi
-    if [ "$2" = '-u' ] && [ "$5" = '${resizeSlot}' ]; then exit 1; fi
-    if [ "$2" = '-t' ] && [ "$4" = '${attachedSlot}' ]; then rm -f "$state"; fi
-    ;;
-esac
-`,
- async ({ logPath }) => {
-      assert.equal(unregisterHudHooksTransactionally('team:0', resizeName, attachedName, '%1'), false);
-      const log = await readFile(logPath, 'utf-8');
-      assert.match(log, new RegExp(`set-hook -u -t team:0 ${escapeRegExp(attachedSlot)}`));
-      assert.match(log, new RegExp(`set-hook -u -t team:0 ${escapeRegExp(resizeSlot)}`));
-      assert.match(log, new RegExp(`set-hook -t team:0 ${escapeRegExp(attachedSlot)} ${escapeRegExp(attachedCommand)}`));
+      assert.doesNotMatch(log, new RegExp(`set-hook -t team:0 ${escapeRegExp(resizeSlot)} ${escapeRegExp(resizeCommand)}`));
+      assert.doesNotMatch(log, new RegExp(`set-hook -t team:0 ${escapeRegExp(attachedSlot)} ${escapeRegExp(attachedCommand)}`));
     });
   });
   it('preserves a foreign hook command occupying an OMX hook slot', async () => {
@@ -606,7 +571,7 @@ esac
     }
   });
 
-  it('resolves the tmux executable twice for win32 client-attached one-shot hooks', async () => {
+  it('resolves the tmux executable once for win32 lifecycle-owned client-attached hooks', async () => {
     const fakeBin = await mkdtemp(join(tmpdir(), 'omx-win32-attached-hook-'));
     const prevPath = process.env.PATH;
     const prevPathext = process.env.PATHEXT;
@@ -620,7 +585,7 @@ esac
 
       const args = buildRegisterClientAttachedReconcileArgs('my-session:0', 'omx_attached_team_session_0_1', '%1');
       const matches = (args[4] ?? '').match(new RegExp(escapeRegExp(tmuxPath), 'g')) || [];
-      assert.equal(matches.length, 2, 'client-attached hook should resolve tmux for both resize and unregister commands');
+      assert.equal(matches.length, 1, 'client-attached hook should resolve tmux only for its resize command');
       assert.doesNotMatch(args[4] ?? '', /; tmux set-hook -u -t my-session:0 client-attached/);
     } finally {
       if (origPlatform) Object.defineProperty(process, 'platform', origPlatform);

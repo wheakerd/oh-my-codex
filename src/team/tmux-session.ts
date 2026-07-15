@@ -554,6 +554,21 @@ function findExactTeamHudPaneIds(target: string, candidate: ExactTeamHudCandidat
     .map((pane) => pane.paneId);
 }
 
+/** Kills only a still-exact HUD pane, with tmux evaluating identity immediately before kill. */
+export function killExactTeamHudPane(
+  target: string,
+  paneId: string,
+  candidate: ExactTeamHudCandidate,
+  teamOwnerId?: string,
+): boolean {
+  if (!findExactTeamHudPaneIds(target, candidate).includes(paneId)) return false;
+  const sessionName = candidate.tmuxSessionName ?? target.split(':')[0] ?? '';
+  const ownerCondition = teamOwnerId ? `,#{==:#{@omx_team_pane_owner},${teamOwnerId}}` : '';
+  const condition = `#{&&:#{==:#{pane_id},${paneId}},#{==:#{@omx_pane_instance_id},${candidate.tmuxPaneInstanceId}},#{==:#{session_name},${sessionName}}${ownerCondition}}`;
+  const result = runTmux(['if-shell', '-t', paneId, '-F', condition, `kill-pane -t ${paneId}`, '']);
+  return result.ok && !findExactTeamHudPaneIds(target, candidate).includes(paneId);
+}
+
 function normalizeExactTeamHudCandidate(candidate: ExactTeamHudCandidate | null | undefined): ExactTeamHudCandidate | null {
   const sessionId = candidate?.sessionId?.trim() ?? '';
   const leaderPaneId = normalizePaneTarget(candidate?.leaderPaneId);
@@ -945,8 +960,10 @@ export function buildRegisterClientAttachedReconcileArgs(
   heightLines: number = HUD_TMUX_TEAM_HEIGHT_LINES,
 ): string[] {
   const hookSlot = buildClientAttachedHookSlot(hookName);
+  // Keep the owned command installed until transactional lifecycle cleanup. A shell
+  // callback cannot safely prove it is still the same hook after queueing.
   const oneShotCommand = shellQuoteSingle(
-    `${buildBestEffortShellCommand(buildNestedTmuxShellCommand(buildHudResizeCommand(hudPaneId, heightLines)))}; ${buildNestedTmuxShellCommand(`set-hook -u -t ${hookTarget} ${hookSlot}`)}`,
+    buildBestEffortShellCommand(buildNestedTmuxShellCommand(buildHudResizeCommand(hudPaneId, heightLines))),
   );
   return ['set-hook', '-t', hookTarget, hookSlot, `run-shell -b ${oneShotCommand}`];
 }
@@ -980,7 +997,10 @@ function readTmuxHookSnapshot(hookTarget: string, slot: string): TmuxHookSnapsho
   return match?.[1] ? { slot, command: match[1] } : null;
 }
 
-function restoreTmuxHookSnapshot(hookTarget: string, snapshot: TmuxHookSnapshot): boolean {
+function restoreTmuxHookSnapshot(hookTarget: string, snapshot: TmuxHookSnapshot, expectedCurrent: string | null): boolean {
+  // Never restore over a concurrent replacement. A mismatch is uncertainty, not a
+  // license to rewrite the slot.
+  if (!tmuxHookMatchesSnapshot(hookTarget, { slot: snapshot.slot, command: expectedCurrent })) return false;
   const result = snapshot.command === null
     ? runTmux(['set-hook', '-u', '-t', hookTarget, snapshot.slot])
     : runTmux(['set-hook', '-t', hookTarget, snapshot.slot, snapshot.command]);
@@ -1027,15 +1047,15 @@ export function registerHudHooksTransactionally(
   ) return false;
   if (resizeSnapshot.command === null && !runTmux(resizeArgs).ok) return false;
   if (!tmuxHookMatchesSnapshot(hookTarget, { slot: resizeSlot, command: resizeArgs[4]! })) {
-    restoreHudHookSnapshots(hookTarget, clientAttachedSnapshot, resizeSnapshot);
+    restoreHudHookSnapshots(hookTarget, clientAttachedSnapshot, resizeSnapshot, clientAttachedArgs[4]!, resizeArgs[4]!);
     return false;
   }
   if (clientAttachedSnapshot.command === null && !runTmux(clientAttachedArgs).ok) {
-    restoreHudHookSnapshots(hookTarget, clientAttachedSnapshot, resizeSnapshot);
+    restoreHudHookSnapshots(hookTarget, clientAttachedSnapshot, resizeSnapshot, clientAttachedArgs[4]!, resizeArgs[4]!);
     return false;
   }
   if (!tmuxHookMatchesSnapshot(hookTarget, { slot: clientAttachedSlot, command: clientAttachedArgs[4]! })) {
-    restoreHudHookSnapshots(hookTarget, clientAttachedSnapshot, resizeSnapshot);
+    restoreHudHookSnapshots(hookTarget, clientAttachedSnapshot, resizeSnapshot, clientAttachedArgs[4]!, resizeArgs[4]!);
     return false;
   }
   return true;
@@ -1045,15 +1065,13 @@ function restoreHudHookSnapshots(
   hookTarget: string,
   clientAttachedSnapshot: TmuxHookSnapshot,
   resizeSnapshot: TmuxHookSnapshot,
+  expectedClientAttachedCurrent: string | null,
+  expectedResizeCurrent: string | null,
 ): boolean {
-  // Always attempt and verify both restores. A failed first restore must not
-  // leave the other slot in a transaction-created state.
-  const clientAttachedRestored = restoreTmuxHookSnapshot(hookTarget, clientAttachedSnapshot);
-  const resizeRestored = restoreTmuxHookSnapshot(hookTarget, resizeSnapshot);
-  return clientAttachedRestored
-    && resizeRestored
-    && tmuxHookMatchesSnapshot(hookTarget, clientAttachedSnapshot)
-    && tmuxHookMatchesSnapshot(hookTarget, resizeSnapshot);
+  // Always attempt both restores; each independently refuses a foreign/newer value.
+  const clientAttachedRestored = restoreTmuxHookSnapshot(hookTarget, clientAttachedSnapshot, expectedClientAttachedCurrent);
+  const resizeRestored = restoreTmuxHookSnapshot(hookTarget, resizeSnapshot, expectedResizeCurrent);
+  return clientAttachedRestored && resizeRestored;
 }
 
 /**
@@ -1080,12 +1098,16 @@ export function unregisterHudHooksTransactionally(
     || (resizeSnapshot.command !== null && resizeSnapshot.command !== expectedResizeCommand)
   ) return false;
 
-  const remove = (slot: string, installed: boolean): boolean => !installed
-    || (runTmux(['set-hook', '-u', '-t', hookTarget, slot]).ok && tmuxHookIsAbsent(hookTarget, slot));
-  const clientRemoved = remove(clientAttachedSlot, clientAttachedSnapshot.command !== null);
-  const resizeRemoved = remove(resizeSlot, resizeSnapshot.command !== null);
+  const remove = (snapshot: TmuxHookSnapshot): boolean => {
+    if (snapshot.command === null) return true;
+    if (!tmuxHookMatchesSnapshot(hookTarget, snapshot)) return false;
+    return runTmux(['set-hook', '-u', '-t', hookTarget, snapshot.slot]).ok
+      && tmuxHookIsAbsent(hookTarget, snapshot.slot);
+  };
+  const clientRemoved = remove(clientAttachedSnapshot);
+  const resizeRemoved = remove(resizeSnapshot);
   if (!clientRemoved || !resizeRemoved) {
-    restoreHudHookSnapshots(hookTarget, clientAttachedSnapshot, resizeSnapshot);
+    restoreHudHookSnapshots(hookTarget, clientAttachedSnapshot, resizeSnapshot, null, null);
     return false;
   }
   return true;
@@ -2013,7 +2035,7 @@ export function createTeamSession(
     // unverified panes are preserved rather than inferred from their command.
     if (canRecreateTeamHud) {
       for (const hudPaneId of duplicateHudPaneIds) {
-        runTmux(['kill-pane', '-t', hudPaneId]);
+        killExactTeamHudPane(teamTarget, hudPaneId, hudExactCandidate!, teamPaneOwnerId);
       }
     }
     const workerPaneIds: string[] = [];

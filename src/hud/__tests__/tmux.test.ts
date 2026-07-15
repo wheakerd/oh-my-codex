@@ -122,19 +122,15 @@ describe('HUD resize hook helpers', () => {
     assert.equal(fixture.hooks.size, 0);
   });
 
-  it('preserves foreign replacement and removes only an exact owned pair', () => {
+  it('preserves a foreign replacement while safely removing the remaining owned slot', () => {
     const fixture = statefulHooks();
     const resizeSlot = buildHudResizeHookSlot('omx_hud_resize_7_3_1');
     const layoutSlot = buildHudLayoutHookSlot('omx_hud_resize_7_3_1');
     assert.equal(registerHudResizeHook('%9', '%1', 3, { cwd: '/repo', env: { TMUX: '/tmp/tmux' } }, fixture.exec), true);
     fixture.hooks.set(layoutSlot, 'run-shell -b foreign');
-    assert.equal(unregisterHudResizeHook('%1', fixture.exec), false);
-    assert.match(fixture.hooks.get(resizeSlot) ?? '', /omx-hud-owned/);
-    assert.equal(fixture.hooks.get(layoutSlot), 'run-shell -b foreign');
-    fixture.hooks.set(layoutSlot, fixture.hooks.get(resizeSlot)!.replace(resizeSlot, layoutSlot));
     assert.equal(unregisterHudResizeHook('%1', fixture.exec), true);
     assert.equal(fixture.hooks.has(resizeSlot), false);
-    assert.equal(fixture.hooks.has(layoutSlot), false);
+    assert.equal(fixture.hooks.get(layoutSlot), 'run-shell -b foreign');
   });
 
   it('uses leader-scoped slots and treats an absent pair as completed cleanup', () => {
