@@ -22,6 +22,7 @@ import {
   readSubagentSessionSummary,
   readSubagentSessionLedger,
   readSubagentTrackingState,
+  readSubagentTrackingStateStrict,
   recordSubagentTurn,
   recordSubagentTurnForSession,
   resolveInstalledRoleName,
@@ -3363,16 +3364,14 @@ function hasSubagentThreadSpawnProvenance(payload: CodexHookPayload): boolean {
 async function isThreadTrackedAsSubagent(cwd: string, threadId: string): Promise<boolean> {
   const id = threadId.trim();
   if (!id) return false;
-  try {
-    const state = await readSubagentTrackingState(cwd);
-    for (const session of Object.values(state.sessions)) {
-      if (session.threads?.[id]?.kind === "subagent") return true;
-    }
-    return false;
-  } catch {
-    // Fail closed for attestation: without readable tracker evidence, do not attest.
-    return true;
+  // Strict read: an unreadable/corrupt tracker fails closed (treated as "is a subagent")
+  // so corrupt evidence cannot let a source-less child reconcile/attest as leader.
+  const read = await readSubagentTrackingStateStrict(cwd);
+  if (!read.ok) return true;
+  for (const session of Object.values(read.state.sessions)) {
+    if (session.threads?.[id]?.kind === "subagent") return true;
   }
+  return false;
 }
 
 function buildNativeUnknownRolePreToolUseOutput(

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
@@ -8,6 +8,8 @@ import {
   attestLeaderThread,
   ensureLeaderAndRecordIntent,
   readSubagentTrackingState,
+  recordSubagentTurnForSession,
+  subagentTrackingPath,
 } from '../tracker.js';
 
 // 32 lowercase-hex chars: the canonical correlation-token shape the CLI generates via
@@ -131,6 +133,32 @@ describe('#3181 leader bootstrap tracker carrier', () => {
       const state = await readSubagentTrackingState(cwd);
       assert.equal(state.pending_role_intents.length, 1);
       assert.equal(state.pending_role_intents[0]?.role, 'architect');
+    });
+  });
+
+  it('atomically refuses to attest a thread already tracked as a subagent (native_anchor_mismatch)', async () => {
+    await withCwd(async (cwd) => {
+      await recordSubagentTurnForSession(cwd, {
+        sessionId: 'leader-session',
+        threadId: 'child-thread',
+        kind: 'subagent',
+        leaderThreadId: 'leader-session',
+        timestamp: new Date().toISOString(),
+      });
+      const result = attestLeaderThread(cwd, { sessionId: 'child-thread', leaderThreadId: 'child-thread', source: 'native-pretooluse' });
+      assert.deepEqual(result, { ok: false, reason: 'native_anchor_mismatch' });
+      const state = await readSubagentTrackingState(cwd);
+      assert.equal(state.sessions['child-thread'], undefined);
+    });
+  });
+
+  it('fails closed (native_anchor_unavailable) when the tracker file exists but is corrupt', async () => {
+    await withCwd(async (cwd) => {
+      const path = subagentTrackingPath(cwd);
+      await mkdir(join(cwd, '.omx', 'state'), { recursive: true });
+      await writeFile(path, '{ this is not valid json');
+      const result = attestLeaderThread(cwd, { sessionId: 'sess-a', leaderThreadId: 'leader-thread-a', source: 'native-pretooluse' });
+      assert.deepEqual(result, { ok: false, reason: 'native_anchor_unavailable' });
     });
   });
 });

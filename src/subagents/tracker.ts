@@ -766,6 +766,39 @@ function readSubagentTrackingStateSync(cwd: string): SubagentTrackingState {
   }
 }
 
+// #3181: strict readers for the leader-attestation security decision. A missing file is a
+// legitimate empty state (fresh turn), but an existing file that fails to read/parse must
+// NOT be silently treated as empty — that would let corrupt/unreadable subagent evidence
+// be bypassed. Callers making a security decision (attest vs deny) use these.
+function readSubagentTrackingStateSyncStrict(cwd: string): { ok: true; state: SubagentTrackingState } | { ok: false } {
+  const path = subagentTrackingPath(cwd);
+  if (!existsSync(path)) return { ok: true, state: createSubagentTrackingState() };
+  try {
+    return { ok: true, state: normalizeSubagentTrackingState(JSON.parse(readFileSync(path, 'utf-8'))) };
+  } catch {
+    return { ok: false };
+  }
+}
+
+export async function readSubagentTrackingStateStrict(cwd: string): Promise<{ ok: true; state: SubagentTrackingState } | { ok: false }> {
+  const path = subagentTrackingPath(cwd);
+  if (!existsSync(path)) return { ok: true, state: createSubagentTrackingState() };
+  try {
+    return { ok: true, state: normalizeSubagentTrackingState(JSON.parse(await readFile(path, 'utf-8'))) };
+  } catch {
+    return { ok: false };
+  }
+}
+
+function threadIsTrackedAsSubagent(state: SubagentTrackingState, threadId: string): boolean {
+  const id = threadId.trim();
+  if (!id) return false;
+  for (const session of Object.values(state.sessions)) {
+    if (session.threads[id]?.kind === 'subagent') return true;
+  }
+  return false;
+}
+
 function writeSubagentTrackingStateSync(
   cwd: string,
   state: SubagentTrackingState,
@@ -990,7 +1023,17 @@ export function attestLeaderThread(
   const nowMs = normalizeNowMs(input.nowMs);
   const nowIso = new Date(nowMs).toISOString();
   return withCrossProcessFileLockSync(subagentTrackingPath(cwd), (context) => {
-    const state = readSubagentTrackingStateSync(cwd);
+    // Strict read under the lock: an unreadable/corrupt tracker denies attestation
+    // (fail closed) rather than silently reading empty.
+    const read = readSubagentTrackingStateSyncStrict(cwd);
+    if (!read.ok) return { ok: false, reason: 'native_anchor_unavailable' as const };
+    const state = read.state;
+    // Atomic positive counter-evidence: a thread tracked as a subagent in ANY session is
+    // never attested as a leader. Checked under the same lock as the write so a concurrent
+    // child record cannot race in between a caller's pre-check and this attestation.
+    if (threadIsTrackedAsSubagent(state, leaderThreadId)) {
+      return { ok: false, reason: 'native_anchor_mismatch' as const };
+    }
     const existing = state.sessions[sessionId];
     const existingLeader = existing?.leader_thread_id?.trim();
     if (existingLeader && existingLeader !== leaderThreadId) {
