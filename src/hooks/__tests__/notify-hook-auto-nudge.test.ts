@@ -2672,6 +2672,101 @@ exit 0
     });
   });
 
+  it('G1a-N preserves ordered multi-skill classification and seeds only the ralplan primary when Team is enabled', async () => {
+    await withTempWorkingDir(async (cwd) => {
+      const stateDir = join(cwd, '.omx', 'state');
+      const sessionId = 'sess-g1a-notify-ordered';
+      const threadId = 'thread-g1a-notify-ordered';
+      const turnId = 'turn-g1a-notify-ordered';
+      const sessionDir = join(stateDir, 'sessions', sessionId);
+      const text = '$ralplan, $autopilot; $team';
+      let classification: ReturnType<typeof classifyKeywordInput> | undefined;
+      let writerClassification: ReturnType<typeof classifyKeywordInput> | undefined;
+      let writerCalls = 0;
+      const previousTeamMode = process.env.OMX_TEAM_MODE;
+      process.env.OMX_TEAM_MODE = 'enabled';
+
+      try {
+        const result = await recordNotifySkillActivation({
+          stateDir,
+          sourceCwd: cwd,
+          text,
+          sessionId,
+          threadId,
+          turnId,
+          payload: { type: 'agent-turn-complete', 'thread-id': threadId, 'turn-id': turnId },
+        }, {
+          classifyKeywordInput: (input) => {
+            classification = classifyKeywordInput(input);
+            return classification;
+          },
+          recordSkillActivation: async (input) => {
+            writerCalls += 1;
+            writerClassification = input.classification;
+            return recordSkillActivation(input);
+          },
+        });
+
+        assert.equal(writerCalls, 1);
+        assert.strictEqual(writerClassification, classification, 'notify must pass the ordered classifier output to the writer');
+        assert.deepEqual(classification?.matches.map((match) => match.skill), ['ralplan', 'autopilot', 'team']);
+        assert.equal(result?.skill, 'ralplan');
+        assert.deepEqual(result?.deferred_skills, ['autopilot', 'team']);
+        assert.deepEqual(result?.active_skills?.map((entry) => entry.skill), ['ralplan']);
+        assert.equal(existsSync(join(sessionDir, 'ralplan-state.json')), true);
+        assert.equal(existsSync(join(sessionDir, 'autopilot-state.json')), false);
+        assert.equal(existsSync(join(stateDir, 'team-state.json')), false);
+      } finally {
+        if (previousTeamMode === undefined) delete process.env.OMX_TEAM_MODE;
+        else process.env.OMX_TEAM_MODE = previousTeamMode;
+      }
+    });
+  });
+
+  it('G1c-N deduplicates exact canonical and alias Autopilot invocations across classifier, writer, canonical state, and detail state', async () => {
+    await withTempWorkingDir(async (cwd) => {
+      const stateDir = join(cwd, '.omx', 'state');
+      const sessionId = 'sess-g1c-notify-duplicate';
+      const threadId = 'thread-g1c-notify-duplicate';
+      const turnId = 'turn-g1c-notify-duplicate';
+      const sessionDir = join(stateDir, 'sessions', sessionId);
+      const text = '$autopilot $oh-my-codex:autopilot build it';
+      let classification: ReturnType<typeof classifyKeywordInput> | undefined;
+      let writerClassification: ReturnType<typeof classifyKeywordInput> | undefined;
+      let writerCalls = 0;
+
+      const result = await recordNotifySkillActivation({
+        stateDir,
+        sourceCwd: cwd,
+        text,
+        sessionId,
+        threadId,
+        turnId,
+        payload: { type: 'agent-turn-complete', 'thread-id': threadId, 'turn-id': turnId },
+      }, {
+        classifyKeywordInput: (input) => {
+          classification = classifyKeywordInput(input);
+          return classification;
+        },
+        recordSkillActivation: async (input) => {
+          writerCalls += 1;
+          writerClassification = input.classification;
+          return recordSkillActivation(input);
+        },
+      });
+
+      assert.equal(writerCalls, 1);
+      assert.strictEqual(writerClassification, classification, 'writer must receive the deduplicated classifier output');
+      assert.deepEqual(classification?.matches.map((match) => match.skill), ['autopilot']);
+      assert.equal(result?.skill, 'autopilot');
+      assert.deepEqual(result?.deferred_skills ?? [], []);
+      assert.deepEqual(result?.active_skills?.map((entry) => entry.skill), ['autopilot']);
+      const canonical = JSON.parse(await readFile(join(sessionDir, 'skill-active-state.json'), 'utf8')) as { active_skills?: Array<{ skill: string }> };
+      assert.deepEqual(canonical.active_skills?.map((entry) => entry.skill), ['autopilot']);
+      assert.equal(existsSync(join(sessionDir, 'autopilot-state.json')), true);
+    });
+  });
+
   // Notify Stop is N/A: it has no user-prompt activation transport to replay.
 
   it('G1b-N filters disabled Team before suppressing an exact same-turn terminal Autopilot replay without changing state bytes', async () => {
@@ -2776,6 +2871,12 @@ exit 0
   it('G2a sends the exact stale predecessor prompt through the shared classification and writer boundary without state', async () => {
     await withTempWorkingDir(async (cwd) => {
       const stateDir = join(cwd, 'isolated-g2a-state-root');
+      const sessionId = 'sess-g2a-stale-predecessor';
+      const sessionDir = join(stateDir, 'sessions', sessionId);
+      const rootSkillPath = join(stateDir, 'skill-active-state.json');
+      const sessionSkillPath = join(sessionDir, 'skill-active-state.json');
+      const rootRalplanPath = join(stateDir, 'ralplan-state.json');
+      const sessionRalplanPath = join(sessionDir, 'ralplan-state.json');
       const text = 'use $ralplan is the consensus-planning command';
       const textBytes = Buffer.from(text, 'utf8');
       let classification: ReturnType<typeof classifyKeywordInput> | undefined;
@@ -2787,7 +2888,7 @@ exit 0
         stateDir,
         sourceCwd: cwd,
         text,
-        sessionId: 'sess-g2a-stale-predecessor',
+        sessionId,
         threadId: 'thread-g2a-stale-predecessor',
         turnId: 'turn-g2a-stale-predecessor',
         payload: { type: 'agent-turn-complete' },
@@ -2810,10 +2911,14 @@ exit 0
       assert.deepEqual(classification?.matches, [], 'the stale predecessor wording must not activate ralplan');
       assert.equal(result, null);
       assert.equal(existsSync(stateDir), false, 'the stale predecessor wording must not create isolated state');
+      assert.equal(existsSync(rootSkillPath), false, 'the stale predecessor wording must not create root canonical state');
+      assert.equal(existsSync(sessionSkillPath), false, 'the stale predecessor wording must not create session canonical state');
+      assert.equal(existsSync(rootRalplanPath), false, 'the stale predecessor wording must not create root ralplan detail state');
+      assert.equal(existsSync(sessionRalplanPath), false, 'the stale predecessor wording must not create session ralplan detail state');
     });
   });
 
-  it('G2b preserves five distinct terminal state files for the exact negated notify prompt', async () => {
+  it('G2b-N preserves five distinct terminal state files for the exact negated notify prompt without a fabricated Stop signal', async () => {
     await withTempWorkingDir(async (cwd) => {
       const stateDir = join(cwd, '.omx', 'state');
       const sessionId = 'sess-g2b-negated-terminal';
@@ -2826,14 +2931,16 @@ exit 0
       const sessionSkillPath = join(sessionDir, 'skill-active-state.json');
       const sessionAutopilotPath = join(sessionDir, 'autopilot-state.json');
       const seededPaths = [sessionJsonPath, rootSkillPath, rootAutopilotPath, sessionSkillPath, sessionAutopilotPath];
+      const terminalBytes = [
+        Buffer.from(`{\n  "session_id": "${sessionId}",\n  "started_at": "2026-06-01T00:00:01.001Z",\n  "turn_id": "turn-g2b-session-pointer"\n}\n`),
+        Buffer.from(`{\n  "version": 1,\n  "active": true,\n  "skill": "autopilot",\n  "phase": "completing",\n  "updated_at": "2026-06-01T00:00:02.002Z",\n  "turn_id": "turn-g2b-root-skill"\n}\n`),
+        Buffer.from(`{\n  "mode": "autopilot",\n  "active": false,\n  "current_phase": "complete",\n  "completed_at": "2026-06-01T00:00:03.003Z",\n  "turn_id": "turn-g2b-root-detail"\n}\n`),
+        Buffer.from(`{\n  "version": 1,\n  "active": true,\n  "skill": "autopilot",\n  "phase": "completing",\n  "updated_at": "2026-06-01T00:00:04.004Z",\n  "turn_id": "turn-g2b-session-skill"\n}\n`),
+        Buffer.from(`{\n  "mode": "autopilot",\n  "active": false,\n  "current_phase": "complete",\n  "completed_at": "2026-06-01T00:00:05.005Z",\n  "turn_id": "turn-g2b-session-detail"\n}\n`),
+      ];
 
       await mkdir(sessionDir, { recursive: true });
-      await writeJson(sessionJsonPath, { session_id: sessionId, fixture: 'g2b-session-json' });
-      await writeJson(rootSkillPath, { version: 1, active: true, skill: 'autopilot', keyword: '$autopilot', phase: 'completing', fixture: 'g2b-root-skill', session_id: sessionId, thread_id: threadId, turn_id: turnId });
-      await writeJson(rootAutopilotPath, { mode: 'autopilot', active: false, current_phase: 'complete', completed_at: '2026-05-31T20:24:39.005Z', fixture: 'g2b-root-autopilot', session_id: sessionId, thread_id: threadId, turn_id: turnId });
-      await writeJson(sessionSkillPath, { version: 1, active: true, skill: 'autopilot', keyword: '$autopilot', phase: 'completing', fixture: 'g2b-session-skill', session_id: sessionId, thread_id: threadId, turn_id: turnId });
-      await writeJson(sessionAutopilotPath, { mode: 'autopilot', active: false, current_phase: 'complete', completed_at: '2026-05-31T20:24:39.005Z', fixture: 'g2b-session-autopilot', session_id: sessionId, thread_id: threadId, turn_id: turnId });
-      const bytesBefore = new Map(await Promise.all(seededPaths.map(async (path) => [path, await readFile(path)] as const)));
+      await Promise.all(seededPaths.map((path, index) => writeFile(path, terminalBytes[index]!)));
       const text = 'do not start $autopilot — café';
       const textBytes = Buffer.from(text, 'utf8');
       let classification: ReturnType<typeof classifyKeywordInput> | undefined;
@@ -2852,7 +2959,6 @@ exit 0
           type: 'agent-turn-complete',
           'thread-id': threadId,
           'turn-id': turnId,
-          'last-assistant-message': 'Autopilot complete.',
         },
       }, {
         classifyKeywordInput: (input) => {
@@ -2872,8 +2978,8 @@ exit 0
       assert.deepEqual(Buffer.from(writerText, 'utf8'), textBytes, 'notify must retain the exact negated input bytes');
       assert.deepEqual(classification?.matches, [], 'the exact negated input must not restart Autopilot');
       assert.equal(result, null);
-      for (const path of seededPaths) {
-        assert.deepEqual(await readFile(path), bytesBefore.get(path), `negated notify input must preserve ${path} byte-for-byte`);
+      for (const [index, path] of seededPaths.entries()) {
+        assert.deepEqual(await readFile(path), terminalBytes[index], `negated notify input must preserve ${path} byte-for-byte`);
       }
     });
   });

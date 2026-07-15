@@ -977,6 +977,7 @@ const ASCII_ADVANCE = asciiCaseWordPattern('advance');
 const ASCII_DIRECTIVE_COMMAND = `(?:${asciiCaseWordPattern('continue')}\\s+${ASCII_WITH}|${ASCII_JUMP}\\s+${ASCII_STRAIGHT}\\s+${ASCII_TO}|${ASCII_ADVANCE}\\s+${ASCII_TO}|${ASCII_DIRECTIVE_VERB})`;
 const DIRECTIVE_COMMAND_PREFIX_SOURCE = `(?:(?:${ASCII_PLEASE}\\s+)?(?:(?:${ASCII_INSTEAD}|${ASCII_THEN}|${ASCII_NOW})\\s+)?${ASCII_DIRECTIVE_COMMAND}\\s+|(?:${ASCII_PLEASE}\\s+)?(?:${ASCII_INSTEAD}|${ASCII_THEN}|${ASCII_NOW}|${ASCII_PLEASE})\\s+|(?:${ASCII_AND}|${ASCII_BUT})\\s+(?:${ASCII_PLEASE}\\s+)?(?:${ASCII_INSTEAD}\\s+)?${ASCII_DIRECTIVE_COMMAND}\\s+)(?:${ASCII_THE}\\s+)?`;
 const DIRECTIVE_COMMAND_PREFIX_AT = new RegExp(DIRECTIVE_COMMAND_PREFIX_SOURCE, 'yu');
+
 const EXCLUSION_PREFIX = `(?:${['ignore', 'discard', 'skip', 'omit', 'forget', 'disregard', 'except'].map(asciiCaseWordPattern).join('|')}|${asciiCaseWordPattern('exclude')}(?:${asciiCaseWordPattern('ing')})?)`;
 const ASCII_NEGATIVE_PREFIX = `(?:${asciiCaseWordPattern('do')}\\s+${asciiCaseWordPattern('not')}|${asciiCaseWordPattern('don')}'${asciiCaseWordPattern('t')}|${asciiCaseWordPattern('without')}|${asciiCaseWordPattern('never')}|${asciiCaseWordPattern('not')}|${asciiCaseWordPattern('no')}|${asciiCaseWordPattern('neither')}|${asciiCaseWordPattern('nor')}|${asciiCaseWordPattern('avoid')}(?:${asciiCaseWordPattern('ing')})?|${asciiCaseWordPattern('cannot')}|${asciiCaseWordPattern('can')}'${asciiCaseWordPattern('t')}|${EXCLUSION_PREFIX})`;
 const NEGATIVE_PREFIX_PATTERN = new RegExp(`(?:${ASCII_NEGATIVE_PREFIX}|[Нн][Ее]\\s+(?:[Зз]апускай|[Ии]спользуй)|実行しないで|使わないで)`, 'u');
@@ -1041,14 +1042,23 @@ function hasAsciiDirectiveCommand(text: string): boolean {
   return false;
 }
 
+function isDiscourseNegation(text: string, start: number, end: number): boolean {
+  const suffix = text.slice(end);
+  if (/^\s+worries\s*[,，،、]/iu.test(suffix)) return true;
+  return /(?:^|\s)i'm\s+$/iu.test(text.slice(0, start))
+    && /^\s+sure\s*[,，،、]/iu.test(suffix);
+}
+
 function hasUnicodeBoundedNegativePrefix(text: string): boolean {
   const scanner = new RegExp(NEGATIVE_PREFIX_PATTERN.source, 'gu');
   let match: RegExpExecArray | null;
   while ((match = scanner.exec(text)) !== null) {
-    if (hasUnicodeGrammarTokenBoundaries(text, match.index, scanner.lastIndex)) return true;
+    if (hasUnicodeGrammarTokenBoundaries(text, match.index, scanner.lastIndex)
+      && !isDiscourseNegation(text, match.index, scanner.lastIndex)) return true;
   }
   return false;
 }
+
 
 function isNegativePrefixExemptImplicitKeyword(keyword: string): boolean {
   const normalized = keyword.toLowerCase();
@@ -1545,12 +1555,14 @@ function directiveCommandTargetStart(text: string, cursor: number, limit = text.
   return targetStart !== null && targetStart <= limit ? targetStart : null;
 }
 
+
 function promptLeadingExplicitCandidateStart(text: string): number {
   const leading = leadingDirectiveCursor(text, 0, true);
   if (text[leading.cursor] === '$') return leading.cursor;
   const commandTarget = directiveCommandTargetStart(text, leading.cursor);
   return commandTarget !== null && text[commandTarget] === '$' ? commandTarget : leading.cursor;
 }
+
 
 function punctuationSeparatedCandidateStart(text: string, cursor: number): number | null {
   let next = boundedHorizontalCursor(text, cursor, text.length);
@@ -3003,7 +3015,8 @@ function collectImplicitClauseIndex(text: string, documentationBlocks: readonly 
   let prefix: RegExpExecArray | null;
   let prefixCoveredUntil = -1;
   while ((prefix = prefixScanner.exec(normalizedText)) !== null) {
-    if (!hasUnicodeGrammarTokenBoundaries(normalizedText, prefix.index, prefixScanner.lastIndex)) continue;
+    if (!hasUnicodeGrammarTokenBoundaries(normalizedText, prefix.index, prefixScanner.lastIndex)
+      || isDiscourseNegation(normalizedText, prefix.index, prefixScanner.lastIndex)) continue;
     if (prefix.index < prefixCoveredUntil) continue;
     const lineIndex = lineIndexAt(lineStarts, prefix.index);
     const lineLimit = lineEnds[lineIndex] ?? text.length;

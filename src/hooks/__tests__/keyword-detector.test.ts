@@ -536,6 +536,21 @@ describe('keyword input classification direct grammar', () => {
     }
   });
 
+
+  it('does not extend discourse negation beyond a comma-separated directive', () => {
+    for (const text of [
+      'No worries, use autopilot mode.',
+      "I'm not sure, please use autopilot mode.",
+    ] as const) {
+      assert.deepEqual(classifyKeywordInput(text).matches.map((match) => match.skill), ['autopilot'], text);
+    }
+
+    for (const text of ['Do not use autopilot mode.', 'No autopilot mode.'] as const) {
+      assert.deepEqual(classifyKeywordInput(text).matches, [], text);
+    }
+  });
+
+
   it('accepts every directive verb and polite prefix for every explicit token and alias', () => {
     const tokens = new Set([
       ...KEYWORD_TRIGGER_DEFINITIONS
@@ -636,6 +651,46 @@ describe('keyword input classification direct grammar', () => {
 
     const relativeCloser = classifyKeywordInput('- ```\n  sample\n    ```\n$ralplan plan it');
     assert.deepEqual(relativeCloser.matches.map((match) => match.skill), ['ralplan']);
+  });
+
+  it('binds B3 through B5 fence candidates exactly', () => {
+    const cases = [
+      {
+        text: '```\n$ralph\n````\n$ralplan plan it',
+        skills: ['ralplan'],
+        candidates: [
+          { rawKeyword: '$ralph', reasons: ['fenced-code', 'not-leading-region'] },
+          { rawKeyword: '$ralplan', reasons: [] },
+        ],
+      },
+      {
+        text: '````\n$ralplan\n```\n$ralph ship it',
+        skills: [],
+        candidates: [
+          { rawKeyword: '$ralplan', reasons: ['fenced-code', 'not-leading-region'] },
+          { rawKeyword: '$ralph', reasons: ['fenced-code', 'not-leading-region'] },
+        ],
+      },
+      {
+        text: '```\n$ralplan\n~~~\n$ralph ship it',
+        skills: [],
+        candidates: [
+          { rawKeyword: '$ralplan', reasons: ['fenced-code', 'not-leading-region'] },
+          { rawKeyword: '$ralph', reasons: ['fenced-code', 'not-leading-region'] },
+        ],
+      },
+    ] as const;
+
+    for (const testCase of cases) {
+      const classification = classifyKeywordInput(testCase.text);
+      assert.equal(classification.reservedInput, null, testCase.text);
+      assert.deepEqual(classification.matches.map((match) => match.skill), testCase.skills, testCase.text);
+      assert.deepEqual(
+        classification.candidates.map((candidate) => ({ rawKeyword: candidate.rawKeyword, reasons: candidate.reasons })),
+        testCase.candidates,
+        testCase.text,
+      );
+    }
   });
 
   it('masks multiline Markdown reference titles', () => {
@@ -1543,6 +1598,53 @@ describe('keyword input classification direct grammar', () => {
       const classification = classifyKeywordInput(testCase.text);
       assert.equal(classification.reservedInput, testCase.reservedInput, testCase.text);
       assert.deepEqual(classification.matches.map((match) => match.skill), testCase.skills, testCase.text);
+    }
+  });
+
+  it('binds G1 and G2 direct classification fields exactly', () => {
+    const cases = [
+      {
+        text: '$ralplan, $autopilot; $team',
+        reservedInput: null,
+        skills: ['ralplan', 'autopilot', 'team'],
+        candidates: [
+          { rawKeyword: '$ralplan', reasons: [] },
+          { rawKeyword: '$autopilot', reasons: [] },
+          { rawKeyword: '$team', reasons: [] },
+        ],
+      },
+      {
+        text: '$ultrawork $ulw',
+        reservedInput: null,
+        skills: ['ultrawork'],
+        candidates: [
+          { rawKeyword: '$ultrawork', reasons: [] },
+          { rawKeyword: '$ulw', reasons: [] },
+        ],
+      },
+      {
+        text: 'use $ralplan is the consensus-planning command',
+        reservedInput: null,
+        skills: [],
+        candidates: [{ rawKeyword: '$ralplan', reasons: ['not-leading-region'] }],
+      },
+      {
+        text: 'do not start $autopilot — café',
+        reservedInput: null,
+        skills: [],
+        candidates: [{ rawKeyword: '$autopilot', reasons: ['not-leading-region'] }],
+      },
+    ] as const;
+
+    for (const testCase of cases) {
+      const classification = classifyKeywordInput(testCase.text);
+      assert.equal(classification.reservedInput, testCase.reservedInput, testCase.text);
+      assert.deepEqual(classification.matches.map((match) => match.skill), testCase.skills, testCase.text);
+      assert.deepEqual(
+        classification.candidates.map((candidate) => ({ rawKeyword: candidate.rawKeyword, reasons: candidate.reasons })),
+        testCase.candidates,
+        testCase.text,
+      );
     }
   });
 
