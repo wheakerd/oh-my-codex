@@ -1369,9 +1369,9 @@ function smokeInstalledNativeHookDist(prefixDir: string): void {
       validateHookStdout(eventName, result.stdout as string);
     }
 
-    for (const testCase of PACKED_INSTALL_NATIVE_HOOK_REGRESSION_PROMPTS) {
+    for (const [caseIndex, testCase] of PACKED_INSTALL_NATIVE_HOOK_REGRESSION_PROMPTS.entries()) {
       const caseCwd = join(smokeCwd, testCase.name);
-      const sessionId = `packed-install-regression-${testCase.name}`;
+      const sessionId = `packed-regression-${caseIndex}`;
       mkdirSync(caseCwd, { recursive: true });
       const environment = buildPackedRegressionEnvironment(testCase);
       const promptPayload = {
@@ -1379,8 +1379,8 @@ function smokeInstalledNativeHookDist(prefixDir: string): void {
         cwd: caseCwd,
         source: 'codex-app',
         session_id: sessionId,
-        thread_id: `thread-${testCase.name}`,
-        turn_id: `turn-${testCase.name}`,
+        thread_id: `thread-${caseIndex}`,
+        turn_id: `turn-${caseIndex}`,
         prompt: testCase.prompt,
       };
       const promptResult = run(process.execPath, [realpathSync(hookScript)], {
@@ -1406,7 +1406,7 @@ function smokeInstalledNativeHookDist(prefixDir: string): void {
       const stopResult = run(process.execPath, [realpathSync(hookScript)], {
         cwd: caseCwd,
         env: environment,
-        input: JSON.stringify({ ...promptPayload, hook_event_name: 'Stop', turn_id: `stop-${testCase.name}` }),
+        input: JSON.stringify({ ...promptPayload, hook_event_name: 'Stop', turn_id: `stop-${caseIndex}` }),
       });
       const stopOutput = JSON.parse(String(stopResult.stdout || '{}')) as { decision?: string };
       if (testCase.expectedStopBlock && stopOutput.decision !== 'block') {
