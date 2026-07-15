@@ -43,6 +43,14 @@ export interface TrackedSubagentThread {
 export interface TrackedSubagentSession {
   session_id: string;
   leader_thread_id?: string;
+  // #3181: durable native-hook leader attestation. The native hook (SessionStart/
+  // PreToolUse) writes these when it reconciles the canonical session pointer so a
+  // fresh in-turn `role-intent write` can authenticate the leader before the
+  // turn-completion notify path would otherwise seed tracker activity. The CLI reads
+  // `leader_thread_id` as the attested leader and MUST NOT infer it from a native
+  // session id or a caller-supplied `--parent-thread`.
+  leader_attested_at?: string;
+  leader_attest_source?: string;
   updated_at: string;
   threads: Record<string, TrackedSubagentThread>;
 }
@@ -341,6 +349,12 @@ export function normalizeSubagentTrackingState(input: unknown): SubagentTracking
 
     const sessionCandidate = rawSession as TrackedSubagentSession;
     const leaderThreadId = typeof sessionCandidate.leader_thread_id === 'string' ? sessionCandidate.leader_thread_id.trim() || undefined : undefined;
+    const leaderAttestedAt = typeof sessionCandidate.leader_attested_at === 'string' && sessionCandidate.leader_attested_at.trim().length > 0
+      ? sessionCandidate.leader_attested_at.trim()
+      : undefined;
+    const leaderAttestSource = typeof sessionCandidate.leader_attest_source === 'string' && sessionCandidate.leader_attest_source.trim().length > 0
+      ? sessionCandidate.leader_attest_source.trim()
+      : undefined;
     const updatedAt =
       typeof sessionCandidate.updated_at === 'string' && sessionCandidate.updated_at.trim().length > 0
         ? sessionCandidate.updated_at
@@ -349,6 +363,8 @@ export function normalizeSubagentTrackingState(input: unknown): SubagentTracking
     sessions[sessionId] = {
       session_id: sessionId,
       leader_thread_id: leaderThreadId,
+      ...(leaderAttestedAt ? { leader_attested_at: leaderAttestedAt } : {}),
+      ...(leaderAttestSource ? { leader_attest_source: leaderAttestSource } : {}),
       updated_at: updatedAt,
       threads,
     };
@@ -943,6 +959,150 @@ export function recordPendingRoleIntent(
     context.assertOwnership();
     writeSubagentTrackingStateSync(cwd, state, context.publish);
     return { ok: true, intent };
+  });
+}
+
+export type LeaderBootstrapFailureReason =
+  | 'unknown_role'
+  | 'invalid_correlation_token'
+  | 'invalid_origin'
+  | 'single_flight_conflict'
+  | 'native_anchor_unavailable'
+  | 'native_anchor_mismatch';
+
+/**
+ * #3181 Phase 1 carrier write. Durably attest the authenticated leader thread for a
+ * session from native-hook-reconciled metadata. Idempotent and fail-closed: it seeds
+ * `leader_thread_id` + `leader_attested_at` + `leader_attest_source` only when the
+ * session has no conflicting leader already. A different existing leader is NEVER
+ * overwritten (returns `native_anchor_mismatch`) so a stale/foreign leader cannot be
+ * replaced from a later turn. Authority for `leaderThreadId` is the caller's native
+ * payload thread; it must never be derived from a native session id.
+ */
+export function attestLeaderThread(
+  cwd: string,
+  input: { sessionId: string; leaderThreadId: string; source: string; nowMs?: number },
+): { ok: true; alreadyAttested: boolean } | { ok: false; reason: 'native_anchor_unavailable' | 'native_anchor_mismatch' } {
+  const sessionId = input.sessionId.trim();
+  const leaderThreadId = input.leaderThreadId.trim();
+  const source = input.source.trim() || 'native';
+  if (!sessionId || !leaderThreadId) return { ok: false, reason: 'native_anchor_unavailable' };
+  const nowMs = normalizeNowMs(input.nowMs);
+  const nowIso = new Date(nowMs).toISOString();
+  return withCrossProcessFileLockSync(subagentTrackingPath(cwd), (context) => {
+    const state = readSubagentTrackingStateSync(cwd);
+    const existing = state.sessions[sessionId];
+    const existingLeader = existing?.leader_thread_id?.trim();
+    if (existingLeader && existingLeader !== leaderThreadId) {
+      return { ok: false, reason: 'native_anchor_mismatch' as const };
+    }
+    if (existing && existingLeader === leaderThreadId && existing.leader_attested_at) {
+      return { ok: true, alreadyAttested: true };
+    }
+    const session: TrackedSubagentSession = existing
+      ? { ...existing }
+      : { session_id: sessionId, updated_at: nowIso, threads: {} };
+    session.leader_thread_id = leaderThreadId;
+    session.leader_attested_at = nowIso;
+    session.leader_attest_source = source;
+    session.updated_at = nowIso;
+    state.sessions = { ...state.sessions, [sessionId]: session };
+    context.assertOwnership();
+    writeSubagentTrackingStateSync(cwd, state, context.publish);
+    return { ok: true, alreadyAttested: false };
+  });
+}
+
+/**
+ * #3181 Phase 2. Single tracker-locked publish that self-heals the leader thread record
+ * from a durable native attestation and records the pending role intent in the same
+ * operation, closing the previous verify-then-record TOCTOU window. Fail-closed:
+ * requires a durable attested leader for the session (`native_anchor_unavailable`
+ * otherwise) and requires `parentThreadId` to equal the attested `leader_thread_id`
+ * (`native_anchor_mismatch` otherwise). `leaderThreadId` is never inferred from a
+ * native session id. Duplicate same-identity intents reuse the original receipt
+ * (idempotent), never a second leader or a second intent.
+ */
+export function ensureLeaderAndRecordIntent(
+  cwd: string,
+  input: {
+    role: string;
+    sessionId: string;
+    parentThreadId: string;
+    correlationToken: string;
+    ttlMs?: number;
+    nowMs?: number;
+  },
+): { ok: true; intent: PendingRoleIntent; reused: boolean } | { ok: false; reason: LeaderBootstrapFailureReason } {
+  const role = resolveInstalledRoleName(input.role);
+  if (!role) return { ok: false, reason: 'unknown_role' };
+  const correlationToken = input.correlationToken;
+  if (!isCanonicalCorrelationToken(correlationToken)) {
+    return { ok: false, reason: 'invalid_correlation_token' };
+  }
+  const nowMs = normalizeNowMs(input.nowMs);
+  const sessionId = input.sessionId.trim();
+  const parentThreadId = input.parentThreadId.trim();
+  const canonicalOrigin = canonicalizeOriginCwd(cwd);
+  if (canonicalOrigin === null) return { ok: false, reason: 'invalid_origin' };
+  const { isOwn, shouldPruneExpired } = pendingRoleIntentPredicates(cwd, canonicalOrigin, nowMs);
+  return withCrossProcessFileLockSync(subagentTrackingPath(cwd), (context) => {
+    const state = readSubagentTrackingStateSync(cwd);
+    const session = state.sessions[sessionId];
+    const attestedLeader = session?.leader_thread_id?.trim();
+    // Fail closed unless a durable native attestation established the leader anchor.
+    if (!session || !attestedLeader || !session.leader_attested_at) {
+      return { ok: false, reason: 'native_anchor_unavailable' as const };
+    }
+    if (parentThreadId !== attestedLeader) {
+      return { ok: false, reason: 'native_anchor_mismatch' as const };
+    }
+
+    // Idempotent reuse: a live own intent for this exact identity returns its original
+    // receipt instead of creating a second intent.
+    const all = state.pending_role_intents;
+    const existingIntent = all.find((intent) => (
+      isOwn(intent)
+      && intent.role === role
+      && intent.session_id === sessionId
+      && intent.parent_thread_id === parentThreadId
+      && (intent.binding_state === 'bound' || !isExpiredPendingRoleIntent(intent, nowMs))
+    ));
+    if (existingIntent) {
+      return { ok: true, intent: existingIntent, reused: true };
+    }
+
+    // Self-heal the leader thread record so leader-anchor consumers see kind:"leader".
+    const nowIso = new Date(nowMs).toISOString();
+    const nextSession: TrackedSubagentSession = { ...session, threads: { ...session.threads } };
+    const existingLeaderThread = nextSession.threads[attestedLeader];
+    if (!existingLeaderThread || existingLeaderThread.kind !== 'leader') {
+      nextSession.threads[attestedLeader] = {
+        ...(existingLeaderThread ?? {}),
+        thread_id: attestedLeader,
+        kind: 'leader',
+        first_seen_at: existingLeaderThread?.first_seen_at ?? nowIso,
+        last_seen_at: nowIso,
+        turn_count: existingLeaderThread?.turn_count ?? 0,
+      };
+    }
+    nextSession.updated_at = nowIso;
+
+    const ttlMs = typeof input.ttlMs === 'number' && Number.isFinite(input.ttlMs) ? input.ttlMs : 10 * 60_000;
+    const intent: PendingRoleIntent = {
+      role,
+      session_id: sessionId,
+      parent_thread_id: parentThreadId,
+      correlation_token: correlationToken,
+      created_at: nowIso,
+      expires_at: new Date(nowMs + ttlMs).toISOString(),
+      ...(canonicalOrigin ? { origin_cwd: canonicalOrigin } : {}),
+    };
+    state.sessions = { ...state.sessions, [sessionId]: nextSession };
+    state.pending_role_intents = [...all.filter((candidate) => !shouldPruneExpired(candidate)), intent];
+    context.assertOwnership();
+    writeSubagentTrackingStateSync(cwd, state, context.publish);
+    return { ok: true, intent, reused: false };
   });
 }
 
