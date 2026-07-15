@@ -4178,18 +4178,23 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
       console.warn(`[team shutdown] ${sanitized}: preserving Team HUD pane, hooks, and metadata because fresh exact HUD authority evidence or lifecycle lock was unavailable`);
     }
 
-    const clientHookTarget = lockedHudPaneId && ownsHudTeardownAuthority
-      ? (config.resize_hook_target || sessionName)
-      : null;
+    const ownsHudHookTeardownAuthority = Boolean(
+      ownsHudLifecycleLock
+      && hasFreshHudRestoreEvidence
+      && config.resize_hook_name
+      && config.resize_hook_target
+      && hudPaneId,
+    );
+    const clientHookTarget = ownsHudHookTeardownAuthority ? config.resize_hook_target : null;
     let hooksRemoved = false;
-    if (clientHookTarget && lockedHudPaneId && config.resize_hook_name && config.resize_hook_target) {
+    if (clientHookTarget && config.resize_hook_name && hudPaneId) {
       const windowIndex = clientHookTarget.slice(clientHookTarget.lastIndexOf(':') + 1);
       const clientHookName = windowIndex
-        ? buildClientAttachedReconcileHookName(sanitized, sessionName.split(':')[0] ?? sessionName, windowIndex, lockedHudPaneId)
+        ? buildClientAttachedReconcileHookName(sanitized, sessionName.split(':')[0] ?? sessionName, windowIndex, hudPaneId)
         : '';
       hooksRemoved = Boolean(
         clientHookName
-        && unregisterHudHooksTransactionally(clientHookTarget, config.resize_hook_name, clientHookName, lockedHudPaneId)
+        && unregisterHudHooksTransactionally(clientHookTarget, config.resize_hook_name, clientHookName, hudPaneId)
       );
       if (!hooksRemoved) {
         console.warn(`[team shutdown] ${sanitized}: preserving Team HUD pane and metadata because authorized HUD hook cleanup failed; hook state may have changed`);

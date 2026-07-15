@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { delimiter, isAbsolute, join, relative, resolve as resolvePath } from 'path';
 import { existsSync, realpathSync } from 'fs';
-import { readFile, readdir } from 'fs/promises';
+import { readFile, readdir, mkdir, rename, writeFile } from 'fs/promises';
 import {
   isSessionStateUsable,
   readUsableSessionState,
@@ -86,7 +86,11 @@ export interface HudTmuxBirthLineage {
   tmuxPaneInstanceId: string;
 }
 
-const HUD_TMUX_BIRTH_LINEAGE_FILE = 'hud-tmux-birth-lineage.json';
+const HUD_TMUX_BIRTH_LINEAGE_DIR = 'hud-tmux-birth-lineage';
+
+function hudTmuxBirthLineagePath(baseStateDir: string, sessionId: string): string {
+  return join(baseStateDir, HUD_TMUX_BIRTH_LINEAGE_DIR, `${createHash('sha256').update(sessionId).digest('hex')}.json`);
+}
 
 export async function writeHudTmuxBirthLineage(
   domain: Pick<ResolvedHudControlPlaneDomain, 'baseStateDir'>,
@@ -96,15 +100,18 @@ export async function writeHudTmuxBirthLineage(
   if (values.some((value) => typeof value !== 'string' || value.trim() === '')) {
     throw new Error('HUD tmux birth lineage requires complete evidence');
   }
-  const { mkdir, writeFile } = await import('fs/promises');
-  await mkdir(domain.baseStateDir, { recursive: true });
-  await writeFile(join(domain.baseStateDir, HUD_TMUX_BIRTH_LINEAGE_FILE), `${JSON.stringify(lineage)}\n`, { mode: 0o600 });
+  const directory = join(domain.baseStateDir, HUD_TMUX_BIRTH_LINEAGE_DIR);
+  await mkdir(directory, { recursive: true });
+  const target = hudTmuxBirthLineagePath(domain.baseStateDir, lineage.sessionId);
+  const temporary = `${target}.${process.pid}.${Date.now()}.tmp`;
+  await writeFile(temporary, `${JSON.stringify(lineage)}\n`, { mode: 0o600 });
+  await rename(temporary, target);
 }
 
 async function readHudTmuxBirthLineage(baseStateDir: string, sessionId: string | undefined): Promise<HudTmuxBirthLineage | null> {
   if (!sessionId) return null;
   try {
-    const value: unknown = JSON.parse(await readFile(join(baseStateDir, HUD_TMUX_BIRTH_LINEAGE_FILE), 'utf-8'));
+    const value: unknown = JSON.parse(await readFile(hudTmuxBirthLineagePath(baseStateDir, sessionId), 'utf-8'));
     if (!value || typeof value !== 'object') return null;
     const candidate = value as Partial<HudTmuxBirthLineage>;
     if (
