@@ -105,7 +105,9 @@ describe('ralplan role-intent write', () => {
   it('records the authenticated current-session native leader intent with a correlation token receipt', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-ralplan-role-intent-'));
     try {
-      await writeCurrentSession(cwd, 'current-session', 'native-leader', 'tracker-leader');
+      // A real leader's tracker leader_thread_id equals its native session id; #3181
+      // authorizes the legacy native path only against that positively-provenanced anchor.
+      await writeCurrentSession(cwd, 'current-session', 'native-leader', 'native-leader');
 
       const result = await invokeRoleIntent(cwd, [
         'role-intent', 'write', '--role', 'ARCHITECT', '--parent-thread', 'native-leader', '--ttl-ms', '5000', '--json',

@@ -225,43 +225,58 @@ describe('#3181 leader bootstrap tracker carrier', () => {
     });
   });
 
-  it('recordNativeLeaderIntent records under a valid native anchor and is role-agnostic single-flight', async () => {
+  it('recordNativeLeaderIntent records under a positively-provenanced tracker leader and is role-agnostic single-flight', async () => {
     await withCwd(async (cwd) => {
+      // A real recorded leader turn establishes the positive tracker leader anchor.
+      await recordSubagentTurnForSession(cwd, { sessionId: 'sess-A', threadId: 'native-L', kind: 'leader', leaderThreadId: 'native-L', timestamp: new Date().toISOString() });
       const ok = recordNativeLeaderIntent(cwd, {
-        role: 'architect', sessionId: 'sess-A', parentThreadId: 'native-L', nativeSessionId: 'native-L', allowTrackerLeader: true, correlationToken: TOKEN,
+        role: 'architect', sessionId: 'sess-A', parentThreadId: 'native-L', allowTrackerLeader: true, correlationToken: TOKEN,
       });
       assert.equal(ok.ok, true);
       if (!ok.ok) return;
       assert.equal(ok.intent.role, 'architect');
       // Same identity reuses; different role conflicts.
-      const reuse = recordNativeLeaderIntent(cwd, { role: 'architect', sessionId: 'sess-A', parentThreadId: 'native-L', nativeSessionId: 'native-L', allowTrackerLeader: true, correlationToken: TOKEN2 });
+      const reuse = recordNativeLeaderIntent(cwd, { role: 'architect', sessionId: 'sess-A', parentThreadId: 'native-L', allowTrackerLeader: true, correlationToken: TOKEN2 });
       assert.equal(reuse.ok, true);
       if (reuse.ok) assert.equal(reuse.reused, true);
-      const conflict = recordNativeLeaderIntent(cwd, { role: 'critic', sessionId: 'sess-A', parentThreadId: 'native-L', nativeSessionId: 'native-L', allowTrackerLeader: true, correlationToken: TOKEN2 });
+      const conflict = recordNativeLeaderIntent(cwd, { role: 'critic', sessionId: 'sess-A', parentThreadId: 'native-L', allowTrackerLeader: true, correlationToken: TOKEN2 });
       assert.deepEqual(conflict, { ok: false, reason: 'single_flight_conflict' });
       assert.equal((await readSubagentTrackingState(cwd)).pending_role_intents.length, 1);
     });
   });
 
-  it('recordNativeLeaderIntent rejects a parent that is not a native anchor (parent_not_active_leader), no mutation', async () => {
+  it('recordNativeLeaderIntent fails closed when there is no positive tracker leader anchor (session.json alone never authorizes)', async () => {
     await withCwd(async (cwd) => {
+      // No recorded leader turn / attestation: the bare native-session pointer is NOT trusted.
       const res = recordNativeLeaderIntent(cwd, {
-        role: 'architect', sessionId: 'sess-A', parentThreadId: 'attacker', nativeSessionId: 'native-L', allowTrackerLeader: true, correlationToken: TOKEN,
+        role: 'architect', sessionId: 'sess-A', parentThreadId: 'native-L', allowTrackerLeader: true, correlationToken: TOKEN,
       });
       assert.deepEqual(res, { ok: false, reason: 'parent_not_active_leader' });
       assert.deepEqual((await readSubagentTrackingState(cwd)).pending_role_intents, []);
     });
   });
 
-  it('recordNativeLeaderIntent atomically rejects a native anchor also tracked as a subagent (race: child record wins)', async () => {
+  it('recordNativeLeaderIntent rejects a parent that is not the tracker leader (parent_not_active_leader), no mutation', async () => {
     await withCwd(async (cwd) => {
-      // The child record wins the race: the native-anchor thread is recorded as a subagent
-      // in a different session before the legacy fallback runs.
+      await recordSubagentTurnForSession(cwd, { sessionId: 'sess-A', threadId: 'native-L', kind: 'leader', leaderThreadId: 'native-L', timestamp: new Date().toISOString() });
+      const res = recordNativeLeaderIntent(cwd, {
+        role: 'architect', sessionId: 'sess-A', parentThreadId: 'attacker', allowTrackerLeader: true, correlationToken: TOKEN,
+      });
+      assert.deepEqual(res, { ok: false, reason: 'parent_not_active_leader' });
+      assert.deepEqual((await readSubagentTrackingState(cwd)).pending_role_intents, []);
+    });
+  });
+
+  it('recordNativeLeaderIntent atomically rejects a tracker leader also tracked as a subagent (race: child record wins)', async () => {
+    await withCwd(async (cwd) => {
+      await recordSubagentTurnForSession(cwd, { sessionId: 'sess-A', threadId: 'native-L', kind: 'leader', leaderThreadId: 'native-L', timestamp: new Date().toISOString() });
+      // The child record wins the race: the same thread is recorded as a subagent in a
+      // different session before the legacy fallback runs.
       await recordSubagentTurnForSession(cwd, {
         sessionId: 'sess-B', threadId: 'native-L', kind: 'subagent', leaderThreadId: 'sess-B', timestamp: new Date().toISOString(),
       });
       const res = recordNativeLeaderIntent(cwd, {
-        role: 'architect', sessionId: 'sess-A', parentThreadId: 'native-L', nativeSessionId: 'native-L', allowTrackerLeader: true, correlationToken: TOKEN,
+        role: 'architect', sessionId: 'sess-A', parentThreadId: 'native-L', allowTrackerLeader: true, correlationToken: TOKEN,
       });
       assert.deepEqual(res, { ok: false, reason: 'native_anchor_mismatch' });
       assert.deepEqual((await readSubagentTrackingState(cwd)).pending_role_intents, []);
@@ -273,7 +288,7 @@ describe('#3181 leader bootstrap tracker carrier', () => {
       await mkdir(subagentTrackingPath(cwd).replace(/\/[^/]+$/, ''), { recursive: true });
       await writeFile(subagentTrackingPath(cwd), '{ corrupt not json');
       const res = recordNativeLeaderIntent(cwd, {
-        role: 'architect', sessionId: 'sess-A', parentThreadId: 'native-L', nativeSessionId: 'native-L', allowTrackerLeader: true, correlationToken: TOKEN,
+        role: 'architect', sessionId: 'sess-A', parentThreadId: 'native-L', allowTrackerLeader: true, correlationToken: TOKEN,
       });
       assert.deepEqual(res, { ok: false, reason: 'native_anchor_unavailable' });
       assert.equal(await readFile(subagentTrackingPath(cwd), 'utf-8'), '{ corrupt not json');

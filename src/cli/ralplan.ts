@@ -134,9 +134,6 @@ export async function ralplanCommand(
       role: parsed.role,
       sessionId: currentScope.sessionId,
       parentThreadId: parsed.parentThreadId,
-      ...(hasUsableCurrentPointer && currentScope.metadata?.nativeSessionId
-        ? { nativeSessionId: currentScope.metadata.nativeSessionId }
-        : {}),
       allowTrackerLeader: hasUsableCurrentPointer,
       correlationToken,
       ...(parsed.ttlMs === undefined ? {} : { ttlMs: parsed.ttlMs }),

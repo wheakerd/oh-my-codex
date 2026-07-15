@@ -22,7 +22,7 @@ async function invokeRoleIntent(cwd: string, args: string[]) {
 }
 
 describe('#3181 end-to-end fresh App turn bootstrap', () => {
-  it('SessionStart establishes the canonical pointer (without attesting) so a fresh in-turn role-intent write succeeds via native-session auth', async () => {
+  it('SessionStart reconcile alone neither attests nor authorizes a role intent (fail-closed; positive provenance required)', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-3181-e2e-'));
     const priorEnv = { OMX_SESSION_ID: process.env.OMX_SESSION_ID, CODEX_SESSION_ID: process.env.CODEX_SESSION_ID, SESSION_ID: process.env.SESSION_ID };
     try {
@@ -38,24 +38,21 @@ describe('#3181 end-to-end fresh App turn bootstrap', () => {
       );
 
       // 2. SessionStart reconciles the canonical pointer but does NOT attest a leader
-      //    (a null transcript cannot positively classify a root vs a malformed child).
+      //    (a null transcript cannot positively classify a root vs a malformed child) and
+      //    writes no positively-provenanced tracker leader.
       const afterStart = await readSubagentTrackingState(cwd);
       assert.equal(afterStart.sessions[nativeSessionId]?.leader_attested_at, undefined, 'SessionStart must not attest a leader');
 
-      // 3. The first in-turn command still succeeds: session.json's native_session_id
-      //    authenticates the leader via the legacy native-session path (no more
-      //    missing_session), reproducing the exact #3181 repro command shape.
+      // 3. A role-intent write on the reconciled-pointer-only session FAILS CLOSED: the bare
+      //    session.json native_session_id is not a trusted leader anchor (an ambiguous /
+      //    malformed-child SessionStart could set it). Authorization requires positive
+      //    provenance — a PreToolUse attestation (next test) or a recorded tracker leader.
       const res = await invokeRoleIntent(cwd, ['role-intent', 'write', '--role', 'architect', '--parent-thread', nativeSessionId, '--json']);
-      assert.equal(res.exitCode, undefined);
-      const receipt = JSON.parse(res.stdout.join('\n')) as { ok: boolean; intent: { role: string; parent_thread_id: string; correlation_token: string }; spawn_task_name: string };
-      assert.equal(receipt.ok, true);
-      assert.equal(receipt.intent.role, 'architect');
-      assert.equal(receipt.intent.parent_thread_id, nativeSessionId);
-      assert.match(receipt.spawn_task_name, /^omx_role_intent_[a-z0-9_]+$/);
+      assert.equal(res.exitCode, 1);
+      assert.deepEqual(JSON.parse(res.stdout.join('\n')), { ok: false, reason: 'parent_not_active_leader' });
 
       const finalState = await readSubagentTrackingState(cwd);
-      assert.equal(finalState.pending_role_intents.length, 1);
-      assert.equal(finalState.pending_role_intents[0]?.role, 'architect');
+      assert.deepEqual(finalState.pending_role_intents, []);
     } finally {
       if (priorEnv.OMX_SESSION_ID !== undefined) process.env.OMX_SESSION_ID = priorEnv.OMX_SESSION_ID;
       if (priorEnv.CODEX_SESSION_ID !== undefined) process.env.CODEX_SESSION_ID = priorEnv.CODEX_SESSION_ID;
