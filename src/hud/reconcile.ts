@@ -11,7 +11,7 @@ import {
   buildHudWatchCommand,
   createHudWatchPane,
   isHudWatchPane,
-  killTmuxPane,
+  killExactHudPane,
   listCurrentWindowPanes,
   readCurrentWindowSize,
   readHudPaneOwner,
@@ -20,6 +20,7 @@ import {
   registerHudResizeHook,
   unregisterHudResizeHook,
   resizeTmuxPane,
+  type ExactHudPaneKillCandidate,
   type HudPaneOwner,
   type TmuxPaneSnapshot,
 } from './tmux.js';
@@ -60,7 +61,7 @@ export interface ReconcileHudForPromptSubmitDeps {
     hudCmd: string,
     options?: { heightLines?: number; fullWidth?: boolean; targetPaneId?: string; instanceId?: string },
   ) => string | null;
-  killTmuxPane?: (paneId: string) => boolean;
+  killManagedHudPane?: (candidate: ExactHudPaneKillCandidate) => boolean;
   resizeTmuxPane?: (paneId: string, heightLines: number) => boolean;
   readHudConfig?: typeof readHudConfig;
   readAllState?: typeof readAllState;
@@ -354,7 +355,7 @@ export async function reconcileHudForPromptSubmit(
 
   const listPanes = deps.listCurrentWindowPanes ?? ((paneId) => listCurrentWindowPanes(undefined, paneId));
   const createPane = deps.createHudWatchPane ?? ((hudCwd, hudCmd, options) => createHudWatchPane(hudCwd, hudCmd, options));
-  const killPane = deps.killTmuxPane ?? ((paneId) => killTmuxPane(paneId));
+  const killPane = deps.killManagedHudPane ?? killExactHudPane;
   const resizePane = deps.resizeTmuxPane ?? ((paneId, lines) => resizeTmuxPane(paneId, lines));
   const lock = acquired.lock;
   const resolvedSessionId = domain.session?.canonicalId;
@@ -386,35 +387,44 @@ export async function reconcileHudForPromptSubmit(
     sessionIds: equivalentSessionIds,
     leaderPaneId: currentPaneId,
   };
-  const canKillOwnedHudPane = async (paneId: string): Promise<boolean> => {
+  const exactHudKillCandidate = async (paneId: string, stale = false): Promise<ExactHudPaneKillCandidate | null> => {
     const latestEvidence = currentPaneId
       ? await (deps.probeTmuxInstance ?? probeActualTmuxInstanceEvidence)(currentPaneId).catch(() => null)
       : null;
-    if (!latestEvidence || !isVerifiedManagedHudOwner(domain, currentPaneId, latestEvidence)) return false;
+    if (!latestEvidence || !isVerifiedManagedHudOwner(domain, currentPaneId, latestEvidence)) return null;
     const latestPanes = listPanes(currentPaneId);
-    const latestLeader = latestPanes.find((pane) => pane.paneId === currentPaneId && !isHudWatchPane(pane));
     const candidate = latestPanes.find((pane) => pane.paneId === paneId);
-    return Boolean(
-      latestLeader
-      && candidate
-      && hudPaneMatchesOwner(candidate, owner)
-      && (hasVerifiedHudPaneInstanceIdentity(candidate, equivalentSessionIdSet) || tmuxSnapshotMatchesClaimantBirth(candidate, domain)),
-    );
-  };
-  const canKillStaleOwnedHudPane = async (paneId: string): Promise<boolean> => {
-    const latestEvidence = currentPaneId
-      ? await (deps.probeTmuxInstance ?? probeActualTmuxInstanceEvidence)(currentPaneId).catch(() => null)
-      : null;
-    if (!latestEvidence || !isVerifiedManagedHudOwner(domain, currentPaneId, latestEvidence)) return false;
-    const candidate = listPanes(currentPaneId).find((pane) => pane.paneId === paneId);
-    if (!candidate || !isHudWatchPane(candidate)) return false;
+    if (!candidate || !isHudWatchPane(candidate)) return null;
     const candidateOwner = readHudPaneOwner(candidate);
-    return Boolean(
-      candidateOwner.sessionId
-      && candidateOwner.leaderPaneId
-      && (equivalentSessionIdSet.has(candidateOwner.sessionId) || candidateOwner.leaderPaneId === currentPaneId)
-      && hasVerifiedHudPaneInstanceIdentity(candidate, equivalentSessionIdSet),
-    );
+    const ownerMatches = stale
+      ? Boolean(
+        candidateOwner.sessionId
+        && candidateOwner.leaderPaneId
+        && (equivalentSessionIdSet.has(candidateOwner.sessionId) || candidateOwner.leaderPaneId === currentPaneId)
+        && hasVerifiedHudPaneInstanceIdentity(candidate, equivalentSessionIdSet),
+      )
+      : Boolean(
+        latestPanes.some((pane) => pane.paneId === currentPaneId && !isHudWatchPane(pane))
+        && hudPaneMatchesOwner(candidate, owner)
+        && (hasVerifiedHudPaneInstanceIdentity(candidate, equivalentSessionIdSet) || tmuxSnapshotMatchesClaimantBirth(candidate, domain)),
+      );
+    if (!ownerMatches) return null;
+    const paneInstanceId = candidate.paneInstanceId?.trim() ?? '';
+    const sessionInstanceId = candidate.sessionInstanceId?.trim() ?? '';
+    if (!paneInstanceId || !sessionInstanceId) return null;
+    return {
+      paneId,
+      currentCommand: candidate.currentCommand,
+      startCommand: candidate.startCommand,
+      owner: candidateOwner,
+      paneInstanceId,
+      sessionInstanceId,
+      sessionName: latestEvidence.sessionName,
+    };
+  };
+  const killOwnedHudPane = async (paneId: string, stale = false): Promise<boolean> => {
+    const candidate = await exactHudKillCandidate(paneId, stale);
+    return candidate ? killPane(candidate) : false;
   };
   const liveNonHudPaneIds = new Set(panes.filter((pane) => !isHudWatchPane(pane)).map((pane) => pane.paneId));
   const staleHudPaneIds = panes
@@ -433,7 +443,7 @@ export async function reconcileHudForPromptSubmit(
     })
     .map((pane) => pane.paneId);
   for (const paneId of staleHudPaneIds) {
-    if (await canKillStaleOwnedHudPane(paneId)) killPane(paneId);
+    await killOwnedHudPane(paneId, true);
   }
   if (staleHudPaneIds.length > 0) {
     const stalePaneIdSet = new Set(staleHudPaneIds);
@@ -485,7 +495,7 @@ export async function reconcileHudForPromptSubmit(
 
     if (keeperPane) {
       for (const paneId of hudPaneIds.filter((paneId) => paneId !== keeperPane.paneId)) {
-        if (await canKillOwnedHudPane(paneId)) killPane(paneId);
+        await killOwnedHudPane(paneId);
       }
       const resized = resizePane(keeperPane.paneId, desiredHeight);
       if (resized) ensureHudResizeHook(keeperPane.paneId, currentPaneId, desiredHeight, cwd, deps);
@@ -530,7 +540,7 @@ export async function reconcileHudForPromptSubmit(
 
   const removedHudPaneIds = new Set<string>();
   for (const paneId of hudPaneIds) {
-    if (await canKillOwnedHudPane(paneId) && killPane(paneId)) removedHudPaneIds.add(paneId);
+    if (await killOwnedHudPane(paneId)) removedHudPaneIds.add(paneId);
   }
 
   const createOptions: { heightLines: number; fullWidth?: boolean; targetPaneId?: string; instanceId?: string } = {
@@ -565,7 +575,7 @@ export async function reconcileHudForPromptSubmit(
     return { status: 'recreated', paneId, desiredHeight, duplicateCount: 0 };
   }
   for (const duplicatePaneId of postCreate.duplicatePaneIds) {
-    if (await canKillOwnedHudPane(duplicatePaneId)) killPane(duplicatePaneId);
+    await killOwnedHudPane(duplicatePaneId);
   }
   const resized = resizePane(postCreate.paneId, desiredHeight);
   if (!resized) {
@@ -666,9 +676,20 @@ export async function teardownManagedHudPane(
       return { status: 'unchanged', removedPaneIds: [] };
     }
     const removedPaneIds: string[] = [];
-    const killPane = deps.killTmuxPane ?? killTmuxPane;
-    for (const paneId of exactHudPaneIds) {
-      if (killPane(paneId)) removedPaneIds.push(paneId);
+    const killPane = deps.killManagedHudPane ?? killExactHudPane;
+    for (const pane of panes.filter((candidate) => exactHudPaneIds.includes(candidate.paneId))) {
+      const paneInstanceId = pane.paneInstanceId?.trim() ?? '';
+      const sessionInstanceId = pane.sessionInstanceId?.trim() ?? '';
+      const owner = readHudPaneOwner(pane);
+      if (paneInstanceId && sessionInstanceId && killPane({
+        paneId: pane.paneId,
+        currentCommand: pane.currentCommand,
+        startCommand: pane.startCommand,
+        owner,
+        paneInstanceId,
+        sessionInstanceId,
+        sessionName: lockedEvidence.sessionName,
+      })) removedPaneIds.push(pane.paneId);
     }
     return { status: removedPaneIds.length > 0 ? 'removed' : 'unchanged', removedPaneIds };
   } finally {

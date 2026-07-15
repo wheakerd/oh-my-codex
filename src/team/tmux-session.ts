@@ -43,9 +43,14 @@ const execFileAsync = promisify(execFile);
 import { HUD_RESIZE_RECONCILE_DELAY_SECONDS, HUD_TMUX_TEAM_HEIGHT_LINES } from '../hud/constants.js';
 import { OMX_TMUX_HUD_OWNER_ENV } from '../hud/reconcile.js';
 import { buildHudRuntimeEnv, hudPaneMatchesExactCandidate, hudPaneMatchesOwner, OMX_TMUX_HUD_LEADER_PANE_ENV, type HudRuntimeEnvInput } from '../hud/tmux.js';
+import type { TeamLifecycleResource } from './state.js';
 const OMX_INSTANCE_OPTION = '@omx_instance_id';
 const OMX_PANE_INSTANCE_OPTION = '@omx_pane_instance_id';
 const OMX_TEAM_PANE_OWNER_OPTION = '@omx_team_pane_owner_id';
+const OMX_TEAM_PANE_BIRTH_OPTION = '@omx_team_pane_birth';
+const OMX_TEAM_PANE_ROLE_OPTION = '@omx_team_pane_role';
+
+
 
 export interface TeamSession {
   name: string; // tmux target in "session:window" form
@@ -62,6 +67,9 @@ export interface TeamSession {
   resizeHookTarget: string | null;
   /** Team-scoped tmux pane ownership token used by shutdown safety checks. */
   teamPaneOwnerId: string;
+  /** Opaque births captured after exact tmux tagging; required for lifecycle recovery. */
+  workerPaneBirths?: Record<string, string>;
+  hudPaneBirth?: string | null;
 }
 
 export interface CreateTeamSessionOptions {
@@ -79,6 +87,10 @@ export interface CreateTeamSessionOptions {
 
   /** Verified HUD ownership evidence. Without all fields, Team leaves HUD panes untouched. */
   hudExactCandidate?: ExactTeamHudCandidate | null;
+  /** Must synchronously durably append each exact resource receipt before another tmux mutation. */
+  journalResource?: (resource: TeamLifecycleResource) => void;
+  /** Immutable lifecycle hook generation used to compare-and-mutate owned hook slots. */
+  hookGeneration?: string;
 
 }
 export interface ExactTeamHudCandidate {
@@ -396,6 +408,26 @@ function tagNewHudPaneOrRollback(
 
 }
 
+function tagTeamPaneBirth(paneTarget: string, birthId: string): void {
+  const target = paneTarget.trim();
+  const sanitized = birthId.trim();
+  if (!target || !sanitized) return;
+  const result = runTmux(['set-option', '-p', '-t', target, OMX_TEAM_PANE_BIRTH_OPTION, sanitized]);
+  if (!result.ok) throw new Error(`failed to tag tmux pane birth ${target}: ${result.stderr}`);
+  const verified = runTmux(['show-option', '-qv', '-p', '-t', target, OMX_TEAM_PANE_BIRTH_OPTION]);
+  if (!verified.ok || verified.stdout.trim() !== sanitized) {
+    throw new Error(`failed to verify tmux pane birth ${target}`);
+  }
+}
+
+function readTeamPaneBirth(paneTarget: string): string | null {
+  const result = runTmux(['show-option', '-qv', '-p', '-t', paneTarget, OMX_TEAM_PANE_BIRTH_OPTION]);
+  return result.ok ? result.stdout.trim() || null : null;
+}
+function tagTeamPaneRole(paneTarget: string, role: 'worker' | 'hud'): void {
+  const result = runTmux(['set-option', '-p', '-t', paneTarget, OMX_TEAM_PANE_ROLE_OPTION, role]);
+  if (!result.ok) throw new Error(`failed to tag tmux pane role ${paneTarget}: ${result.stderr}`);
+}
 export function tagPaneTeamOwner(paneTarget: string, teamOwnerId: string): void {
   const target = paneTarget.trim();
   const sanitized = teamOwnerId.trim();
@@ -929,12 +961,13 @@ export function buildRegisterResizeHookArgs(
   hookName: string,
   hudPaneId: string,
   heightLines: number = HUD_TMUX_TEAM_HEIGHT_LINES,
+  generation?: string,
 ): string[] {
   const resizeCommand = buildBestEffortShellCommand(buildNestedTmuxShellCommand(buildHudResizeCommand(hudPaneId, heightLines)));
   const hookCommand = shellQuoteSingle(
     `${resizeCommand}; sleep ${HUD_RESIZE_RECONCILE_DELAY_SECONDS}; ${resizeCommand}`,
   );
-  return ['set-hook', '-t', hookTarget, buildResizeHookSlot(hookName), `run-shell -b ${hookCommand}`];
+  return ['set-hook', '-t', hookTarget, buildResizeHookSlot(hookName), `run-shell -b ${hookCommand}${generation ? ` # omx-generation=${generation}` : ''}`];
 }
 
 export function buildUnregisterResizeHookArgs(hookTarget: string, hookName: string): string[] {
@@ -961,6 +994,7 @@ export function buildRegisterClientAttachedReconcileArgs(
   hookName: string,
   hudPaneId: string,
   heightLines: number = HUD_TMUX_TEAM_HEIGHT_LINES,
+  generation?: string,
 ): string[] {
   const hookSlot = buildClientAttachedHookSlot(hookName);
   // Keep the owned command installed until transactional lifecycle cleanup. A shell
@@ -968,7 +1002,7 @@ export function buildRegisterClientAttachedReconcileArgs(
   const oneShotCommand = shellQuoteSingle(
     buildBestEffortShellCommand(buildNestedTmuxShellCommand(buildHudResizeCommand(hudPaneId, heightLines))),
   );
-  return ['set-hook', '-t', hookTarget, hookSlot, `run-shell -b ${oneShotCommand}`];
+  return ['set-hook', '-t', hookTarget, hookSlot, `run-shell -b ${oneShotCommand}${generation ? ` # omx-generation=${generation}` : ''}`];
 }
 
 export function buildUnregisterClientAttachedReconcileArgs(hookTarget: string, hookName: string): string[] {
@@ -985,135 +1019,60 @@ export function unregisterClientAttachedReconcileHook(hookTarget: string, hookNa
   return result.ok;
 }
 
-type TmuxHookSnapshot = {
-  slot: string;
-  command: string | null;
-};
-
-function readTmuxHookSnapshot(hookTarget: string, slot: string): TmuxHookSnapshot | null {
-  const result = runTmux(['show-hooks', '-t', hookTarget, slot]);
-  if (!result.ok) return null;
-  const output = result.stdout.trim();
-  if (output === '') return { slot, command: null };
-  const escapedSlot = slot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const match = output.split('\n').map((value) => value.trim()).map((value) => value.match(new RegExp(`^${escapedSlot}\\s+(.+)$`))).find(Boolean);
-  return match?.[1] ? { slot, command: match[1] } : null;
+/** One tmux-server conditional mutation; foreign or newer hook commands survive. */
+function mutateHudHookIfCurrent(hookTarget: string, slot: string, expected: string | null, next: string | null): boolean {
+  const expectedLine = expected === null ? '' : `${slot} ${expected}`;
+  const condition = expected === null
+    ? `test -z "$(tmux show-hooks -t ${shellQuoteSingle(hookTarget)} ${shellQuoteSingle(slot)})"`
+    : `test "$(tmux show-hooks -t ${shellQuoteSingle(hookTarget)} ${shellQuoteSingle(slot)})" = ${shellQuoteSingle(expectedLine)}`;
+  const mutation = next === null
+    ? `set-hook -u -t ${shellQuoteSingle(hookTarget)} ${shellQuoteSingle(slot)}`
+    : `set-hook -t ${shellQuoteSingle(hookTarget)} ${shellQuoteSingle(slot)} ${shellQuoteSingle(next)}`;
+  const result = runTmux(['if-shell', '-t', hookTarget, condition, mutation, '']);
+  if (!result.ok) return false;
+  const readback = runTmux(['show-hooks', '-t', hookTarget, slot]);
+  return readback.ok && readback.stdout.trim() === (next === null ? '' : `${slot} ${next}`);
 }
 
-function restoreTmuxHookSnapshot(hookTarget: string, snapshot: TmuxHookSnapshot, expectedCurrent: string | null): boolean {
-  // Never restore over a concurrent replacement. A mismatch is uncertainty, not a
-  // license to rewrite the slot.
-  if (!tmuxHookMatchesSnapshot(hookTarget, { slot: snapshot.slot, command: expectedCurrent })) return false;
-  const result = snapshot.command === null
-    ? runTmux(['set-hook', '-u', '-t', hookTarget, snapshot.slot])
-    : runTmux(['set-hook', '-t', hookTarget, snapshot.slot, snapshot.command]);
-  return result.ok && tmuxHookMatchesSnapshot(hookTarget, snapshot);
-}
-
-function tmuxHookMatchesSnapshot(hookTarget: string, expected: TmuxHookSnapshot): boolean {
-  const actual = readTmuxHookSnapshot(hookTarget, expected.slot);
-  return actual?.command === expected.command;
-}
-
-function tmuxHookIsAbsent(hookTarget: string, slot: string): boolean {
-  return readTmuxHookSnapshot(hookTarget, slot)?.command === null;
-}
-
-/** Registers only an empty hook slot or an identical OMX command; foreign collisions are preserved. */
+/** Registers only an empty hook slot; callers retain metadata on uncertainty. */
 export function registerHudHookIfVacant(hookTarget: string, args: string[]): boolean {
   const slot = args[3]?.trim() ?? '';
   const command = args[4] ?? '';
-  if (!slot || !command) return false;
-  const snapshot = readTmuxHookSnapshot(hookTarget, slot);
-  if (!snapshot || (snapshot.command !== null && snapshot.command !== command)) return false;
-  if (snapshot.command === command) return true;
-  return runTmux(args).ok;
+  return Boolean(slot && command && mutateHudHookIfCurrent(hookTarget, slot, null, command));
 }
 
-/** Installs the paired Team HUD hooks atomically, preserving foreign hook slots. */
 export function registerHudHooksTransactionally(
   hookTarget: string,
   resizeHookName: string,
   clientAttachedHookName: string,
   hudPaneId: string,
+  generation?: string,
 ): boolean {
-  const resizeArgs = buildRegisterResizeHookArgs(hookTarget, resizeHookName, hudPaneId);
-  const clientAttachedArgs = buildRegisterClientAttachedReconcileArgs(hookTarget, clientAttachedHookName, hudPaneId);
+  const resizeArgs = buildRegisterResizeHookArgs(hookTarget, resizeHookName, hudPaneId, HUD_TMUX_TEAM_HEIGHT_LINES, generation);
+  const attachedArgs = buildRegisterClientAttachedReconcileArgs(hookTarget, clientAttachedHookName, hudPaneId, HUD_TMUX_TEAM_HEIGHT_LINES, generation);
   const resizeSlot = resizeArgs[3]!;
-  const clientAttachedSlot = clientAttachedArgs[3]!;
-  const resizeSnapshot = readTmuxHookSnapshot(hookTarget, resizeSlot);
-  const clientAttachedSnapshot = readTmuxHookSnapshot(hookTarget, clientAttachedSlot);
-  if (!resizeSnapshot || !clientAttachedSnapshot) return false;
-  if (
-    (resizeSnapshot.command !== null && resizeSnapshot.command !== resizeArgs[4])
-    || (clientAttachedSnapshot.command !== null && clientAttachedSnapshot.command !== clientAttachedArgs[4])
-  ) return false;
-  if (resizeSnapshot.command === null && !runTmux(resizeArgs).ok) return false;
-  if (!tmuxHookMatchesSnapshot(hookTarget, { slot: resizeSlot, command: resizeArgs[4]! })) {
-    restoreHudHookSnapshots(hookTarget, clientAttachedSnapshot, resizeSnapshot, clientAttachedArgs[4]!, resizeArgs[4]!);
-    return false;
-  }
-  if (clientAttachedSnapshot.command === null && !runTmux(clientAttachedArgs).ok) {
-    restoreHudHookSnapshots(hookTarget, clientAttachedSnapshot, resizeSnapshot, clientAttachedArgs[4]!, resizeArgs[4]!);
-    return false;
-  }
-  if (!tmuxHookMatchesSnapshot(hookTarget, { slot: clientAttachedSlot, command: clientAttachedArgs[4]! })) {
-    restoreHudHookSnapshots(hookTarget, clientAttachedSnapshot, resizeSnapshot, clientAttachedArgs[4]!, resizeArgs[4]!);
-    return false;
-  }
-  return true;
+  const attachedSlot = attachedArgs[3]!;
+  const resizeCommand = resizeArgs[4]!;
+  const attachedCommand = attachedArgs[4]!;
+  if (!mutateHudHookIfCurrent(hookTarget, resizeSlot, null, resizeCommand)) return false;
+  if (mutateHudHookIfCurrent(hookTarget, attachedSlot, null, attachedCommand)) return true;
+  mutateHudHookIfCurrent(hookTarget, resizeSlot, resizeCommand, null);
+  return false;
 }
 
-function restoreHudHookSnapshots(
-  hookTarget: string,
-  clientAttachedSnapshot: TmuxHookSnapshot,
-  resizeSnapshot: TmuxHookSnapshot,
-  expectedClientAttachedCurrent: string | null,
-  expectedResizeCurrent: string | null,
-): boolean {
-  // Always attempt both restores; each independently refuses a foreign/newer value.
-  const clientAttachedRestored = restoreTmuxHookSnapshot(hookTarget, clientAttachedSnapshot, expectedClientAttachedCurrent);
-  const resizeRestored = restoreTmuxHookSnapshot(hookTarget, resizeSnapshot, expectedResizeCurrent);
-  return clientAttachedRestored && resizeRestored;
-}
-
-/**
- * Removes the paired Team HUD hooks only when both can be snapshotted first.
- * If the second deletion fails, restore the first hook and report failure so
- * shutdown preserves the HUD pane and lifecycle metadata.
- */
+/** Teardown removes exactly the generation we installed; no snapshot/restore race. */
 export function unregisterHudHooksTransactionally(
   hookTarget: string,
   resizeHookName: string,
   clientAttachedHookName: string,
   hudPaneId: string,
+  generation?: string,
 ): boolean {
-  const resizeSlot = buildResizeHookSlot(resizeHookName);
-  const clientAttachedSlot = buildClientAttachedHookSlot(clientAttachedHookName);
-  const clientAttachedSnapshot = readTmuxHookSnapshot(hookTarget, clientAttachedSlot);
-  const resizeSnapshot = readTmuxHookSnapshot(hookTarget, resizeSlot);
-  const expectedResizeCommand = buildRegisterResizeHookArgs(hookTarget, resizeHookName, hudPaneId)[4];
-  const expectedClientAttachedCommand = buildRegisterClientAttachedReconcileArgs(hookTarget, clientAttachedHookName, hudPaneId)[4];
-  if (!clientAttachedSnapshot || !resizeSnapshot) return false;
-  if (clientAttachedSnapshot.command === null && resizeSnapshot.command === null) return true;
-  if (
-    (clientAttachedSnapshot.command !== null && clientAttachedSnapshot.command !== expectedClientAttachedCommand)
-    || (resizeSnapshot.command !== null && resizeSnapshot.command !== expectedResizeCommand)
-  ) return false;
-
-  const remove = (snapshot: TmuxHookSnapshot): boolean => {
-    if (snapshot.command === null) return true;
-    if (!tmuxHookMatchesSnapshot(hookTarget, snapshot)) return false;
-    return runTmux(['set-hook', '-u', '-t', hookTarget, snapshot.slot]).ok
-      && tmuxHookIsAbsent(hookTarget, snapshot.slot);
-  };
-  const clientRemoved = remove(clientAttachedSnapshot);
-  const resizeRemoved = remove(resizeSnapshot);
-  if (!clientRemoved || !resizeRemoved) {
-    restoreHudHookSnapshots(hookTarget, clientAttachedSnapshot, resizeSnapshot, null, null);
-    return false;
-  }
-  return true;
+  const resizeArgs = buildRegisterResizeHookArgs(hookTarget, resizeHookName, hudPaneId, HUD_TMUX_TEAM_HEIGHT_LINES, generation);
+  const attachedArgs = buildRegisterClientAttachedReconcileArgs(hookTarget, clientAttachedHookName, hudPaneId, HUD_TMUX_TEAM_HEIGHT_LINES, generation);
+  const attachedRemoved = mutateHudHookIfCurrent(hookTarget, attachedArgs[3]!, attachedArgs[4]!, null);
+  const resizeRemoved = mutateHudHookIfCurrent(hookTarget, resizeArgs[3]!, resizeArgs[4]!, null);
+  return attachedRemoved && resizeRemoved;
 }
 
 export function buildScheduleDelayedHudResizeArgs(
@@ -1984,6 +1943,9 @@ export function createTeamSession(
   let registeredResizeHook: { name: string; target: string } | null = null;
   let registeredClientAttachedHook: { name: string; target: string } | null = null;
   const rollbackPaneIds: string[] = [];
+  const rollbackPaneBirths = new Map<string, string>();
+  let createdHudPaneBirth: string | null = null;
+
   let rollbackOwnerSessionId = '';
   let rollbackTeamPaneOwnerId = '';
 
@@ -2035,6 +1997,12 @@ export function createTeamSession(
       tagPaneInstance(leaderPaneId, ownerSessionId);
     }
     tagPaneTeamOwner(leaderPaneId, teamPaneOwnerId);
+    options.journalResource?.({
+      kind: 'leader',
+      id: leaderPaneId,
+      created: false,
+      acquired_at: new Date().toISOString(),
+    });
     const [retainedHudPaneId, ...duplicateHudPaneIds] = hasExactHudAuthority
       ? findExactTeamHudPaneIds(teamTarget, hudExactCandidate)
       : [];
@@ -2104,7 +2072,20 @@ export function createTeamSession(
       }
       tagPaneInstance(paneId, ownerSessionId);
       tagPaneTeamOwner(paneId, teamPaneOwnerId);
+      const paneBirth = randomUUID();
+      tagTeamPaneBirth(paneId, paneBirth);
+      rollbackPaneBirths.set(paneId, paneBirth);
+      tagTeamPaneRole(paneId, 'worker');
+      options.journalResource?.({
+        kind: 'worker',
+        id: paneId,
+        created: true,
+        pane_birth: paneBirth,
+        acquired_at: new Date().toISOString(),
+      });
+
       workerPaneIds.push(paneId);
+
       if (i === 1) rightStackRootPaneId = paneId;
     }
 
@@ -2140,18 +2121,43 @@ export function createTeamSession(
       if (hudPaneId || hudResult?.ok) {
         const id = hudPaneId ?? (hudResult && hudResult.ok ? hudResult.stdout.split('\n')[0]?.trim() ?? '' : '');
         if (id.startsWith('%')) {
+          if (retainedHudPaneId) {
+            options.journalResource?.({
+              kind: 'hud',
+              id,
+              created: false,
+              pane_birth: readTeamPaneBirth(id) ?? undefined,
+              acquired_at: new Date().toISOString(),
+            });
+          }
           if (!retainedHudPaneId) rollbackPaneIds.push(id);
           if (isNativeWindows() && !waitForPaneToRemainPresent(teamTarget, id)) {
             throw new Error(`HUD pane did not remain present after tmux split-window returned ${id}`);
           }
-          if (!retainedHudPaneId && !tagNewHudPaneOrRollback(
-            id,
-            hudExactCandidate?.tmuxPaneInstanceId ?? ownerSessionId,
-            teamPaneOwnerId,
-          )) {
-            if (rollbackPaneIds[rollbackPaneIds.length - 1] === id) rollbackPaneIds.pop();
-            throw new Error(`failed to tag and verify HUD pane ${id}`);
+          if (!retainedHudPaneId) {
+            const paneBirth = randomUUID();
+            if (!tagNewHudPaneOrRollback(
+              id,
+              hudExactCandidate?.tmuxPaneInstanceId ?? ownerSessionId,
+              teamPaneOwnerId,
+            )) {
+              if (rollbackPaneIds[rollbackPaneIds.length - 1] === id) rollbackPaneIds.pop();
+              throw new Error(`failed to tag and verify HUD pane ${id}`);
+            }
+            tagTeamPaneBirth(id, paneBirth);
+            rollbackPaneBirths.set(id, paneBirth);
+            createdHudPaneBirth = paneBirth;
+            tagTeamPaneRole(id, 'hud');
+            options.journalResource?.({
+              kind: 'hud',
+              id,
+              created: true,
+              pane_birth: paneBirth,
+              acquired_at: new Date().toISOString(),
+            });
+
           }
+
           hudPaneId = id;
 
           if (isNativeWindows()) {
@@ -2170,7 +2176,11 @@ export function createTeamSession(
               windowIndex,
               hudPaneId,
             );
-            if (registerHudHooksTransactionally(hookTarget, hookName, clientAttachedHookName, hudPaneId)) {
+            // Persist both prospective hook slots before their first CAS. A failed
+            // CAS remains recovery evidence rather than a reason to discard metadata.
+            options.journalResource?.({ kind: 'hook', id: hookName, created: true, command: options.hookGeneration, acquired_at: new Date().toISOString() });
+            options.journalResource?.({ kind: 'hook', id: clientAttachedHookName, created: true, command: options.hookGeneration, acquired_at: new Date().toISOString() });
+            if (registerHudHooksTransactionally(hookTarget, hookName, clientAttachedHookName, hudPaneId, options.hookGeneration)) {
               resizeHookTarget = hookTarget;
               resizeHookName = hookName;
               registeredResizeHook = { name: resizeHookName, target: resizeHookTarget };
@@ -2215,6 +2225,11 @@ export function createTeamSession(
       leaderPaneId,
       hudPaneId,
       resizeHookName,
+      workerPaneBirths: Object.fromEntries(workerPaneIds.flatMap((paneId) => {
+        const birth = rollbackPaneBirths.get(paneId);
+        return birth ? [[paneId, birth]] : [];
+      })),
+      hudPaneBirth: createdHudPaneBirth,
       resizeHookTarget,
       teamPaneOwnerId,
     };
@@ -2231,11 +2246,12 @@ export function createTeamSession(
       runTmux(buildUnregisterResizeHookArgs(registeredResizeHook.target, registeredResizeHook.name));
     }
     // Every rollback candidate was tagged and read back before being journaled.
-    // Revalidate its exact Team ownership and both opaque births in tmux itself;
+    // Revalidate its exact Team ownership and opaque per-pane birth in tmux itself;
     // a failed conditional kill deliberately retains the pane for recovery.
     for (const paneId of rollbackPaneIds) {
-      if (!rollbackOwnerSessionId || !rollbackTeamPaneOwnerId) continue;
-      const condition = `#{&&:#{==:#{pane_id},${paneId}},#{==:#{@omx_pane_instance_id},${rollbackOwnerSessionId}},#{==:#{@omx_instance_id},${rollbackOwnerSessionId}},#{==:#{@omx_team_pane_owner_id},${rollbackTeamPaneOwnerId}}}`;
+      const paneBirth = rollbackPaneBirths.get(paneId);
+      if (!rollbackOwnerSessionId || !rollbackTeamPaneOwnerId || !paneBirth) continue;
+      const condition = `#{&&:#{==:#{pane_id},${paneId}},#{==:#{@omx_pane_instance_id},${rollbackOwnerSessionId}},#{==:#{@omx_instance_id},${rollbackOwnerSessionId}},#{==:#{@omx_team_pane_owner_id},${rollbackTeamPaneOwnerId}},#{==:#{@omx_team_pane_birth},${paneBirth}}}`;
       runTmux(['if-shell', '-t', paneId, '-F', condition, `kill-pane -t ${paneId}`, '']);
     }
     throw error;
@@ -3091,7 +3107,11 @@ export interface PaneTeardownOptions {
   leaderPaneId?: string | null;
   hudPaneId?: string | null;
   graceMs?: number;
+  /** Team generation identity required for destructive worker cleanup. */
+  teamPaneOwnerId?: string | null;
+  sessionName?: string | null;
 }
+
 
 export interface SharedSessionShutdownTopology {
   livePaneIds: string[];
@@ -3359,8 +3379,23 @@ export async function teardownWorkerPanes(
     },
   };
 
+  const sessionName = options.sessionName?.trim().split(':')[0] ?? '';
+  const teamOwnerId = options.teamPaneOwnerId?.trim() ?? '';
   for (const paneId of killablePaneIds) {
-    const result = await runTmuxAsync(['kill-pane', '-t', paneId]);
+    // Snapshot opaque births, then have tmux compare every identity in the same
+    // server command that performs the kill. Re-used pane ids fail closed.
+    const paneBirth = readTeamPaneBirth(paneId);
+    const sessionBirthResult = sessionName
+      ? runTmux(['show-options', '-qv', '-t', sessionName, OMX_INSTANCE_OPTION])
+      : null;
+    const sessionBirth = sessionBirthResult?.ok ? sessionBirthResult.stdout.trim() : '';
+    if (!paneBirth || !sessionBirth || !sessionName || !teamOwnerId) {
+      summary.kill.failed += 1;
+      await sleep(perPaneGrace);
+      continue;
+    }
+    const condition = `#{&&:#{==:#{pane_id},${paneId}},#{==:#{session_name},${sessionName}},#{==:#{@omx_instance_id},${sessionBirth}},#{==:#{@omx_team_pane_owner_id},${teamOwnerId}},#{==:#{@omx_team_pane_birth},${paneBirth}},#{==:#{@omx_team_pane_role},worker}}`;
+    const result = await runTmuxAsync(['if-shell', '-t', paneId, '-F', condition, `kill-pane -t ${paneId}`, '']);
     if (result.ok) summary.kill.succeeded += 1;
     else summary.kill.failed += 1;
     await sleep(perPaneGrace);

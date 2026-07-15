@@ -25,6 +25,34 @@ export interface TeamConfig {
   resize_hook_name: string | null;
   resize_hook_target: string | null;
   next_worker_index?: number;
+  /** Immutable hook command generation for exact teardown. */
+  hook_generation?: string | null;
+}
+
+/** Durable, append-only evidence for one interactive Team tmux generation. */
+export interface TeamLifecycleResource {
+  kind: 'leader' | 'worker' | 'hud' | 'hook';
+  id: string;
+  created: boolean;
+  pane_birth?: string;
+  command?: string;
+  acquired_at: string;
+}
+
+export interface TeamLifecycleGenerationCertificate {
+  version: 1;
+  token: string;
+  team_name: string;
+  canonical_session_id: string;
+  native_session_ids: string[];
+  tmux_session_name: string | null;
+  tmux_session_birth: string | null;
+  tmux_context: string | null;
+  team_pane_owner_id: string;
+  hook_generation: string;
+  status: 'preparing' | 'active' | 'cleanup_complete' | 'transferred';
+  created_at: string;
+  resources: TeamLifecycleResource[];
 }
 
 export interface WorkerInfo {

@@ -183,7 +183,7 @@ describe('reconcileHudForPromptSubmit', () => {
           listed = true;
           return [{ paneId: '%1', currentCommand: 'codex', startCommand: 'codex' }];
         },
-        killTmuxPane: () => {
+        killManagedHudPane: () => {
           killed = true;
           return true;
         },
@@ -324,8 +324,8 @@ describe('reconcileHudForPromptSubmit', () => {
         orphan('%42'),
         orphan('%47'),
       ],
-      killTmuxPane: (paneId) => {
-        killed.push(paneId);
+      killManagedHudPane: (candidate) => {
+        killed.push(candidate.paneId);
         return true;
       },
       resizeTmuxPane: () => true,
@@ -363,8 +363,8 @@ describe('reconcileHudForPromptSubmit', () => {
           startCommand: `env OMX_SESSION_ID='codex-native-uuid' OMX_TMUX_HUD_OWNER='1' ${OMX_TMUX_HUD_LEADER_PANE_ENV}='%21' node omx hud --watch`,
         },
       ],
-      killTmuxPane: (paneId) => {
-        killed.push(paneId);
+      killManagedHudPane: (candidate) => {
+        killed.push(candidate.paneId);
         return true;
       },
       resizeTmuxPane: () => true,
@@ -392,8 +392,8 @@ describe('reconcileHudForPromptSubmit', () => {
           startCommand: `exec env OMX_SESSION_ID='sess-old' OMX_TMUX_HUD_OWNER='1' ${OMX_TMUX_HUD_LEADER_PANE_ENV}='%leader' node omx hud --watch --preset=focused`,
         },
       ],
-      killTmuxPane: (paneId) => {
-        killed.push(paneId);
+      killManagedHudPane: (candidate) => {
+        killed.push(candidate.paneId);
         return true;
       },
       createHudWatchPane: (_cwd, _cmd, options) => {
@@ -431,8 +431,8 @@ describe('reconcileHudForPromptSubmit', () => {
           startCommand: `exec env OMX_SESSION_ID='sess-old' OMX_TMUX_HUD_OWNER='1' ${OMX_TMUX_HUD_LEADER_PANE_ENV}='%leader' node omx hud --watch --preset=focused`,
         },
       ],
-      killTmuxPane: (paneId) => {
-        killed.push(paneId);
+      killManagedHudPane: (candidate) => {
+        killed.push(candidate.paneId);
         return true;
       },
       createHudWatchPane: () => {
@@ -468,8 +468,8 @@ describe('reconcileHudForPromptSubmit', () => {
           startCommand: `exec env OMX_SESSION_ID='sess-right' OMX_TMUX_HUD_OWNER='1' ${OMX_TMUX_HUD_LEADER_PANE_ENV}='%right' node omx hud --watch --preset=focused`,
         },
       ],
-      killTmuxPane: (paneId) => {
-        killed.push(paneId);
+      killManagedHudPane: (candidate) => {
+        killed.push(candidate.paneId);
         return true;
       },
       createHudWatchPane: () => '%left-hud',
@@ -497,8 +497,8 @@ describe('reconcileHudForPromptSubmit', () => {
           startCommand: `env OMX_SESSION_ID='sess-b' OMX_TMUX_HUD_OWNER='1' ${OMX_TMUX_HUD_LEADER_PANE_ENV}='%5' node omx hud --watch`,
         },
       ],
-      killTmuxPane: (paneId) => {
-        killed.push(paneId);
+      killManagedHudPane: (candidate) => {
+        killed.push(candidate.paneId);
         return true;
       },
       resizeTmuxPane: () => true,
@@ -536,8 +536,8 @@ describe('reconcileHudForPromptSubmit', () => {
           startCommand: `exec env OMX_SESSION_ID='sess-a' OMX_TMUX_HUD_OWNER='1' ${OMX_TMUX_HUD_LEADER_PANE_ENV}='%21' node omx hud --watch --preset=focused`,
         },
       ],
-      killTmuxPane: (paneId) => {
-        killed.push(paneId);
+      killManagedHudPane: (candidate) => {
+        killed.push(candidate.paneId);
         return true;
       },
       resizeTmuxPane: () => true,
@@ -773,8 +773,8 @@ describe('reconcileHudForPromptSubmit', () => {
         created.push({ side: 'left', options });
         return '%hud-left';
       },
-      killTmuxPane: (paneId) => {
-        killed.push(paneId);
+      killManagedHudPane: (candidate) => {
+        killed.push(candidate.paneId);
         return true;
       },
       resizeTmuxPane: (paneId, heightLines) => {
@@ -796,8 +796,8 @@ describe('reconcileHudForPromptSubmit', () => {
         created.push({ side: 'left', options });
         return '%hud-left-repeat';
       },
-      killTmuxPane: (paneId) => {
-        killed.push(paneId);
+      killManagedHudPane: (candidate) => {
+        killed.push(candidate.paneId);
         return true;
       },
       resizeTmuxPane: (paneId, heightLines) => {
@@ -818,8 +818,8 @@ describe('reconcileHudForPromptSubmit', () => {
         created.push({ side: 'right', options });
         return '%hud-right';
       },
-      killTmuxPane: (paneId) => {
-        killed.push(paneId);
+      killManagedHudPane: (candidate) => {
+        killed.push(candidate.paneId);
         return true;
       },
       resizeTmuxPane: (paneId, heightLines) => {
@@ -841,8 +841,8 @@ describe('reconcileHudForPromptSubmit', () => {
         created.push({ side: 'right', options });
         return '%hud-right-repeat';
       },
-      killTmuxPane: (paneId) => {
-        killed.push(paneId);
+      killManagedHudPane: (candidate) => {
+        killed.push(candidate.paneId);
         return true;
       },
       resizeTmuxPane: (paneId, heightLines) => {
@@ -913,8 +913,8 @@ describe('reconcileHudForPromptSubmit', () => {
         created.push({ options });
         return '%hud-left-repeat';
       },
-      killTmuxPane: (paneId) => {
-        killed.push(paneId);
+      killManagedHudPane: (candidate) => {
+        killed.push(candidate.paneId);
         return true;
       },
       resizeTmuxPane: (paneId, heightLines) => {
@@ -941,8 +941,8 @@ describe('reconcileHudForPromptSubmit', () => {
         created.push({ options });
         return '%hud-right-repeat';
       },
-      killTmuxPane: (paneId) => {
-        killed.push(paneId);
+      killManagedHudPane: (candidate) => {
+        killed.push(candidate.paneId);
         return true;
       },
       resizeTmuxPane: (paneId, heightLines) => {
@@ -991,8 +991,8 @@ describe('reconcileHudForPromptSubmit', () => {
         ];
       },
       createHudWatchPane: () => '%9',
-      killTmuxPane: (paneId) => {
-        killed.push(paneId);
+      killManagedHudPane: (candidate) => {
+        killed.push(candidate.paneId);
         return true;
       },
       resizeTmuxPane: (paneId, heightLines) => {
@@ -1029,7 +1029,7 @@ describe('reconcileHudForPromptSubmit', () => {
         ];
       },
       createHudWatchPane: () => '%9',
-      killTmuxPane: (paneId) => { killed.push(paneId); return true; },
+      killManagedHudPane: (candidate) => { killed.push(candidate.paneId); return true; },
       resizeTmuxPane: (paneId, heightLines) => { resized.push({ paneId, heightLines }); return true; },
       resolveOmxCliEntryPath: () => '/repo/dist/cli/omx.js',
     });
@@ -1066,7 +1066,7 @@ describe('reconcileHudForPromptSubmit', () => {
         ];
       },
       createHudWatchPane: () => '%9',
-      killTmuxPane: (paneId) => { killed.push(paneId); return true; },
+      killManagedHudPane: (candidate) => { killed.push(candidate.paneId); return true; },
       resizeTmuxPane: () => false,
       registerHudResizeHook: (paneId) => { registered.push(paneId); return true; },
       resolveOmxCliEntryPath: () => '/repo/dist/cli/omx.js',
@@ -1100,8 +1100,8 @@ describe('reconcileHudForPromptSubmit', () => {
         },
         { paneId: '%4', currentCommand: 'codex', startCommand: 'codex' },
       ],
-      killTmuxPane: (paneId) => {
-        killed.push(paneId);
+      killManagedHudPane: (candidate) => {
+        killed.push(candidate.paneId);
         return true;
       },
       createHudWatchPane: (_cwd, cmd) => {
@@ -1153,8 +1153,8 @@ describe('reconcileHudForPromptSubmit', () => {
           startCommand: `env OMX_SESSION_ID='codex-native-uuid' ${OMX_TMUX_HUD_LEADER_PANE_ENV}='%4' node omx hud --watch`,
         },
       ],
-      killTmuxPane: (paneId) => {
-        killed.push(paneId);
+      killManagedHudPane: (candidate) => {
+        killed.push(candidate.paneId);
         return true;
       },
       createHudWatchPane: (_cwd, cmd) => {
@@ -1190,7 +1190,7 @@ describe('reconcileHudForPromptSubmit', () => {
         { paneId: '%4', currentCommand: 'node', startCommand: 'node /tmp/bin/omx.js hud --watch --preset=minimal' },
         { paneId: '%5', currentCommand: 'node', startCommand: 'node /tmp/bin/omx.js hud --tmux --preset=focused' },
       ],
-      killTmuxPane: (paneId) => { killed.push(paneId); return true; },
+      killManagedHudPane: (candidate) => { killed.push(candidate.paneId); return true; },
       createHudWatchPane: () => { created.push('create'); return '%9'; },
       resizeTmuxPane: (paneId, heightLines) => { resized.push({ paneId, heightLines }); return true; },
       resolveOmxCliEntryPath: () => '/repo/dist/cli/omx.js',
@@ -1219,7 +1219,7 @@ describe('reconcileHudForPromptSubmit', () => {
         },
         { paneId: '%3', currentCommand: 'node', startCommand: 'node /tmp/bin/omx.js hud --watch --preset=focused' },
       ],
-      killTmuxPane: (paneId) => { killed.push(paneId); return true; },
+      killManagedHudPane: (candidate) => { killed.push(candidate.paneId); return true; },
       resizeTmuxPane: (paneId, heightLines) => { resized.push({ paneId, heightLines }); return true; },
       resolveOmxCliEntryPath: () => '/repo/dist/cli/omx.js',
     });
@@ -1252,7 +1252,7 @@ describe('reconcileHudForPromptSubmit', () => {
         ];
       },
       createHudWatchPane: () => '%9',
-      killTmuxPane: (paneId) => { killed.push(paneId); return true; },
+      killManagedHudPane: (candidate) => { killed.push(candidate.paneId); return true; },
       resizeTmuxPane: (paneId, heightLines) => { resized.push({ paneId, heightLines }); return true; },
       resolveOmxCliEntryPath: () => '/repo/dist/cli/omx.js',
     });
@@ -1283,7 +1283,7 @@ describe('reconcileHudForPromptSubmit', () => {
           startCommand: `env OMX_SESSION_ID='sess-a' ${OMX_TMUX_HUD_LEADER_PANE_ENV}='%1' node omx hud --watch`,
         },
       ],
-      killTmuxPane: (paneId) => { killed.push(paneId); return true; },
+      killManagedHudPane: (candidate) => { killed.push(candidate.paneId); return true; },
       resizeTmuxPane: () => false,
       registerHudResizeHook: (paneId) => { registered.push(paneId); return true; },
       resolveOmxCliEntryPath: () => '/repo/dist/cli/omx.js',
@@ -1312,8 +1312,8 @@ describe('reconcileHudForPromptSubmit', () => {
         },
         { paneId: '%3', currentCommand: 'codex', startCommand: 'codex' },
       ],
-      killTmuxPane: (paneId) => {
-        killed.push(paneId);
+      killManagedHudPane: (candidate) => {
+        killed.push(candidate.paneId);
         return true;
       },
       resizeTmuxPane: (paneId) => {
@@ -1366,8 +1366,8 @@ describe('reconcileHudForPromptSubmit', () => {
           startCommand: `env OMX_SESSION_ID='sess-b' ${OMX_TMUX_HUD_LEADER_PANE_ENV}='%5' node omx hud --watch`,
         },
       ],
-      killTmuxPane: (paneId) => {
-        killed.push(paneId);
+      killManagedHudPane: (candidate) => {
+        killed.push(candidate.paneId);
         return true;
       },
       createHudWatchPane: () => '%9',
@@ -1422,7 +1422,7 @@ describe('reconcileHudForPromptSubmit', () => {
         hudNotify: null,
         session: null,
       }),
-      killTmuxPane: (paneId) => { killed.push(paneId); return true; },
+      killManagedHudPane: (candidate) => { killed.push(candidate.paneId); return true; },
       resizeTmuxPane: (paneId, heightLines) => { resized.push({ paneId, heightLines }); return true; },
       createHudWatchPane: () => { created.push('create'); return '%9'; },
       resolveOmxCliEntryPath: () => '/repo/dist/cli/omx.js',
@@ -1557,7 +1557,7 @@ describe('reconcileHudForPromptSubmit', () => {
         { paneId: '%2', currentCommand: 'node', startCommand: `env OMX_TMUX_HUD_OWNER='1' ${OMX_TMUX_HUD_LEADER_PANE_ENV}='%1' node omx hud --watch` },
         { paneId: '%3', currentCommand: 'node', startCommand: `env OMX_TMUX_HUD_OWNER='1' ${OMX_TMUX_HUD_LEADER_PANE_ENV}='%1' node omx hud --watch` },
       ],
-      killTmuxPane: (paneId) => { killed.push(paneId); return true; },
+      killManagedHudPane: (candidate) => { killed.push(candidate.paneId); return true; },
       resizeTmuxPane: (paneId, heightLines) => { resized.push({ paneId, heightLines }); return true; },
       createHudWatchPane: () => { created.push('create'); return '%9'; },
       resolveOmxCliEntryPath: () => '/repo/dist/cli/omx.js',
@@ -1624,8 +1624,8 @@ describe('reconcileHudForPromptSubmit', () => {
           windowHeight: 50,
         },
       ],
-      killTmuxPane: (paneId) => {
-        killed.push(paneId);
+      killManagedHudPane: (candidate) => {
+        killed.push(candidate.paneId);
         return true;
       },
       createHudWatchPane: (_cwd, _cmd, options) => {
@@ -1675,8 +1675,8 @@ describe('reconcileHudForPromptSubmit', () => {
         unregistered.push(currentPaneId);
         return true;
       },
-      killTmuxPane: (paneId) => {
-        killed.push(paneId);
+      killManagedHudPane: (candidate) => {
+        killed.push(candidate.paneId);
         return true;
       },
       createHudWatchPane: (_cwd, _cmd, options) => {
@@ -1730,8 +1730,8 @@ describe('reconcileHudForPromptSubmit', () => {
         { paneId: '%3', currentCommand: 'codex', startCommand: 'codex', paneLeft: 80, paneTop: 3, paneWidth: 80, paneHeight: 47, paneBottom: 49, windowWidth: 160, windowHeight: 50 },
       ],
       unregisterHudResizeHook: () => true,
-      killTmuxPane: (paneId) => {
-        killed.push(paneId);
+      killManagedHudPane: (candidate) => {
+        killed.push(candidate.paneId);
         return true;
       },
       createHudWatchPane: (_cwd, _cmd, options) => {
@@ -1783,8 +1783,8 @@ describe('reconcileHudForPromptSubmit', () => {
           windowHeight: 50,
         },
       ],
-      killTmuxPane: (paneId) => {
-        killed.push(paneId);
+      killManagedHudPane: (candidate) => {
+        killed.push(candidate.paneId);
         return true;
       },
       createHudWatchPane: (_cwd, _cmd, options) => {
@@ -1843,8 +1843,8 @@ describe('reconcileHudForPromptSubmit', () => {
         unregistered.push(leaderPaneId);
         return true;
       },
-      killTmuxPane: (paneId) => {
-        killed.push(paneId);
+      killManagedHudPane: (candidate) => {
+        killed.push(candidate.paneId);
         return true;
       },
       createHudWatchPane: (_cwd, _cmd, options) => {
@@ -1927,7 +1927,7 @@ describe('reconcileHudForPromptSubmit', () => {
         { paneId: '%2', currentCommand: 'node', startCommand: `env OMX_SESSION_ID='sess-a' ${OMX_TMUX_HUD_LEADER_PANE_ENV}='%1' node omx hud --watch` },
         { paneId: '%3', currentCommand: 'node', startCommand: `env OMX_SESSION_ID='sess-a' ${OMX_TMUX_HUD_LEADER_PANE_ENV}='%1' node omx hud --watch` },
       ],
-      killTmuxPane: () => true,
+      killManagedHudPane: () => true,
       createHudWatchPane: () => '%9',
       resizeTmuxPane: () => true,
       unregisterHudResizeHook: (leaderPaneId) => { unregistered.push(leaderPaneId); return true; },
@@ -2196,7 +2196,7 @@ describe('reconcileHudForPromptSubmit verified lifecycle ownership', () => {
         { paneId: '%leader', currentCommand: 'codex', startCommand: 'codex' },
         { paneId: '%reused', currentCommand: 'node', paneInstanceId: 'other-server', startCommand: `env OMX_SESSION_ID='sess-a' ${OMX_TMUX_HUD_LEADER_PANE_ENV}='%leader' node omx hud --watch` },
       ],
-      killTmuxPane: (paneId) => { killed.push(paneId); return true; },
+      killManagedHudPane: (candidate) => { killed.push(candidate.paneId); return true; },
       createHudWatchPane: () => { created = true; return '%new'; },
       resizeTmuxPane: () => { assert.fail('unverified candidate must not be resized'); return false; },
       resolveOmxCliEntryPath: () => '/repo/dist/cli/omx.js',
@@ -2222,7 +2222,7 @@ describe('reconcileHudForPromptSubmit verified lifecycle ownership', () => {
           ];
       },
       createHudWatchPane: () => '%created',
-      killTmuxPane: (paneId) => { killed.push(paneId); return true; },
+      killManagedHudPane: (candidate) => { killed.push(candidate.paneId); return true; },
       resizeTmuxPane: () => { assert.fail('unsafe post-create candidates must not be resized'); return false; },
       resolveOmxCliEntryPath: () => '/repo/dist/cli/omx.js',
     });
@@ -2277,7 +2277,7 @@ describe('reconcileHudForPromptSubmit verified lifecycle ownership', () => {
           instanceId: 'session-a', source: 'pane', paneTagStatus: 'present', sessionTagStatus: 'present', sessionId: '$1', windowId: '@1', contextStable: true,
         }),
         listCurrentWindowPanes: () => { mutated = true; return []; },
-        killTmuxPane: () => { mutated = true; return true; },
+        killManagedHudPane: () => { mutated = true; return true; },
         resolveOmxCliEntryPath: () => '/repo/dist/cli/omx.js',
       });
       assert.equal(result.status, 'unchanged');
@@ -2309,7 +2309,7 @@ describe('teardownManagedHudPane', () => {
         { paneId: '%2', currentCommand: 'node', startCommand: "exec env OMX_SESSION_ID='session-a' OMX_TMUX_HUD_OWNER='1' OMX_TMUX_HUD_LEADER_PANE='%1' node omx.js hud --watch", paneInstanceId: 'session-a', sessionInstanceId: 'session-a' },
         { paneId: '%3', currentCommand: 'node', startCommand: "exec env OMX_SESSION_ID='session-b' OMX_TMUX_HUD_OWNER='1' OMX_TMUX_HUD_LEADER_PANE='%1' node omx.js hud --watch", paneInstanceId: 'session-b', sessionInstanceId: 'session-b' },
       ],
-      killTmuxPane: (paneId) => { events.push(`kill:${paneId}`); killed.push(paneId); return true; },
+      killManagedHudPane: (candidate) => { events.push(`kill:${candidate.paneId}`); killed.push(candidate.paneId); return true; },
       unregisterHudResizeHook: (paneId) => { events.push(`unregister:${paneId}`); if (paneId) unregistered.push(paneId); return true; },
     };
     try {
@@ -2341,7 +2341,7 @@ describe('teardownManagedHudPane', () => {
           { paneId: '%1', currentCommand: 'codex', startCommand: 'codex', paneInstanceId: 'stale', sessionInstanceId: 'session-a' },
           { paneId: '%2', currentCommand: 'node', startCommand: "exec env OMX_SESSION_ID='session-a' OMX_TMUX_HUD_OWNER='1' OMX_TMUX_HUD_LEADER_PANE='%1' node omx.js hud --watch", paneInstanceId: 'session-a', sessionInstanceId: 'session-a' },
         ],
-        killTmuxPane: (paneId) => { killed.push(paneId); return true; },
+        killManagedHudPane: (candidate) => { killed.push(candidate.paneId); return true; },
       });
       assert.equal(result.status, 'skipped_not_omx_owned_tmux');
       assert.deepEqual(killed, []);
@@ -2367,7 +2367,7 @@ describe('teardownManagedHudPane', () => {
           sessionId: '$1', windowId: '@1', contextStable: true,
         }),
         listCurrentWindowPanes: () => { assert.fail('mixed authority must not enumerate panes'); return []; },
-        killTmuxPane: (paneId) => { killed.push(paneId); return true; },
+        killManagedHudPane: (candidate) => { killed.push(candidate.paneId); return true; },
       });
       assert.equal(result.status, 'skipped_not_omx_owned_tmux');
       assert.deepEqual(killed, []);
@@ -2389,7 +2389,7 @@ describe('teardownManagedHudPane', () => {
           { paneId: '%1', currentCommand: 'codex', startCommand: 'codex', paneInstanceId: 'pane-birth', sessionInstanceId: 'session-birth' },
           { paneId: '%2', currentCommand: 'node', startCommand: "exec env OMX_SESSION_ID='logical-session' OMX_TMUX_HUD_OWNER='1' OMX_TMUX_HUD_LEADER_PANE='%1' node omx.js hud --watch", paneInstanceId: 'pane-birth', sessionInstanceId: 'session-birth' },
         ],
-        killTmuxPane: (paneId) => { killed.push(paneId); return true; }, unregisterHudResizeHook: noOpUnregisterHudResizeHook,
+        killManagedHudPane: (candidate) => { killed.push(candidate.paneId); return true; }, unregisterHudResizeHook: noOpUnregisterHudResizeHook,
       });
       assert.equal(result.status, 'removed');
       assert.deepEqual(killed, ['%2']);

@@ -57,16 +57,18 @@ esac
     }
   });
 
-  it('accepts identical canonical tags despite additional resolver-proven aliases', () => {
-    assert.equal(tmuxEvidenceBindsCandidate({
-      paneTarget: '%1', sessionName: 'session', paneInstanceId: 'canonical', sessionInstanceId: 'canonical',
-      instanceId: 'canonical', source: 'pane', paneTagStatus: 'present', sessionTagStatus: 'present',
+  it('admits every identical resolver-proven alias while restricting mixed tags to explicit pairs', () => {
+    const evidence = (paneInstanceId: string, sessionInstanceId: string) => ({
+      paneTarget: '%1', sessionName: 'session', paneInstanceId, sessionInstanceId,
+      instanceId: paneInstanceId, source: 'pane' as const, paneTagStatus: 'present' as const, sessionTagStatus: 'present' as const,
       sessionId: '$1', windowId: '@1', contextStable: true,
-    }, ['canonical', 'native', 'previous']), true);
-    assert.equal(tmuxEvidenceBindsCandidate({
-      paneTarget: '%1', sessionName: 'session', paneInstanceId: 'native', sessionInstanceId: 'previous',
-      instanceId: 'native', source: 'pane', paneTagStatus: 'present', sessionTagStatus: 'present',
-      sessionId: '$1', windowId: '@1', contextStable: true,
-    }, ['canonical', 'native', 'previous']), false);
+    });
+    const resolverLineage = ['canonical', 'native', 'previous'] as const;
+    assert.equal(tmuxEvidenceBindsCandidate(evidence('canonical', 'canonical'), resolverLineage), true);
+    assert.equal(tmuxEvidenceBindsCandidate(evidence('native', 'native'), resolverLineage), true);
+    assert.equal(tmuxEvidenceBindsCandidate(evidence('previous', 'previous'), resolverLineage), true);
+    assert.equal(tmuxEvidenceBindsCandidate(evidence('unknown', 'unknown'), resolverLineage), false);
+    assert.equal(tmuxEvidenceBindsCandidate(evidence('native', 'previous'), resolverLineage), false);
+    assert.equal(tmuxEvidenceBindsCandidate(evidence('canonical', 'native'), ['canonical', 'native']), true);
   });
 });

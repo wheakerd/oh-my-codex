@@ -1,3 +1,4 @@
+import { randomUUID } from 'crypto';
 import { join, resolve, dirname } from 'path';
 import { existsSync, appendFileSync, mkdirSync } from 'fs';
 import { mkdir, readdir, readFile, writeFile } from 'fs/promises';
@@ -44,6 +45,14 @@ import {
 import { acquireHudLifecycleLock, releaseHudLifecycleLock } from '../hud/lifecycle-lock.js';
 import { normalizeSessionId, resolveHudControlPlaneDomain, writeHudTmuxBirthLineage } from '../mcp/state-paths.js';
 import type { HudRuntimeRootSource } from '../hud/tmux.js';
+import {
+  appendTeamLifecycleResource,
+  appendTeamLifecycleResourceSync,
+  createTeamLifecycleGeneration,
+  finalizeTeamLifecycleGeneration,
+  readTeamLifecycleGeneration,
+  type TeamLifecycleGenerationCertificate,
+} from './state.js';
 
 import type { HudRuntimeEnvInput } from '../hud/tmux.js';
 import {
@@ -2701,6 +2710,7 @@ export async function startTeam(
   const overlay = generateWorkerOverlay(sanitized);
   let workerInstructionsPath: string | null = null;
   let sessionCreated = false;
+  let lifecycleCertificate: TeamLifecycleGenerationCertificate | null = null;
 
   let config: TeamConfig | null = null;
   const workerReadyTimeoutMs = resolveWorkerReadyTimeoutMs(launchEnv);
@@ -2761,6 +2771,32 @@ export async function startTeam(
     config.requested_name = displayName;
     config.identity_source = identityScope.source;
     config.worktree_mode = effectiveWorktreeMode;
+    const incompleteGeneration = await readTeamLifecycleGeneration(sanitized, leaderCwd);
+    if (incompleteGeneration?.status === 'preparing') {
+      // A prior process may have acquired panes or hooks after its last receipt.
+      // Preserve both resources and recovery metadata rather than guessing at IDs.
+      throw new Error(`team_lifecycle_recovery_required:${incompleteGeneration.token}`);
+    }
+    if (workerLaunchMode === 'interactive') {
+      lifecycleCertificate = {
+        version: 1,
+        token: randomUUID(),
+        team_name: sanitized,
+        canonical_session_id: leaderSessionId,
+        native_session_ids: [leaderSessionId],
+        tmux_session_name: null,
+        tmux_session_birth: null,
+        tmux_context: null,
+        team_pane_owner_id: config.tmux_pane_owner_id ?? `team:${sanitized}`,
+        hook_generation: randomUUID(),
+        status: 'preparing',
+        created_at: new Date().toISOString(),
+        resources: [],
+      };
+      if (!await createTeamLifecycleGeneration(lifecycleCertificate, leaderCwd)) {
+        throw new Error('team_lifecycle_certificate_conflict');
+      }
+    }
     await writePersistedApprovedTeamExecutionBinding(
       sanitized,
       leaderCwd,
@@ -3059,6 +3095,17 @@ export async function startTeam(
             teamPaneOwnerId: config.tmux_pane_owner_id,
             hudRuntime,
             hudExactCandidate,
+            hookGeneration: lifecycleCertificate?.hook_generation,
+            journalResource: (resource) => {
+              if (!lifecycleCertificate || !appendTeamLifecycleResourceSync(
+                sanitized,
+                lifecycleCertificate.token,
+                resource,
+                leaderCwd,
+              )) {
+                throw new Error(`team_lifecycle_receipt_failed:${resource.kind}:${resource.id}`);
+              }
+            },
           },
         );
         // The session owns real panes as soon as tmux returns. Mark that fact before
@@ -3066,6 +3113,39 @@ export async function startTeam(
         sessionName = createdSession.name;
         sessionCreated = true;
         applyCreatedInteractiveSessionToConfig(config, createdSession, workerPaneIds);
+        config.hook_generation = lifecycleCertificate?.hook_generation ?? null;
+        if (!lifecycleCertificate) throw new Error('missing_team_lifecycle_certificate');
+        const acquiredResources = [
+          ...createdSession.workerPaneIds.map((paneId) => ({
+            kind: 'worker' as const,
+            id: paneId,
+            created: true,
+            pane_birth: createdSession.workerPaneBirths?.[paneId],
+            acquired_at: new Date().toISOString(),
+          })),
+          ...(createdSession.hudPaneId ? [{
+            kind: 'hud' as const,
+            id: createdSession.hudPaneId,
+            created: Boolean(createdSession.hudPaneBirth),
+            pane_birth: createdSession.hudPaneBirth ?? undefined,
+            acquired_at: new Date().toISOString(),
+          }] : []),
+          ...(createdSession.resizeHookName ? [{
+            kind: 'hook' as const,
+            id: createdSession.resizeHookName,
+            created: true,
+            command: lifecycleCertificate.hook_generation,
+            acquired_at: new Date().toISOString(),
+          }] : []),
+        ];
+        for (const resource of acquiredResources) {
+          if (!await appendTeamLifecycleResource(sanitized, lifecycleCertificate.token, resource, leaderCwd)) {
+            throw new Error(`team_lifecycle_receipt_failed:${resource.kind}:${resource.id}`);
+          }
+        }
+        if (!await finalizeTeamLifecycleGeneration(sanitized, lifecycleCertificate.token, 'active', leaderCwd)) {
+          throw new Error('team_lifecycle_activation_failed');
+        }
         const revalidatedHudCandidate = hudExactCandidate
           ? probeExactTeamHudCandidate({
             sessionId: hudExactCandidate.sessionId,
@@ -3327,7 +3407,7 @@ export async function startTeam(
         try {
           hookCleanupCertain = Boolean(
             clientHookName
-            && unregisterHudHooksTransactionally(config.resize_hook_target, config.resize_hook_name, clientHookName, config.hud_pane_id),
+            && unregisterHudHooksTransactionally(config.resize_hook_target, config.resize_hook_name, clientHookName, config.hud_pane_id, config.hook_generation ?? undefined),
           );
           if (!hookCleanupCertain) rollbackErrors.push('unregisterHudHooksTransactionally: returned false');
         } catch (cleanupError) {
@@ -4192,7 +4272,7 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
         : '';
       hooksRemoved = Boolean(
         clientHookName
-        && unregisterHudHooksTransactionally(clientHookTarget, config.resize_hook_name, clientHookName, persistedHudPaneId)
+        && unregisterHudHooksTransactionally(clientHookTarget, config.resize_hook_name, clientHookName, persistedHudPaneId, config.hook_generation ?? undefined)
       );
       if (!hooksRemoved) {
         console.warn(`[team shutdown] ${sanitized}: preserving Team HUD pane and metadata because authorized HUD hook cleanup failed; hook state may have changed`);
@@ -4257,6 +4337,8 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
     await teardownWorkerPanes(shutdownPaneIds, {
       leaderPaneId: effectiveLeaderPaneId,
       hudPaneId: restoredHudPaneId ?? (ownsHudTeardownAuthority && hooksRemoved ? effectiveHudPaneId : undefined),
+      teamPaneOwnerId: tmuxPaneOwnerId,
+      sessionName,
     });
     } finally {
       if (hudLifecycleLock?.status === 'acquired' && hudLifecycleLock.lock) {

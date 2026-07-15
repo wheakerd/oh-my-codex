@@ -105,6 +105,24 @@ function hudTmuxBirthLineagePath(baseStateDir: string, sessionId: string): strin
   return join(baseStateDir, HUD_TMUX_BIRTH_LINEAGE_DIR, `${createHash('sha256').update(sessionId).digest('hex')}.json`);
 }
 
+function hudTmuxBirthLineageRecordPath(
+  baseStateDir: string,
+  sessionId: string,
+  receipt: Pick<HudTmuxBirthLineageReceipt, 'version' | 'nonce'>,
+): string {
+  const sessionHash = createHash('sha256').update(sessionId).digest('hex');
+  return join(baseStateDir, HUD_TMUX_BIRTH_LINEAGE_DIR, `${sessionHash}.${receipt.version}.${receipt.nonce}.json`);
+}
+
+function isHudTmuxBirthLineageReceipt(value: unknown): value is HudTmuxBirthLineageReceipt {
+  if (!value || typeof value !== 'object') return false;
+  const candidate = value as Partial<HudTmuxBirthLineageReceipt>;
+  return candidate.version === HUD_TMUX_BIRTH_LINEAGE_VERSION
+    && typeof candidate.nonce === 'string' && candidate.nonce.trim() !== ''
+    && typeof candidate.births?.tmuxSessionInstanceId === 'string' && candidate.births.tmuxSessionInstanceId.trim() !== ''
+    && typeof candidate.births?.tmuxPaneInstanceId === 'string' && candidate.births.tmuxPaneInstanceId.trim() !== '';
+}
+
 function isHudTmuxBirthLineage(value: unknown, sessionId: string): value is HudTmuxBirthLineage {
   if (!value || typeof value !== 'object') return false;
   const candidate = value as Partial<HudTmuxBirthLineage>;
@@ -134,11 +152,7 @@ export async function writeHudTmuxBirthLineage(
     createdAtMs: nowMs,
     nonce: `${process.pid}-${nowMs}-${Math.random().toString(36).slice(2)}`,
   };
-  const target = hudTmuxBirthLineagePath(domain.baseStateDir, lineage.sessionId);
-  const temporary = `${target}.${record.nonce}.tmp`;
-  await writeFile(temporary, `${JSON.stringify(record)}\n`, { mode: 0o600 });
-  await rename(temporary, target);
-  return {
+  const receipt: HudTmuxBirthLineageReceipt = {
     version: record.version,
     nonce: record.nonce,
     births: {
@@ -146,6 +160,15 @@ export async function writeHudTmuxBirthLineage(
       tmuxPaneInstanceId: record.tmuxPaneInstanceId,
     },
   };
+  await writeFile(hudTmuxBirthLineageRecordPath(domain.baseStateDir, lineage.sessionId, receipt), `${JSON.stringify(record)}\n`, {
+    mode: 0o600,
+    flag: 'wx',
+  });
+  const target = hudTmuxBirthLineagePath(domain.baseStateDir, lineage.sessionId);
+  const temporary = `${target}.${record.nonce}.tmp`;
+  await writeFile(temporary, `${JSON.stringify(receipt)}\n`, { mode: 0o600 });
+  await rename(temporary, target);
+  return receipt;
 }
 
 export async function deleteHudTmuxBirthLineage(
@@ -159,22 +182,31 @@ export async function deleteHudTmuxBirthLineage(
     || lineage.tmuxSessionInstanceId !== receipt.births.tmuxSessionInstanceId
     || lineage.tmuxPaneInstanceId !== receipt.births.tmuxPaneInstanceId
   ) return false;
-  const path = hudTmuxBirthLineagePath(domain.baseStateDir, lineage.sessionId);
+  const path = hudTmuxBirthLineageRecordPath(domain.baseStateDir, lineage.sessionId, receipt);
   try {
     const current: unknown = JSON.parse(await readFile(path, 'utf-8'));
     if (!isHudTmuxBirthLineage(current, lineage.sessionId) || JSON.stringify(current) !== JSON.stringify(lineage)) return false;
     await unlink(path);
     return true;
-  } catch (error: unknown) {
-    return (error as NodeJS.ErrnoException).code === 'ENOENT';
+  } catch {
+    return false;
   }
 }
 
 export async function readHudTmuxBirthLineage(baseStateDir: string, sessionId: string | undefined): Promise<HudTmuxBirthLineage | null> {
   if (!sessionId) return null;
   try {
-    const value: unknown = JSON.parse(await readFile(hudTmuxBirthLineagePath(baseStateDir, sessionId), 'utf-8'));
-    return isHudTmuxBirthLineage(value, sessionId) ? value : null;
+    const pointer: unknown = JSON.parse(await readFile(hudTmuxBirthLineagePath(baseStateDir, sessionId), 'utf-8'));
+    if (isHudTmuxBirthLineage(pointer, sessionId)) return pointer;
+    if (!isHudTmuxBirthLineageReceipt(pointer)) return null;
+    const lineage: unknown = JSON.parse(await readFile(hudTmuxBirthLineageRecordPath(baseStateDir, sessionId, pointer), 'utf-8'));
+    return isHudTmuxBirthLineage(lineage, sessionId)
+      && lineage.version === pointer.version
+      && lineage.nonce === pointer.nonce
+      && lineage.tmuxSessionInstanceId === pointer.births.tmuxSessionInstanceId
+      && lineage.tmuxPaneInstanceId === pointer.births.tmuxPaneInstanceId
+      ? lineage
+      : null;
   } catch {
     return null;
   }

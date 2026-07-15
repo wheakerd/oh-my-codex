@@ -157,7 +157,51 @@ async function withMockTmuxFixture<T>(
   const previousPath = process.env.PATH;
 
   try {
-    await writeFile(tmuxStubPath, tmuxScript(logPath));
+    const script = tmuxScript(logPath).replace(
+      /^#!\/bin\/sh\n/,
+      `#!/bin/sh
+state_dir="${logPath}.tmux-state"
+mkdir -p "$state_dir"
+key_for_hook() { printf '%s' "$1:$2" | tr -c 'A-Za-z0-9_.-' '_'; }
+if [ "${'$'}{1:-}" = "if-shell" ]; then
+  printf '%s\\n' "${'$'}*" >> "${logPath}"
+  if [ "${'$'}{4:-}" != "-F" ] && sh -c "${'$'}{4:-}"; then
+    eval "set -- ${'$'}{5:-}"
+    "${'$'}0" "${'$'}@"
+  fi
+  exit 0
+fi
+if [ "${'$'}{1:-}" = "set-hook" ]; then
+  if [ "${'$'}{2:-}" = "-u" ]; then
+    hook_target="${'$'}{4:-}"; hook_slot="${'$'}{5:-}"
+    rm -f "$state_dir/hook-$(key_for_hook "${'$'}hook_target" "${'$'}hook_slot")"
+  elif [ "${'$'}{2:-}" = "-t" ]; then
+    hook_target="${'$'}{3:-}"; hook_slot="${'$'}{4:-}"
+    printf '%s %s\\n' "${'$'}hook_slot" "${'$'}{5:-}" > "$state_dir/hook-$(key_for_hook "${'$'}hook_target" "${'$'}hook_slot")"
+  fi
+fi
+if [ "${'$'}{1:-}" = "show-hooks" ]; then
+  hook_target="${'$'}{3:-}"; hook_slot="${'$'}{4:-}"
+  hook_file="$state_dir/hook-$(key_for_hook "${'$'}hook_target" "${'$'}hook_slot")"
+  [ -f "$hook_file" ] && cat "$hook_file" && exit 0
+fi
+# Faithfully emulate tmux's per-pane opaque birth option: set-option writes it
+# and show-option reads the exact value back, rather than accepting untagged panes.
+if [ "${'$'}{1:-}" = "set-option" ] && case "${'$'}*" in *"@omx_team_pane_birth"*) true;; *) false;; esac; then
+  pane_target="${'$'}{4:-}"; pane_birth="${'$'}{6:-}"
+  printf '%s\\n' "${'$'}pane_birth" > "$state_dir/birth-${'$'}pane_target"
+fi
+if [ "${'$'}{1:-}" = "show-option" ]; then
+  case "${'$'}*" in
+    *"@omx_team_pane_birth"*)
+      pane_target="${'$'}{5:-}"
+      [ -f "$state_dir/birth-${'$'}pane_target" ] && cat "$state_dir/birth-${'$'}pane_target" && exit 0
+      ;;
+  esac
+fi
+`,
+    );
+    await writeFile(tmuxStubPath, script);
     await chmod(tmuxStubPath, 0o755);
     process.env.PATH = `${fakeBinDir}:${previousPath ?? ''}`;
     return await run({ logPath });
@@ -426,7 +470,10 @@ printf '%s\\n' "$*" >> "${logPath}"
 [ "$1" = show-hooks ] && echo "${slot} run-shell -b 'foreign'"
 `, async ({ logPath }) => {
       assert.equal(registerHudHookIfVacant('team:0', args), false);
-      assert.doesNotMatch(await readFile(logPath, 'utf-8'), /set-hook -t/);
+      const log = await readFile(logPath, 'utf-8');
+      assert.match(log, new RegExp(`if-shell -t team:0 .*${escapeRegExp(slot)}`));
+      assert.match(log, new RegExp(`show-hooks -t team:0 ${escapeRegExp(slot)}`));
+      assert.equal((log.match(/set-hook -t/g) ?? []).length, 1);
     });
   });
 
@@ -438,7 +485,10 @@ printf '%s\\n' "$*" >> "${logPath}"
 [ "$1" = show-hooks ] && echo "${slot} run-shell -b 'foreign'"
 `, async ({ logPath }) => {
       assert.equal(registerHudHookIfVacant('team:0', args), false);
-      assert.doesNotMatch(await readFile(logPath, 'utf-8'), /set-hook -t/);
+      const log = await readFile(logPath, 'utf-8');
+      assert.match(log, new RegExp(`if-shell -t team:0 .*${escapeRegExp(slot)}`));
+      assert.match(log, new RegExp(`show-hooks -t team:0 ${escapeRegExp(slot)}`));
+      assert.equal((log.match(/set-hook -t/g) ?? []).length, 1);
     });
   });
 
@@ -458,15 +508,12 @@ case "$1" in
       "${attachedSlot}") echo "${attachedSlot} ${attachedCommand}" ;;
     esac
     ;;
-  set-hook)
-    if [ "$2" = '-u' ] && [ "$5" = '${attachedSlot}' ]; then exit 1; fi
-    ;;
 esac
 `, async ({ logPath }) => {
       assert.equal(unregisterHudHooksTransactionally('team:0', resizeName, attachedName, '%1'), false);
       const log = await readFile(logPath, 'utf-8');
-      assert.match(log, new RegExp(`set-hook -u -t team:0 ${escapeRegExp(attachedSlot)}`));
-      assert.match(log, new RegExp(`set-hook -u -t team:0 ${escapeRegExp(resizeSlot)}`));
+      assert.match(log, new RegExp(`if-shell -t team:0 .*${escapeRegExp(attachedSlot)}.*set-hook -u`));
+      assert.match(log, new RegExp(`if-shell -t team:0 .*${escapeRegExp(resizeSlot)}.*set-hook -u`));
       assert.doesNotMatch(log, new RegExp(`set-hook -t team:0 ${escapeRegExp(resizeSlot)} ${escapeRegExp(resizeCommand)}`));
       assert.doesNotMatch(log, new RegExp(`set-hook -t team:0 ${escapeRegExp(attachedSlot)} ${escapeRegExp(attachedCommand)}`));
     });
@@ -489,7 +536,8 @@ esac
 `, async ({ logPath }) => {
       assert.equal(unregisterHudHooksTransactionally('team:0', resizeName, attachedName, '%1'), false);
       const log = await readFile(logPath, 'utf-8');
-      assert.doesNotMatch(log, /set-hook -u/);
+      assert.match(log, /if-shell -t team:0/);
+      assert.equal(log.match(/^set-hook -u -t/m)?.length ?? 0, 0);
     });
   });
 
@@ -4799,10 +4847,10 @@ esac
           assert.equal(warnings.join('\n'), '');
 
           const tmuxLog = await readFile(logPath, 'utf-8');
-          assert.match(tmuxLog, /set-hook -t leader:0 client-resized\[\d+\]/);
+          assert.match(tmuxLog, /if-shell -t leader:0 test -z .*client-resized\[\d+\].*set-hook -t 'leader:0' 'client-resized\[\d+\]'/);
           assert.doesNotMatch(tmuxLog, /window-resized\[/);
           assert.doesNotMatch(tmuxLog, /set-hook -w /);
-          assert.match(tmuxLog, /set-hook -t leader:0 client-attached\[\d+\]/);
+          assert.match(tmuxLog, /if-shell -t leader:0 test -z .*client-attached\[\d+\].*set-hook -t 'leader:0' 'client-attached\[\d+\]'/);
           assert.match(tmuxLog, new RegExp(`run-shell -b sleep ${HUD_RESIZE_RECONCILE_DELAY_SECONDS}; .*resize-pane -t %3 -y ${HUD_TMUX_TEAM_HEIGHT_LINES}`));
           assert.match(tmuxLog, new RegExp(`run-shell .*resize-pane -t %3 -y ${HUD_TMUX_TEAM_HEIGHT_LINES}`));
           assert.doesNotMatch(tmuxLog, /kill-pane -t %2/);
@@ -6436,54 +6484,58 @@ describe('teardownWorkerPanes shared primitive', () => {
       (logPath) => `#!/bin/sh
 set -eu
 printf '%s\\n' "$*" >> "${logPath}"
-exit 0
+case "$1" in
+  show-option) echo 'pane-birth' ;;
+  show-options) echo 'session-birth' ;;
+  *) exit 0 ;;
+esac
 `,
+
       async ({ logPath }) => {
         const summary = await teardownWorkerPanes(['%1', '%2', '%3'], {
           leaderPaneId: '%1',
           hudPaneId: '%2',
+          teamPaneOwnerId: 'team:generation-a',
+          sessionName: 'omx-team-x:0',
           graceMs: 1,
         });
+
 
         assert.equal(summary.excluded.leader, 1);
         assert.equal(summary.excluded.hud, 1);
         assert.equal(summary.kill.attempted, 1);
         assert.equal(summary.kill.succeeded, 1);
         const log = await readFile(logPath, 'utf-8');
-        assert.match(log, /kill-pane -t %3/);
+        assert.match(log, /if-shell -t %3 -F .*@omx_team_pane_birth.*@omx_team_pane_role.*,worker.*kill-pane -t %3/);
+
         assert.doesNotMatch(log, /kill-pane -t %1/);
         assert.doesNotMatch(log, /kill-pane -t %2/);
       },
     );
   });
 
-  it('uses pane-id-direct kill semantics without liveness-gated helper calls', async () => {
+  it('uses a server-side compare-and-kill rather than an unconditional pane kill', async () => {
     const source = await readFile(join(process.cwd(), 'src/team/tmux-session.ts'), 'utf-8');
     const primitiveBlock = source.split('export async function teardownWorkerPanes')[1] ?? '';
-    assert.equal(primitiveBlock.includes('isWorkerAlive'), false);
-    assert.equal(primitiveBlock.includes('killWorker('), false);
+    assert.equal(primitiveBlock.includes("runTmuxAsync(['kill-pane'"), false);
+    assert.match(primitiveBlock, /runTmuxAsync\(\['if-shell'.*kill-pane/s);
   });
 
-  it('continues best-effort when a pane target is missing', async () => {
+  it('fails closed without exact generation evidence', async () => {
     await withMockTmuxFixture(
       'omx-tmux-teardown-missing-',
       (logPath) => `#!/bin/sh
 set -eu
 printf '%s\\n' "$*" >> "${logPath}"
-if [ "$1" = "kill-pane" ] && [ "\${3:-}" = "%404" ]; then
-  echo "missing pane" >&2
-  exit 1
-fi
 exit 0
 `,
       async ({ logPath }) => {
         const summary = await teardownWorkerPanes(['%404', '%405'], { graceMs: 1 });
         assert.equal(summary.kill.attempted, 2);
-        assert.equal(summary.kill.succeeded, 1);
-        assert.equal(summary.kill.failed, 1);
+        assert.equal(summary.kill.succeeded, 0);
+        assert.equal(summary.kill.failed, 2);
         const log = await readFile(logPath, 'utf-8');
-        assert.match(log, /kill-pane -t %404/);
-        assert.match(log, /kill-pane -t %405/);
+        assert.doesNotMatch(log, /kill-pane/);
       },
     );
   });

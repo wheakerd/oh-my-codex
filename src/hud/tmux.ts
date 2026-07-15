@@ -1,4 +1,5 @@
 import { execFileSync } from 'child_process';
+import { randomUUID } from 'crypto';
 import { existsSync } from 'fs';
 import { HUD_RESIZE_RECONCILE_DELAY_SECONDS, HUD_TMUX_HEIGHT_LINES } from './constants.js';
 import { resolveTmuxBinaryForPlatform } from '../utils/platform-command.js';
@@ -652,6 +653,43 @@ export function createHudWatchPane(
   }
 }
 
+export interface ExactHudPaneKillCandidate {
+  paneId: string;
+  currentCommand: string;
+  startCommand: string;
+  owner: HudPaneOwner;
+  paneInstanceId: string;
+  sessionInstanceId: string;
+  sessionName: string;
+}
+
+function tmuxFormatLiteral(value: string): string {
+  return value.replace(/([\\,}])/g, '\\$1');
+}
+
+/** Atomically kills a pane only while its complete managed-HUD identity still matches. */
+export function killExactHudPane(
+  candidate: ExactHudPaneKillCandidate,
+  execTmuxSync: TmuxExecSync = defaultExecTmuxSync,
+): boolean {
+  const paneId = candidate.paneId.trim();
+  const paneInstanceId = candidate.paneInstanceId.trim();
+  const sessionInstanceId = candidate.sessionInstanceId.trim();
+  const sessionName = candidate.sessionName.trim();
+  const ownerSessionId = candidate.owner.sessionId?.trim() ?? '';
+  const ownerLeaderPaneId = candidate.owner.leaderPaneId?.trim() ?? '';
+  if (!isTmuxPaneId(paneId) || !paneInstanceId || !sessionInstanceId || !sessionName || !ownerSessionId || !isTmuxPaneId(ownerLeaderPaneId)) return false;
+  if (!isHudWatchPane({ paneId, currentCommand: candidate.currentCommand, startCommand: candidate.startCommand })
+    || readHudPaneOwner({ paneId, currentCommand: candidate.currentCommand, startCommand: candidate.startCommand }).sessionId !== ownerSessionId
+    || readHudPaneOwner({ paneId, currentCommand: candidate.currentCommand, startCommand: candidate.startCommand }).leaderPaneId !== ownerLeaderPaneId) return false;
+  const condition = `#{&&:#{==:#{pane_id},${tmuxFormatLiteral(paneId)}},#{==:#{pane_current_command},${tmuxFormatLiteral(candidate.currentCommand)}},#{==:#{pane_start_command},${tmuxFormatLiteral(candidate.startCommand)}},#{==:#{@omx_pane_instance_id},${tmuxFormatLiteral(paneInstanceId)}},#{==:#{@omx_instance_id},${tmuxFormatLiteral(sessionInstanceId)}},#{==:#{session_name},${tmuxFormatLiteral(sessionName)}}}`;
+  try {
+    execTmuxSync(['if-shell', '-t', paneId, '-F', condition, `kill-pane -t ${paneId}`, '']);
+    return true;
+  } catch {
+    return false;
+  }
+}
 export function killTmuxPane(
   paneId: string,
   execTmuxSync: TmuxExecSync = defaultExecTmuxSync,
@@ -704,7 +742,8 @@ export function registerHudResizeHook(
   const reconcileCmd = shellEscapeSingle(
     buildHudLayoutReconcileHookCommand(tmuxBin, omxBin, leaderPaneId, options),
   );
-  const ownershipMarker = ` # omx-hud-owned:${context.hookSlot}:${context.layoutHookSlot}`;
+  const generation = randomUUID();
+  const ownershipMarker = ` # omx-hud-owned:${context.hookSlot}:${context.layoutHookSlot}:${generation}`;
   return registerHudHookPair(
     context,
     `run-shell -b ${resizeCmd}${ownershipMarker}`,
@@ -743,23 +782,73 @@ function hookMatches(context: HudResizeHookContext, snapshot: TmuxHookSnapshot, 
   return readTmuxHookSnapshot(context, snapshot.slot, execTmuxSync)?.command === snapshot.command;
 }
 
+/**
+ * Mutate a hook only as the then-branch of one tmux server command. The shell
+ * condition and branch are queued together, so an observed value never grants
+ * a later unconditional set-hook or unset-hook mutation.
+ */
+function compareAndMutateHudHook(
+  context: HudResizeHookContext,
+  slot: string,
+  expectedCommand: string | null,
+  mutation: string,
+  execTmuxSync: TmuxExecSync,
+): boolean {
+  const tmuxBin = resolveTmuxBinaryForPlatform() || 'tmux';
+  const expectedOutput = expectedCommand === null ? '' : `${slot} ${expectedCommand}`;
+  const condition = `test "$(${shellEscapeSingle(tmuxBin)} show-hooks -t ${shellEscapeSingle(context.sessionId)} ${shellEscapeSingle(slot)})" = ${shellEscapeSingle(expectedOutput)}`;
+  try {
+    execTmuxSync(['if-shell', '-t', context.sessionId, condition, mutation, '']);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function setHudHookIfMatches(
+  context: HudResizeHookContext,
+  slot: string,
+  expectedCommand: string | null,
+  command: string,
+  execTmuxSync: TmuxExecSync,
+): boolean {
+  return compareAndMutateHudHook(
+    context,
+    slot,
+    expectedCommand,
+    `set-hook -t ${shellEscapeSingle(context.sessionId)} ${shellEscapeSingle(slot)} ${shellEscapeSingle(command)}`,
+    execTmuxSync,
+  );
+}
+
+function unsetHudHookIfMatches(
+  context: HudResizeHookContext,
+  slot: string,
+  expectedCommand: string,
+  execTmuxSync: TmuxExecSync,
+): boolean {
+  return compareAndMutateHudHook(
+    context,
+    slot,
+    expectedCommand,
+    `set-hook -u -t ${shellEscapeSingle(context.sessionId)} ${shellEscapeSingle(slot)}`,
+    execTmuxSync,
+  );
+}
+
 function restoreHudHookPair(
   context: HudResizeHookContext,
   resize: TmuxHookSnapshot,
   layout: TmuxHookSnapshot,
-  expectedResizeCurrent: string | null,
-  expectedLayoutCurrent: string | null,
+  expectedResizeCurrent: string,
+  expectedLayoutCurrent: string,
   execTmuxSync: TmuxExecSync,
 ): boolean {
-  const restore = (snapshot: TmuxHookSnapshot, expectedCurrent: string | null): boolean => {
-    if (!hookMatches(context, { slot: snapshot.slot, command: expectedCurrent }, execTmuxSync)) return false;
-    try {
-      if (snapshot.command === null) execTmuxSync(['set-hook', '-u', '-t', context.sessionId, snapshot.slot]);
-      else execTmuxSync(['set-hook', '-t', context.sessionId, snapshot.slot, snapshot.command]);
-    } catch {
-      return false;
-    }
-    return hookMatches(context, snapshot, execTmuxSync);
+  const restore = (snapshot: TmuxHookSnapshot, expectedCurrent: string): boolean => {
+    const mutated = snapshot.command === null
+      ? unsetHudHookIfMatches(context, snapshot.slot, expectedCurrent, execTmuxSync)
+      : setHudHookIfMatches(context, snapshot.slot, expectedCurrent, snapshot.command, execTmuxSync);
+    return mutated && hookMatches(context, snapshot, execTmuxSync);
   };
   const resizeRestored = restore(resize, expectedResizeCurrent);
   const layoutRestored = restore(layout, expectedLayoutCurrent);
@@ -769,12 +858,14 @@ function restoreHudHookPair(
 function registerHudHookPair(context: HudResizeHookContext, resizeCommand: string, layoutCommand: string, execTmuxSync: TmuxExecSync): boolean {
   const resize = readTmuxHookSnapshot(context, context.hookSlot, execTmuxSync);
   const layout = readTmuxHookSnapshot(context, context.layoutHookSlot, execTmuxSync);
-  if (!resize || !layout || (resize.command !== null && resize.command !== resizeCommand) || (layout.command !== null && layout.command !== layoutCommand)) return false;
+  // Each registration owns a new immutable generation. Existing hooks, even
+  // prior OMX generations, remain owned by their transaction and are retained.
+  if (!resize || !layout || resize.command !== null || layout.command !== null) return false;
   try {
-    if (resize.command === null) execTmuxSync(['set-hook', '-t', context.sessionId, resize.slot, resizeCommand]);
-    if (!hookMatches(context, { slot: resize.slot, command: resizeCommand }, execTmuxSync)) throw new Error('resize hook verification failed');
-    if (layout.command === null) execTmuxSync(['set-hook', '-t', context.sessionId, layout.slot, layoutCommand]);
-    if (!hookMatches(context, { slot: layout.slot, command: layoutCommand }, execTmuxSync)) throw new Error('layout hook verification failed');
+    if (!setHudHookIfMatches(context, resize.slot, null, resizeCommand, execTmuxSync)
+      || !hookMatches(context, { slot: resize.slot, command: resizeCommand }, execTmuxSync)) throw new Error('resize hook verification failed');
+    if (!setHudHookIfMatches(context, layout.slot, null, layoutCommand, execTmuxSync)
+      || !hookMatches(context, { slot: layout.slot, command: layoutCommand }, execTmuxSync)) throw new Error('layout hook verification failed');
     return true;
   } catch {
     restoreHudHookPair(context, resize, layout, resizeCommand, layoutCommand, execTmuxSync);
@@ -786,24 +877,18 @@ function unregisterHudHookPair(context: HudResizeHookContext, execTmuxSync: Tmux
   const resize = readTmuxHookSnapshot(context, context.hookSlot, execTmuxSync);
   const layout = readTmuxHookSnapshot(context, context.layoutHookSlot, execTmuxSync);
   if (!resize || !layout) return false;
-  const ownershipMarker = `# omx-hud-owned:${context.hookSlot}:${context.layoutHookSlot}`;
+  const ownershipMarker = `# omx-hud-owned:${context.hookSlot}:${context.layoutHookSlot}:`;
   const removeOwnedOrPreserveForeign = (snapshot: TmuxHookSnapshot): boolean => {
-    const current = readTmuxHookSnapshot(context, snapshot.slot, execTmuxSync);
-    if (!current) return false;
-    // A concurrent removal or replacement has already made this transaction's
-    // owned hook harmless; preserve it and treat this slot as safely handled.
-    if (current.command === null || !current.command.endsWith(ownershipMarker)) return true;
-    if (snapshot.command === null || current.command !== snapshot.command) return false;
-    try {
-      execTmuxSync(['set-hook', '-u', '-t', context.sessionId, snapshot.slot]);
-    } catch {
-      return false;
-    }
+    // The captured generation is immutable mutation authority. A replacement
+    // between this observation and the queued branch fails the exact compare
+    // and is deliberately preserved.
+    if (snapshot.command === null || !snapshot.command.includes(ownershipMarker)) return true;
+    if (!unsetHudHookIfMatches(context, snapshot.slot, snapshot.command, execTmuxSync)) return false;
     const after = readTmuxHookSnapshot(context, snapshot.slot, execTmuxSync);
-    return after === null || after.command === null || !after.command.endsWith(ownershipMarker);
+    return after !== null && (after.command === null || after.command !== snapshot.command);
   };
   // Attempt both slots even when one cannot be safely handled. Never restore a
-  // removed owned hook: that could overwrite a concurrent replacement.
+  // removed generation: that could overwrite a concurrent replacement.
   const resizeHandled = removeOwnedOrPreserveForeign(resize);
   const layoutHandled = removeOwnedOrPreserveForeign(layout);
   return resizeHandled && layoutHandled;

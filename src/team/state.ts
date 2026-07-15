@@ -1,6 +1,6 @@
 import { appendFile, readFile, writeFile, mkdir, rm, rename, readdir } from 'fs/promises';
 import { join, dirname, resolve, sep } from 'path';
-import { existsSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync, rmSync, openSync, fsyncSync, closeSync } from 'fs';
 import { randomUUID } from 'crypto';
 import { readUsableSessionState } from '../hooks/session.js';
 import { isTerminalPhase, type TeamPhase, type TerminalPhase } from './orchestrator.js';
@@ -99,9 +99,37 @@ export interface TeamConfig {
   resize_hook_target: string | null;
   /** Monotonic counter for worker index assignment during scaling. */
   next_worker_index?: number;
+  /** Immutable hook command generation for exact teardown. */
+  hook_generation?: string | null;
   display_name?: string;
   requested_name?: string;
   identity_source?: string;
+}
+
+export interface TeamLifecycleResource {
+  kind: 'leader' | 'worker' | 'hud' | 'hook';
+  id: string;
+  created: boolean;
+  pane_birth?: string;
+  command?: string;
+  acquired_at: string;
+}
+
+/** Immutable-generation journal. Resource entries are only appended. */
+export interface TeamLifecycleGenerationCertificate {
+  version: 1;
+  token: string;
+  team_name: string;
+  canonical_session_id: string;
+  native_session_ids: string[];
+  tmux_session_name: string | null;
+  tmux_session_birth: string | null;
+  tmux_context: string | null;
+  team_pane_owner_id: string;
+  hook_generation: string;
+  status: 'preparing' | 'active' | 'cleanup_complete' | 'transferred';
+  created_at: string;
+  resources: TeamLifecycleResource[];
 }
 
 export interface WorkerInfo {
@@ -644,6 +672,88 @@ function teamConfigPath(teamName: string, cwd: string): string {
 
 function teamManifestV2Path(teamName: string, cwd: string): string {
   return join(teamDir(teamName, cwd), 'manifest.v2.json');
+}
+
+function lifecycleGenerationPath(teamName: string, cwd: string): string {
+  return join(teamDir(teamName, cwd), 'lifecycle-generation.json');
+}
+
+function isLifecycleCertificate(value: unknown): value is TeamLifecycleGenerationCertificate {
+  if (!value || typeof value !== 'object') return false;
+  const certificate = value as Partial<TeamLifecycleGenerationCertificate>;
+  return certificate.version === 1 && typeof certificate.token === 'string'
+    && typeof certificate.team_name === 'string' && Array.isArray(certificate.resources)
+    && typeof certificate.hook_generation === 'string';
+}
+
+export async function readTeamLifecycleGeneration(teamName: string, cwd: string): Promise<TeamLifecycleGenerationCertificate | null> {
+  try {
+    const parsed: unknown = JSON.parse(await readFile(lifecycleGenerationPath(teamName, cwd), 'utf-8'));
+    return isLifecycleCertificate(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Persists the immutable certificate before the first tmux mutation. */
+export async function createTeamLifecycleGeneration(certificate: TeamLifecycleGenerationCertificate, cwd: string): Promise<boolean> {
+  const existing = await readTeamLifecycleGeneration(certificate.team_name, cwd);
+  if (existing) return existing.token === certificate.token;
+  await mkdir(dirname(lifecycleGenerationPath(certificate.team_name, cwd)), { recursive: true });
+  await writeAtomic(lifecycleGenerationPath(certificate.team_name, cwd), `${JSON.stringify(certificate, null, 2)}\n`);
+  return true;
+}
+
+/** Appends acquisition evidence; duplicate entries are idempotent. */
+export async function appendTeamLifecycleResource(teamName: string, token: string, resource: TeamLifecycleResource, cwd: string): Promise<boolean> {
+  const current = await readTeamLifecycleGeneration(teamName, cwd);
+  if (!current || current.token !== token || current.status !== 'preparing') return false;
+  if (current.resources.some((entry) => entry.kind === resource.kind && entry.id === resource.id)) return true;
+  await writeAtomic(lifecycleGenerationPath(teamName, cwd), `${JSON.stringify({ ...current, resources: [...current.resources, resource] }, null, 2)}\n`);
+  return true;
+}
+
+/**
+ * Synchronously appends a receipt before a caller is allowed to issue another
+ * tmux mutation. The unique temporary file prevents a failed write from
+ * replacing the durable prior generation; a token/status mismatch is a
+ * recovery condition, never an invitation to overwrite another generation.
+ */
+export function appendTeamLifecycleResourceSync(teamName: string, token: string, resource: TeamLifecycleResource, cwd: string): boolean {
+  const path = lifecycleGenerationPath(teamName, cwd);
+  let current: TeamLifecycleGenerationCertificate;
+  try {
+    current = JSON.parse(readFileSync(path, 'utf8')) as TeamLifecycleGenerationCertificate;
+  } catch {
+    return false;
+  }
+  if (!isLifecycleCertificate(current) || current.token !== token || current.status !== 'preparing') return false;
+  if (current.resources.some((entry) => entry.kind === resource.kind && entry.id === resource.id)) return true;
+  const next = { ...current, resources: [...current.resources, resource] };
+  const temporaryPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(temporaryPath, `${JSON.stringify(next, null, 2)}\n`, 'utf8');
+    const descriptor = openSync(temporaryPath, 'r');
+    try { fsyncSync(descriptor); } finally { closeSync(descriptor); }
+    renameSync(temporaryPath, path);
+    return true;
+  } catch {
+    try { rmSync(temporaryPath, { force: true }); } catch { /* preserve prior certificate */ }
+    return false;
+  }
+}
+
+export async function finalizeTeamLifecycleGeneration(
+  teamName: string,
+  token: string,
+  status: Extract<TeamLifecycleGenerationCertificate['status'], 'active' | 'cleanup_complete' | 'transferred'>,
+  cwd: string,
+): Promise<boolean> {
+  const current = await readTeamLifecycleGeneration(teamName, cwd);
+  if (!current || current.token !== token || current.status !== 'preparing') return false;
+  await writeAtomic(lifecycleGenerationPath(teamName, cwd), `${JSON.stringify({ ...current, status }, null, 2)}\n`);
+  return true;
 }
 
 function taskClaimLockDir(teamName: string, taskId: string, cwd: string): string {

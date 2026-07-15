@@ -762,7 +762,7 @@ describe('HUD control-plane domains', () => {
       await rm(cwd, { recursive: true, force: true });
     }
   });
-  it('requires versioned nonce receipts to read and delete opaque tmux birth lineage', async () => {
+  it('deletes only immutable nonce-bound lineage records during concurrent replacement', async () => {
     const cwd = await mkRealTemp('omx-hud-lineage-receipt-');
     try {
       const domain = await resolveHudControlPlaneDomain({ cwd, requestedSessionId: 'session-receipt' });
@@ -780,8 +780,23 @@ describe('HUD control-plane domains', () => {
         await deleteHudTmuxBirthLineage(domain, lineage, { ...receipt, nonce: 'replacement-receipt' }),
         false,
       );
-      assert.ok(await readHudTmuxBirthLineage(domain.baseStateDir, 'session-receipt'));
-      assert.equal(await deleteHudTmuxBirthLineage(domain, lineage, receipt), true);
+      const [replacementReceipt, staleDeleted] = await Promise.all([
+        writeHudTmuxBirthLineage(domain, {
+          sessionId: 'session-receipt',
+          tmuxSessionName: 'replacement-tmux-session',
+          tmuxSessionInstanceId: 'replacement-session-birth',
+          tmuxPaneInstanceId: 'replacement-pane-birth',
+        }),
+        deleteHudTmuxBirthLineage(domain, lineage, receipt),
+      ]);
+      assert.equal(staleDeleted, true);
+      const replacement = await readHudTmuxBirthLineage(domain.baseStateDir, 'session-receipt');
+      assert.ok(replacement);
+      assert.equal(replacement.nonce, replacementReceipt.nonce);
+      assert.equal(replacement.tmuxSessionInstanceId, 'replacement-session-birth');
+      assert.equal(replacement.tmuxPaneInstanceId, 'replacement-pane-birth');
+      assert.deepEqual(await readHudTmuxBirthLineage(domain.baseStateDir, 'session-receipt'), replacement);
+      assert.equal(await deleteHudTmuxBirthLineage(domain, replacement, replacementReceipt), true);
       assert.equal(await readHudTmuxBirthLineage(domain.baseStateDir, 'session-receipt'), null);
     } finally {
       await rm(cwd, { recursive: true, force: true });

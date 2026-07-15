@@ -22,6 +22,8 @@ import {
   parseHudResizeHookContext,
   registerHudResizeHook,
   unregisterHudResizeHook,
+  killExactHudPane,
+
 } from '../tmux.js';
 import { HUD_RESIZE_RECONCILE_DELAY_SECONDS } from '../constants.js';
 
@@ -40,6 +42,41 @@ describe('HUD pane creation', () => {
     assert.equal(result, null);
     assert.equal(calls.filter((args) => args[0] === 'kill-pane').length, 0);
     assert.ok(calls.some((args) => args[0] === 'show-option' && args.at(-1) === '@omx_pane_instance_id'));
+  });
+});
+
+describe('exact HUD pane destruction', () => {
+  it('uses one tmux server-side conditional mutation for the complete HUD identity', () => {
+    const calls: string[][] = [];
+    const startCommand = `exec env OMX_SESSION_ID='session-a' OMX_TMUX_HUD_OWNER='1' ${OMX_TMUX_HUD_LEADER_PANE_ENV}='%1' node /repo/omx.js hud --watch`;
+    assert.equal(killExactHudPane({
+      paneId: '%2',
+      currentCommand: 'node',
+      startCommand,
+      owner: { sessionId: 'session-a', leaderPaneId: '%1' },
+      paneInstanceId: 'pane-birth',
+      sessionInstanceId: 'session-birth',
+      sessionName: 'managed',
+    }, (args) => { calls.push(args); return ''; }), true);
+    assert.deepEqual(calls, [[
+      'if-shell', '-t', '%2', '-F',
+      `#{&&:#{==:#{pane_id},%2},#{==:#{pane_current_command},node},#{==:#{pane_start_command},${startCommand}},#{==:#{@omx_pane_instance_id},pane-birth},#{==:#{@omx_instance_id},session-birth},#{==:#{session_name},managed}}`,
+      'kill-pane -t %2', '',
+    ]]);
+  });
+
+  it('rejects a reused pane before issuing the conditional mutation when its captured owner no longer matches', () => {
+    const calls: string[][] = [];
+    assert.equal(killExactHudPane({
+      paneId: '%2',
+      currentCommand: 'bash',
+      startCommand: 'bash',
+      owner: { sessionId: 'session-a', leaderPaneId: '%1' },
+      paneInstanceId: 'replacement-pane',
+      sessionInstanceId: 'replacement-session',
+      sessionName: 'managed',
+    }, (args) => { calls.push(args); return ''; }), false);
+    assert.deepEqual(calls, []);
   });
 });
 describe('HUD resize hook helpers', () => {
@@ -84,9 +121,47 @@ describe('HUD resize hook helpers', () => {
     assert.equal(parseHudResizeHookContext('$7\t@3\n', '%1; touch /tmp/owned'), null);
   });
 
-  function statefulHooks(options: { failSlot?: string } = {}) {
+  function statefulHooks(options: {
+    failSlot?: string;
+    beforeConditionalMutation?: (slot: string, hooks: Map<string, string>) => void;
+  } = {}) {
     const hooks = new Map<string, string>();
     const calls: string[][] = [];
+    const parseTmuxCommand = (command: string): string[] => {
+      const parts: string[] = [];
+      let part = '';
+      let tokenStarted = false;
+      let quote: "'" | '"' | null = null;
+      for (let index = 0; index < command.length; index += 1) {
+        const char = command[index]!;
+        if (quote) {
+          if (char === quote) {
+            quote = null;
+          } else if (char === '\\' && quote === '"' && command[index + 1] !== undefined) {
+            part += command[index + 1]!;
+            index += 1;
+          } else {
+            part += char;
+          }
+        } else if (char === "'" || char === '"') {
+          quote = char;
+          tokenStarted = true;
+        } else if (char === '\\' && command[index + 1] !== undefined) {
+          part += command[index + 1]!;
+          tokenStarted = true;
+          index += 1;
+        } else if (/\s/.test(char)) {
+          if (tokenStarted) parts.push(part);
+          part = '';
+          tokenStarted = false;
+        } else {
+          part += char;
+          tokenStarted = true;
+        }
+      }
+      if (tokenStarted) parts.push(part);
+      return parts;
+    };
     const exec = (args: string[]): string => {
       calls.push(args);
       if (args[0] === 'display-message') return '$7\t@3\n';
@@ -94,11 +169,20 @@ describe('HUD resize hook helpers', () => {
         const command = hooks.get(args[3]!);
         return command ? `${args[3]} ${command}\n` : '';
       }
-      if (args[0] === 'set-hook') {
-        const slot = args[args[1] === '-u' ? 4 : 3]!;
+      if (args[0] === 'if-shell') {
+        const condition = parseTmuxCommand(args[3]!);
+        const mutation = parseTmuxCommand(args[4]!);
+        const slot = mutation[mutation[1] === '-u' ? 4 : 3]!;
+        options.beforeConditionalMutation?.(slot, hooks);
         if (slot === options.failSlot) throw new Error('injected hook failure');
-        if (args[1] === '-u') hooks.delete(slot);
-        else hooks.set(slot, args[4]!);
+        const expectedOutput = condition.at(-1);
+        const actualOutput = hooks.has(slot) ? `${slot} ${hooks.get(slot)!}` : '';
+        if (expectedOutput !== actualOutput) return '';
+        if (mutation[1] === '-u') {
+          hooks.delete(slot);
+        } else {
+          hooks.set(slot, mutation[4]!);
+        }
       }
       return '';
     };
@@ -121,6 +205,46 @@ describe('HUD resize hook helpers', () => {
     const fixture = statefulHooks({ failSlot: layoutSlot });
     assert.equal(registerHudResizeHook('%9', '%1', 3, { cwd: '/repo', env: { TMUX: '/tmp/tmux' } }, fixture.exec), false);
     assert.equal(fixture.hooks.size, 0);
+  });
+
+  it('preserves a foreign insertion that races vacant-slot registration', () => {
+    const resizeSlot = buildHudResizeHookSlot('omx_hud_resize_7_3_1');
+    const fixture = statefulHooks({
+      beforeConditionalMutation: (slot, hooks) => {
+        if (slot === resizeSlot && !hooks.has(slot)) hooks.set(slot, 'run-shell -b foreign');
+      },
+    });
+    assert.equal(registerHudResizeHook('%9', '%1', 3, { cwd: '/repo', env: { TMUX: '/tmp/tmux' } }, fixture.exec), false);
+    assert.equal(fixture.hooks.get(resizeSlot), 'run-shell -b foreign');
+    assert.ok(fixture.calls.some((args) => args[0] === 'if-shell'));
+    assert.equal(fixture.calls.some((args) => args[0] === 'set-hook'), false);
+  });
+
+  it('preserves a foreign replacement that races stale rollback', () => {
+    const resizeSlot = buildHudResizeHookSlot('omx_hud_resize_7_3_1');
+    const layoutSlot = buildHudLayoutHookSlot('omx_hud_resize_7_3_1');
+    const fixture = statefulHooks({
+      failSlot: layoutSlot,
+      beforeConditionalMutation: (slot, hooks) => {
+        if (slot === resizeSlot && hooks.has(slot)) hooks.set(slot, 'run-shell -b foreign replacement');
+      },
+    });
+    assert.equal(registerHudResizeHook('%9', '%1', 3, { cwd: '/repo', env: { TMUX: '/tmp/tmux' } }, fixture.exec), false);
+    assert.equal(fixture.hooks.get(resizeSlot), 'run-shell -b foreign replacement');
+    assert.equal(fixture.hooks.has(layoutSlot), false);
+  });
+
+  it('tears down only the exact owned hook generations through conditional mutation', () => {
+    const fixture = statefulHooks();
+    const resizeSlot = buildHudResizeHookSlot('omx_hud_resize_7_3_1');
+    const layoutSlot = buildHudLayoutHookSlot('omx_hud_resize_7_3_1');
+    assert.equal(registerHudResizeHook('%9', '%1', 3, { cwd: '/repo', env: { TMUX: '/tmp/tmux' } }, fixture.exec), true);
+    assert.match(fixture.hooks.get(resizeSlot) ?? '', /# omx-hud-owned:.*:[0-9a-f-]{36}$/);
+    assert.equal(unregisterHudResizeHook('%1', fixture.exec), true);
+    assert.equal(fixture.hooks.has(resizeSlot), false);
+    assert.equal(fixture.hooks.has(layoutSlot), false);
+    assert.equal(fixture.calls.some((args) => args[0] === 'set-hook'), false);
+    assert.ok(fixture.calls.filter((args) => args[0] === 'if-shell').length >= 4);
   });
 
   it('preserves a foreign replacement while safely removing the remaining owned slot', () => {
