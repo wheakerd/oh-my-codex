@@ -209,12 +209,10 @@ export function tmuxEvidenceBindsCandidate(
     || evidence.sessionTagStatus !== 'present'
   ) return false;
 
-  if (acceptedSessionIds.length === 1) {
-    return evidence.paneInstanceId === acceptedSessionIds[0]
-      && evidence.sessionInstanceId === acceptedSessionIds[0];
-  }
-  // A canonical/native alias pair is one resolver-proven lineage. Do not turn
-  // a broader list of aliases into a Cartesian pane/session authorization.
+  const canonicalId = acceptedSessionIds[0];
+  if (evidence.paneInstanceId === canonicalId && evidence.sessionInstanceId === canonicalId) return true;
+  // Only an explicit canonical/native pair may prove a mixed-tag lineage. Extra
+  // resolver-proven aliases do not expand that pairwise authorization.
   if (acceptedSessionIds.length !== 2) return false;
   const [firstId, secondId] = acceptedSessionIds;
   return (evidence.paneInstanceId === firstId && evidence.sessionInstanceId === secondId)

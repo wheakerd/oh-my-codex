@@ -36,6 +36,7 @@ export interface RunHudAuthorityTickDeps {
   lifecycleLockDeps?: HudLifecycleLockDeps;
   processStartIdentity?: (pid: number) => Promise<string | undefined>;
   probeLeaseProcess?: (lease: HudAuthorityLease) => Promise<'live' | 'dead' | 'reused' | 'uncertain'>;
+  probeLiveClaimant?: (domain: ResolvedHudControlPlaneDomain) => Promise<boolean>;
 }
 
 interface HudAuthorityState {
@@ -296,6 +297,19 @@ async function defaultProbeLeaseProcess(lease: HudAuthorityLease): Promise<'live
   return currentIdentity === lease.processStartIdentity ? 'live' : 'reused';
 }
 
+async function defaultProbeLiveClaimant(domain: ResolvedHudControlPlaneDomain): Promise<boolean> {
+  if (!domain.managed) return true;
+  const claimant = domain.claimant;
+  if (!claimant.sessionId || !claimant.leaderPaneId || !claimant.tmuxSessionName
+    || !claimant.tmuxSessionInstanceId || !claimant.tmuxPaneInstanceId) return false;
+  const paneContext = spawnSync('tmux', ['display-message', '-p', '-t', claimant.leaderPaneId, '#{pane_id}\t#{session_name}'], { encoding: 'utf8' });
+  if (paneContext.status !== 0 || paneContext.stdout.trim() !== `${claimant.leaderPaneId}\t${claimant.tmuxSessionName}`) return false;
+  const paneBirth = spawnSync('tmux', ['show-option', '-p', '-v', '-t', claimant.leaderPaneId, '@omx_pane_instance_id'], { encoding: 'utf8' });
+  if (paneBirth.status !== 0 || paneBirth.stdout.trim() !== claimant.tmuxPaneInstanceId) return false;
+  const sessionBirth = spawnSync('tmux', ['show-option', '-v', '-t', claimant.tmuxSessionName, '@omx_instance_id'], { encoding: 'utf8' });
+  return sessionBirth.status === 0 && sessionBirth.stdout.trim() === claimant.tmuxSessionInstanceId;
+}
+
 
 function buildAuthorityState(
   cwd: string,
@@ -361,6 +375,7 @@ export async function runHudAuthorityTick(
     const claimant = claimantIdentity(domain);
     const processStartIdentity = await (deps.processStartIdentity ?? defaultProcessStartIdentity)(process.pid);
     if (typeof processStartIdentity !== 'string' || processStartIdentity.trim().length === 0) return;
+    if (!await (deps.probeLiveClaimant ?? defaultProbeLiveClaimant)(domain).catch(() => false)) return;
     const currentLease = await readAuthorityLease(domain.authorityLeasePath);
     const ownsLease = currentLease !== null
       && currentLease !== 'uncertain'
@@ -468,6 +483,7 @@ export async function runHudAuthorityTick(
           OMX_HUD_AUTHORITY_OWNER_PID: String(process.pid),
           OMX_HUD_AUTHORITY_OWNER_PLATFORM: process.platform,
           OMX_HUD_AUTHORITY_OWNER_START_IDENTITY: processStartIdentity,
+          OMX_HUD_AUTHORITY_CLAIMANT: claimant,
         },
         timeoutMs,
       });

@@ -499,6 +499,7 @@ async function buildAuthorityAdmissionEnv(cwd: string, overrides: Record<string,
     OMX_HUD_AUTHORITY_OWNER_PID: String(process.pid),
     OMX_HUD_AUTHORITY_OWNER_PLATFORM: process.platform,
     OMX_HUD_AUTHORITY_OWNER_START_IDENTITY: identity,
+    OMX_HUD_AUTHORITY_CLAIMANT: JSON.stringify(domain.claimant),
   };
 }
 
@@ -1009,6 +1010,25 @@ describe('notify-fallback watcher', () => {
     }
   });
 
+  it('fails closed on missing, stale, or mismatched serialized authority claimant evidence', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-fallback-authority-claimant-'));
+    try {
+      const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
+      const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
+      const admitted = await buildAuthorityAdmissionEnv(wd);
+      for (const claimant of ['', '{"sessionId":"stale"}', '{"sessionId":"other","leaderPaneId":"%1","tmuxSessionName":"wrong","tmuxSessionInstanceId":"birth","tmuxPaneInstanceId":"birth"}']) {
+        const env = { ...admitted, OMX_HUD_AUTHORITY_CLAIMANT: claimant };
+        const result = spawnSync(process.execPath,
+          [watcherScript, '--once', '--authority-only', '--cwd', wd, '--notify-script', notifyHook, '--poll-ms', '50'],
+          { encoding: 'utf-8', env });
+        assert.equal(result.status, 0, result.stderr || result.stdout);
+        assert.equal(await readFile(join(wd, '.omx', 'state', 'notify-fallback-state.json'), 'utf8').then(() => true).catch(() => false), false);
+      }
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
   it('fails closed before registration when an authority-only child lacks an owner identity', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-fallback-authority-missing-identity-'));
     try {
@@ -1075,7 +1095,7 @@ describe('notify-fallback watcher', () => {
     }
   });
 
-  it('backs off authority-only nudge ticks when the primary watcher is healthy', async () => {
+  it('fails closed before authority backoff when managed claimant birth evidence is absent', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-fallback-authority-backed-off-'));
     const fakeBinDir = join(wd, 'fake-bin');
     const tmuxLogPath = join(wd, 'tmux.log');
@@ -1135,9 +1155,7 @@ describe('notify-fallback watcher', () => {
       const watcherState = JSON.parse(await readFile(join(wd, '.omx', 'state', 'notify-fallback-state.json'), 'utf-8'));
       assert.equal(watcherState.pid, process.pid, 'authority backoff should preserve the primary watcher state owner');
       assert.equal(watcherState.authority_only, false, 'authority backoff should not overwrite primary watcher ownership');
-      assert.equal(watcherState.authority_backoff?.active, true);
-      assert.equal(watcherState.authority_backoff?.reason, 'primary_watcher_healthy');
-      assert.equal(watcherState.authority_backoff?.primary_pid, process.pid);
+      assert.equal(watcherState.authority_backoff, undefined);
       assert.match(watcherState.dispatch_drain?.last_tick_at ?? '', /^\d{4}-\d{2}-\d{2}T/);
 
       const logPath = join(wd, '.omx', 'logs', `notify-fallback-${new Date().toISOString().split('T')[0]}.jsonl`);
@@ -1150,7 +1168,7 @@ describe('notify-fallback watcher', () => {
 
 
 
-  it('treats symlinked cwd aliases as the same primary watcher during authority handoff', async () => {
+  it('fails closed on a symlinked managed cwd when claimant birth evidence is absent', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-fallback-cwd-alias-'));
     const aliasWd = `${wd}-alias`;
     const fakeBinDir = join(wd, 'fake-bin');
@@ -1193,9 +1211,7 @@ describe('notify-fallback watcher', () => {
       assert.equal(result.status, 0, result.stderr || result.stdout);
 
       const watcherState = JSON.parse(await readFile(join(wd, '.omx', 'state', 'notify-fallback-state.json'), 'utf-8'));
-      assert.equal(watcherState.authority_backoff?.active, true);
-      assert.equal(watcherState.authority_backoff?.reason, 'primary_watcher_healthy');
-      assert.equal(watcherState.authority_backoff?.primary_pid, process.pid);
+      assert.equal(watcherState.authority_backoff, undefined);
     } finally {
       await rm(aliasWd, { recursive: true, force: true });
       await rm(wd, { recursive: true, force: true });

@@ -27,7 +27,8 @@ import { HUD_RESIZE_RECONCILE_DELAY_SECONDS } from '../constants.js';
 
 
 describe('HUD pane creation', () => {
-  it('rolls back only the new pane when instance-tag readback fails', () => {
+  it('preserves a newly split pane when instance-tag readback fails without exact teardown proof', () => {
+
     const calls: string[][] = [];
     const result = createHudWatchPane('/repo', 'node omx.js hud --watch', { instanceId: 'session-a' }, (args) => {
       calls.push(args);
@@ -37,8 +38,8 @@ describe('HUD pane creation', () => {
     });
 
     assert.equal(result, null);
-    assert.deepEqual(calls.at(-1), ['kill-pane', '-t', '%new']);
-    assert.equal(calls.filter((args) => args[0] === 'kill-pane').length, 1);
+    assert.equal(calls.filter((args) => args[0] === 'kill-pane').length, 0);
+    assert.ok(calls.some((args) => args[0] === 'show-option' && args.at(-1) === '@omx_pane_instance_id'));
   });
 });
 describe('HUD resize hook helpers', () => {

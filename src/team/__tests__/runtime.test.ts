@@ -3998,10 +3998,10 @@ process.on('SIGTERM', () => process.exit(0));
           assert.equal(outcome.ok, false);
           assert.match(String((outcome as { ok: false; error: Error }).error), /worker_notify_failed:worker-1/);
 
-          assert.equal(
-            existsSync(join(cwd, '.omx', 'state', 'team', runtimeTeamName)),
-            false,
-          );
+          const retainedConfig = await readTeamConfig(runtimeTeamName, cwd);
+          assert.ok(retainedConfig);
+          assert.ok(Array.isArray(retainedConfig.workers) && retainedConfig.workers.length === 2);
+          assert.ok(retainedConfig.workers.every((worker) => typeof worker.pane_id === 'string' && worker.pane_id.startsWith('%')));
         },
       );
     } finally {

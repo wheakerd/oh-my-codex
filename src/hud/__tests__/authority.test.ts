@@ -831,6 +831,33 @@ describe('runHudAuthorityTick', () => {
     }
   });
 
+  it('fails closed when a managed claimant cannot be proven live', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'omx-hud-authority-unproven-claimant-'));
+    const shared = {
+      ...domain(join(root, 'state'), 'hud-control-plane:claimant-proof', '/claimant'),
+      managed: true,
+      claimant: {
+        sessionId: 'session', leaderPaneId: '%1', tmuxSessionName: 'omx-session',
+        tmuxSessionInstanceId: 'session-birth', tmuxPaneInstanceId: 'pane-birth',
+      },
+    };
+    try {
+      let calls = 0;
+      await runHudAuthorityTick(
+        { cwd: '/claimant', nodePath: '/node', packageRoot: '/pkg' },
+        {
+          resolveDomain: async () => shared,
+          probeLiveClaimant: async () => false,
+          runProcess: async () => { calls += 1; },
+        },
+      );
+      assert.equal(calls, 0);
+      assert.equal(existsSync(shared.authorityLeasePath), false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('allows independent authorities for distinct canonical roots', async () => {
     const root = await mkdtemp(join(tmpdir(), 'omx-hud-authority-roots-'));
     try {

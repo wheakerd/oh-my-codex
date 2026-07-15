@@ -5249,7 +5249,8 @@ esac
           const tmuxLog = await readFile(logPath, 'utf-8');
           const listPaneCalls = tmuxLog.match(/list-panes -t leader:0 -F #\{pane_id\}\t#\{pane_current_command\}\t#\{pane_start_command\}/g) || [];
           assert.ok(listPaneCalls.length >= 2, tmuxLog);
-          assert.match(tmuxLog, /kill-pane -t %2/);
+          assert.doesNotMatch(tmuxLog, /(?:^|\n)kill-pane -t %2(?:\n|$)/);
+          assert.doesNotMatch(tmuxLog, /(?:^|\n)if-shell -t %2 -F /);
         },
       );
     } finally {
@@ -5403,7 +5404,8 @@ esac
     }
   });
 
-  it('rolls back a newly split standalone HUD when pane-tag readback mismatches', async () => {
+  it('preserves a newly split standalone HUD when pane-tag readback mismatches', async () => {
+
     const cwd = await mkdtemp(join(tmpdir(), 'omx-standalone-tag-rollback-'));
     try {
       await withMockTmuxFixture(
@@ -5426,7 +5428,7 @@ esac
             tmuxSessionInstanceId: 'session-instance',
             tmuxPaneInstanceId: 'pane-instance',
           }), null);
-          assert.match(await readFile(logPath, 'utf-8'), /kill-pane -t %44/);
+          assert.doesNotMatch(await readFile(logPath, 'utf-8'), /kill-pane -t %44/);
         },
       );
     } finally {

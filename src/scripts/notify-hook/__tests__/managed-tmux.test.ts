@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { describe, it } from 'node:test';
 import { resolveHudControlPlaneDomain, writeHudTmuxBirthLineage } from '../../../mcp/state-paths.js';
 import { writeSessionStart } from '../../../hooks/session.js';
-import { isManagedOmxSession } from '../managed-tmux.js';
+import { isManagedOmxSession, tmuxEvidenceBindsCandidate } from '../managed-tmux.js';
 
 describe('managed tmux opaque birth lineage', () => {
   it('authorizes Team-established opaque UUID lineage through production resolution only with stable dual tags', async () => {
@@ -55,5 +55,18 @@ esac
       else process.env.TMUX = previousTmux;
       await rm(cwd, { recursive: true, force: true });
     }
+  });
+
+  it('accepts identical canonical tags despite additional resolver-proven aliases', () => {
+    assert.equal(tmuxEvidenceBindsCandidate({
+      paneTarget: '%1', sessionName: 'session', paneInstanceId: 'canonical', sessionInstanceId: 'canonical',
+      instanceId: 'canonical', source: 'pane', paneTagStatus: 'present', sessionTagStatus: 'present',
+      sessionId: '$1', windowId: '@1', contextStable: true,
+    }, ['canonical', 'native', 'previous']), true);
+    assert.equal(tmuxEvidenceBindsCandidate({
+      paneTarget: '%1', sessionName: 'session', paneInstanceId: 'native', sessionInstanceId: 'previous',
+      instanceId: 'native', source: 'pane', paneTagStatus: 'present', sessionTagStatus: 'present',
+      sessionId: '$1', windowId: '@1', contextStable: true,
+    }, ['canonical', 'native', 'previous']), false);
   });
 });

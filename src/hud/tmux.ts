@@ -645,13 +645,9 @@ export function createHudWatchPane(
     }
     return paneId;
   } catch {
-    if (paneId) {
-      try {
-        execTmuxSync(['kill-pane', '-t', paneId]);
-      } catch {
-        // The split succeeded but its ownership tag could not be verified.
-      }
-    }
+    // The split may have succeeded but its ownership tag could not be verified.
+    // Do not kill by pane id here: tmux pane ids can be reused before cleanup.
+    // Leaving the uncertain pane intact is the fail-closed rollback behavior.
     return null;
   }
 }
