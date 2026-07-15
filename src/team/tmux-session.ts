@@ -144,19 +144,9 @@ export function establishExactTeamHudCandidate(
 
   const before = readContext();
   if (!before || (expectedLeaderPaneId && before.leaderPaneId !== expectedLeaderPaneId)) return null;
-  const sessionTag = runTmux(['show-options', '-qv', '-t', before.sessionName, OMX_INSTANCE_OPTION]);
-  if (!sessionTag.ok) return null;
-  const tmuxSessionInstanceId = sessionTag.stdout.trim() || randomUUID();
-  if (!sessionTag.stdout.trim() && !runTmux(['set-option', '-t', before.sessionName, OMX_INSTANCE_OPTION, tmuxSessionInstanceId]).ok) return null;
-  const verifiedSessionTag = runTmux(['show-options', '-qv', '-t', before.sessionName, OMX_INSTANCE_OPTION]);
-  if (!verifiedSessionTag.ok || verifiedSessionTag.stdout.trim() !== tmuxSessionInstanceId) return null;
-
-  const paneTag = runTmux(['show-option', '-qv', '-p', '-t', before.leaderPaneId, OMX_PANE_INSTANCE_OPTION]);
-  if (!paneTag.ok) return null;
-  const tmuxPaneInstanceId = paneTag.stdout.trim() || randomUUID();
-  if (!paneTag.stdout.trim() && !runTmux(['set-option', '-p', '-t', before.leaderPaneId, OMX_PANE_INSTANCE_OPTION, tmuxPaneInstanceId]).ok) return null;
-  const verifiedPaneTag = runTmux(['show-option', '-qv', '-p', '-t', before.leaderPaneId, OMX_PANE_INSTANCE_OPTION]);
-  if (!verifiedPaneTag.ok || verifiedPaneTag.stdout.trim() !== tmuxPaneInstanceId) return null;
+  const births = establishTmuxBirths(before.sessionName, before.leaderPaneId);
+  if (!births) return null;
+  const { sessionBirth: tmuxSessionInstanceId, paneBirth: tmuxPaneInstanceId } = births;
 
   const after = readContext();
   if (!after || after.sessionName !== before.sessionName || after.windowIndex !== before.windowIndex || after.leaderPaneId !== before.leaderPaneId) return null;
@@ -341,6 +331,68 @@ function runTmux(args: string[]): { ok: true; stdout: string } | { ok: false; st
   return { ok: true, stdout: (result.stdout || '').trim() };
 }
 
+/** Escapes a value embedded as a literal operand in a tmux format expression. */
+function escapeTmuxFormatLiteral(value: string): string {
+  // tmux consumes a leading # as an escape while expanding formats. Escaping
+  // every format delimiter prevents a dynamic value from terminating an operand
+  // or introducing a nested format expression.
+  return value.replace(/[#{},:]/g, (character) => `#${character}`);
+}
+
+interface EstablishedTmuxBirths {
+  sessionBirth: string;
+  paneBirth: string;
+}
+
+/**
+ * Publishes both immutable leader identities in one tmux-server conditional.
+ * A partial pre-existing pair is deliberately not repaired: doing so would turn
+ * an uncertain prior write into authority over a potentially reused target.
+ */
+function establishTmuxBirths(sessionName: string, leaderPaneId: string): EstablishedTmuxBirths | null {
+  const sessionTag = runTmux(['show-options', '-qv', '-t', sessionName, OMX_INSTANCE_OPTION]);
+  const paneTag = runTmux(['show-option', '-qv', '-p', '-t', leaderPaneId, OMX_PANE_INSTANCE_OPTION]);
+  if (!sessionTag.ok || !paneTag.ok) return null;
+
+  const existingSessionBirth = sessionTag.stdout.trim();
+  const existingPaneBirth = paneTag.stdout.trim();
+  if (existingSessionBirth || existingPaneBirth) {
+    return existingSessionBirth && existingPaneBirth
+      ? { sessionBirth: existingSessionBirth, paneBirth: existingPaneBirth }
+      : null;
+  }
+
+  const sessionBirth = randomUUID();
+  const paneBirth = randomUUID();
+  const appliedReceipt = `__omx_birth_established_${randomUUID()}__`;
+  const rejectedReceipt = `__omx_birth_rejected_${randomUUID()}__`;
+  const condition = `#{&&:#{==:#{${OMX_INSTANCE_OPTION}},},#{==:#{${OMX_PANE_INSTANCE_OPTION}},}}`;
+  const publish = [
+    `set-option -t ${shellQuoteSingle(sessionName)} ${OMX_INSTANCE_OPTION} ${shellQuoteSingle(sessionBirth)}`,
+    `set-option -p -t ${shellQuoteSingle(leaderPaneId)} ${OMX_PANE_INSTANCE_OPTION} ${shellQuoteSingle(paneBirth)}`,
+    `display-message -p ${appliedReceipt}`,
+  ].join(' \\; ');
+  const result = runTmux([
+    'if-shell', '-t', leaderPaneId, '-F', condition, publish,
+    `display-message -p ${rejectedReceipt}`,
+  ]);
+  if (!result.ok) return null;
+
+  const received = result.stdout.split('\n').map((line) => line.trim());
+  if (received.includes(appliedReceipt)) return { sessionBirth, paneBirth };
+  if (!received.includes(rejectedReceipt)) return null;
+
+  // A concurrent publisher won the exact same conditional. It is safe to use
+  // only a complete pair that tmux now exposes for this still-revalidated pane.
+  const concurrentSessionTag = runTmux(['show-options', '-qv', '-t', sessionName, OMX_INSTANCE_OPTION]);
+  const concurrentPaneTag = runTmux(['show-option', '-qv', '-p', '-t', leaderPaneId, OMX_PANE_INSTANCE_OPTION]);
+  const concurrentSessionBirth = concurrentSessionTag.ok ? concurrentSessionTag.stdout.trim() : '';
+  const concurrentPaneBirth = concurrentPaneTag.ok ? concurrentPaneTag.stdout.trim() : '';
+  return concurrentSessionBirth && concurrentPaneBirth
+    ? { sessionBirth: concurrentSessionBirth, paneBirth: concurrentPaneBirth }
+    : null;
+}
+
 function appendNoUnderlineStyleFlags(style: string): string {
   const normalized = style
     .split(/[,\s]+/)
@@ -422,6 +474,12 @@ function tagTeamPaneBirth(paneTarget: string, birthId: string): void {
 function readTeamPaneBirth(paneTarget: string): string | null {
   const result = runTmux(['show-option', '-qv', '-p', '-t', paneTarget, OMX_TEAM_PANE_BIRTH_OPTION]);
   return result.ok ? result.stdout.trim() || null : null;
+}
+
+function readTeamPaneRole(paneTarget: string): 'worker' | 'hud' | null {
+  const result = runTmux(['show-option', '-qv', '-p', '-t', paneTarget, OMX_TEAM_PANE_ROLE_OPTION]);
+  const role = result.ok ? result.stdout.trim() : '';
+  return role === 'worker' || role === 'hud' ? role : null;
 }
 function tagTeamPaneRole(paneTarget: string, role: 'worker' | 'hud'): void {
   const result = runTmux(['set-option', '-p', '-t', paneTarget, OMX_TEAM_PANE_ROLE_OPTION, role]);
@@ -602,7 +660,7 @@ export function killExactTeamHudPane(
   if (!sessionName || !candidate.tmuxSessionInstanceId || !candidate.tmuxPaneInstanceId) return false;
   const appliedReceipt = `__omx_hud_teardown_applied_${randomUUID()}__`;
   const rejectedReceipt = `__omx_hud_teardown_rejected_${randomUUID()}__`;
-  const condition = `#{&&:#{==:#{pane_id},${paneId}},#{==:#{pane_start_command},${receipt.command}},#{==:#{@omx_pane_instance_id},${candidate.tmuxPaneInstanceId}},#{==:#{@omx_instance_id},${candidate.tmuxSessionInstanceId}},#{==:#{session_name},${sessionName}},#{==:#{@omx_team_pane_owner_id},${teamOwnerId}},#{==:#{@omx_team_pane_birth},${receipt.pane_birth}},#{==:#{@omx_team_pane_role},hud}}`;
+  const condition = `#{&&:#{==:#{pane_id},${escapeTmuxFormatLiteral(paneId)}},#{==:#{pane_start_command},${escapeTmuxFormatLiteral(receipt.command)}},#{==:#{@omx_pane_instance_id},${escapeTmuxFormatLiteral(candidate.tmuxPaneInstanceId)}},#{==:#{@omx_instance_id},${escapeTmuxFormatLiteral(candidate.tmuxSessionInstanceId)}},#{==:#{session_name},${escapeTmuxFormatLiteral(sessionName)}},#{==:#{@omx_team_pane_owner_id},${escapeTmuxFormatLiteral(teamOwnerId)}},#{==:#{@omx_team_pane_birth},${escapeTmuxFormatLiteral(receipt.pane_birth)}},#{==:#{@omx_team_pane_role},${escapeTmuxFormatLiteral('hud')}}}`;
   const result = runTmux([
     'if-shell', '-t', paneId, '-F', condition,
     `kill-pane -t ${paneId} \\; display-message -p ${appliedReceipt}`,
@@ -955,24 +1013,37 @@ function teamHookActiveOption(generation: string): string {
   return `@omx_team_hook_active_${generation.replace(/[^a-zA-Z0-9_]/g, '_')}`;
 }
 
+function hasCompleteTeamHudHookEvidence(evidence?: TeamHudHookEvidence): evidence is TeamHudHookEvidence {
+  return Boolean(
+    evidence
+    && evidence.generation.trim()
+    && evidence.sessionName.trim()
+    && evidence.windowIndex.trim()
+    && evidence.sessionBirth.trim()
+    && evidence.hudPaneId.trim().startsWith('%')
+    && evidence.hudPaneBirth.trim()
+    && evidence.hudPaneCommand.trim()
+    && evidence.ownerId.trim(),
+  );
+}
+
 function buildTeamHookCondition(evidence?: TeamHudHookEvidence): string {
-  const generation = evidence?.generation.trim() ?? '';
-  if (!evidence || !generation || !evidence.hudPaneCommand.trim()) return '#{==:0,1}';
-  return `#{&&:#{==:#{pane_id},${buildHudPaneTarget(evidence.hudPaneId)}},#{==:#{pane_start_command},${evidence.hudPaneCommand}},#{==:#{session_name},${evidence.sessionName}},#{==:#{window_index},${evidence.windowIndex}},#{==:#{@omx_instance_id},${evidence.sessionBirth}},#{==:#{@omx_team_pane_owner_id},${evidence.ownerId}},#{==:#{@omx_team_pane_birth},${evidence.hudPaneBirth}},#{==:#{@omx_team_pane_role},hud},#{==:#{${teamHookActiveOption(generation)}},1}}`;
+  if (!hasCompleteTeamHudHookEvidence(evidence)) return '#{==:0,1}';
+  return `#{&&:#{==:#{pane_id},${escapeTmuxFormatLiteral(buildHudPaneTarget(evidence.hudPaneId))}},#{==:#{pane_start_command},${escapeTmuxFormatLiteral(evidence.hudPaneCommand)}},#{==:#{session_name},${escapeTmuxFormatLiteral(evidence.sessionName)}},#{==:#{window_index},${escapeTmuxFormatLiteral(evidence.windowIndex)}},#{==:#{@omx_instance_id},${escapeTmuxFormatLiteral(evidence.sessionBirth)}},#{==:#{@omx_team_pane_owner_id},${escapeTmuxFormatLiteral(evidence.ownerId)}},#{==:#{@omx_team_pane_birth},${escapeTmuxFormatLiteral(evidence.hudPaneBirth)}},#{==:#{@omx_team_pane_role},${escapeTmuxFormatLiteral('hud')}},#{==:#{${teamHookActiveOption(evidence.generation)}},1}}`;
 }
 
 function buildGuardedTeamResizeCommand(hudPaneId: string, heightLines: number, evidence?: TeamHudHookEvidence): string {
   const condition = buildTeamHookCondition(evidence);
-  if (condition === '#{==:0,1}') return buildBestEffortShellCommand(buildNestedTmuxShellCommand(buildHudResizeCommand(hudPaneId, heightLines)));
+  if (condition === '#{==:0,1}') return ':';
   const resizeCommand = buildHudResizeCommand(hudPaneId, heightLines);
   const guarded = `if-shell -t ${buildHudPaneTarget(hudPaneId)} -F ${shellQuoteSingle(condition)} ${shellQuoteSingle(resizeCommand)} ''`;
   return buildBestEffortShellCommand(buildNestedTmuxShellCommand(guarded));
 }
 
 function buildTeamHookCommand(hookCommand: string, evidence?: TeamHudHookEvidence): string {
-  const generation = evidence?.generation?.trim() ?? '';
+  if (!hasCompleteTeamHudHookEvidence(evidence)) return 'run-shell -b :';
   const condition = buildTeamHookCondition(evidence);
-  return `if-shell -t ${buildHudPaneTarget(evidence?.hudPaneId ?? '')} -F ${shellQuoteSingle(condition)} ${shellQuoteSingle(`run-shell -b ${hookCommand}`)} ''${generation ? ` # omx-generation=${generation}` : ''}`;
+  return `if-shell -t ${buildHudPaneTarget(evidence.hudPaneId)} -F ${shellQuoteSingle(condition)} ${shellQuoteSingle(`run-shell -b ${hookCommand}`)} '' # omx-generation=${evidence.generation}`;
 }
 
 
@@ -1103,7 +1174,7 @@ export function registerHudHooksTransactionally(
 
   const receiptOption = teamHookReceiptOption(hookTarget);
   const receipt = randomUUID();
-  const condition = `#{==:#{${generationOption}},${priorGeneration}}`;
+  const condition = `#{==:#{${generationOption}},${escapeTmuxFormatLiteral(priorGeneration)}}`;
   const publish = [
     `set-option -t ${hookTarget} ${generationOption} ${generation}`,
     `set-option -t ${hookTarget} ${teamHookActiveOption(generation)} 1`,
@@ -1134,7 +1205,7 @@ export function unregisterHudHooksTransactionally(
   if (!generation || !/^[0-9a-f-]{36}$/.test(generation)) return false;
   const receiptOption = teamHookReceiptOption(hookTarget);
   const receipt = randomUUID();
-  const condition = `#{==:#{${teamHookGenerationOption(hookTarget)}},${generation}}`;
+  const condition = `#{==:#{${teamHookGenerationOption(hookTarget)}},${escapeTmuxFormatLiteral(generation)}}`;
   const deactivate = `set-option -t ${hookTarget} ${teamHookActiveOption(generation)} 0 \\; set-option -t ${hookTarget} ${receiptOption} ${receipt}`;
   if (!runTmux(['if-shell', '-t', hookTarget, '-F', condition, deactivate, '']).ok) return false;
   const applied = runTmux(['show-options', '-qv', '-t', hookTarget, receiptOption]);
@@ -1147,6 +1218,7 @@ export function buildScheduleDelayedHudResizeArgs(
   heightLines: number = HUD_TMUX_TEAM_HEIGHT_LINES,
   evidence?: TeamHudHookEvidence,
 ): string[] {
+  if (!hasCompleteTeamHudHookEvidence(evidence)) return ['run-shell', '-b', ':'];
   const delay = Number.isFinite(delaySeconds) && delaySeconds > 0 ? delaySeconds : HUD_RESIZE_RECONCILE_DELAY_SECONDS;
   return ['run-shell', '-b', `sleep ${delay}; ${buildGuardedTeamResizeCommand(hudPaneId, heightLines, evidence)}`];
 }
@@ -2199,13 +2271,25 @@ export function createTeamSession(
         const id = hudPaneId ?? (hudResult && hudResult.ok ? hudResult.stdout.split('\n')[0]?.trim() ?? '' : '');
         if (id.startsWith('%')) {
           if (retainedHudPaneId) {
-            options.journalResource?.({
-              kind: 'hud',
-              id,
-              created: false,
-              pane_birth: readTeamPaneBirth(id) ?? undefined,
-              acquired_at: new Date().toISOString(),
-            });
+            const retainedHudPane = panes.find((pane) => pane.paneId === id);
+            const retainedHudPaneBirth = readTeamPaneBirth(id);
+            const retainedHudPaneRole = readTeamPaneRole(id);
+            if (
+              retainedHudPane?.startCommand.trim()
+              && retainedHudPaneBirth
+              && retainedHudPaneRole === 'hud'
+              && readNewPaneTeamOwnerTag(id) === teamPaneOwnerId
+            ) {
+              options.journalResource?.({
+                kind: 'hud',
+                id,
+                created: false,
+                pane_birth: retainedHudPaneBirth,
+                command: retainedHudPane.startCommand,
+                role: 'hud',
+                acquired_at: new Date().toISOString(),
+              });
+            }
           }
           if (!retainedHudPaneId) rollbackPaneIds.push(id);
           if (isNativeWindows() && !waitForPaneToRemainPresent(teamTarget, id)) {
@@ -2374,7 +2458,7 @@ export function createTeamSession(
       const role = rollbackPaneRoles.get(paneId);
       const command = workerPaneCommands.get(paneId) ?? (role === 'hud' ? createdHudPaneCommand : null);
       if (!rollbackOwnerSessionId || !rollbackTeamPaneOwnerId || !paneBirth || !role || !command) continue;
-      const condition = `#{&&:#{==:#{pane_id},${paneId}},#{==:#{pane_start_command},${command}},#{==:#{@omx_pane_instance_id},${rollbackOwnerSessionId}},#{==:#{@omx_instance_id},${rollbackOwnerSessionId}},#{==:#{@omx_team_pane_owner_id},${rollbackTeamPaneOwnerId}},#{==:#{@omx_team_pane_birth},${paneBirth}},#{==:#{@omx_team_pane_role},${role}}}`;
+      const condition = `#{&&:#{==:#{pane_id},${escapeTmuxFormatLiteral(paneId)}},#{==:#{pane_start_command},${escapeTmuxFormatLiteral(command)}},#{==:#{@omx_pane_instance_id},${escapeTmuxFormatLiteral(rollbackOwnerSessionId)}},#{==:#{@omx_instance_id},${escapeTmuxFormatLiteral(rollbackOwnerSessionId)}},#{==:#{@omx_team_pane_owner_id},${escapeTmuxFormatLiteral(rollbackTeamPaneOwnerId)}},#{==:#{@omx_team_pane_birth},${escapeTmuxFormatLiteral(paneBirth)}},#{==:#{@omx_team_pane_role},${escapeTmuxFormatLiteral(role)}}}`;
       runTmux(['if-shell', '-t', paneId, '-F', condition, `kill-pane -t ${paneId}`, '']);
     }
     throw error;
@@ -3512,7 +3596,7 @@ export async function teardownWorkerPanes(
     }
     const appliedReceipt = `__omx_worker_teardown_applied_${randomUUID()}__`;
     const rejectedReceipt = `__omx_worker_teardown_rejected_${randomUUID()}__`;
-    const condition = `#{&&:#{==:#{pane_id},${paneId}},#{==:#{pane_start_command},${receipt.command}},#{==:#{session_name},${sessionName}},#{==:#{@omx_instance_id},${sessionBirth}},#{==:#{@omx_team_pane_owner_id},${teamOwnerId}},#{==:#{@omx_team_pane_birth},${receipt.pane_birth}},#{==:#{@omx_team_pane_role},worker}}`;
+    const condition = `#{&&:#{==:#{pane_id},${escapeTmuxFormatLiteral(paneId)}},#{==:#{pane_start_command},${escapeTmuxFormatLiteral(receipt.command)}},#{==:#{session_name},${escapeTmuxFormatLiteral(sessionName)}},#{==:#{@omx_instance_id},${escapeTmuxFormatLiteral(sessionBirth)}},#{==:#{@omx_team_pane_owner_id},${escapeTmuxFormatLiteral(teamOwnerId)}},#{==:#{@omx_team_pane_birth},${escapeTmuxFormatLiteral(receipt.pane_birth)}},#{==:#{@omx_team_pane_role},${escapeTmuxFormatLiteral('worker')}}}`;
     const result = await runTmuxAsync([
       'if-shell', '-t', paneId, '-F', condition,
       `kill-pane -t ${paneId} \\; display-message -p ${appliedReceipt}`,
@@ -3542,7 +3626,7 @@ export function destroyTeamSession(sessionName: string, sessionBirth: string): b
   if (!normalizedSessionName || !normalizedSessionBirth) return false;
   const appliedReceipt = `__omx_session_teardown_applied_${randomUUID()}__`;
   const rejectedReceipt = `__omx_session_teardown_rejected_${randomUUID()}__`;
-  const condition = `#{&&:#{==:#{session_name},${normalizedSessionName}},#{==:#{@omx_instance_id},${normalizedSessionBirth}}}`;
+  const condition = `#{&&:#{==:#{session_name},${escapeTmuxFormatLiteral(normalizedSessionName)}},#{==:#{@omx_instance_id},${escapeTmuxFormatLiteral(normalizedSessionBirth)}}}`;
   const result = runTmux([
     'if-shell', '-t', normalizedSessionName, '-F', condition,
     `kill-session -t ${normalizedSessionName} \\; display-message -p ${appliedReceipt}`,

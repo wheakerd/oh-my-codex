@@ -351,7 +351,9 @@ export async function reconcileHudForPromptSubmit(
 
   const listPanes = deps.listCurrentWindowPanes ?? ((paneId) => listCurrentWindowPanes(undefined, paneId));
   const createPane = deps.createHudWatchPane ?? ((hudCwd, hudCmd, options) => createHudWatchPane(hudCwd, hudCmd, options));
-  const killPane = deps.killManagedHudPane ?? killExactHudPane;
+  const killPane = deps.killManagedHudPane
+    ? (candidate: ExactHudPaneKillCandidate) => deps.killManagedHudPane!(candidate) !== false
+    : killExactHudPane;
   const resizePane = deps.resizeTmuxPane ?? ((paneId, lines) => resizeTmuxPane(paneId, lines));
   const lock = acquired.lock;
   const resolvedSessionId = domain.session?.canonicalId;
@@ -439,7 +441,9 @@ export async function reconcileHudForPromptSubmit(
     })
     .map((pane) => pane.paneId);
   for (const paneId of staleHudPaneIds) {
-    await killOwnedHudPane(paneId, true);
+    if (!await killOwnedHudPane(paneId, true)) {
+      return { status: 'failed', paneId: null, desiredHeight: null, duplicateCount: 0 };
+    }
   }
   if (staleHudPaneIds.length > 0) {
     const stalePaneIdSet = new Set(staleHudPaneIds);
@@ -491,7 +495,14 @@ export async function reconcileHudForPromptSubmit(
 
     if (keeperPane) {
       for (const paneId of hudPaneIds.filter((paneId) => paneId !== keeperPane.paneId)) {
-        await killOwnedHudPane(paneId);
+        if (!await killOwnedHudPane(paneId)) {
+          return {
+            status: 'failed',
+            paneId: keeperPane.paneId,
+            desiredHeight,
+            duplicateCount,
+          };
+        }
       }
       const resized = resizePane(keeperPane.paneId, desiredHeight);
       const hooksRegistered = resized && ensureHudResizeHook(keeperPane.paneId, currentPaneId, desiredHeight, cwd, deps);
@@ -536,7 +547,10 @@ export async function reconcileHudForPromptSubmit(
 
   const removedHudPaneIds = new Set<string>();
   for (const paneId of hudPaneIds) {
-    if (await killOwnedHudPane(paneId)) removedHudPaneIds.add(paneId);
+    if (!await killOwnedHudPane(paneId)) {
+      return { status: 'failed', paneId: null, desiredHeight, duplicateCount };
+    }
+    removedHudPaneIds.add(paneId);
   }
 
   const createOptions: { heightLines: number; fullWidth?: boolean; targetPaneId?: string; instanceId?: string } = {
@@ -568,10 +582,24 @@ export async function reconcileHudForPromptSubmit(
     domain,
   );
   if (postCreate.unsafeCandidate) {
-    return { status: 'recreated', paneId, desiredHeight, duplicateCount: 0 };
+    const rolledBack = await killOwnedHudPane(paneId);
+    return {
+      status: 'failed',
+      paneId: rolledBack ? null : paneId,
+      desiredHeight,
+      duplicateCount: 0,
+    };
   }
   for (const duplicatePaneId of postCreate.duplicatePaneIds) {
-    await killOwnedHudPane(duplicatePaneId);
+    if (!await killOwnedHudPane(duplicatePaneId)) {
+      const rolledBack = await killOwnedHudPane(paneId);
+      return {
+        status: 'failed',
+        paneId: rolledBack ? null : paneId,
+        desiredHeight,
+        duplicateCount: postCreate.duplicatePaneIds.length,
+      };
+    }
   }
   const resized = resizePane(postCreate.paneId, desiredHeight);
   if (!resized) {

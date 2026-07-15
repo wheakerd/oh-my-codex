@@ -49,6 +49,7 @@ import {
   cleanupTeamWorkerLaunchOrphanedMcpProcesses,
   settleStartupAttemptResults,
   TEAM_LOW_COMPLEXITY_DEFAULT_MODEL,
+  detectAndCleanStaleTeam,
   type TeamRuntime,
 } from '../runtime.js';
 import {
@@ -713,6 +714,72 @@ describe('runtime', () => {
       await shutdownTeam(teamName, cwd, { force: true });
       assert.equal(existsSync(teamRoot), true);
     } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('deletes stale state only for a confirmed-missing or terminal lifecycle certificate', async () => {
+    const cwd = await initRepo();
+    const stateRoot = join(cwd, '.omx', 'state', 'team');
+    const writeStaleState = async (teamName: string, certificate: unknown): Promise<string> => {
+      const teamRoot = join(stateRoot, teamName);
+      await mkdir(teamRoot, { recursive: true });
+      await writeFile(join(teamRoot, 'config.json'), '{corrupt', 'utf-8');
+      await writeFile(join(teamRoot, 'manifest.v2.json'), '{corrupt', 'utf-8');
+      if (certificate !== undefined) {
+        await writeFile(join(teamRoot, 'lifecycle-generation.json'), JSON.stringify(certificate), 'utf-8');
+      }
+      return teamRoot;
+    };
+    const certificate = (teamName: string, status: 'preparing' | 'active' | 'cleanup_complete' | 'transferred') => ({
+      version: 1,
+      token: `${teamName}-token`,
+      team_name: teamName,
+      canonical_session_id: 'leader-session',
+      native_session_ids: ['leader-session'],
+      tmux_session_name: 'omx-team-stale-certificate',
+      tmux_session_birth: 'birth-1',
+      tmux_context: 'server-context',
+      team_pane_owner_id: `team:${teamName}`,
+      hook_generation: 'hook-generation',
+      status,
+      created_at: '2026-01-01T00:00:00.000Z',
+      resources: [],
+    });
+    try {
+      const missingRoot = await writeStaleState('team-stale-missing', undefined);
+      await detectAndCleanStaleTeam('team-stale-missing', cwd, 1);
+      assert.equal(existsSync(missingRoot), false);
+
+      for (const status of ['cleanup_complete', 'transferred'] as const) {
+        const teamName = `team-stale-${status}`;
+        const teamRoot = await writeStaleState(teamName, certificate(teamName, status));
+        if (status === 'transferred') {
+          await rm(join(teamRoot, 'config.json'), { force: true });
+          await rm(join(teamRoot, 'manifest.v2.json'), { force: true });
+        }
+        await detectAndCleanStaleTeam(teamName, cwd, 1);
+        assert.equal(existsSync(teamRoot), false, `${status} certificate should authorize cleanup`);
+      }
+
+      const invalidRoot = await writeStaleState('team-stale-invalid', { status: 'cleanup_complete' });
+      await detectAndCleanStaleTeam('team-stale-invalid', cwd, 1);
+      assert.equal(existsSync(invalidRoot), true);
+
+      for (const status of ['preparing', 'active'] as const) {
+        const teamName = `team-stale-${status}`;
+        const teamRoot = await writeStaleState(teamName, certificate(teamName, status));
+        await detectAndCleanStaleTeam(teamName, cwd, 1);
+        assert.equal(existsSync(teamRoot), true, `${status} certificate must retain state`);
+      }
+
+      const readErrorRoot = await writeStaleState('team-stale-read-error', certificate('team-stale-read-error', 'cleanup_complete'));
+      const readError = Object.assign(new Error('temporary read failure'), { code: 'EIO' });
+      setLifecycleCertificateReaderForTests(async () => { throw readError; });
+      await detectAndCleanStaleTeam('team-stale-read-error', cwd, 1);
+      assert.equal(existsSync(readErrorRoot), true);
+    } finally {
+      resetLifecycleCertificateReaderForTests();
       await rm(cwd, { recursive: true, force: true });
     }
   });

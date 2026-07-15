@@ -120,6 +120,13 @@ export interface TeamLifecycleResource {
 /** Immutable-generation journal. Resource entries are only appended. */
 export type TeamLifecycleGenerationStatus = 'preparing' | 'active' | 'cleanup_complete' | 'transferred';
 
+/** Terminal generations are the only certificates that authorize state removal. */
+export function isTerminalTeamLifecycleGenerationStatus(
+  status: TeamLifecycleGenerationStatus,
+): status is 'cleanup_complete' | 'transferred' {
+  return status === 'cleanup_complete' || status === 'transferred';
+}
+
 export interface TeamLifecycleGenerationCertificate {
   version: 1;
   token: string;

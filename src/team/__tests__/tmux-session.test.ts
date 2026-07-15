@@ -182,11 +182,23 @@ if [ "${'$'}{1:-}" = "if-shell" ]; then
     hook_target="${'$'}{2:-}"
   fi
   case "${'$'}branch" in
-    *__omx_*_teardown_applied_*)
+    *__omx_*_teardown_applied_*|*__omx_birth_established_*)
       selected="${'$'}branch"
       [ -f "$state_dir/if-shell-reject" ] && selected="${'$'}rejected_branch"
       receipt="${'$'}{selected##*display-message -p }"
       receipt="${'$'}{receipt%% *}"
+      if [ -f "$state_dir/if-shell-race-publish" ]; then
+        remaining="${'$'}branch"
+        while [ -n "${'$'}remaining" ]; do
+          command="${'$'}{remaining%% \\; *}"
+          eval "set -- ${'$'}command"
+          "${'$'}0" "${'$'}@"
+          [ "${'$'}command" = "${'$'}remaining" ] && break
+          remaining="${'$'}{remaining#* \\; }"
+        done
+        receipt="${'$'}{rejected_branch##*display-message -p }"
+        receipt="${'$'}{receipt%% *}"
+      fi
       printf '%s\n' "${'$'}receipt"
       exit 0
       ;;
@@ -259,6 +271,7 @@ if [ "${'$'}{1:-}" = "show-options" ]; then
     exit 0
   fi
   if [ "$option_name" = "@omx_instance_id" ]; then
+    [ -f "$state_dir/births-empty" ] && exit 0
     printf '%s\n' "immutable-team-session-birth"
     exit 0
   fi
@@ -405,6 +418,62 @@ esac
     }
   });
 
+  it('publishes missing session and leader births once with an applied receipt, then preserves the published pair', async () => {
+    const previousPane = process.env.TMUX_PANE;
+    try {
+      process.env.TMUX_PANE = '%1';
+      await withMockTmuxFixture('omx-atomic-birth-', (logPath) => `#!/bin/sh
+printf '%s\\n' "$*" >> "${logPath}"
+case "$1" in
+  display-message) printf 'leader:0 %%1\\n' ;;
+  *) exit 0 ;;
+esac
+`, async ({ logPath }) => {
+        await writeFile(`${logPath}.tmux-state/births-empty`, '1');
+        const first = establishExactTeamHudCandidate({ sessionId: 'canonical-session', expectedLeaderPaneId: '%1' });
+        const second = establishExactTeamHudCandidate({ sessionId: 'canonical-session', expectedLeaderPaneId: '%1' });
+        assert.ok(first);
+        assert.equal(second?.tmuxSessionInstanceId, first.tmuxSessionInstanceId);
+        assert.equal(second?.tmuxPaneInstanceId, first.tmuxPaneInstanceId);
+        const log = await readFile(logPath, 'utf-8');
+        assert.equal((log.match(/^if-shell /gm) ?? []).length, 1);
+        assert.match(log, /__omx_birth_established_/);
+        assert.match(log, /__omx_birth_rejected_/);
+        assert.match(log, /set-option -t 'leader' @omx_instance_id/);
+        assert.match(log, /set-option -p -t '%1' @omx_pane_instance_id/);
+      });
+    } finally {
+      if (typeof previousPane === 'string') process.env.TMUX_PANE = previousPane;
+      else delete process.env.TMUX_PANE;
+    }
+  });
+
+  it('adopts only the complete pair published by a concurrent birth conditional', async () => {
+    const previousPane = process.env.TMUX_PANE;
+    try {
+      process.env.TMUX_PANE = '%1';
+      await withMockTmuxFixture('omx-concurrent-birth-', (logPath) => `#!/bin/sh
+printf '%s\\n' "$*" >> "${logPath}"
+case "$1" in
+  display-message) printf 'leader:0 %%1\\n' ;;
+  *) exit 0 ;;
+esac
+`, async ({ logPath }) => {
+        await writeFile(`${logPath}.tmux-state/births-empty`, '1');
+        await writeFile(`${logPath}.tmux-state/if-shell-race-publish`, '1');
+        const candidate = establishExactTeamHudCandidate({ sessionId: 'canonical-session', expectedLeaderPaneId: '%1' });
+        assert.ok(candidate);
+        const log = await readFile(logPath, 'utf-8');
+        assert.match(log, /__omx_birth_established_/);
+        assert.match(log, /__omx_birth_rejected_/);
+        assert.equal((log.match(/^if-shell /gm) ?? []).length, 1);
+      });
+    } finally {
+      if (typeof previousPane === 'string') process.env.TMUX_PANE = previousPane;
+      else delete process.env.TMUX_PANE;
+    }
+  });
+
   it('reads shutdown evidence without rewriting tmux tags', async () => {
     const previousPane = process.env.TMUX_PANE;
     try {
@@ -498,6 +567,26 @@ describe('HUD resize hook command builders', () => {
     ownerId: 'team:demo',
   };
 
+  it('format-escapes every dynamic Team identity operand in hook predicates', () => {
+    const hostile = {
+      sessionName: 'team#{inject},:name',
+      windowIndex: '0#{inject},:',
+      sessionBirth: 'birth#{inject},:',
+      hudPaneId: '%1#{inject},:',
+      hudPaneBirth: 'pane#{inject},:',
+      hudPaneCommand: 'exec node omx #{inject},: --watch',
+      ownerId: 'owner#{inject},:',
+    };
+    const command = buildRegisterResizeHookArgs('team:0', 'hook', hostile.hudPaneId, HUD_TMUX_TEAM_HEIGHT_LINES, 'generation-a', hostile)[5] ?? '';
+    for (const value of Object.values(hostile)) {
+      assert.doesNotMatch(command, new RegExp(escapeRegExp(`,${value}}`)));
+    }
+    assert.match(command, /##/);
+    assert.match(command, /#\{/);
+    assert.match(command, /#,/);
+    assert.match(command, /#:/);
+  });
+
   it('appends a self-validating resize hook rather than replacing a numeric slot', () => {
     const args = buildRegisterResizeHookArgs('my-session:0', 'omx_resize_team_session_0_1', '%1', HUD_TMUX_TEAM_HEIGHT_LINES, 'generation-a', hookEvidence);
     assert.deepEqual(args.slice(0, 5), ['set-hook', '-a', '-t', 'my-session:0', 'client-resized']);
@@ -568,6 +657,19 @@ if [ "$1" = if-shell ]; then set -- $6; while [ "$#" -gt 0 ]; do if [ "$1" = set
     assert.match(delayed[2] ?? '', /@omx_team_hook_active_generation_a/);
     assert.match(reconcile[1] ?? '', /pane_start_command/);
     assert.match(reconcile[1] ?? '', /resize-pane -t %7/);
+  });
+
+  it('makes missing immutable resize evidence inert without scheduling an ID-only resize', () => {
+    const incompleteEvidence = { ...hookEvidence, hudPaneBirth: '' };
+    const hook = buildRegisterResizeHookArgs('my-session:0', 'omx_resize_team_session_0_1', '%1', HUD_TMUX_TEAM_HEIGHT_LINES, 'generation-a', incompleteEvidence);
+    const delayed = buildScheduleDelayedHudResizeArgs('%1', HUD_RESIZE_RECONCILE_DELAY_SECONDS, HUD_TMUX_TEAM_HEIGHT_LINES, { ...incompleteEvidence, generation: 'generation-a' });
+    const reconcile = buildReconcileHudResizeArgs('%1', HUD_TMUX_TEAM_HEIGHT_LINES, { ...incompleteEvidence, generation: 'generation-a' });
+
+    assert.deepEqual(hook.slice(0, 5), ['set-hook', '-a', '-t', 'my-session:0', 'client-resized']);
+    assert.equal(hook[5], 'run-shell -b :');
+    assert.deepEqual(delayed, ['run-shell', '-b', ':']);
+    assert.deepEqual(reconcile, ['run-shell', ':']);
+    assert.doesNotMatch([...hook, ...delayed, ...reconcile].join(' '), /resize-pane|sleep/);
   });
 
   it('resolves the tmux executable for win32 hook shell snippets', async () => {

@@ -50,6 +50,7 @@ import {
   appendTeamLifecycleResourceSync,
   createTeamLifecycleGeneration,
   finalizeTeamLifecycleGeneration,
+  isTerminalTeamLifecycleGenerationStatus,
   probeTeamLifecycleGeneration,
   readTeamLifecycleGeneration,
   type TeamLifecycleGenerationCertificate,
@@ -4115,6 +4116,13 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
   );
   const hudReceipt = lifecycleResources.find((resource) => resource.kind === 'hud'
     && resource.id === hudPaneId && resource.role === 'hud' && resource.pane_birth && resource.command);
+  const borrowedHudReceipt = lifecycleResources.find((resource) => resource.kind === 'hud'
+    && resource.id === hudPaneId
+    && resource.created === false
+    && resource.role === 'hud'
+    && resource.pane_birth
+    && resource.command);
+  const hasCompleteBorrowedHudRecoveryMetadata = Boolean(borrowedHudReceipt);
 
   if (config.worker_launch_mode === 'interactive') {
     const sharedSessionTopology = sessionName.includes(':')
@@ -4268,7 +4276,7 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
       : '';
     const ownsHudTeardownAuthority = Boolean(
       lifecycleAuthority
-      && hudReceipt
+      && hudReceipt?.created === true
       && ownsHudLifecycleLock
       && hasFreshHudRestoreEvidence
       && lockedHudPaneId
@@ -4281,7 +4289,7 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
     // HUD lifecycle state is authority-bearing. Do not mutate it, its hooks,
     // or the pane unless a fresh live tmux proof was obtained under this
     // domain's lock.
-    if (hudPaneId && !ownsHudTeardownAuthority) {
+    if (hudPaneId && !ownsHudTeardownAuthority && !hasCompleteBorrowedHudRecoveryMetadata) {
       retainHudLifecycleState = true;
       console.warn(`[team shutdown] ${sanitized}: preserving Team HUD pane, hooks, and metadata because fresh exact HUD authority evidence or lifecycle lock was unavailable`);
     }
@@ -4341,6 +4349,9 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
           console.warn(`[team shutdown] ${sanitized}: failed to restore standalone HUD pane`);
         }
       }
+    } else if (hasCompleteBorrowedHudRecoveryMetadata) {
+      // The HUD predates this Team generation. Its immutable receipt is retained
+      // only to exclude it from worker teardown; never mutate or destroy it.
     } else if (hudPaneId) {
       retainHudContainer = true;
       retainHudLifecycleState = true;
@@ -4646,7 +4657,7 @@ async function findActiveTeams(cwd: string, leaderSessionId: string): Promise<st
   return active;
 }
 
-async function detectAndCleanStaleTeam(
+export async function detectAndCleanStaleTeam(
   teamName: string,
   leaderCwd: string,
   workerCount: number,
@@ -4655,26 +4666,15 @@ async function detectAndCleanStaleTeam(
   const stateDir = teamRuntimeTeamRoot(teamName, leaderCwd);
   if (!existsSync(stateDir)) return;
 
-  // listTeamSessions has no error channel. An active/preparing immutable
-  // generation therefore makes a missing session result uncertain, not stale.
+  // A lifecycle probe is the sole authority for stale-state deletion. Missing
+  // or corrupt mutable config/manifest data cannot make a generation stale.
   const lifecycleCertificateProbe = await probeTeamLifecycleGeneration(teamName, leaderCwd);
-  if (lifecycleCertificateProbe.status === 'valid'
-    && (lifecycleCertificateProbe.certificate.status === 'active'
-      || lifecycleCertificateProbe.certificate.status === 'preparing')) return;
-  const retainedHudConfig = await readTeamConfig(teamName, leaderCwd);
-  // An interactive config can name panes, hooks, or a session acquired before
-  // its final receipt. Never delete that recovery metadata without a valid
-  // terminal certificate.
-  if (retainedHudConfig && hasInteractiveTmuxOwnershipEvidence(retainedHudConfig)
-    && lifecycleCertificateProbe.status !== 'valid') return;
+  const cleanupAuthorized = lifecycleCertificateProbe.status === 'confirmed_missing'
+    || (lifecycleCertificateProbe.status === 'valid'
+      && isTerminalTeamLifecycleGenerationStatus(lifecycleCertificateProbe.certificate.status));
+  if (!cleanupAuthorized) return;
   const sessions = new Set(listTeamSessions());
   if (sessions.has(`omx-team-${teamName}`)) return;
-  if (
-    retainedHudConfig?.worker_launch_mode === 'interactive'
-    && retainedHudConfig.hud_pane_id
-    && retainedHudConfig.resize_hook_name
-    && retainedHudConfig.resize_hook_target
-  ) return;
 
   const repoRootResult = spawnSync('git', ['rev-parse', '--show-toplevel'], {
     cwd: leaderCwd, encoding: 'utf-8', windowsHide: true,

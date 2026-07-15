@@ -49,6 +49,7 @@ import {
   appendTeamLifecycleResource,
   finalizeTeamLifecycleGeneration,
   readTeamLifecycleGeneration,
+  isTerminalTeamLifecycleGenerationStatus,
 } from '../state.js';
 import { normalizeDispatchRequest } from '../state/dispatch.js';
 
@@ -1998,6 +1999,12 @@ exit 1
     }
   });
 
+  it('recognizes only completed or transferred lifecycle generations as terminal', () => {
+    assert.equal(isTerminalTeamLifecycleGenerationStatus('preparing'), false);
+    assert.equal(isTerminalTeamLifecycleGenerationStatus('active'), false);
+    assert.equal(isTerminalTeamLifecycleGenerationStatus('cleanup_complete'), true);
+    assert.equal(isTerminalTeamLifecycleGenerationStatus('transferred'), true);
+  });
   it('serializes lifecycle certificate creation, receipt appends, and status transitions', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-team-lifecycle-generation-'));
     try {
