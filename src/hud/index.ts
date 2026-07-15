@@ -76,7 +76,8 @@ interface RunWatchModeDependencies {
   readAllStateFn: (cwd: string, config?: ResolvedHudConfig) => Promise<HudRenderContext>;
   readHudConfigFn: (cwd: string) => Promise<ResolvedHudConfig>;
   renderHudFn: (ctx: HudRenderContext, preset: HudPreset, options?: { maxWidth?: number; maxLines?: number }) => string;
-  runAuthorityTickFn: (options: { cwd: string }) => Promise<void>;
+  runAuthorityTickFn: (options: { cwd: string ;
+		frameCwd: string;}) => Promise<void>;
   resizeTmuxPaneFn: (paneId: string, heightLines: number) => boolean;
   registerHudResizeHookFn: (hudPaneId: string, leaderPaneId: string | undefined, heightLines: number) => boolean;
   writeStdout: (text: string) => void;
@@ -177,8 +178,8 @@ export async function runWatchMode(
     readAllStateFn: deps.readAllStateFn ?? readAllState,
     readHudConfigFn: deps.readHudConfigFn ?? readHudConfig,
     renderHudFn: deps.renderHudFn ?? renderHud,
-    runAuthorityTickFn: deps.runAuthorityTickFn ?? (async ({ cwd: authorityCwd }) => {
-      await runHudAuthorityTick({ cwd: authorityCwd });
+    runAuthorityTickFn: deps.runAuthorityTickFn ?? (async ({ cwd: authorityCwd , frameCwd}) => {
+      await runHudAuthorityTick({ cwd: authorityCwd , frameCwd});
     }),
     resizeTmuxPaneFn: deps.resizeTmuxPaneFn ?? resizeTmuxPane,
     registerHudResizeHookFn: deps.registerHudResizeHookFn ?? registerHudResizeHook,
@@ -251,7 +252,7 @@ export async function runWatchMode(
       });
       dependencies.writeStdout(line + '\x1b[K\x1b[J');
       try {
-        await dependencies.runAuthorityTickFn({ cwd: frameCwd });
+        await dependencies.runAuthorityTickFn({ cwd, frameCwd });
       } catch (authorityError) {
         const message = authorityError instanceof Error ? authorityError.message : String(authorityError);
         dependencies.writeStderr(`HUD watch authority tick failed: ${message}\n`);

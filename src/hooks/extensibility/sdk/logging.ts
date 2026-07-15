@@ -11,8 +11,8 @@ export async function appendHookPluginLog(
   level: HookPluginLogLevel,
   message: string,
   meta: Record<string, unknown>,
-): Promise<void> {
-  const logPath = hookPluginLogPath(cwd);
+stateRoot?: string,): Promise<void> {
+  const logPath = hookPluginLogPath(cwd, undefined, stateRoot);
   await mkdir(dirname(logPath), { recursive: true });
   await appendFile(logPath, `${JSON.stringify({
     timestamp: new Date().toISOString(),
@@ -21,26 +21,52 @@ export async function appendHookPluginLog(
     level,
     message,
     ...meta,
-  })}\n`).catch(() => {});
+  })}\n`,
+	).catch(() => {});
 }
 
 export function createHookPluginLogger(
-  cwd: string,
-  pluginName: string,
-  event: HookEventEnvelope,
-): HookPluginSdk['log'] {
-  return {
-    info: (message: string, meta: Record<string, unknown> = {}) => appendHookPluginLog(cwd, pluginName, 'info', message, {
-      hook_event: event.event,
-      ...meta,
-    }),
-    warn: (message: string, meta: Record<string, unknown> = {}) => appendHookPluginLog(cwd, pluginName, 'warn', message, {
-      hook_event: event.event,
-      ...meta,
-    }),
-    error: (message: string, meta: Record<string, unknown> = {}) => appendHookPluginLog(cwd, pluginName, 'error', message, {
-      hook_event: event.event,
-      ...meta,
-    }),
-  };
+	cwd: string,
+	pluginName: string,
+	event: HookEventEnvelope,
+	stateRoot?: string,
+): HookPluginSdk["log"] {
+	return {
+		info: (message: string, meta: Record<string, unknown> = {}) =>
+			appendHookPluginLog(
+				cwd,
+				pluginName,
+				"info",
+				message,
+				{
+					hook_event: event.event,
+					...meta,
+				},
+				stateRoot,
+			),
+		warn: (message: string, meta: Record<string, unknown> = {}) =>
+			appendHookPluginLog(
+				cwd,
+				pluginName,
+				"warn",
+				message,
+				{
+					hook_event: event.event,
+					...meta,
+				},
+				stateRoot,
+			),
+		error: (message: string, meta: Record<string, unknown> = {}) =>
+			appendHookPluginLog(
+				cwd,
+				pluginName,
+				"error",
+				message,
+				{
+					hook_event: event.event,
+					...meta,
+				},
+				stateRoot,
+			),
+	};
 }

@@ -4533,275 +4533,362 @@ async function retireUnanchoredPreJournalGeneration(
   const generationId = inspected.pre_journal_generation_id;
   if (!generationId) return;
   const operationId = `pre-anchor-retire-${createHash('sha256').update(generationId, 'utf8').digest('hex').slice(0, 32)}`;
-  const journalPath = authorityJournalPath(inspected.state_root, generationId, operationId);
-  const journal = createStateAuthorityJournal({
-    operation_id: operationId,
-    kind: 'generation_establish',
-    authority_id: generationId,
-    generation_id: generationId,
-    binding_revision: 0,
-    workspace_identity_digest: workspace.digest,
-    expected_anchor_revision: 1,
-    fencing_token: lock.record.fencing_token,
-    effects_digest: journalEffectsDigest({
-      workspace: workspace.digest,
-      source_generation: 'none',
-      target_generation: generationId,
-      target_root: inspected.state_root,
-    }),
-    now,
-  });
-  await writeStateAuthorityJournal(
-    journalPath,
-    transitionStateAuthorityJournal(journal, 'aborted', {
-      blocked_reason: UNANCHORED_PRE_JOURNAL_RETIREMENT_REASON,
-      now,
-    }),
-    inspected.state_root,
-    inspected.root_identity,
-  );
+	const journalPath = authorityJournalPath(
+		inspected.state_root,
+		generationId,
+		operationId,
+	);
+	const journal = createStateAuthorityJournal({
+		operation_id: operationId,
+		kind: "generation_establish",
+		authority_id: generationId,
+		generation_id: generationId,
+		binding_revision: 0,
+		workspace_identity_digest: workspace.digest,
+		expected_anchor_revision: 1,
+		fencing_token: lock.record.fencing_token,
+		effects_digest: journalEffectsDigest({
+			workspace: workspace.digest,
+			source_generation: "none",
+			target_generation: generationId,
+			target_root: inspected.state_root,
+		}),
+		now,
+	});
+	await writeStateAuthorityJournal(
+		journalPath,
+		transitionStateAuthorityJournal(journal, "aborted", {
+			blocked_reason: UNANCHORED_PRE_JOURNAL_RETIREMENT_REASON,
+			now,
+		}),
+		inspected.state_root,
+		inspected.root_identity,
+	);
 }
 
 async function recoverUnanchoredPristinePreparation(
-  workspace: WorkspaceIdentity,
-  now: Date,
+	workspace: WorkspaceIdentity,
+	now: Date,
 ): Promise<boolean> {
-  const inspected = await inspectUnanchoredPristinePreparation(workspace);
-  const coordinationOnly = !inspected && await hasOnlyPreAnchorCoordinationEvidence(workspace);
-  if (!inspected && !coordinationOnly) return false;
-  const { lock } = await acquireCurrentWorkspaceAuthorityLock(workspace, now);
-  try {
-    if (await readWorkspaceAuthorityAnchor(workspace)) return false;
-    if (!inspected) return true;
-    const current = await inspectUnanchoredPristinePreparation(workspace);
-    if (!current || !sameUnanchoredPristineInspection(inspected, current)) {
-      authorityError(AUTHORITY_DIAGNOSTIC_CODES.journalConflict, 'unanchored pristine authority preparation changed during recovery');
-    }
-    if (current.prepared) {
-      await writeStateAuthorityJournal(
-        current.prepared.journal_path,
-        transitionStateAuthorityJournal(current.prepared.journal, 'aborted', {
-          blocked_reason: UNANCHORED_PRISTINE_RECOVERY_REASON,
-          now,
-        }),
-        current.state_root,
-        current.root_identity,
-      );
-    } else if (current.pre_journal_generation_id) {
-      await retireUnanchoredPreJournalGeneration(current, workspace, lock, now);
-    }
-    return true;
-  } finally {
-    await releaseWorkspaceAuthorityLock(lock);
-  }
+	const inspected = await inspectUnanchoredPristinePreparation(workspace);
+	const coordinationOnly =
+		!inspected && (await hasOnlyPreAnchorCoordinationEvidence(workspace));
+	if (!inspected && !coordinationOnly) return false;
+	const { lock } = await acquireCurrentWorkspaceAuthorityLock(workspace, now);
+	try {
+		if (await readWorkspaceAuthorityAnchor(workspace)) return false;
+		if (!inspected) return true;
+		const current = await inspectUnanchoredPristinePreparation(workspace);
+		if (!current || !sameUnanchoredPristineInspection(inspected, current)) {
+			authorityError(
+				AUTHORITY_DIAGNOSTIC_CODES.journalConflict,
+				"unanchored pristine authority preparation changed during recovery",
+			);
+		}
+		if (current.prepared) {
+			await writeStateAuthorityJournal(
+				current.prepared.journal_path,
+				transitionStateAuthorityJournal(current.prepared.journal, "aborted", {
+					blocked_reason: UNANCHORED_PRISTINE_RECOVERY_REASON,
+					now,
+				}),
+				current.state_root,
+				current.root_identity,
+			);
+		} else if (current.pre_journal_generation_id) {
+			await retireUnanchoredPreJournalGeneration(current, workspace, lock, now);
+		}
+		return true;
+	} finally {
+		await releaseWorkspaceAuthorityLock(lock);
+	}
 }
 
 async function isProvenLegacyAuthorityCandidate(
-  stateRoot: string,
-  workspace: WorkspaceIdentity,
-  input: InitializeStateAuthorityInput,
-  allowUnscopedDeterministicRoot = false,
+	stateRoot: string,
+	workspace: WorkspaceIdentity,
+	input: InitializeStateAuthorityInput,
+	allowUnscopedDeterministicRoot = false,
 ): Promise<boolean> {
-  const sessionPath = join(stateRoot, 'session.json');
-  try {
-    const fileStat = await lstat(sessionPath);
-    if (!fileStat.isFile() || fileStat.isSymbolicLink()) return false;
-    const session = JSON.parse(await readFile(sessionPath, 'utf-8')) as Record<string, unknown>;
-    const sessionId = typeof session.session_id === 'string' ? session.session_id.trim() : '';
-    const sessionCwd = typeof session.cwd === 'string' ? session.cwd.trim() : '';
-    if (!sessionId) return false;
-    if (sessionCwd) {
-      const legacyWorkspace = resolveWorkspaceIdentity(sessionCwd);
-      if (legacyWorkspace.digest !== workspace.digest) return false;
-    }
-    const aliases = input.session_binding.aliases;
-    const acceptedSessionIds = new Set([
-      input.session_binding.canonical_session_id,
-      ...(aliases?.current_session_aliases ?? []),
-      ...(aliases?.previous_session_aliases ?? []),
-      ...(aliases?.owner_session_aliases ?? []),
-      aliases?.native_session_id,
-    ].filter((value): value is string => typeof value === 'string' && value.trim() !== '').map((value) => value.trim()));
-    return acceptedSessionIds.has(sessionId);
-  } catch (error) {
-    return allowUnscopedDeterministicRoot && (error as NodeJS.ErrnoException).code === 'ENOENT';
-  }
+	const sessionPath = join(stateRoot, "session.json");
+	try {
+		const fileStat = await lstat(sessionPath);
+		if (!fileStat.isFile() || fileStat.isSymbolicLink()) return false;
+		const session = JSON.parse(await readFile(sessionPath, "utf-8")) as Record<
+			string,
+			unknown
+		>;
+		const sessionId =
+			typeof session.session_id === "string" ? session.session_id.trim() : "";
+		const sessionCwd =
+			typeof session.cwd === "string" ? session.cwd.trim() : "";
+		if (!sessionId) return false;
+		if (sessionCwd) {
+			const legacyWorkspace = resolveWorkspaceIdentity(sessionCwd);
+			if (legacyWorkspace.digest !== workspace.digest) return false;
+		}
+		const aliases = input.session_binding.aliases;
+		const acceptedSessionIds = new Set(
+			[
+				input.session_binding.canonical_session_id,
+				...(aliases?.current_session_aliases ?? []),
+				...(aliases?.previous_session_aliases ?? []),
+				...(aliases?.owner_session_aliases ?? []),
+				aliases?.native_session_id,
+			]
+				.filter(
+					(value): value is string =>
+						typeof value === "string" && value.trim() !== "",
+				)
+				.map((value) => value.trim()),
+		);
+		return acceptedSessionIds.has(sessionId);
+	} catch (error) {
+		return (
+			allowUnscopedDeterministicRoot &&
+			(error as NodeJS.ErrnoException).code === "ENOENT"
+		);
+	}
 }
 function requestedBindingMatchesActive(
-  requested: CreateSessionAuthorityBindingInput,
-  active: SessionAuthorityBinding,
+	requested: CreateSessionAuthorityBindingInput,
+	active: SessionAuthorityBinding,
 ): boolean {
-  const requestedAliases = normalizeAliases(requested.aliases);
-  const requestedNative = requestedAliases.native_session_id;
-  const aliasAlreadyBound = (alias: string): boolean =>
-    alias === active.canonical_session_id
-    || alias === active.aliases.native_session_id
-    || active.aliases.current_session_aliases.includes(alias)
-    || active.aliases.previous_session_aliases.includes(alias)
-    || active.aliases.owner_session_aliases.includes(alias);
-  const requestedAliasesAreAlreadyBound =
-    requestedAliases.current_session_aliases.every(aliasAlreadyBound)
-    && requestedAliases.previous_session_aliases.every(aliasAlreadyBound)
-    && requestedAliases.owner_session_aliases.every(aliasAlreadyBound);
-  const nativeAliasIsUnchanged = !requestedNative || requestedNative === active.aliases.native_session_id;
-  const initialNativeAliasIsSafe = !active.aliases.native_session_id
-    && Boolean(requestedNative)
-    && requestedAliases.current_session_aliases.every((alias) => alias === requestedNative || alias === active.canonical_session_id)
-    && requestedAliases.previous_session_aliases.length === 0
-    && requestedAliases.owner_session_aliases.every((alias) => alias === active.canonical_session_id);
-  if (requested.canonical_session_id === active.canonical_session_id
-    && ((nativeAliasIsUnchanged && requestedAliasesAreAlreadyBound) || initialNativeAliasIsSafe)) {
-    return true;
-  }
-  const ownerContinuity = requestedAliases.owner_session_aliases.some((alias) =>
-    alias === active.canonical_session_id || active.aliases.owner_session_aliases.includes(alias),
-  );
-  const previousNativeContinuity = requestedAliases.previous_session_aliases.some((alias) =>
-    active.aliases.native_session_id === alias,
-  );
-  return ownerContinuity && previousNativeContinuity;
+	const requestedAliases = normalizeAliases(requested.aliases);
+	const requestedNative = requestedAliases.native_session_id;
+	const aliasAlreadyBound = (alias: string): boolean =>
+		alias === active.canonical_session_id ||
+		alias === active.aliases.native_session_id ||
+		active.aliases.current_session_aliases.includes(alias) ||
+		active.aliases.previous_session_aliases.includes(alias) ||
+		active.aliases.owner_session_aliases.includes(alias);
+	const requestedAliasesAreAlreadyBound =
+		requestedAliases.current_session_aliases.every(aliasAlreadyBound) &&
+		requestedAliases.previous_session_aliases.every(aliasAlreadyBound) &&
+		requestedAliases.owner_session_aliases.every(aliasAlreadyBound);
+	const nativeAliasIsUnchanged =
+		!requestedNative || requestedNative === active.aliases.native_session_id;
+	const initialNativeAliasIsSafe =
+		!active.aliases.native_session_id &&
+		Boolean(requestedNative) &&
+		requestedAliases.current_session_aliases.every(
+			(alias) =>
+				alias === requestedNative || alias === active.canonical_session_id,
+		) &&
+		requestedAliases.previous_session_aliases.length === 0 &&
+		requestedAliases.owner_session_aliases.every(
+			(alias) => alias === active.canonical_session_id,
+		);
+	if (
+		requested.canonical_session_id === active.canonical_session_id &&
+		((nativeAliasIsUnchanged && requestedAliasesAreAlreadyBound) ||
+			initialNativeAliasIsSafe)
+	) {
+		return true;
+	}
+	const ownerContinuity = requestedAliases.owner_session_aliases.some(
+		(alias) =>
+			alias === active.canonical_session_id ||
+			active.aliases.owner_session_aliases.includes(alias),
+	);
+	const previousNativeContinuity =
+		requestedAliases.previous_session_aliases.some(
+			(alias) => active.aliases.native_session_id === alias,
+		);
+	return ownerContinuity && previousNativeContinuity;
 }
 
 function mergeSessionAliases(
-  active: SessionAliasSet,
-  requested: Partial<SessionAliasSet> | undefined,
+	active: SessionAliasSet,
+	requested: Partial<SessionAliasSet> | undefined,
 ): Partial<SessionAliasSet> {
-  return {
-    native_session_id: requested?.native_session_id ?? active.native_session_id,
-    current_session_aliases: [...new Set([...active.current_session_aliases, ...(requested?.current_session_aliases ?? [])])],
-    previous_session_aliases: [...new Set([...active.previous_session_aliases, ...(requested?.previous_session_aliases ?? [])])],
-    owner_session_aliases: [...new Set([...active.owner_session_aliases, ...(requested?.owner_session_aliases ?? [])])],
-  };
+	return {
+		native_session_id: requested?.native_session_id ?? active.native_session_id,
+		current_session_aliases: [
+			...new Set([
+				...active.current_session_aliases,
+				...(requested?.current_session_aliases ?? []),
+			]),
+		],
+		previous_session_aliases: [
+			...new Set([
+				...active.previous_session_aliases,
+				...(requested?.previous_session_aliases ?? []),
+			]),
+		],
+		owner_session_aliases: [
+			...new Set([
+				...active.owner_session_aliases,
+				...(requested?.owner_session_aliases ?? []),
+			]),
+		],
+	};
 }
 function isProcessAlive(pid: number): boolean {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === 'EPERM';
-  }
+	if (!Number.isInteger(pid) || pid <= 0) return false;
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code === "EPERM";
+	}
 }
 
-async function mayTerminalizeRecordedGeneration(generation: StateAuthorityGeneration): Promise<boolean> {
-  const owner: StateAuthorityLockOwner = {
-    host: hostname(),
-    pid: generation.created_by_pid,
-    process_started_at: generation.created_by_process_started_at ?? generation.created_at,
-    ...(generation.created_by_boot_id ? { boot_id: generation.created_by_boot_id } : {}),
-    ...(generation.created_by_command_digest ? { command_digest: generation.created_by_command_digest } : {}),
-  };
-  const state = await inspectLockOwner(owner);
-  return state === 'exited' || state === 'reused';
+async function mayTerminalizeRecordedGeneration(
+	generation: StateAuthorityGeneration,
+): Promise<boolean> {
+	const owner: StateAuthorityLockOwner = {
+		host: hostname(),
+		pid: generation.created_by_pid,
+		process_started_at:
+			generation.created_by_process_started_at ?? generation.created_at,
+		...(generation.created_by_boot_id
+			? { boot_id: generation.created_by_boot_id }
+			: {}),
+		...(generation.created_by_command_digest
+			? { command_digest: generation.created_by_command_digest }
+			: {}),
+	};
+	const state = await inspectLockOwner(owner);
+	return state === "exited" || state === "reused";
 }
 
 function createGeneration(
-  workspace: WorkspaceIdentity,
-  stateRoot: string,
-  rootIdentity: RootFilesystemIdentity,
-  rootCapability: StateAuthorityFilesystemCapability,
-  fence: number,
-  priorGenerationId: string | undefined,
-  now: Date,
-  generationId = randomUUID(),
+	workspace: WorkspaceIdentity,
+	stateRoot: string,
+	rootIdentity: RootFilesystemIdentity,
+	rootCapability: StateAuthorityFilesystemCapability,
+	fence: number,
+	priorGenerationId: string | undefined,
+	now: Date,
+	generationId = randomUUID(),
 ): StateAuthorityGeneration {
-  const authorityId = safeIdentifier(generationId, 'generation ID');
-  const creator = createStateAuthorityLockOwner(now);
-  return {
-    schema_version: 1,
-    authority_protocol_version: 1,
-    authority_id: authorityId,
-    generation_id: authorityId,
-    status: 'committed',
-    canonical_state_root: stateRoot,
-    canonical_omx_root: dirname(stateRoot),
-    root_identity: rootIdentity,
-    root_capability: rootCapability,
-    workspace_identity: workspace,
-    workspace_identity_digest: workspace.digest,
-    creation_fence: fence,
-    prior_generation_id: priorGenerationId,
-    created_at: nowIso(now),
-    created_by_pid: creator.pid,
-    created_by_process_started_at: creator.process_started_at,
-    created_by_boot_id: creator.boot_id,
-    created_by_command_digest: creator.command_digest,
-  };
+	const authorityId = safeIdentifier(generationId, "generation ID");
+	const creator = createStateAuthorityLockOwner(now);
+	return {
+		schema_version: 1,
+		authority_protocol_version: 1,
+		authority_id: authorityId,
+		generation_id: authorityId,
+		status: "committed",
+		canonical_state_root: stateRoot,
+		canonical_omx_root: dirname(stateRoot),
+		root_identity: rootIdentity,
+		root_capability: rootCapability,
+		workspace_identity: workspace,
+		workspace_identity_digest: workspace.digest,
+		creation_fence: fence,
+		prior_generation_id: priorGenerationId,
+		created_at: nowIso(now),
+		created_by_pid: creator.pid,
+		created_by_process_started_at: creator.process_started_at,
+		created_by_boot_id: creator.boot_id,
+		created_by_command_digest: creator.command_digest,
+	};
 }
 
 async function ensureStateAuthorityGenerationDirectories(
-  workspace: WorkspaceIdentity,
-  stateRoot: string,
-  generationId: string,
+	workspace: WorkspaceIdentity,
+	stateRoot: string,
+	generationId: string,
 ): Promise<AuthorityGenerationPaths> {
-  if (isAuthorityPathWithin(workspace.canonical_path, stateRoot)) {
-    await ensureAuthorityDirectory(workspace.canonical_path, dirname(stateRoot));
-    await ensureAuthorityDirectory(workspace.canonical_path, stateRoot);
-  } else {
-    await assertPathHasNoSymlinkComponents(stateRoot, 'legacy state root');
-    await assertDirectoryNotSymlink(stateRoot, 'legacy state root');
-  }
+	if (isAuthorityPathWithin(workspace.canonical_path, stateRoot)) {
+		await ensureAuthorityDirectory(
+			workspace.canonical_path,
+			dirname(stateRoot),
+		);
+		await ensureAuthorityDirectory(workspace.canonical_path, stateRoot);
+	} else {
+		await assertPathHasNoSymlinkComponents(stateRoot, "legacy state root");
+		await assertDirectoryNotSymlink(stateRoot, "legacy state root");
+	}
 
-  const paths = authorityGenerationPaths(stateRoot, generationId);
-  await ensureAuthorityDirectory(stateRoot, join(stateRoot, 'authority'));
-  await ensureAuthorityDirectory(stateRoot, join(stateRoot, 'authority', 'generations'));
-  await ensureAuthorityDirectory(stateRoot, paths.generation_directory);
-  await ensureAuthorityDirectory(stateRoot, paths.binding_directory);
-  await ensureAuthorityDirectory(stateRoot, paths.journal_directory);
-  return paths;
+	const paths = authorityGenerationPaths(stateRoot, generationId);
+	await ensureAuthorityDirectory(stateRoot, join(stateRoot, "authority"));
+	await ensureAuthorityDirectory(
+		stateRoot,
+		join(stateRoot, "authority", "generations"),
+	);
+	await ensureAuthorityDirectory(stateRoot, paths.generation_directory);
+	await ensureAuthorityDirectory(stateRoot, paths.binding_directory);
+	await ensureAuthorityDirectory(stateRoot, paths.journal_directory);
+	return paths;
 }
 
-async function readActiveGeneration(
-  anchor: WorkspaceAuthorityAnchor,
-): Promise<{ generation: StateAuthorityGeneration; authorityPath: string; binding: SessionAuthorityBinding }> {
-  if (!anchor.active_generation_locator || !anchor.active_binding_locator || !anchor.active_generation_id || !anchor.active_lease) {
-    authorityError(AUTHORITY_DIAGNOSTIC_CODES.authorityMissing, 'workspace anchor has no active authority generation');
-  }
-  const generation = await readAuthorityJson(
-    anchor.active_generation_locator,
-    AUTHORITY_DIAGNOSTIC_CODES.authorityMalformed,
-  ) as StateAuthorityGeneration;
-  validateStateAuthorityGeneration(generation);
-  if (generation.generation_id !== anchor.active_generation_id
-    || generation.authority_id !== anchor.active_lease.generation_id) {
-    authorityError(AUTHORITY_DIAGNOSTIC_CODES.authorityMalformed, 'active generation does not match the anchor active generation ID and lease');
-  }
-  await assertPathHasNoSymlinkComponents(generation.canonical_state_root, 'active state root');
-  const expectedAuthorityPath = authorityGenerationPaths(
-    generation.canonical_state_root,
-    generation.generation_id,
-  ).authority_path;
-  await assertAuthorityLocator(
-    generation.canonical_state_root,
-    anchor.active_generation_locator,
-    expectedAuthorityPath,
-    'active authority locator',
-  );
-  const binding = await readAuthorityJson(
-    anchor.active_binding_locator,
-    AUTHORITY_DIAGNOSTIC_CODES.sessionBindingConflict,
-  ) as SessionAuthorityBinding;
-  validateSessionAuthorityBinding(binding);
-  const expectedBindingPath = authorityBindingPath(
-    generation.canonical_state_root,
-    generation.generation_id,
-    binding.binding_id,
-  );
-  await assertAuthorityLocator(
-    generation.canonical_state_root,
-    anchor.active_binding_locator,
-    expectedBindingPath,
-    'active binding locator',
-  );
-  if (binding.authority_id !== generation.authority_id
-    || binding.generation_id !== generation.generation_id
-    || binding.lifecycle !== 'active'
-    || binding.binding_id !== anchor.active_lease.binding_id
-    || binding.creation_fence > anchor.fencing_token
-    || generation.creation_fence > anchor.fencing_token) {
-    authorityError(AUTHORITY_DIAGNOSTIC_CODES.sessionBindingConflict, 'active session binding does not satisfy the active authority generation and lease invariant');
-  }
-  return { generation, authorityPath: expectedAuthorityPath, binding };
+async function readActiveGeneration(anchor: WorkspaceAuthorityAnchor): Promise<{
+	generation: StateAuthorityGeneration;
+	authorityPath: string;
+	binding: SessionAuthorityBinding;
+}> {
+	if (
+		!anchor.active_generation_locator ||
+		!anchor.active_binding_locator ||
+		!anchor.active_generation_id ||
+		!anchor.active_lease
+	) {
+		authorityError(
+			AUTHORITY_DIAGNOSTIC_CODES.authorityMissing,
+			"workspace anchor has no active authority generation",
+		);
+	}
+	const generation = (await readAuthorityJson(
+		anchor.active_generation_locator,
+		AUTHORITY_DIAGNOSTIC_CODES.authorityMalformed,
+	)) as StateAuthorityGeneration;
+	validateStateAuthorityGeneration(generation);
+	if (
+		generation.generation_id !== anchor.active_generation_id ||
+		generation.authority_id !== anchor.active_lease.generation_id
+	) {
+		authorityError(
+			AUTHORITY_DIAGNOSTIC_CODES.authorityMalformed,
+			"active generation does not match the anchor active generation ID and lease",
+		);
+	}
+	await assertPathHasNoSymlinkComponents(
+		generation.canonical_state_root,
+		"active state root",
+	);
+	const expectedAuthorityPath = authorityGenerationPaths(
+		generation.canonical_state_root,
+		generation.generation_id,
+	).authority_path;
+	await assertAuthorityLocator(
+		generation.canonical_state_root,
+		anchor.active_generation_locator,
+		expectedAuthorityPath,
+		"active authority locator",
+	);
+	const binding = (await readAuthorityJson(
+		anchor.active_binding_locator,
+		AUTHORITY_DIAGNOSTIC_CODES.sessionBindingConflict,
+	)) as SessionAuthorityBinding;
+	validateSessionAuthorityBinding(binding);
+	const expectedBindingPath = authorityBindingPath(
+		generation.canonical_state_root,
+		generation.generation_id,
+		binding.binding_id,
+	);
+	await assertAuthorityLocator(
+		generation.canonical_state_root,
+		anchor.active_binding_locator,
+		expectedBindingPath,
+		"active binding locator",
+	);
+	if (
+		binding.authority_id !== generation.authority_id ||
+		binding.generation_id !== generation.generation_id ||
+		binding.lifecycle !== "active" ||
+		binding.binding_id !== anchor.active_lease.binding_id ||
+		binding.creation_fence > anchor.fencing_token ||
+		generation.creation_fence > anchor.fencing_token
+	) {
+		authorityError(
+			AUTHORITY_DIAGNOSTIC_CODES.sessionBindingConflict,
+			"active session binding does not satisfy the active authority generation and lease invariant",
+		);
+	}
+	return { generation, authorityPath: expectedAuthorityPath, binding };
 }
 
 /**
@@ -4811,72 +4898,89 @@ async function readActiveGeneration(
  * generation was retired.  Never allow a rolled-back anchor to reactivate it.
  */
 async function assertAnchorHasNoCommittedSuccessor(
-  workspace: WorkspaceIdentity,
-  anchor: WorkspaceAuthorityAnchor,
+	workspace: WorkspaceIdentity,
+	anchor: WorkspaceAuthorityAnchor,
 ): Promise<void> {
-  const counter = await readWorkspaceAuthorityLockFenceCounter(
-    stateAuthorityPaths(workspace).lock_fence_path,
-  );
-  if (!counter || counter.record.last_fencing_token <= anchor.fencing_token
-    || !anchor.active_generation_id || !anchor.active_generation_locator) {
-    return;
-  }
+	const counter = await readWorkspaceAuthorityLockFenceCounter(
+		stateAuthorityPaths(workspace).lock_fence_path,
+	);
+	if (
+		!counter ||
+		counter.record.last_fencing_token <= anchor.fencing_token ||
+		!anchor.active_generation_id ||
+		!anchor.active_generation_locator
+	) {
+		return;
+	}
 
-  const generation = await readAuthorityJson(
-    anchor.active_generation_locator,
-    AUTHORITY_DIAGNOSTIC_CODES.authorityMalformed,
-  ) as StateAuthorityGeneration;
-  validateStateAuthorityGeneration(generation);
-  if (generation.generation_id !== anchor.active_generation_id) {
-    authorityError(AUTHORITY_DIAGNOSTIC_CODES.authorityMalformed, 'active generation does not match the workspace anchor');
-  }
-  const expectedAuthorityPath = authorityGenerationPaths(
-    generation.canonical_state_root,
-    generation.generation_id,
-  ).authority_path;
-  await assertAuthorityLocator(
-    generation.canonical_state_root,
-    anchor.active_generation_locator,
-    expectedAuthorityPath,
-    'active authority locator',
-  );
+	const generation = (await readAuthorityJson(
+		anchor.active_generation_locator,
+		AUTHORITY_DIAGNOSTIC_CODES.authorityMalformed,
+	)) as StateAuthorityGeneration;
+	validateStateAuthorityGeneration(generation);
+	if (generation.generation_id !== anchor.active_generation_id) {
+		authorityError(
+			AUTHORITY_DIAGNOSTIC_CODES.authorityMalformed,
+			"active generation does not match the workspace anchor",
+		);
+	}
+	const expectedAuthorityPath = authorityGenerationPaths(
+		generation.canonical_state_root,
+		generation.generation_id,
+	).authority_path;
+	await assertAuthorityLocator(
+		generation.canonical_state_root,
+		anchor.active_generation_locator,
+		expectedAuthorityPath,
+		"active authority locator",
+	);
 
-  const journalDirectory = authorityGenerationPaths(
-    generation.canonical_state_root,
-    generation.generation_id,
-  ).journal_directory;
-  await assertPathHasNoSymlinkComponents(journalDirectory, 'active generation journal directory');
-  const entries = await readdir(journalDirectory, { withFileTypes: true });
-  for (const entry of entries) {
-    if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
-    const journal = await readStateAuthorityJournal(join(journalDirectory, entry.name));
-    if (journal.status === 'committed'
-      && (journal.kind === 'generation_establish' || journal.kind === 'alternate_root_rollover')
-      && journal.generation_id !== generation.generation_id) {
-      authorityError(
-        AUTHORITY_DIAGNOSTIC_CODES.anchorRevisionConflict,
-        'workspace authority anchor attempts to reactivate a generation retired by a committed successor journal',
-      );
-    }
-  }
+	const journalDirectory = authorityGenerationPaths(
+		generation.canonical_state_root,
+		generation.generation_id,
+	).journal_directory;
+	await assertPathHasNoSymlinkComponents(
+		journalDirectory,
+		"active generation journal directory",
+	);
+	const entries = await readdir(journalDirectory, { withFileTypes: true });
+	for (const entry of entries) {
+		if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+		const journal = await readStateAuthorityJournal(
+			join(journalDirectory, entry.name),
+		);
+		if (
+			journal.status === "committed" &&
+			(journal.kind === "generation_establish" ||
+				journal.kind === "alternate_root_rollover") &&
+			journal.generation_id !== generation.generation_id
+		) {
+			authorityError(
+				AUTHORITY_DIAGNOSTIC_CODES.anchorRevisionConflict,
+				"workspace authority anchor attempts to reactivate a generation retired by a committed successor journal",
+			);
+		}
+	}
 }
 
 function transportCapabilityMatchesActiveAuthority(
-  metadata: StateAuthorityTransportCapabilityMetadata,
-  anchor: WorkspaceAuthorityAnchor,
-  active: Awaited<ReturnType<typeof readActiveGeneration>>,
+	metadata: StateAuthorityTransportCapabilityMetadata,
+	anchor: WorkspaceAuthorityAnchor,
+	active: Awaited<ReturnType<typeof readActiveGeneration>>,
 ): boolean {
-  const lease = anchor.active_lease;
-  return metadata.status === 'active'
-    && Boolean(lease)
-    && metadata.workspace_identity_digest === anchor.workspace_identity_digest
-    && metadata.authority_id === active.generation.authority_id
-    && metadata.generation_id === active.generation.generation_id
-    && metadata.binding_id === active.binding.binding_id
-    && metadata.binding_revision === active.binding.binding_revision
-    && metadata.lease_launch_id === lease?.launch_id
-    && metadata.lease_owner_nonce === lease?.owner_nonce
-    && metadata.fencing_token === lease?.fencing_token;
+	const lease = anchor.active_lease;
+	return (
+		metadata.status === "active" &&
+		Boolean(lease) &&
+		metadata.workspace_identity_digest === anchor.workspace_identity_digest &&
+		metadata.authority_id === active.generation.authority_id &&
+		metadata.generation_id === active.generation.generation_id &&
+		metadata.binding_id === active.binding.binding_id &&
+		metadata.binding_revision === active.binding.binding_revision &&
+		metadata.lease_launch_id === lease?.launch_id &&
+		metadata.lease_owner_nonce === lease?.owner_nonce &&
+		metadata.fencing_token === lease?.fencing_token
+	);
 }
 
 /**
@@ -4885,345 +4989,565 @@ function transportCapabilityMatchesActiveAuthority(
  * in this process until a child environment is built.
  */
 export async function mintStateAuthorityTransportCapability(
-  context: ResolvedStateAuthorityContext,
-  input: MintStateAuthorityTransportCapabilityInput = {},
+	context: ResolvedStateAuthorityContext,
+	input: MintStateAuthorityTransportCapabilityInput = {},
 ): Promise<MintedStateAuthorityTransportCapability> {
-  const now = input.now ?? new Date();
-  const ttlMs = input.ttl_ms ?? STATE_AUTHORITY_TRANSPORT_CAPABILITY_DEFAULT_TTL_MS;
-  if (!Number.isSafeInteger(ttlMs) || ttlMs <= 0 || ttlMs > STATE_AUTHORITY_TRANSPORT_CAPABILITY_MAX_TTL_MS) {
-    authorityError(AUTHORITY_DIAGNOSTIC_CODES.transportCapabilityInvalid, 'transport capability lifetime must be positive and bounded');
-  }
-  const capability = randomBytes(32).toString('base64url');
-  const { lock } = await acquireCurrentWorkspaceAuthorityLock(context.workspace_identity, now);
-  try {
-    const anchor = await readWorkspaceAuthorityAnchor(context.workspace_identity);
-    if (!anchor) {
-      authorityError(AUTHORITY_DIAGNOSTIC_CODES.anchorMissing, 'cannot mint transport capability without an active workspace anchor');
-    }
-    const active = await readActiveGeneration(anchor);
-    if (context.workspace_identity.digest !== anchor.workspace_identity_digest
-      || context.generation.authority_id !== active.generation.authority_id
-      || context.generation.generation_id !== active.generation.generation_id
-      || context.session_binding?.binding_id !== active.binding.binding_id
-      || context.session_binding?.binding_revision !== active.binding.binding_revision) {
-      authorityError(AUTHORITY_DIAGNOSTIC_CODES.anchorRevisionConflict, 'cannot mint transport capability for a stale authority context');
-    }
-    const metadata: StateAuthorityTransportCapabilityMetadata = {
-      schema_version: 1,
-      status: 'active',
-      capability_digest: transportCapabilityDigest(capability),
-      workspace_identity_digest: anchor.workspace_identity_digest,
-      authority_id: active.generation.authority_id,
-      generation_id: active.generation.generation_id,
-      binding_id: active.binding.binding_id,
-      binding_revision: active.binding.binding_revision,
-      lease_launch_id: anchor.active_lease!.launch_id,
-      lease_owner_nonce: lock.record.owner_nonce,
-      fencing_token: lock.record.fencing_token,
-      issued_at: nowIso(now),
-      expires_at: nowIso(new Date(now.getTime() + ttlMs)),
-    };
-    const mintedAnchor = nextFencedAnchor(anchor, lock, now, { transport_capability: metadata });
-    await writeFencedWorkspaceAuthorityAnchor(context.workspace_identity, mintedAnchor, lock);
-    stateAuthorityTransportCapabilityCache.set(
-      transportCapabilityCacheKey(
-        metadata.workspace_identity_digest,
-        metadata.generation_id,
-        metadata.binding_id,
-        metadata.binding_revision,
-      ),
-      { capability, metadata },
-    );
-    return { capability, metadata };
-  } finally {
-    await releaseWorkspaceAuthorityLock(lock);
-  }
+	const now = input.now ?? new Date();
+	const ttlMs =
+		input.ttl_ms ?? STATE_AUTHORITY_TRANSPORT_CAPABILITY_DEFAULT_TTL_MS;
+	if (
+		!Number.isSafeInteger(ttlMs) ||
+		ttlMs <= 0 ||
+		ttlMs > STATE_AUTHORITY_TRANSPORT_CAPABILITY_MAX_TTL_MS
+	) {
+		authorityError(
+			AUTHORITY_DIAGNOSTIC_CODES.transportCapabilityInvalid,
+			"transport capability lifetime must be positive and bounded",
+		);
+	}
+	const capability = randomBytes(32).toString("base64url");
+	const { lock } = await acquireCurrentWorkspaceAuthorityLock(
+		context.workspace_identity,
+		now,
+	);
+	try {
+		const anchor = await readWorkspaceAuthorityAnchor(
+			context.workspace_identity,
+		);
+		if (!anchor) {
+			authorityError(
+				AUTHORITY_DIAGNOSTIC_CODES.anchorMissing,
+				"cannot mint transport capability without an active workspace anchor",
+			);
+		}
+		const active = await readActiveGeneration(anchor);
+		if (
+			context.workspace_identity.digest !== anchor.workspace_identity_digest ||
+			context.generation.authority_id !== active.generation.authority_id ||
+			context.generation.generation_id !== active.generation.generation_id ||
+			context.session_binding?.binding_id !== active.binding.binding_id ||
+			context.session_binding?.binding_revision !==
+				active.binding.binding_revision
+		) {
+			authorityError(
+				AUTHORITY_DIAGNOSTIC_CODES.anchorRevisionConflict,
+				"cannot mint transport capability for a stale authority context",
+			);
+		}
+		const metadata: StateAuthorityTransportCapabilityMetadata = {
+			schema_version: 1,
+			status: "active",
+			capability_digest: transportCapabilityDigest(capability),
+			workspace_identity_digest: anchor.workspace_identity_digest,
+			authority_id: active.generation.authority_id,
+			generation_id: active.generation.generation_id,
+			binding_id: active.binding.binding_id,
+			binding_revision: active.binding.binding_revision,
+			lease_launch_id: anchor.active_lease!.launch_id,
+			lease_owner_nonce: lock.record.owner_nonce,
+			fencing_token: lock.record.fencing_token,
+			issued_at: nowIso(now),
+			expires_at: nowIso(new Date(now.getTime() + ttlMs)),
+		};
+		const mintedAnchor = nextFencedAnchor(anchor, lock, now, {
+			transport_capability: metadata,
+		});
+		await writeFencedWorkspaceAuthorityAnchor(
+			context.workspace_identity,
+			mintedAnchor,
+			lock,
+		);
+		stateAuthorityTransportCapabilityCache.set(
+			transportCapabilityCacheKey(
+				metadata.workspace_identity_digest,
+				metadata.generation_id,
+				metadata.binding_id,
+				metadata.binding_revision,
+			),
+			{ capability, metadata },
+		);
+		return { capability, metadata };
+	} finally {
+		await releaseWorkspaceAuthorityLock(lock);
+	}
 }
 
 /** Validates and remembers an inherited opaque transport bearer. */
 export async function validateStateAuthorityTransportCapability(
-  context: ResolvedStateAuthorityContext,
-  capability: string,
-  now = new Date(),
+	context: ResolvedStateAuthorityContext,
+	capability: string,
+	now = new Date(),
 ): Promise<StateAuthorityTransportCapabilityMetadata> {
-  if (typeof capability !== 'string' || capability.length < 32) {
-    authorityError(AUTHORITY_DIAGNOSTIC_CODES.transportCapabilityInvalid, 'inherited state-authority transport capability is missing or malformed');
-  }
-  const anchor = await readWorkspaceAuthorityAnchor(context.workspace_identity);
-  if (!anchor) authorityError(AUTHORITY_DIAGNOSTIC_CODES.anchorMissing, 'inherited state-authority transport has no active workspace anchor');
-  const metadata = anchor.transport_capability;
-  if (!metadata) {
-    authorityError(AUTHORITY_DIAGNOSTIC_CODES.transportCapabilityInvalid, 'inherited state-authority transport capability is absent from the active anchor');
-  }
-  validateTransportCapabilityMetadata(metadata, anchor);
-  const active = await readActiveGeneration(anchor);
-  if (!transportCapabilityMatchesActiveAuthority(metadata, anchor, active)
-    || context.authority_path !== active.authorityPath
-    || context.generation.authority_id !== active.generation.authority_id
-    || context.generation.generation_id !== active.generation.generation_id
-    || context.session_binding?.binding_id !== active.binding.binding_id
-    || context.session_binding?.binding_revision !== metadata.binding_revision) {
-    authorityError(AUTHORITY_DIAGNOSTIC_CODES.transportCapabilityInvalid, 'inherited state-authority transport capability does not match the active authority tuple');
-  }
-  if (new Date(metadata.expires_at).getTime() <= now.getTime()) {
-    authorityError(AUTHORITY_DIAGNOSTIC_CODES.transportCapabilityExpired, 'inherited state-authority transport capability has expired');
-  }
-  const actualDigest = Buffer.from(transportCapabilityDigest(capability), 'hex');
-  const expectedDigest = Buffer.from(metadata.capability_digest, 'hex');
-  if (actualDigest.length !== expectedDigest.length || !timingSafeEqual(actualDigest, expectedDigest)) {
-    authorityError(AUTHORITY_DIAGNOSTIC_CODES.transportCapabilityInvalid, 'inherited state-authority transport capability digest does not match the active anchor');
-  }
-  stateAuthorityTransportCapabilityCache.set(
-    transportCapabilityCacheKey(
-      metadata.workspace_identity_digest,
-      metadata.generation_id,
-      metadata.binding_id,
-      metadata.binding_revision,
-    ),
-    { capability, metadata },
-  );
-  return metadata;
+	if (typeof capability !== "string" || capability.length < 32) {
+		authorityError(
+			AUTHORITY_DIAGNOSTIC_CODES.transportCapabilityInvalid,
+			"inherited state-authority transport capability is missing or malformed",
+		);
+	}
+	const anchor = await readWorkspaceAuthorityAnchor(context.workspace_identity);
+	if (!anchor)
+		authorityError(
+			AUTHORITY_DIAGNOSTIC_CODES.anchorMissing,
+			"inherited state-authority transport has no active workspace anchor",
+		);
+	const metadata = anchor.transport_capability;
+	if (!metadata) {
+		authorityError(
+			AUTHORITY_DIAGNOSTIC_CODES.transportCapabilityInvalid,
+			"inherited state-authority transport capability is absent from the active anchor",
+		);
+	}
+	validateTransportCapabilityMetadata(metadata, anchor);
+	const active = await readActiveGeneration(anchor);
+	if (
+		!transportCapabilityMatchesActiveAuthority(metadata, anchor, active) ||
+		context.authority_path !== active.authorityPath ||
+		context.generation.authority_id !== active.generation.authority_id ||
+		context.generation.generation_id !== active.generation.generation_id ||
+		context.session_binding?.binding_id !== active.binding.binding_id ||
+		context.session_binding?.binding_revision !== metadata.binding_revision
+	) {
+		authorityError(
+			AUTHORITY_DIAGNOSTIC_CODES.transportCapabilityInvalid,
+			"inherited state-authority transport capability does not match the active authority tuple",
+		);
+	}
+	if (new Date(metadata.expires_at).getTime() <= now.getTime()) {
+		authorityError(
+			AUTHORITY_DIAGNOSTIC_CODES.transportCapabilityExpired,
+			"inherited state-authority transport capability has expired",
+		);
+	}
+	const actualDigest = Buffer.from(
+		transportCapabilityDigest(capability),
+		"hex",
+	);
+	const expectedDigest = Buffer.from(metadata.capability_digest, "hex");
+	if (
+		actualDigest.length !== expectedDigest.length ||
+		!timingSafeEqual(actualDigest, expectedDigest)
+	) {
+		authorityError(
+			AUTHORITY_DIAGNOSTIC_CODES.transportCapabilityInvalid,
+			"inherited state-authority transport capability digest does not match the active anchor",
+		);
+	}
+	stateAuthorityTransportCapabilityCache.set(
+		transportCapabilityCacheKey(
+			metadata.workspace_identity_digest,
+			metadata.generation_id,
+			metadata.binding_id,
+			metadata.binding_revision,
+		),
+		{ capability, metadata },
+	);
+	return metadata;
 }
 
 /** Returns a locally held bearer suitable only for post-commit child publication. */
 export function stateAuthorityTransportCapabilityForChild(
-  authority: Pick<ResolvedStateAuthorityContext, 'workspace_identity' | 'generation' | 'session_binding'>,
-  now = new Date(),
+	authority: Pick<
+		ResolvedStateAuthorityContext,
+		"workspace_identity" | "generation" | "session_binding"
+	>,
+	now = new Date(),
 ): string {
-  const binding = authority.session_binding;
-  if (!binding) {
-    authorityError(AUTHORITY_DIAGNOSTIC_CODES.transportCapabilityInvalid, 'cannot publish child transport without an active authority binding');
-  }
-  const key = transportCapabilityCacheKey(
-    authority.workspace_identity.digest,
-    authority.generation.generation_id,
-    binding.binding_id,
-    binding.binding_revision,
-  );
-  let cached = stateAuthorityTransportCapabilityCache.get(key);
-  if (!cached) {
-    for (const candidate of stateAuthorityTransportCapabilityCache.values()) {
-      if (candidate.metadata.workspace_identity_digest === authority.workspace_identity.digest
-        && candidate.metadata.generation_id === authority.generation.generation_id
-        && candidate.metadata.binding_id === binding.binding_id
-        && candidate.metadata.binding_revision === binding.binding_revision) {
-        cached = candidate;
-        break;
-      }
-    }
-    if (cached) stateAuthorityTransportCapabilityCache.set(key, cached);
-  }
-  if (!cached || cached.metadata.status !== 'active' || new Date(cached.metadata.expires_at).getTime() <= now.getTime()) {
-    stateAuthorityTransportCapabilityCache.delete(key);
-    authorityError(AUTHORITY_DIAGNOSTIC_CODES.transportCapabilityExpired, 'no live post-commit state-authority transport capability is available for child publication');
-  }
+	const binding = authority.session_binding;
+	if (!binding) {
+		authorityError(
+			AUTHORITY_DIAGNOSTIC_CODES.transportCapabilityInvalid,
+			"cannot publish child transport without an active authority binding",
+		);
+	}
+	const key = transportCapabilityCacheKey(
+		authority.workspace_identity.digest,
+		authority.generation.generation_id,
+		binding.binding_id,
+		binding.binding_revision,
+	);
+	let cached = stateAuthorityTransportCapabilityCache.get(key);
+	if (!cached) {
+		for (const candidate of stateAuthorityTransportCapabilityCache.values()) {
+			if (
+				candidate.metadata.workspace_identity_digest ===
+					authority.workspace_identity.digest &&
+				candidate.metadata.generation_id ===
+					authority.generation.generation_id &&
+				candidate.metadata.binding_id === binding.binding_id &&
+				candidate.metadata.binding_revision === binding.binding_revision
+			) {
+				cached = candidate;
+				break;
+			}
+		}
+		if (cached) stateAuthorityTransportCapabilityCache.set(key, cached);
+	}
+	if (
+		!cached ||
+		cached.metadata.status !== "active" ||
+		new Date(cached.metadata.expires_at).getTime() <= now.getTime()
+	) {
+		stateAuthorityTransportCapabilityCache.delete(key);
+		authorityError(
+			AUTHORITY_DIAGNOSTIC_CODES.transportCapabilityExpired,
+			"no live post-commit state-authority transport capability is available for child publication",
+		);
+	}
 
-  try {
-    const anchor = readWorkspaceAuthorityAnchorForChild(authority.workspace_identity);
-    const metadata = anchor.transport_capability;
-    if (!metadata) {
-      authorityError(AUTHORITY_DIAGNOSTIC_CODES.transportCapabilityInvalid, 'active workspace authority anchor has no child transport capability');
-    }
-    validateTransportCapabilityMetadata(metadata, anchor);
-    if (metadata.status !== 'active'
-      || metadata.workspace_identity_digest !== authority.workspace_identity.digest
-      || metadata.authority_id !== authority.generation.authority_id
-      || metadata.generation_id !== authority.generation.generation_id
-      || metadata.binding_id !== binding.binding_id
-      || metadata.binding_revision !== binding.binding_revision
-      || anchor.active_generation_id !== authority.generation.generation_id
-      || anchor.active_lease?.generation_id !== authority.generation.generation_id
-      || anchor.active_lease?.binding_id !== binding.binding_id
-      || metadata.lease_launch_id !== anchor.active_lease?.launch_id
-      || metadata.lease_owner_nonce !== anchor.active_lease?.owner_nonce
-      || metadata.fencing_token !== anchor.active_lease?.fencing_token
-      || metadata.capability_digest !== transportCapabilityDigest(cached.capability)
-      || new Date(metadata.expires_at).getTime() <= now.getTime()) {
-      authorityError(AUTHORITY_DIAGNOSTIC_CODES.transportCapabilityInvalid, 'cached child transport capability no longer matches the active persisted authority metadata');
-    }
-    return cached.capability;
-  } catch (error) {
-    for (const [candidateKey, candidate] of stateAuthorityTransportCapabilityCache.entries()) {
-      if (candidateKey === key
-        || (candidate.metadata.workspace_identity_digest === authority.workspace_identity.digest
-          && candidate.metadata.generation_id === authority.generation.generation_id
-          && candidate.metadata.binding_id === binding.binding_id)) {
-        stateAuthorityTransportCapabilityCache.delete(candidateKey);
-      }
-    }
-    throw error;
-  }
+	try {
+		const anchor = readWorkspaceAuthorityAnchorForChild(
+			authority.workspace_identity,
+		);
+		const metadata = anchor.transport_capability;
+		if (!metadata) {
+			authorityError(
+				AUTHORITY_DIAGNOSTIC_CODES.transportCapabilityInvalid,
+				"active workspace authority anchor has no child transport capability",
+			);
+		}
+		validateTransportCapabilityMetadata(metadata, anchor);
+		if (
+			metadata.status !== "active" ||
+			metadata.workspace_identity_digest !==
+				authority.workspace_identity.digest ||
+			metadata.authority_id !== authority.generation.authority_id ||
+			metadata.generation_id !== authority.generation.generation_id ||
+			metadata.binding_id !== binding.binding_id ||
+			metadata.binding_revision !== binding.binding_revision ||
+			anchor.active_generation_id !== authority.generation.generation_id ||
+			anchor.active_lease?.generation_id !==
+				authority.generation.generation_id ||
+			anchor.active_lease?.binding_id !== binding.binding_id ||
+			metadata.lease_launch_id !== anchor.active_lease?.launch_id ||
+			metadata.lease_owner_nonce !== anchor.active_lease?.owner_nonce ||
+			metadata.fencing_token !== anchor.active_lease?.fencing_token ||
+			metadata.capability_digest !==
+				transportCapabilityDigest(cached.capability) ||
+			new Date(metadata.expires_at).getTime() <= now.getTime()
+		) {
+			authorityError(
+				AUTHORITY_DIAGNOSTIC_CODES.transportCapabilityInvalid,
+				"cached child transport capability no longer matches the active persisted authority metadata",
+			);
+		}
+		return cached.capability;
+	} catch (error) {
+		for (const [
+			candidateKey,
+			candidate,
+		] of stateAuthorityTransportCapabilityCache.entries()) {
+			if (
+				candidateKey === key ||
+				(candidate.metadata.workspace_identity_digest ===
+					authority.workspace_identity.digest &&
+					candidate.metadata.generation_id ===
+						authority.generation.generation_id &&
+					candidate.metadata.binding_id === binding.binding_id)
+			) {
+				stateAuthorityTransportCapabilityCache.delete(candidateKey);
+			}
+		}
+		throw error;
+	}
 }
 
 export async function initializeStateAuthority(
-  input: InitializeStateAuthorityInput,
+	input: InitializeStateAuthorityInput,
 ): Promise<ResolvedStateAuthorityContext> {
-  const workspace = resolveWorkspaceIdentity(input.startup_cwd);
-  assertWorkspaceIdentity(workspace);
-  safeIdentifier(input.launch_id, 'launch ID');
-  safeSessionIdentifier(input.session_binding.canonical_session_id, 'canonical session ID');
-  normalizeAliases(input.session_binding.aliases);
-  const paths = stateAuthorityPaths(workspace);
-  const anchorBeforeEstablishment = await readWorkspaceAuthorityAnchor(workspace);
-  const missingAnchorProtocolEvidence = anchorBeforeEstablishment === null
-    && await hasSurvivingStateAuthorityProtocolEvidence(workspace);
-  await ensureAuthorityDirectory(workspace.canonical_path, paths.omx_root);
-  await ensureAuthorityDirectory(workspace.canonical_path, paths.bootstrap_directory);
+	const workspace = resolveWorkspaceIdentity(input.startup_cwd);
+	assertWorkspaceIdentity(workspace);
+	safeIdentifier(input.launch_id, "launch ID");
+	safeSessionIdentifier(
+		input.session_binding.canonical_session_id,
+		"canonical session ID",
+	);
+	normalizeAliases(input.session_binding.aliases);
+	const paths = stateAuthorityPaths(workspace);
+	const anchorBeforeEstablishment =
+		await readWorkspaceAuthorityAnchor(workspace);
+	const missingAnchorProtocolEvidence =
+		anchorBeforeEstablishment === null &&
+		(await hasSurvivingStateAuthorityProtocolEvidence(workspace));
+	await ensureAuthorityDirectory(workspace.canonical_path, paths.omx_root);
+	await ensureAuthorityDirectory(
+		workspace.canonical_path,
+		paths.bootstrap_directory,
+	);
 
-  const now = input.now ?? new Date();
-  const recoveredUnanchoredPristinePreparation = missingAnchorProtocolEvidence
-    && await recoverUnanchoredPristinePreparation(workspace, now);
+	const now = input.now ?? new Date();
+	const recoveredUnanchoredPristinePreparation =
+		missingAnchorProtocolEvidence &&
+		(await recoverUnanchoredPristinePreparation(workspace, now));
 
-  await recoverPendingAlternateRootRollover(workspace, now);
-  const recoveredAnchor = await readWorkspaceAuthorityAnchor(workspace);
-  if (recoveredAnchor) await assertAnchorHasNoCommittedSuccessor(workspace, recoveredAnchor);
+	await recoverPendingAlternateRootRollover(workspace, now);
+	const recoveredAnchor = await readWorkspaceAuthorityAnchor(workspace);
+	if (recoveredAnchor)
+		await assertAnchorHasNoCommittedSuccessor(workspace, recoveredAnchor);
 
-  for (let attempt = 0; attempt < 200; attempt += 1) {
-    const { lock } = await acquireCurrentWorkspaceAuthorityLock(workspace, now);
-    let prepared: {
-      source?: { generation: StateAuthorityGeneration; authorityPath: string; binding: SessionAuthorityBinding; bindingPath: string };
-      canonicalStateRoot: string;
-      rootIdentity: RootFilesystemIdentity;
-      generation: StateAuthorityGeneration;
-      binding: SessionAuthorityBinding;
-      generationPaths: AuthorityGenerationPaths;
-      bindingPath: string;
-      pending: PendingAuthorityOperation;
-    } | undefined;
-    try {
-      const anchor = await readWorkspaceAuthorityAnchor(workspace);
-      if (anchor?.pending_operation) {
-        await recoverPendingAlternateRootRolloverLocked(workspace, anchor, lock, now);
-        continue;
-      }
-      if (!anchor && (anchorBeforeEstablishment !== null || (missingAnchorProtocolEvidence && !recoveredUnanchoredPristinePreparation))) {
-        authorityError(AUTHORITY_DIAGNOSTIC_CODES.resumeEvidenceMissing, 'workspace authority anchor is missing despite surviving generation, journal, tombstone, or bootstrap protocol evidence');
-      }
+	for (let attempt = 0; attempt < 200; attempt += 1) {
+		const { lock } = await acquireCurrentWorkspaceAuthorityLock(workspace, now);
+		let prepared:
+			| {
+					source?: {
+						generation: StateAuthorityGeneration;
+						authorityPath: string;
+						binding: SessionAuthorityBinding;
+						bindingPath: string;
+					};
+					canonicalStateRoot: string;
+					rootIdentity: RootFilesystemIdentity;
+					generation: StateAuthorityGeneration;
+					binding: SessionAuthorityBinding;
+					generationPaths: AuthorityGenerationPaths;
+					bindingPath: string;
+					pending: PendingAuthorityOperation;
+			  }
+			| undefined;
+		try {
+			const anchor = await readWorkspaceAuthorityAnchor(workspace);
+			if (anchor?.pending_operation) {
+				await recoverPendingAlternateRootRolloverLocked(
+					workspace,
+					anchor,
+					lock,
+					now,
+				);
+				continue;
+			}
+			if (
+				!anchor &&
+				(anchorBeforeEstablishment !== null ||
+					(missingAnchorProtocolEvidence &&
+						!recoveredUnanchoredPristinePreparation))
+			) {
+				authorityError(
+					AUTHORITY_DIAGNOSTIC_CODES.resumeEvidenceMissing,
+					"workspace authority anchor is missing despite surviving generation, journal, tombstone, or bootstrap protocol evidence",
+				);
+			}
 
+			let source:
+				| {
+						generation: StateAuthorityGeneration;
+						authorityPath: string;
+						binding: SessionAuthorityBinding;
+						bindingPath: string;
+				  }
+				| undefined;
+			if (anchor?.active_generation_id) {
+				const active = await readActiveGeneration(anchor);
+				const validation = await validateStateAuthority(active.generation, {
+					workspace_identity: workspace,
+				});
+				if (!validation.valid) {
+					const failure = validation.diagnostics[0];
+					authorityError(failure.code, failure.message);
+				}
+				if (
+					requestedBindingMatchesActive(input.session_binding, active.binding)
+				) {
+					const mergedAliases = input.session_binding.aliases
+						? {
+								...mergeSessionAliases(
+									active.binding.aliases,
+									input.session_binding.aliases,
+								),
+								previous_session_aliases: [
+									...new Set([
+										...active.binding.aliases.previous_session_aliases,
+										...(input.session_binding.aliases
+											.previous_session_aliases ?? []),
+										...(input.session_binding.canonical_session_id !==
+										active.binding.canonical_session_id
+											? [active.binding.canonical_session_id]
+											: []),
+									]),
+								],
+							}
+						: undefined;
+					const binding =
+						mergedAliases &&
+						JSON.stringify(normalizeAliases(mergedAliases)) !==
+							JSON.stringify(active.binding.aliases)
+							? {
+									...reviseSessionAuthorityBinding(
+										active.binding,
+										mergedAliases,
+										"active",
+										now,
+									),
+									canonical_session_id:
+										input.session_binding.canonical_session_id,
+								}
+							: active.binding;
+					if (binding !== active.binding) {
+						if (!anchor.active_binding_locator) {
+							authorityError(
+								AUTHORITY_DIAGNOSTIC_CODES.sessionBindingConflict,
+								"active authority binding locator is missing",
+							);
+						}
+						await atomicWriteAuthorityJson(
+							anchor.active_binding_locator,
+							binding,
+							{
+								authority_root: active.generation.canonical_state_root,
+								expected_root_identity: active.generation.root_identity,
+							},
+						);
+						// Binding revisions rotate lease custody and revoke the prior transport bearer.
+						const rotatedTransportCapability =
+							rotateLocallyHeldTransportCapabilityForBindingRevision(
+								anchor,
+								binding,
+							);
+						await writeFencedWorkspaceAuthorityAnchor(
+							workspace,
+							nextFencedAnchor(anchor, lock, now, {
+								...(rotatedTransportCapability
+									? { transport_capability: rotatedTransportCapability }
+									: {}),
+							}),
+							lock,
+						);
+					}
+					return {
+						observed_cwd: canonicalizeExistingAuthorityPath(
+							input.observed_cwd ?? input.startup_cwd,
+							"observed cwd",
+						),
+						workspace_identity: workspace,
+						canonical_state_root: active.generation.canonical_state_root,
+						authority_path: active.authorityPath,
+						anchor_path: paths.anchor_path,
+						generation: active.generation,
+						session_binding: binding,
+					};
+				}
+				if (!(await mayTerminalizeRecordedGeneration(active.generation))) {
+					authorityError(
+						AUTHORITY_DIAGNOSTIC_CODES.sessionBindingConflict,
+						"requested launch session does not match a provably exited active authority binding",
+					);
+				}
+				source = {
+					generation: active.generation,
+					authorityPath: active.authorityPath,
+					binding: active.binding,
+					bindingPath: anchor.active_binding_locator!,
+				};
+			}
+			if (source) {
+				await abortUnanchoredPreparedRolloverJournals(
+					anchor!,
+					source.generation,
+					now,
+				);
+			}
 
-      let source: { generation: StateAuthorityGeneration; authorityPath: string; binding: SessionAuthorityBinding; bindingPath: string } | undefined;
-      if (anchor?.active_generation_id) {
-        const active = await readActiveGeneration(anchor);
-        const validation = await validateStateAuthority(active.generation, { workspace_identity: workspace });
-        if (!validation.valid) {
-          const failure = validation.diagnostics[0];
-          authorityError(failure.code, failure.message);
-        }
-        if (requestedBindingMatchesActive(input.session_binding, active.binding)) {
-          const binding = input.session_binding.aliases
-            ? {
-              ...reviseSessionAuthorityBinding(
-                active.binding,
-                {
-                  ...mergeSessionAliases(active.binding.aliases, input.session_binding.aliases),
-                  previous_session_aliases: [...new Set([
-                    ...active.binding.aliases.previous_session_aliases,
-                    ...(input.session_binding.aliases.previous_session_aliases ?? []),
-                    ...(input.session_binding.canonical_session_id !== active.binding.canonical_session_id
-                      ? [active.binding.canonical_session_id]
-                      : []),
-                  ])],
-                },
-                'active',
-                now,
-              ),
-              canonical_session_id: input.session_binding.canonical_session_id,
-            }
-            : active.binding;
-          if (binding !== active.binding) {
-            if (!anchor.active_binding_locator) {
-              authorityError(AUTHORITY_DIAGNOSTIC_CODES.sessionBindingConflict, 'active authority binding locator is missing');
-            }
-            await atomicWriteAuthorityJson(anchor.active_binding_locator, binding, {
-              authority_root: active.generation.canonical_state_root,
-              expected_root_identity: active.generation.root_identity,
-            });
-            // Binding revisions rotate lease custody and revoke the prior transport bearer.
-            const rotatedTransportCapability = rotateLocallyHeldTransportCapabilityForBindingRevision(anchor, binding);
-            await writeFencedWorkspaceAuthorityAnchor(
-              workspace,
-              nextFencedAnchor(anchor, lock, now, {
-                ...(rotatedTransportCapability ? { transport_capability: rotatedTransportCapability } : {}),
-              }),
-              lock,
-            );
-          }
-          return {
-            observed_cwd: canonicalizeExistingAuthorityPath(input.observed_cwd ?? input.startup_cwd, 'observed cwd'),
-            workspace_identity: workspace,
-            canonical_state_root: active.generation.canonical_state_root,
-            authority_path: active.authorityPath,
-            anchor_path: paths.anchor_path,
-            generation: active.generation,
-            session_binding: binding,
-          };
-        }
-        if (!await mayTerminalizeRecordedGeneration(active.generation)) {
-          authorityError(AUTHORITY_DIAGNOSTIC_CODES.sessionBindingConflict, 'requested launch session does not match a provably exited active authority binding');
-        }
-        source = {
-          generation: active.generation,
-          authorityPath: active.authorityPath,
-          binding: active.binding,
-          bindingPath: anchor.active_binding_locator!,
-        };
-      }
-      if (source) {
-        await abortUnanchoredPreparedRolloverJournals(anchor!, source.generation, now);
-      }
+			const ordinaryStateRoot = resolveOrdinaryStateRoot(workspace);
+			let stateRoot = ordinaryStateRoot;
+			if (!anchor) {
+				const candidates = [ordinaryStateRoot];
+				const legacyCandidate = input.legacy_state_root_candidate?.trim();
+				if (legacyCandidate) {
+					const resolvedCandidate = resolve(input.startup_cwd, legacyCandidate);
+					if (resolvedCandidate !== ordinaryStateRoot) {
+						await assertPathHasNoSymlinkComponents(
+							resolvedCandidate,
+							"legacy state-root candidate",
+						);
+						if (await hasLegacyAuthorityArtifacts(resolvedCandidate)) {
+							authorityError(
+								AUTHORITY_DIAGNOSTIC_CODES.legacyAuthorityUnproven,
+								"alternate legacy state-root candidates require managed authority corroboration and cannot be established from a caller-writable session pointer",
+							);
+						}
+					}
+				}
+				const proven: string[] = [];
+				for (const candidate of candidates) {
+					await assertPathHasNoSymlinkComponents(
+						candidate,
+						"legacy state-root candidate",
+					);
+					if (!(await hasLegacyAuthorityArtifacts(candidate))) continue;
+					if (
+						!(await isProvenLegacyAuthorityCandidate(
+							candidate,
+							workspace,
+							input,
+							candidate === ordinaryStateRoot,
+						))
+					) {
+						authorityError(
+							AUTHORITY_DIAGNOSTIC_CODES.legacyAuthorityUnproven,
+							"cannot establish authority over unproven legacy state-root artifacts",
+						);
+					}
+					proven.push(candidate);
+				}
+				if (proven.length > 1) {
+					authorityError(
+						AUTHORITY_DIAGNOSTIC_CODES.legacyAuthorityUnproven,
+						"multiple proven legacy state roots make migration ambiguous",
+					);
+				}
+				stateRoot = proven[0] ?? ordinaryStateRoot;
+			}
+			if (stateRoot === ordinaryStateRoot) {
+				await ensureAuthorityDirectory(
+					workspace.canonical_path,
+					ordinaryStateRoot,
+				);
+			} else {
+				await assertPathHasNoSymlinkComponents(stateRoot, "legacy state root");
+				await assertDirectoryNotSymlink(stateRoot, "legacy state root");
+			}
+			const canonicalStateRoot = canonicalizeExistingAuthorityPath(
+				stateRoot,
+				"state root",
+			);
+			const rootIdentity =
+				await captureRootFilesystemIdentity(canonicalStateRoot);
+			const rootCapability = await probeStateAuthorityFilesystemCapability(
+				canonicalStateRoot,
+				now,
+			);
+			if (
+				!sameRootFilesystemIdentity(
+					rootIdentity,
+					await captureRootFilesystemIdentity(canonicalStateRoot),
+				)
+			) {
+				authorityError(
+					AUTHORITY_DIAGNOSTIC_CODES.rootFingerprintMismatch,
+					"state root was replaced while its authority capability was being established",
+				);
+			}
+			assertSecureStateRootCustody(rootIdentity, "state root");
+			if (
+				!rootIdentity.strong_identity ||
+				rootCapability.strong_root_identity !== "verified" ||
+				!hasVerifiedAuthorityMutationSafety(rootCapability)
+			) {
+				authorityError(
+					AUTHORITY_DIAGNOSTIC_CODES.rootCapabilityWeak,
+					"state root lacks strong identity or verified safe authority mutation support",
+				);
+			}
+			if (!source) {
+				await abortUnanchoredPreparedOrdinaryEstablishments(
+					canonicalStateRoot,
+					rootIdentity,
+					anchor,
+					now,
+				);
+			}
 
-      const ordinaryStateRoot = resolveOrdinaryStateRoot(workspace);
-      let stateRoot = ordinaryStateRoot;
-      if (!anchor) {
-        const candidates = [ordinaryStateRoot];
-        const legacyCandidate = input.legacy_state_root_candidate?.trim();
-        if (legacyCandidate) {
-          const resolvedCandidate = resolve(input.startup_cwd, legacyCandidate);
-          if (resolvedCandidate !== ordinaryStateRoot) {
-            await assertPathHasNoSymlinkComponents(resolvedCandidate, 'legacy state-root candidate');
-            if (await hasLegacyAuthorityArtifacts(resolvedCandidate)) {
-              authorityError(AUTHORITY_DIAGNOSTIC_CODES.legacyAuthorityUnproven, 'alternate legacy state-root candidates require managed authority corroboration and cannot be established from a caller-writable session pointer');
-            }
-          }
-        }
-        const proven: string[] = [];
-        for (const candidate of candidates) {
-          await assertPathHasNoSymlinkComponents(candidate, 'legacy state-root candidate');
-          if (!await hasLegacyAuthorityArtifacts(candidate)) continue;
-          if (!await isProvenLegacyAuthorityCandidate(candidate, workspace, input, candidate === ordinaryStateRoot)) {
-            authorityError(AUTHORITY_DIAGNOSTIC_CODES.legacyAuthorityUnproven, 'cannot establish authority over unproven legacy state-root artifacts');
-          }
-          proven.push(candidate);
-        }
-        if (proven.length > 1) {
-          authorityError(AUTHORITY_DIAGNOSTIC_CODES.legacyAuthorityUnproven, 'multiple proven legacy state roots make migration ambiguous');
-        }
-        stateRoot = proven[0] ?? ordinaryStateRoot;
-      }
-      if (stateRoot === ordinaryStateRoot) {
-        await ensureAuthorityDirectory(workspace.canonical_path, ordinaryStateRoot);
-      } else {
-        await assertPathHasNoSymlinkComponents(stateRoot, 'legacy state root');
-        await assertDirectoryNotSymlink(stateRoot, 'legacy state root');
-      }
-      const canonicalStateRoot = canonicalizeExistingAuthorityPath(stateRoot, 'state root');
-      const rootIdentity = await captureRootFilesystemIdentity(canonicalStateRoot);
-      const rootCapability = await probeStateAuthorityFilesystemCapability(canonicalStateRoot, now);
-      if (!sameRootFilesystemIdentity(rootIdentity, await captureRootFilesystemIdentity(canonicalStateRoot))) {
-        authorityError(AUTHORITY_DIAGNOSTIC_CODES.rootFingerprintMismatch, 'state root was replaced while its authority capability was being established');
-      }
-      assertSecureStateRootCustody(rootIdentity, 'state root');
-      if (!rootIdentity.strong_identity
-        || rootCapability.strong_root_identity !== 'verified'
-        || !hasVerifiedAuthorityMutationSafety(rootCapability)) {
-        authorityError(AUTHORITY_DIAGNOSTIC_CODES.rootCapabilityWeak, 'state root lacks strong identity or verified safe authority mutation support');
-      }
-      if (!source) {
-        await abortUnanchoredPreparedOrdinaryEstablishments(canonicalStateRoot, rootIdentity, anchor, now);
-      }
-
-      const baseAnchor = anchor ?? createWorkspaceAuthorityAnchor(workspace, now);
-      const operationId = `ordinary-rollover-${randomUUID()}`;
+			const baseAnchor =
+				anchor ?? createWorkspaceAuthorityAnchor(workspace, now);
+			const operationId = `ordinary-rollover-${randomUUID()}`;
       const generationId = randomUUID();
       const pendingFence = lock.record.fencing_token;
       const targetFence = pendingFence + 1;

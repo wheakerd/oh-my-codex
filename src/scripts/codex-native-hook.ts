@@ -56,7 +56,10 @@ import {
 import { omxNotepadPath, resolveProjectMemoryPath } from "../utils/paths.js";
 import { findGitLayout, resolveWorkspaceIdentity } from "../utils/git-layout.js";
 
-import type { ResolvedStateAuthorityContext } from "../state/authority.js";
+import {
+	atomicWriteAuthorityFile,
+	resolveStateAuthorityForGuard,
+	withStateAuthorityTransaction,type  ResolvedStateAuthorityContext ,} from "../state/authority.js";
 import {
   classifyKeywordInput,
   recordSkillActivation,
@@ -2719,108 +2722,127 @@ function buildAdditionalContextMessage(
       activeSkills.length > 1 ? `active skills: ${activeSkills.join(", ")}.` : null,
       deferredSkills.length > 0
         ? `planning preserved over simultaneous execution follow-up; deferred skills: ${deferredSkills.join(", ")}.`
-        : null,
-      promptPriorityMessage,
-      buildSkillStateCliInstruction(skillState.initialized_mode, skillState.initialized_state_path),
-      deepInterviewPromptActivationNote,
-      deepInterviewConfigPromptActivationNote,
-      ultraworkPromptActivationNote,
-      ultragoalPromptActivationNote,
-      autopilotPromptActivationNote,
-      ralphPromptActivationNote,
-      "Follow AGENTS.md routing and preserve workflow transition and planning-safety rules.",
-    ].join(" ");
-  }
+				: null,
+			promptPriorityMessage,
+			buildSkillStateCliInstruction(
+				skillState.initialized_mode,
+				skillState.initialized_state_path,
+			),
+			deepInterviewPromptActivationNote,
+			deepInterviewConfigPromptActivationNote,
+			ultraworkPromptActivationNote,
+			ultragoalPromptActivationNote,
+			autopilotPromptActivationNote,
+			ralphPromptActivationNote,
+			"Follow AGENTS.md routing and preserve workflow transition and planning-safety rules.",
+		].join(" ");
+	}
 
-  return [detectedKeywordMessage, promptPriorityMessage, ultragoalPromptActivationNote, autopilotPromptActivationNote, "Follow AGENTS.md routing and preserve workflow transition and planning-safety rules."].filter(Boolean).join(" ");
+	return [
+		detectedKeywordMessage,
+		promptPriorityMessage,
+		ultragoalPromptActivationNote,
+		autopilotPromptActivationNote,
+		"Follow AGENTS.md routing and preserve workflow transition and planning-safety rules.",
+	]
+		.filter(Boolean)
+		.join(" ");
 }
 
-function parseTeamWorkerEnv(rawValue: string): { teamName: string; workerName: string } | null {
-  const match = /^([a-z0-9][a-z0-9-]{0,29})\/(worker-\d+)$/.exec(rawValue.trim());
-  if (!match) return null;
-  return {
-    teamName: match[1] || "",
-    workerName: match[2] || "",
-  };
-}
-
-function hasTeamWorkerEnvironment(): boolean {
-  return parseTeamWorkerEnv(safeString(process.env.OMX_TEAM_INTERNAL_WORKER))
-    !== null
-    || parseTeamWorkerEnv(safeString(process.env.OMX_TEAM_WORKER)) !== null;
+function parseTeamWorkerEnv(
+	rawValue: string,
+): { teamName: string; workerName: string } | null {
+	const match = /^([a-z0-9][a-z0-9-]{0,29})\/(worker-\d+)$/.exec(
+		rawValue.trim(),
+	);
+	if (!match) return null;
+	return {
+		teamName: match[1] || "",
+		workerName: match[2] || "",
+	};
 }
 
 async function resolveTeamStateDirForWorkerContext(
-  cwd: string,
-  workerContext: { teamName: string; workerName: string },
-  authoritativeStateDir?: string,
+	cwd: string,
+	workerContext: { teamName: string; workerName: string },
+	authoritativeStateDir?: string,
 ): Promise<string | null> {
-  if (authoritativeStateDir) return authoritativeStateDir;
-  return await resolveWorkerNotifyTeamStateRootPath(cwd, workerContext, process.env).catch(() => null);
+	if (authoritativeStateDir) return authoritativeStateDir;
+	return await resolveWorkerNotifyTeamStateRootPath(
+		cwd,
+		workerContext,
+		process.env,
+	).catch(() => null);
 }
 
-async function isConfirmedTeamWorkerPromptSubmitPane(cwd: string): Promise<boolean> {
-  const workerContext =
-    parseTeamWorkerEnv(safeString(process.env.OMX_TEAM_INTERNAL_WORKER))
-    || parseTeamWorkerEnv(safeString(process.env.OMX_TEAM_WORKER));
-  if (!workerContext) return false;
+async function isConfirmedTeamWorkerPromptSubmitPane(
+	cwd: string,
+): Promise<boolean> {
+	const workerContext =
+		parseTeamWorkerEnv(safeString(process.env.OMX_TEAM_INTERNAL_WORKER)) ||
+		parseTeamWorkerEnv(safeString(process.env.OMX_TEAM_WORKER));
+	if (!workerContext) return false;
 
-  const currentPaneId = safeString(process.env.TMUX_PANE).trim();
-  if (!currentPaneId) return false;
+	const currentPaneId = safeString(process.env.TMUX_PANE).trim();
+	if (!currentPaneId) return false;
 
-  const config = await readTeamConfig(workerContext.teamName, cwd).catch(() => null);
-  if (!config) return false;
+	const config = await readTeamConfig(workerContext.teamName, cwd).catch(
+		() => null,
+	);
+	if (!config) return false;
 
-  const leaderPaneId = safeString(config.leader_pane_id).trim();
-  if (leaderPaneId && leaderPaneId === currentPaneId) return false;
+	const leaderPaneId = safeString(config.leader_pane_id).trim();
+	if (leaderPaneId && leaderPaneId === currentPaneId) return false;
 
-  const workerPaneId = safeString(
-    config.workers.find((worker) => worker.name === workerContext.workerName)?.pane_id,
-  ).trim();
-  return workerPaneId !== "" && workerPaneId === currentPaneId;
+	const workerPaneId = safeString(
+		config.workers.find((worker) => worker.name === workerContext.workerName)
+			?.pane_id,
+	).trim();
+	return workerPaneId !== "" && workerPaneId === currentPaneId;
 }
-
 
 type TeamWorkerStopDecision =
-  | {
-      kind: "blocked";
-      stateDir: string;
-      workerContext: { teamName: string; workerName: string };
-      output: Record<string, unknown>;
-      allowRepeatDuringStopHook: boolean;
-    }
-  | {
-      kind: "allowed";
-      stateDir: string;
-      workerContext: { teamName: string; workerName: string };
-    }
-  | {
-      kind: "unresolved";
-      reason: string;
-    };
+	| {
+			kind: "blocked";
+			stateDir: string;
+			workerContext: { teamName: string; workerName: string };
+			output: Record<string, unknown>;
+			allowRepeatDuringStopHook: boolean;
+	  }
+	| {
+			kind: "allowed";
+			stateDir: string;
+			workerContext: { teamName: string; workerName: string };
+	  }
+	| {
+			kind: "unresolved";
+			reason: string;
+	  };
 
 async function resolveTeamWorkerStopDecision(
-  cwd: string,
-  authoritativeStateDir?: string,
+	cwd: string,
+	authoritativeStateDir?: string,
 ): Promise<TeamWorkerStopDecision> {
-  const workerContext =
-    parseTeamWorkerEnv(safeString(process.env.OMX_TEAM_INTERNAL_WORKER))
-    || parseTeamWorkerEnv(safeString(process.env.OMX_TEAM_WORKER));
-  if (!workerContext) return { kind: "unresolved", reason: "missing_worker_context" };
+	const workerContext =
+		parseTeamWorkerEnv(safeString(process.env.OMX_TEAM_INTERNAL_WORKER)) ||
+		parseTeamWorkerEnv(safeString(process.env.OMX_TEAM_WORKER));
+	if (!workerContext)
+		return { kind: "unresolved", reason: "missing_worker_context" };
 
-  const blockWorkerStop = (
-    reasonCode: string,
-    detail: string,
-    stateDirForDecision = authoritativeStateDir ?? canonicalHookStateDirectory(cwd),
-  ): TeamWorkerStopDecision => ({
-    kind: "blocked",
-    stateDir: stateDirForDecision,
-    workerContext,
-    allowRepeatDuringStopHook: false,
-    output: {
-      decision: "block",
-      reason:
-        `OMX team worker ${workerContext.workerName} Stop cannot be allowed for ${reasonCode}: ${detail}. ` +
+	const blockWorkerStop = (
+		reasonCode: string,
+		detail: string,
+		stateDirForDecision = authoritativeStateDir ??
+			canonicalHookStateDirectory(cwd),
+	): TeamWorkerStopDecision => ({
+		kind: "blocked",
+		stateDir: stateDirForDecision,
+		workerContext,
+		allowRepeatDuringStopHook: false,
+		output: {
+			decision: "block",
+			reason:
+				`OMX team worker ${workerContext.workerName} Stop cannot be allowed for ${reasonCode}: ${detail}. ` +
         "Continue the assigned task, repair worker state, or report a concrete blocker before stopping.",
       stopReason: `team_worker_${workerContext.workerName}_${reasonCode}`,
       systemMessage:
@@ -3397,332 +3419,456 @@ function extractStableFinalRecommendationSummary(message: string): string {
     const summary = match[0]?.trim().replace(/\s+/g, " ");
     if (!summary) continue;
     return /[.!?]$/.test(summary) ? summary : `${summary}.`;
-  }
-  return "";
+	}
+	return "";
 }
 
 function buildStableFinalRecommendationStopSignature(
-  payload: CodexHookPayload,
-  teamName: string,
-  summary: string,
+	payload: CodexHookPayload,
+	teamName: string,
+	summary: string,
 ): string {
-  const sessionId = readPayloadSessionId(payload) || "no-session";
-  const threadId = readPayloadThreadId(payload) || "no-thread";
-  const normalizedSummary = normalizeAutoNudgeSignatureText(summary) || summary.toLowerCase();
-  return ["release-readiness-finalize", sessionId, threadId, teamName, normalizedSummary].join("|");
+	const sessionId = readPayloadSessionId(payload) || "no-session";
+	const threadId = readPayloadThreadId(payload) || "no-thread";
+	const normalizedSummary =
+		normalizeAutoNudgeSignatureText(summary) || summary.toLowerCase();
+	return [
+		"release-readiness-finalize",
+		sessionId,
+		threadId,
+		teamName,
+		normalizedSummary,
+	].join("|");
 }
 
 function hasReleaseReadinessMode(payload: CodexHookPayload): boolean {
-  const mode = safeString(payload.mode).trim().toLowerCase();
-  return mode === "release-readiness";
+	const mode = safeString(payload.mode).trim().toLowerCase();
+	return mode === "release-readiness";
 }
 
 async function hasReleaseReadinessStopMarker(
-  cwd: string,
-  stateDir: string,
-  sessionId: string,
-  teamName: string,
+	cwd: string,
+	stateDir: string,
+	sessionId: string,
+	teamName: string,
 ): Promise<boolean> {
-  if (!sessionId) return false;
+	if (!sessionId) return false;
 
-  const markerState = await readStopSessionPinnedState("release-readiness-state.json", cwd, sessionId, stateDir);
-  if (markerState?.active !== true || markerState.stable_final_recommendation_emitted !== true) {
-    return false;
-  }
+	const markerState = await readStopSessionPinnedState(
+		"release-readiness-state.json",
+		cwd,
+		sessionId,
+		stateDir,
+	);
+	if (
+		markerState?.active !== true ||
+		markerState.stable_final_recommendation_emitted !== true
+	) {
+		return false;
+	}
 
-  const markerTeamName = safeString(markerState.team_name).trim();
-  if (markerTeamName && markerTeamName !== teamName) return false;
+	const markerTeamName = safeString(markerState.team_name).trim();
+	if (markerTeamName && markerTeamName !== teamName) return false;
 
-  const markerSessionId = safeString(markerState.session_id).trim();
-  if (markerSessionId && markerSessionId !== sessionId) return false;
+	const markerSessionId = safeString(markerState.session_id).trim();
+	if (markerSessionId && markerSessionId !== sessionId) return false;
 
-  return true;
+	return true;
 }
 
 function rawPayloadSessionId(payload: CodexHookPayload): string {
-  return safeString(payload.session_id ?? payload.sessionId).trim();
+	return safeString(payload.session_id ?? payload.sessionId).trim();
 }
 
 function readPayloadSessionId(payload: CodexHookPayload): string {
-  return normalizeSessionId(rawPayloadSessionId(payload)) ?? "";
+	return normalizeSessionId(rawPayloadSessionId(payload)) ?? "";
 }
 
 function hasMalformedPayloadSessionId(payload: CodexHookPayload): boolean {
-  const rawValue = payload.session_id ?? payload.sessionId;
-  if (rawValue === undefined || rawValue === null) return false;
-  return typeof rawValue !== "string" || !normalizeSessionId(rawValue);
+	const rawValue = payload.session_id ?? payload.sessionId;
+	if (rawValue === undefined || rawValue === null) return false;
+	return typeof rawValue !== "string" || !normalizeSessionId(rawValue);
 }
 
-function sessionScopedStatePath(stateDir: string, sessionId: unknown, fileName: string): string | null {
-  const normalizedSessionId = normalizeSessionId(sessionId);
-  return normalizedSessionId ? join(stateDir, "sessions", normalizedSessionId, fileName) : null;
+function sessionScopedStatePath(
+	stateDir: string,
+	sessionId: unknown,
+	fileName: string,
+): string | null {
+	const normalizedSessionId = normalizeSessionId(sessionId);
+	return normalizedSessionId
+		? join(stateDir, "sessions", normalizedSessionId, fileName)
+		: null;
 }
 
 function readPayloadThreadId(payload: CodexHookPayload): string {
-  return safeString(payload.owner_codex_thread_id ?? payload.thread_id ?? payload.threadId).trim();
+	return safeString(
+		payload.owner_codex_thread_id ?? payload.thread_id ?? payload.threadId,
+	).trim();
 }
 
 function readPayloadAgentRole(payload: CodexHookPayload): string {
-  const directRole = safeString(
-    payload.agent_role
-      ?? payload.agentRole
-      ?? payload.agent_type
-      ?? payload.agentType,
-  ).trim().toLowerCase();
-  if (directRole) return directRole;
+	const directRole = safeString(
+		payload.agent_role ??
+			payload.agentRole ??
+			payload.agent_type ??
+			payload.agentType,
+	)
+		.trim()
+		.toLowerCase();
+	if (directRole) return directRole;
 
-  const source = safeObject(payload.source);
-  const subagent = safeObject(source?.subagent);
-  const threadSpawn = safeObject(subagent?.thread_spawn);
-  return safeString(
-    threadSpawn?.agent_role
-      ?? threadSpawn?.agentRole
-      ?? threadSpawn?.agent_type
-      ?? threadSpawn?.agentType,
-  ).trim().toLowerCase();
+	const source = safeObject(payload.source);
+	const subagent = safeObject(source?.subagent);
+	const threadSpawn = safeObject(subagent?.thread_spawn);
+	return safeString(
+		threadSpawn?.agent_role ??
+			threadSpawn?.agentRole ??
+			threadSpawn?.agent_type ??
+			threadSpawn?.agentType,
+	)
+		.trim()
+		.toLowerCase();
 }
 
 function readRequestedSpawnRole(payload: CodexHookPayload): string {
-  const toolName = safeString(payload.tool_name).trim();
-  if (!isNativeSubagentSpawnToolName(toolName)) return "";
-  const toolInput = safeObject(payload.tool_input);
-  return safeString(
-    toolInput.agent_role
-      ?? toolInput.agentRole
-      ?? toolInput.agent_type
-      ?? toolInput.agentType,
-  ).trim().toLowerCase();
+	const toolName = safeString(payload.tool_name).trim();
+	if (!isNativeSubagentSpawnToolName(toolName)) return "";
+	const toolInput = safeObject(payload.tool_input);
+	return safeString(
+		toolInput.agent_role ??
+			toolInput.agentRole ??
+			toolInput.agent_type ??
+			toolInput.agentType,
+	)
+		.trim()
+		.toLowerCase();
 }
 
 function isTypedAgentRolePayload(payload: CodexHookPayload): boolean {
-  const agentRole = readPayloadAgentRole(payload);
-  return agentRole !== "" && resolveInstalledRoleName(agentRole) !== null;
+	const agentRole = readPayloadAgentRole(payload);
+	return agentRole !== "" && resolveInstalledRoleName(agentRole) !== null;
 }
 
 function buildNativeUnknownRolePreToolUseOutput(
-  payload: CodexHookPayload,
+	payload: CodexHookPayload,
 ): Record<string, unknown> | null {
-  const requestedRole = readRequestedSpawnRole(payload);
-  if (!requestedRole || resolveInstalledRoleName(requestedRole) !== null) return null;
-  return {
-    decision: "block",
-    reason: "Native typed-subagent dispatch denied: supplied agent_type/agent_role is unknown or not installed.",
-    hookSpecificOutput: {
-      hookEventName: "PreToolUse",
-      additionalContext:
-        "Use an installed OMX role for native agent_type/agent_role dispatch. On a role-routing-unavailable surface, record a validated OMX adapted role intent before spawning without fabricating agent_type.",
-    },
-  };
+	const requestedRole = readRequestedSpawnRole(payload);
+	if (!requestedRole || resolveInstalledRoleName(requestedRole) !== null)
+		return null;
+	return {
+		decision: "block",
+		reason:
+			"Native typed-subagent dispatch denied: supplied agent_type/agent_role is unknown or not installed.",
+		hookSpecificOutput: {
+			hookEventName: "PreToolUse",
+			additionalContext:
+				"Use an installed OMX role for native agent_type/agent_role dispatch. On a role-routing-unavailable surface, record a validated OMX adapted role intent before spawning without fabricating agent_type.",
+		},
+	};
 }
 
 function readPayloadTurnId(payload: CodexHookPayload): string {
-  return safeString(payload.turn_id ?? payload.turnId).trim();
+	return safeString(payload.turn_id ?? payload.turnId).trim();
 }
 
 interface NativeSubagentCapacityBlocker {
-  schema_version: 1;
-  reason: "agent_thread_limit_reached";
-  session_id?: string;
-  thread_id?: string;
-  turn_id?: string;
-  tool_name?: string;
-  error_summary: string;
-  observed_at: string;
-  expires_at: string;
+	schema_version: 1;
+	reason: "agent_thread_limit_reached";
+	session_id?: string;
+	thread_id?: string;
+	turn_id?: string;
+	tool_name?: string;
+	error_summary: string;
+	observed_at: string;
+	expires_at: string;
 }
 
 function nativeSubagentCapacityBlockerPath(stateDir: string): string {
-  return join(stateDir, NATIVE_SUBAGENT_CAPACITY_BLOCKER_FILE);
+	return join(stateDir, NATIVE_SUBAGENT_CAPACITY_BLOCKER_FILE);
 }
 
 function nativeSubagentSupportBlockerPath(stateDir: string): string {
-  return join(stateDir, NATIVE_SUBAGENT_SUPPORT_BLOCKER_FILE);
+	return join(stateDir, NATIVE_SUBAGENT_SUPPORT_BLOCKER_FILE);
+}
+
+async function updateNativeHookSidefile(
+	authority: Readonly<ResolvedStateAuthorityContext>,
+	fileName: string,
+	update: (
+		current: Record<string, unknown> | null,
+	) => Record<string, unknown> | null,
+): Promise<void> {
+	await withStateAuthorityTransaction(
+		authority as ResolvedStateAuthorityContext,
+		async (refreshed) => {
+			const stateDir = refreshed.canonical_state_root;
+			const path = join(stateDir, fileName);
+			const next = update(await readJsonIfExists(path));
+			if (next === null) return;
+			await atomicWriteAuthorityFile(path, JSON.stringify(next, null, 2), {
+				authority_root: stateDir,
+				expected_root_identity: refreshed.generation.root_identity,
+			});
+		},
+	);
 }
 
 function readJsonSyncIfExists(path: string): Record<string, unknown> | null {
-  try {
-    return JSON.parse(readFileSync(path, "utf-8")) as Record<string, unknown>;
-  } catch {
-    return null;
-  }
+	try {
+		return JSON.parse(readFileSync(path, "utf-8")) as Record<string, unknown>;
+	} catch {
+		return null;
+	}
 }
 
 function stringifyUnknown(value: unknown): string {
-  if (typeof value === "string") return value;
-  if (value === undefined || value === null) return "";
-  try {
-    return JSON.stringify(value);
-  } catch {
-    return String(value);
-  }
+	if (typeof value === "string") return value;
+	if (value === undefined || value === null) return "";
+	try {
+		return JSON.stringify(value);
+	} catch {
+		return String(value);
+	}
 }
 
 function payloadEvidenceText(payload: CodexHookPayload): string {
-  return [
-    safeString(payload.tool_name),
-    stringifyUnknown(payload.tool_response),
-    stringifyUnknown(payload.response),
-    stringifyUnknown(payload.error),
-    stringifyUnknown(payload.message),
-  ].filter(Boolean).join("\n");
+	return [
+		safeString(payload.tool_name),
+		stringifyUnknown(payload.tool_response),
+		stringifyUnknown(payload.response),
+		stringifyUnknown(payload.error),
+		stringifyUnknown(payload.message),
+	]
+		.filter(Boolean)
+		.join("\n");
 }
 
 function isNativeSubagentCapacityFailure(payload: CodexHookPayload): boolean {
-  const evidence = payloadEvidenceText(payload);
-  if (!/\bagent thread limit reached\b/i.test(evidence)) return false;
-  const toolName = safeString(payload.tool_name).trim();
-  return !toolName || /(?:spawn_agent|multi_agent|subagent|collab|agent)/i.test(toolName);
+	const evidence = payloadEvidenceText(payload);
+	if (!/\bagent thread limit reached\b/i.test(evidence)) return false;
+	const toolName = safeString(payload.tool_name).trim();
+	return (
+		!toolName ||
+		/(?:spawn_agent|multi_agent|subagent|collab|agent)/i.test(toolName)
+	);
 }
 
-function nativeSubagentFailureReason(payload: CodexHookPayload): NativeSubagentUnsupportedReason | null {
-  const evidence = payloadEvidenceText(payload);
-  const toolName = safeString(payload.tool_name).trim();
-  if (toolName && !/(?:spawn_agent|multi_agent|subagent|collab|agent)/i.test(toolName)) return null;
-  if (/\bagent thread limit reached\b/i.test(evidence)) return null;
-  if (/\bnative subagents? (?:unsupported|disabled|not enabled|unavailable|not found)\b/i.test(evidence)) return "native_subagents_unsupported";
-  if (/\bmulti_agent_v1\b/i.test(evidence) && /\b(?:unavailable|unknown tool|disabled|not enabled|not found|unsupported)\b/i.test(evidence)) return "multi_agent_v1_unavailable";
-  if (/\b(?:unknown tool|tool not found|not enabled|disabled|unavailable|unsupported)\b/i.test(evidence)) return "multi_agent_v1_unavailable";
-  return null;
+function nativeSubagentFailureReason(
+	payload: CodexHookPayload,
+): NativeSubagentUnsupportedReason | null {
+	const evidence = payloadEvidenceText(payload);
+	const toolName = safeString(payload.tool_name).trim();
+	if (
+		toolName &&
+		!/(?:spawn_agent|multi_agent|subagent|collab|agent)/i.test(toolName)
+	)
+		return null;
+	if (/\bagent thread limit reached\b/i.test(evidence)) return null;
+	if (
+		/\bnative subagents? (?:unsupported|disabled|not enabled|unavailable|not found)\b/i.test(
+			evidence,
+		)
+	)
+		return "native_subagents_unsupported";
+	if (
+		/\bmulti_agent_v1\b/i.test(evidence) &&
+		/\b(?:unavailable|unknown tool|disabled|not enabled|not found|unsupported)\b/i.test(
+			evidence,
+		)
+	)
+		return "multi_agent_v1_unavailable";
+	if (
+		/\b(?:unknown tool|tool not found|not enabled|disabled|unavailable|unsupported)\b/i.test(
+			evidence,
+		)
+	)
+		return "multi_agent_v1_unavailable";
+	return null;
 }
 
 function summarizeNativeSubagentSupportFailure(text: string): string {
-  const normalized = text.replace(/\s+/g, " ").trim();
-  return (normalized || "native subagent support unavailable").slice(0, 500);
+	const normalized = text.replace(/\s+/g, " ").trim();
+	return (normalized || "native subagent support unavailable").slice(0, 500);
 }
 
 async function recordNativeSubagentSupportBlocker(
-  cwd: string,
-  stateDir: string,
-  payload: CodexHookPayload,
+	authority: Readonly<ResolvedStateAuthorityContext>,
+	cwd: string,
+	payload: CodexHookPayload,
 ): Promise<void> {
-  const reason = nativeSubagentFailureReason(payload);
-  if (!reason) return;
-  const nowIso = new Date().toISOString();
-  await mkdir(stateDir, { recursive: true });
-  await writeFile(nativeSubagentSupportBlockerPath(stateDir), JSON.stringify({
-    schema_version: 1,
-    status: "unsupported",
-    reason,
-    ...(readPayloadSessionId(payload) ? { session_id: readPayloadSessionId(payload) } : {}),
-    ...(readPayloadThreadId(payload) ? { thread_id: readPayloadThreadId(payload) } : {}),
-    ...(readPayloadTurnId(payload) ? { turn_id: readPayloadTurnId(payload) } : {}),
-    ...(safeString(payload.tool_name).trim() ? { tool_name: safeString(payload.tool_name).trim() } : {}),
-    evidence: summarizeNativeSubagentSupportFailure(payloadEvidenceText(payload)),
-    observed_at: nowIso,
-    cwd,
-  }, null, 2));
+	const reason = nativeSubagentFailureReason(payload);
+	if (!reason) return;
+	const nowIso = new Date().toISOString();
+	await updateNativeHookSidefile(
+		authority,
+		NATIVE_SUBAGENT_SUPPORT_BLOCKER_FILE,
+		() => ({
+			schema_version: 1,
+			status: "unsupported",
+			reason,
+			...(readPayloadSessionId(payload)
+				? { session_id: readPayloadSessionId(payload) }
+				: {}),
+			...(readPayloadThreadId(payload)
+				? { thread_id: readPayloadThreadId(payload) }
+				: {}),
+			...(readPayloadTurnId(payload)
+				? { turn_id: readPayloadTurnId(payload) }
+				: {}),
+			...(safeString(payload.tool_name).trim()
+				? { tool_name: safeString(payload.tool_name).trim() }
+				: {}),
+			evidence: summarizeNativeSubagentSupportFailure(
+				payloadEvidenceText(payload),
+			),
+			observed_at: nowIso,
+			cwd,
+		}),
+	);
 }
 
-
 function refreshNativeSubagentRoleRoutingMarker(
-  cwd: string,
-  stateDir: string,
-  sessionId: string,
-  parentThreadId?: string,
+	cwd: string,
+	stateDir: string,
+	sessionId: string,
+	parentThreadId?: string,
 ): void {
-  const marker = readRoleRoutingMarker(stateDir, {
-    cwd,
-    sessionId,
-    ...(parentThreadId ? { parentThreadId } : {}),
-  });
-  if (!marker) return;
-  const nowMs = Date.now();
-  writeRoleRoutingMarker(stateDir, {
-    ...marker,
-    observed_at: new Date(nowMs).toISOString(),
-    expires_at: new Date(nowMs + NATIVE_SUBAGENT_ROLE_ROUTING_MARKER_TTL_MS).toISOString(),
-  });
+	const marker = readRoleRoutingMarker(stateDir, {
+		cwd,
+		sessionId,
+		...(parentThreadId ? { parentThreadId } : {}),
+	});
+	if (!marker) return;
+	const nowMs = Date.now();
+	writeRoleRoutingMarker(stateDir, {
+		...marker,
+		observed_at: new Date(nowMs).toISOString(),
+		expires_at: new Date(
+			nowMs + NATIVE_SUBAGENT_ROLE_ROUTING_MARKER_TTL_MS,
+		).toISOString(),
+	});
 }
 
 function summarizeCapacityFailure(text: string): string {
-  const normalized = text.replace(/\s+/g, " ").trim();
-  if (!normalized) return "agent thread limit reached";
-  const match = normalized.match(/[^.?!\n\r]*agent thread limit reached[^.?!\n\r]*/i);
-  return (match?.[0] ?? normalized).slice(0, 500);
+	const normalized = text.replace(/\s+/g, " ").trim();
+	if (!normalized) return "agent thread limit reached";
+	const match = normalized.match(
+		/[^.?!\n\r]*agent thread limit reached[^.?!\n\r]*/i,
+	);
+	return (match?.[0] ?? normalized).slice(0, 500);
 }
 
 async function recordNativeSubagentCapacityBlocker(
-  cwd: string,
-  stateDir: string,
-  payload: CodexHookPayload,
+	authority: Readonly<ResolvedStateAuthorityContext>,
+	cwd: string,
+	payload: CodexHookPayload,
 ): Promise<void> {
-  if (!isNativeSubagentCapacityFailure(payload)) return;
-  const nowMs = Date.now();
-  const blocker: NativeSubagentCapacityBlocker = {
-    schema_version: 1,
-    reason: "agent_thread_limit_reached",
-    ...(readPayloadSessionId(payload) ? { session_id: readPayloadSessionId(payload) } : {}),
-    ...(readPayloadThreadId(payload) ? { thread_id: readPayloadThreadId(payload) } : {}),
-    ...(readPayloadTurnId(payload) ? { turn_id: readPayloadTurnId(payload) } : {}),
-    ...(safeString(payload.tool_name).trim() ? { tool_name: safeString(payload.tool_name).trim() } : {}),
-    error_summary: summarizeCapacityFailure(payloadEvidenceText(payload)),
-    observed_at: new Date(nowMs).toISOString(),
-    expires_at: new Date(nowMs + NATIVE_SUBAGENT_CAPACITY_BLOCKER_TTL_MS).toISOString(),
-  };
-  await mkdir(stateDir, { recursive: true });
-  await writeFile(nativeSubagentCapacityBlockerPath(stateDir), JSON.stringify({
-    ...blocker,
-    cwd,
-  }, null, 2));
+	if (!isNativeSubagentCapacityFailure(payload)) return;
+	const nowMs = Date.now();
+	const blocker: NativeSubagentCapacityBlocker = {
+		schema_version: 1,
+		reason: "agent_thread_limit_reached",
+		...(readPayloadSessionId(payload)
+			? { session_id: readPayloadSessionId(payload) }
+			: {}),
+		...(readPayloadThreadId(payload)
+			? { thread_id: readPayloadThreadId(payload) }
+			: {}),
+		...(readPayloadTurnId(payload)
+			? { turn_id: readPayloadTurnId(payload) }
+			: {}),
+		...(safeString(payload.tool_name).trim()
+			? { tool_name: safeString(payload.tool_name).trim() }
+			: {}),
+		error_summary: summarizeCapacityFailure(payloadEvidenceText(payload)),
+		observed_at: new Date(nowMs).toISOString(),
+		expires_at: new Date(
+			nowMs + NATIVE_SUBAGENT_CAPACITY_BLOCKER_TTL_MS,
+		).toISOString(),
+	};
+	await updateNativeHookSidefile(
+		authority,
+		NATIVE_SUBAGENT_CAPACITY_BLOCKER_FILE,
+		() => ({
+			...blocker,
+			cwd,
+		}),
+	);
 }
 
 function isFreshNativeSubagentCapacityBlocker(
-  blocker: Record<string, unknown> | null,
-  cwd: string,
-  payload: CodexHookPayload,
-  nowMs = Date.now(),
+	blocker: Record<string, unknown> | null,
+	cwd: string,
+	payload: CodexHookPayload,
+	nowMs = Date.now(),
 ): blocker is NativeSubagentCapacityBlocker & Record<string, unknown> {
-  if (!blocker) return false;
-  if (safeString(blocker.reason) !== "agent_thread_limit_reached") return false;
-  const expiresAtMs = Date.parse(safeString(blocker.expires_at));
-  if (!Number.isFinite(expiresAtMs) || expiresAtMs <= nowMs) return false;
-  const blockerCwd = safeString(blocker.cwd).trim();
-  if (blockerCwd) {
-    try {
-      if (resolve(blockerCwd) !== resolve(cwd)) return false;
-    } catch {
-      return false;
-    }
-  }
-  const blockerSessionId = safeString(blocker.session_id).trim();
-  const payloadSessionId = readPayloadSessionId(payload);
-  return !blockerSessionId || !payloadSessionId || blockerSessionId === payloadSessionId;
+	if (!blocker) return false;
+	if (safeString(blocker.reason) !== "agent_thread_limit_reached") return false;
+	const expiresAtMs = Date.parse(safeString(blocker.expires_at));
+	if (!Number.isFinite(expiresAtMs) || expiresAtMs <= nowMs) return false;
+	const blockerCwd = safeString(blocker.cwd).trim();
+	if (blockerCwd) {
+		try {
+			if (resolve(blockerCwd) !== resolve(cwd)) return false;
+		} catch {
+			return false;
+		}
+	}
+	const blockerSessionId = safeString(blocker.session_id).trim();
+	const payloadSessionId = readPayloadSessionId(payload);
+	return (
+		!blockerSessionId ||
+		!payloadSessionId ||
+		blockerSessionId === payloadSessionId
+	);
 }
 
 function inputContainsCloseAgentRequest(value: unknown): boolean {
-  if (typeof value === "string") return /\bclose_agent\b/i.test(value);
-  if (!value || typeof value !== "object") return false;
-  try {
-    return /\bclose_agent\b/i.test(JSON.stringify(value));
-  } catch {
-    return false;
-  }
+	if (typeof value === "string") return /\bclose_agent\b/i.test(value);
+	if (!value || typeof value !== "object") return false;
+	try {
+		return /\bclose_agent\b/i.test(JSON.stringify(value));
+	} catch {
+		return false;
+	}
 }
 
 function isCloseAgentToolUse(payload: CodexHookPayload): boolean {
-  const toolName = safeString(payload.tool_name).trim();
-  if (/\bclose_agent\b/i.test(toolName)) return true;
-  if (/multi_tool_use\.parallel/i.test(toolName) && inputContainsCloseAgentRequest(payload.tool_input)) return true;
-  return inputContainsCloseAgentRequest(payload.tool_input) && /multi_agent|agent|tool_use/i.test(toolName);
+	const toolName = safeString(payload.tool_name).trim();
+	if (/\bclose_agent\b/i.test(toolName)) return true;
+	if (
+		/multi_tool_use\.parallel/i.test(toolName) &&
+		inputContainsCloseAgentRequest(payload.tool_input)
+	)
+		return true;
+	return (
+		inputContainsCloseAgentRequest(payload.tool_input) &&
+		/multi_agent|agent|tool_use/i.test(toolName)
+	);
 }
 
 async function buildNativeSubagentCapacityCloseGuardOutput(
-  payload: CodexHookPayload,
-  cwd: string,
-  stateDir: string,
+	payload: CodexHookPayload,
+	cwd: string,
+	stateDir: string,
 ): Promise<Record<string, unknown> | null> {
-  if (!isCloseAgentToolUse(payload)) return null;
-  const blocker = await readJsonIfExists(nativeSubagentCapacityBlockerPath(stateDir));
-  if (!isFreshNativeSubagentCapacityBlocker(blocker, cwd, payload)) return null;
+	if (!isCloseAgentToolUse(payload)) return null;
+	const blocker = await readJsonIfExists(
+		nativeSubagentCapacityBlockerPath(stateDir),
+	);
+	if (!isFreshNativeSubagentCapacityBlocker(blocker, cwd, payload)) return null;
 
-  const evidence = safeString(blocker.error_summary).trim() || "agent thread limit reached";
-  return {
-    decision: "block",
-    reason: "Native subagent capacity was exhausted recently; model-level close_agent cleanup is blocked because close_agent can hang indefinitely on stale handles.",
-    hookSpecificOutput: {
-      hookEventName: "PreToolUse",
-      additionalContext:
-        `OMX blocked ${safeString(payload.tool_name).trim() || "close_agent"} before it could start: a recent native subagent capacity failure was recorded (${evidence}). `
+	const evidence =
+		safeString(blocker.error_summary).trim() || "agent thread limit reached";
+	return {
+		decision: "block",
+		reason:
+			"Native subagent capacity was exhausted recently; model-level close_agent cleanup is blocked because close_agent can hang indefinitely on stale handles.",
+		hookSpecificOutput: {
+			hookEventName: "PreToolUse",
+			additionalContext:
+				`OMX blocked ${safeString(payload.tool_name).trim() || "close_agent"} before it could start: a recent native subagent capacity failure was recorded (${evidence}). `
         + "Do not call multi_agent_v1.close_agent, and do not batch close_agent through multi_tool_use.parallel, as stale native handles can hang the whole turn. "
         + "Treat this as a bounded capacity blocker: persist/report the blocker evidence, avoid further native subagent cleanup from the model turn, and recover via runtime-level cleanup or a fresh Codex session.",
     },
@@ -7893,7 +8039,7 @@ async function hasTrustedTypedSubagentProvenanceForPreToolUse(
   sessionId: string,
   options: { allowUntypedProvenance?: boolean } = {},
 ): Promise<boolean> {
-  if (hasTeamWorkerEnvironment()) return true;
+  // Ambient worker markers are diagnostics only; persisted tracking proves delegation.
   const trackingState = await readSubagentTrackingState(cwd).catch(() => null);
   const session = trackingState?.sessions?.[sessionId];
   if (!session) return false;
@@ -8042,7 +8188,7 @@ async function readActiveMainRootConductorStateForPreToolUse(
     }
   }
 
-  if (hasActiveSkill("team") && !hasTeamWorkerEnvironment()) {
+  if (hasActiveSkill("team")) {
     const teamStateForStop = await readTeamModeStateForStop(cwd, stateDir, sessionId, threadId);
     const state = teamStateForStop?.state ?? null;
     if (isActiveConductorModeState(state, "team", sessionId)) {
@@ -9051,31 +9197,28 @@ function modeStateHasExplicitMatchingCwd(state: Record<string, unknown>, cwd: st
 }
 
 async function clearNativeStopSessionEntries(
-  stateDir: string,
+  authority: Readonly<ResolvedStateAuthorityContext>,
   payload: CodexHookPayload,
   canonicalSessionId?: string,
 ): Promise<void> {
-  const statePath = join(stateDir, NATIVE_STOP_STATE_FILE);
-  const state = await readJsonIfExists(statePath);
-  if (!state) return;
-
-  const sessions = safeObject(state.sessions);
-  const keys = new Set(uniqueNonEmpty([
-    readNativeStopSessionKey(payload, canonicalSessionId),
-    canonicalSessionId,
-    readPayloadSessionId(payload),
-    readPayloadThreadId(payload),
-  ]));
-  let changed = false;
-  for (const key of keys) {
-    if (Object.prototype.hasOwnProperty.call(sessions, key)) {
-      delete sessions[key];
-      changed = true;
+  await updateNativeHookSidefile(authority, NATIVE_STOP_STATE_FILE, (state) => {
+    if (!state) return null;
+    const sessions = safeObject(state.sessions);
+    const keys = new Set(uniqueNonEmpty([
+      readNativeStopSessionKey(payload, canonicalSessionId),
+      canonicalSessionId,
+      readPayloadSessionId(payload),
+      readPayloadThreadId(payload),
+    ]));
+    let changed = false;
+    for (const key of keys) {
+      if (Object.prototype.hasOwnProperty.call(sessions, key)) {
+        delete sessions[key];
+        changed = true;
+      }
     }
-  }
-  if (!changed) return;
-
-  await writeFile(statePath, JSON.stringify({ ...state, sessions }, null, 2));
+    return changed ? { ...state, sessions } : null;
+  });
 }
 
 async function hasAuthoritativeInactiveSkillStopState(
@@ -9309,8 +9452,27 @@ async function readSessionScopedModeStateForRootSkill(
 }
 
 async function reconcileStaleRootSkillActiveStateForStop(
+  authority: Readonly<ResolvedStateAuthorityContext>,
+  cwd: string,
+  sessionId: string,
+): Promise<void> {
+  await withStateAuthorityTransaction(
+    authority as ResolvedStateAuthorityContext,
+    async (refreshed) => {
+      await reconcileStaleRootSkillActiveStateForStopLocked(
+        cwd,
+        refreshed.canonical_state_root,
+        refreshed.generation.root_identity,
+        sessionId,
+      );
+    },
+  );
+}
+
+async function reconcileStaleRootSkillActiveStateForStopLocked(
   cwd: string,
   stateDir: string,
+  expectedRootIdentity: ResolvedStateAuthorityContext["generation"]["root_identity"],
   sessionId: string,
 ): Promise<void> {
   const { rootPath } = getSkillActiveStatePathsForStateDir(stateDir);
@@ -9348,7 +9510,6 @@ async function reconcileStaleRootSkillActiveStateForStop(
   }
 
   if (!changed) return;
-
   const nowIso = new Date().toISOString();
   const nextRoot: SkillActiveStateLike = {
     ...rootState,
@@ -9360,10 +9521,11 @@ async function reconcileStaleRootSkillActiveStateForStop(
     reconciled_at: nowIso,
     reconciliation_reason: "stop_hook_session_state_terminal",
   };
-  if (keptEntries.length === 0) {
-    nextRoot.phase = "inactive";
-  }
-  await writeFile(rootPath, JSON.stringify(nextRoot, null, 2));
+  if (keptEntries.length === 0) nextRoot.phase = "inactive";
+  await atomicWriteAuthorityFile(rootPath, JSON.stringify(nextRoot, null, 2), {
+    authority_root: stateDir,
+    expected_root_identity: expectedRootIdentity,
+  });
 }
 
 function buildRalplanContinuationStatus(
@@ -9621,8 +9783,8 @@ function readIsoTimeMs(value: unknown): number | null {
 }
 
 async function maybeBuildOrdinaryStopNoProgressOutput(
+  authority: Readonly<ResolvedStateAuthorityContext>,
   payload: CodexHookPayload,
-  stateDir: string,
   canonicalSessionId?: string,
 ): Promise<Record<string, unknown> | null> {
   const lastAssistantMessage = safeString(
@@ -9630,36 +9792,35 @@ async function maybeBuildOrdinaryStopNoProgressOutput(
   ).trim();
   if (!lastAssistantMessage) return null;
 
-  const statePath = join(stateDir, NATIVE_STOP_STATE_FILE);
-  const state = await readJsonIfExists(statePath) ?? {};
-  const sessions = safeObject(state.sessions);
-  const sessionKey = readNativeStopSessionKey(payload, canonicalSessionId);
-  const sessionState = safeObject(sessions[sessionKey]);
-  const previousGuard = safeObject(sessionState.ordinary_no_progress_guard);
-  const fingerprint = ordinaryStopProgressFingerprint(payload);
-  const nowIso = new Date().toISOString();
-  const previousFingerprint = safeString(previousGuard.fingerprint).trim();
-  const sameFingerprint = previousFingerprint === fingerprint;
-  const firstSeenAt = sameFingerprint
-    ? safeString(previousGuard.first_seen_at).trim() || nowIso
-    : nowIso;
-  const repeatCount = sameFingerprint
-    ? parseBoundedPositiveInteger(previousGuard.repeat_count, 1) + 1
-    : 1;
-
-  sessions[sessionKey] = {
-    ...sessionState,
-    ordinary_no_progress_guard: {
-      fingerprint,
-      first_seen_at: firstSeenAt,
-      last_seen_at: nowIso,
-      repeat_count: repeatCount,
-      last_turn_id: readPayloadTurnId(payload) || null,
-      last_thread_id: readPayloadThreadId(payload) || null,
-    },
-  };
-  await mkdir(stateDir, { recursive: true });
-  await writeFile(statePath, JSON.stringify({ ...state, sessions }, null, 2));
+  let repeatCount = 0;
+  let firstSeenAt = "";
+  await updateNativeHookSidefile(authority, NATIVE_STOP_STATE_FILE, (state) => {
+    const sessions = safeObject(state?.sessions);
+    const sessionKey = readNativeStopSessionKey(payload, canonicalSessionId);
+    const sessionState = safeObject(sessions[sessionKey]);
+    const previousGuard = safeObject(sessionState.ordinary_no_progress_guard);
+    const fingerprint = ordinaryStopProgressFingerprint(payload);
+    const nowIso = new Date().toISOString();
+    const sameFingerprint = safeString(previousGuard.fingerprint).trim() === fingerprint;
+    firstSeenAt = sameFingerprint
+      ? safeString(previousGuard.first_seen_at).trim() || nowIso
+      : nowIso;
+    repeatCount = sameFingerprint
+      ? parseBoundedPositiveInteger(previousGuard.repeat_count, 1) + 1
+      : 1;
+    sessions[sessionKey] = {
+      ...sessionState,
+      ordinary_no_progress_guard: {
+        fingerprint,
+        first_seen_at: firstSeenAt,
+        last_seen_at: nowIso,
+        repeat_count: repeatCount,
+        last_turn_id: readPayloadTurnId(payload) || null,
+        last_thread_id: readPayloadThreadId(payload) || null,
+      },
+    };
+    return { ...(state ?? {}), sessions };
+  });
 
   const maxRepeats = parseBoundedPositiveInteger(
     process.env.OMX_NATIVE_STOP_NO_PROGRESS_MAX_REPEATS,
@@ -9674,13 +9835,13 @@ async function maybeBuildOrdinaryStopNoProgressOutput(
   if (repeatCount < maxRepeats || elapsedMs < idleMs) return null;
 
   const message = shortenOrdinaryStopProgressText(
-    safeString(payload.last_assistant_message ?? payload.lastAssistantMessage) || "no assistant message recorded",
+    safeString(payload.last_assistant_message ?? payload.lastAssistantMessage)
+      || "no assistant message recorded",
   );
   const elapsedSeconds = Math.round(elapsedMs / 1000);
   const diagnostic =
-    `OMX ordinary task no-progress guard triggered after ${repeatCount} repeated Stop-hook pass(es) over ~${elapsedSeconds}s with unchanged status: "${message}". ` +
-    "Emit a concise diagnostic summary now: state the last concrete progress/evidence, whether the task is complete, blocked, failed, or needs missing information, and stop instead of continuing a vague working loop.";
-
+    `OMX ordinary task no-progress guard triggered after ${repeatCount} repeated Stop-hook pass(es) over ~${elapsedSeconds}s with unchanged status: "${message}". `
+    + "Emit a concise diagnostic summary now: state the last concrete progress/evidence, whether the task is complete, blocked, failed, or needs missing information, and stop instead of continuing a vague working loop.";
   return {
     decision: "block",
     reason: diagnostic,
@@ -9690,26 +9851,34 @@ async function maybeBuildOrdinaryStopNoProgressOutput(
 }
 
 async function persistNativeStopSignature(
-  stateDir: string,
+  authority: Readonly<ResolvedStateAuthorityContext> | string,
   payload: CodexHookPayload,
   signature: string,
   canonicalSessionId?: string,
 ): Promise<void> {
   if (!signature) return;
-  const statePath = join(stateDir, NATIVE_STOP_STATE_FILE);
-  const state = await readJsonIfExists(statePath) ?? {};
-  const sessions = safeObject(state.sessions);
-  const sessionKey = readNativeStopSessionKey(payload, canonicalSessionId);
-  sessions[sessionKey] = {
-    ...safeObject(sessions[sessionKey]),
-    last_signature: signature,
-    updated_at: new Date().toISOString(),
-  };
-  await mkdir(stateDir, { recursive: true });
-  await writeFile(statePath, JSON.stringify({
-    ...state,
-    sessions,
-  }, null, 2));
+  let resolvedAuthority: Readonly<ResolvedStateAuthorityContext>;
+  if (typeof authority === "string") {
+    const authenticated = await resolveAuthenticatedTransportAuthority(authority);
+    if (!authenticated || resolve(authenticated.canonical_state_root) !== resolve(authority)) {
+      throw new Error(
+        "native Stop signature persistence requires authenticated canonical state authority",
+      );
+    }
+    resolvedAuthority = authenticated;
+  } else {
+    resolvedAuthority = authority;
+  }
+  await updateNativeHookSidefile(resolvedAuthority, NATIVE_STOP_STATE_FILE, (state) => {
+    const sessions = safeObject(state?.sessions);
+    const sessionKey = readNativeStopSessionKey(payload, canonicalSessionId);
+    sessions[sessionKey] = {
+      ...safeObject(sessions[sessionKey]),
+      last_signature: signature,
+      updated_at: new Date().toISOString(),
+    };
+    return { ...(state ?? {}), sessions };
+  });
 }
 
 async function maybeReturnRepeatableStopOutput(
@@ -9995,6 +10164,7 @@ async function markTeamTransportFailure(
 }
 
 async function buildStopHookOutput(
+  authority: Readonly<ResolvedStateAuthorityContext>,
   payload: CodexHookPayload,
   cwd: string,
   stateDir: string,
@@ -10010,9 +10180,9 @@ async function buildStopHookOutput(
   const threadId = readPayloadThreadId(payload);
   const suppressParentWorkflowStop = shouldSuppressParentWorkflowStopForSideConversation(payload);
   if (canonicalSessionId) {
-    await reconcileStaleRootSkillActiveStateForStop(cwd, stateDir, canonicalSessionId);
+    await reconcileStaleRootSkillActiveStateForStop(authority, cwd, canonicalSessionId);
     if (await hasAuthoritativeInactiveSkillStopState(cwd, stateDir, "ralplan", canonicalSessionId, threadId)) {
-      await clearNativeStopSessionEntries(stateDir, payload, canonicalSessionId);
+      await clearNativeStopSessionEntries(authority, payload, canonicalSessionId);
     }
   }
   if (suppressParentWorkflowStop) {
@@ -10231,8 +10401,8 @@ async function buildStopHookOutput(
       );
     }
     const ordinaryNoProgressOutput = await maybeBuildOrdinaryStopNoProgressOutput(
+      authority,
       payload,
-      stateDir,
       canonicalSessionId,
     );
     if (ordinaryNoProgressOutput) return ordinaryNoProgressOutput;
@@ -10326,7 +10496,18 @@ export async function dispatchCodexNativeHook(
   const hookEventName = readHookEventName(payload);
   const cwd = options.cwd ?? (safeString(payload.cwd).trim() || process.cwd());
   const inheritedAuthority = await resolveInheritedAuthority(cwd);
-  if (inheritedAuthority.failure) {
+  let authority = inheritedAuthority.context;
+  if (!authority && hookEventName === "SessionStart") {
+    try {
+      authority = Object.freeze(await resolveStateAuthorityForGuard({
+        startup_cwd: cwd,
+        observed_cwd: cwd,
+      }));
+    } catch {
+      // The normal denial below fails closed when no committed authority exists.
+    }
+  }
+  if (inheritedAuthority.failure && !authority) {
     return {
       hookEventName,
       omxEventName: mapCodexHookEventToOmxEvent(hookEventName),
@@ -10334,7 +10515,6 @@ export async function dispatchCodexNativeHook(
       outputJson: buildAuthorityHookDenial(hookEventName, inheritedAuthority.failure),
     };
   }
-  const authority = inheritedAuthority.context;
   if (authority) {
     const conflictingAlias = authorityAmbientRootConflict(cwd, authority);
     if (conflictingAlias) {
@@ -10342,10 +10522,7 @@ export async function dispatchCodexNativeHook(
         hookEventName,
         omxEventName: mapCodexHookEventToOmxEvent(hookEventName),
         skillState: null,
-        outputJson: buildAuthorityHookDenial(
-          hookEventName,
-          conflictingAlias,
-        ),
+        outputJson: buildAuthorityHookDenial(hookEventName, conflictingAlias),
       };
     }
   }
@@ -10357,12 +10534,21 @@ export async function dispatchCodexNativeHook(
       outputJson: buildAuthorityHookDenial(hookEventName, "no committed active authority"),
     };
   }
-  if (hookEventName === "Stop" && !authority && !hasNativeStopRuntimeSurface(cwd)) {
+  if (hookEventName === "Stop" && !authority) {
+    const workerMarked = Boolean(
+      process.env.OMX_TEAM_WORKER?.trim()
+        || process.env.OMX_TEAM_INTERNAL_WORKER?.trim(),
+    );
     return {
       hookEventName,
       omxEventName: mapCodexHookEventToOmxEvent(hookEventName),
       skillState: null,
-      outputJson: null,
+      outputJson: workerMarked
+        ? buildAuthorityHookDenial(
+          hookEventName,
+          "Team worker Stop lacks a committed authenticated state authority",
+        )
+        : null,
     };
   }
   // Child hooks resolve only committed inherited authority. They never establish
@@ -10795,7 +10981,7 @@ export async function dispatchCodexNativeHook(
     }
   }
 
-  if (omxEventName && allowImplicitSessionSideEffects && !skipCanonicalSessionStartContext && !suppressNoisySubagentLifecycleDispatch) {
+  if (authority && omxEventName && allowImplicitSessionSideEffects && !skipCanonicalSessionStartContext && !suppressNoisySubagentLifecycleDispatch) {
     const baseContext = buildBaseContext(workspaceCwd, payload, hookEventName!, canonicalSessionId);
     baseContext.observed_cwd = cwd;
     if (authority) {
@@ -10828,6 +11014,7 @@ export async function dispatchCodexNativeHook(
       await dispatchHookEventRuntime({
         event,
         cwd: workspaceCwd,
+        stateRoot: authority.canonical_state_root,
         allowTeamWorkerSideEffects: false,
         skipNativeStopTeamLeaderAttention: true,
       });
@@ -10907,8 +11094,8 @@ export async function dispatchCodexNativeHook(
       ?? buildNativePreToolUseOutput(payload);
   } else if (hookEventName === "PostToolUse") {
     if (authority) {
-      await recordNativeSubagentCapacityBlocker(cwd, stateDir, payload).catch(() => {});
-      await recordNativeSubagentSupportBlocker(cwd, stateDir, payload).catch(() => {});
+      await recordNativeSubagentCapacityBlocker(authority, workspaceCwd, payload).catch(() => {});
+      await recordNativeSubagentSupportBlocker(authority, workspaceCwd, payload).catch(() => {});
       if (detectMcpTransportFailure(payload)) {
         await markTeamTransportFailure(workspaceCwd, payload);
       }
@@ -10916,7 +11103,10 @@ export async function dispatchCodexNativeHook(
     }
     outputJson = buildNativePostToolUseOutput(payload);
   } else if (hookEventName === "Stop") {
-    if (hasTeamWorkerEnvironment() && !authority) {
+    if (!authority && Boolean(
+      process.env.OMX_TEAM_WORKER?.trim()
+        || process.env.OMX_TEAM_INTERNAL_WORKER?.trim(),
+    )) {
       const reason = "OMX cannot authorize Team worker Stop without a committed state authority.";
       outputJson = {
         decision: "block",
@@ -10924,8 +11114,8 @@ export async function dispatchCodexNativeHook(
         reason,
         systemMessage: reason,
       };
-    } else if (allowImplicitSessionSideEffects) {
-      outputJson = await buildStopHookOutput(payload, workspaceCwd, stateDir, {
+    } else if (authority && allowImplicitSessionSideEffects) {
+      outputJson = await buildStopHookOutput(authority, payload, workspaceCwd, stateDir, {
         canonicalSessionId: canonicalSessionId || undefined,
         skipRalphStopBlock: isSubagentStop,
         skipAutoNudge: isSubagentStop,

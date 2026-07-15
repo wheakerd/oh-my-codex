@@ -34,11 +34,12 @@ function normalizeSessionState(value: Record<string, unknown>): HookPluginOmxSes
     : null;
 }
 
-export function createHookPluginOmxApi(cwd: string): HookPluginSdk['omx'] {
+export function createHookPluginOmxApi(cwd: string,
+	stateRoot?: string,): HookPluginSdk['omx'] {
   return {
     session: {
       read: () => readOmxStateFile<HookPluginOmxSessionState>(
-        omxRootStateFilePath(cwd, 'session.json'),
+        omxRootStateFilePath(cwd, 'session.json', stateRoot),
         normalizeSessionState,
       ),
     },
@@ -52,12 +53,12 @@ export function createHookPluginOmxApi(cwd: string): HookPluginSdk['omx'] {
     },
     notifyFallback: {
       read: () => readOmxStateFile<HookPluginOmxNotifyFallbackState>(
-        omxRootStateFilePath(cwd, 'notify-fallback-state.json'),
+        omxRootStateFilePath(cwd, 'notify-fallback-state.json', stateRoot),
       ),
     },
     updateCheck: {
       read: () => readOmxStateFile<HookPluginOmxUpdateCheckState>(
-        omxRootStateFilePath(cwd, 'update-check.json'),
+        omxRootStateFilePath(cwd, 'update-check.json', stateRoot),
       ),
     },
   };

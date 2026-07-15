@@ -25,8 +25,8 @@ export function normalizeHookPluginStateKey(key: string): string {
 export function createHookPluginStateApi(
   cwd: string,
   pluginName: string,
-): HookPluginSdk['state'] {
-  const dataPath = hookPluginDataPath(cwd, pluginName);
+stateRoot?: string,): HookPluginSdk['state'] {
+  const dataPath = hookPluginDataPath(cwd, pluginName, stateRoot);
 
   async function readData(): Promise<Record<string, unknown>> {
     return readJsonIfExists<Record<string, unknown>>(dataPath, {});

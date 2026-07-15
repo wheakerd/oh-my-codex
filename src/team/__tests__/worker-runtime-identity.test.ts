@@ -528,163 +528,157 @@ switch (args[0] || '') {
   case 'capture-pane': console.log(''); break;
 }
 `,
-      );
-      await writeFile(tmuxLogPath, '');
-      process.env[pathKey] = prependPath(fakeBinDir, previousPath);
+			);
+			await writeFile(tmuxLogPath, "");
+			process.env[pathKey] = prependPath(fakeBinDir, previousPath);
 
-      await mkdir(join(cwd, '.omx', 'state', 'team', 'exact-role-cli'), {
-        recursive: true,
-      });
-      await writeFile(
-        join(
-          cwd,
-          '.omx',
-          'state',
-          'team',
-          'exact-role-cli',
-          'worker-agents.md',
-        ),
-        '# Base worker instructions\n',
-      );
+			await mkdir(join(cwd, ".omx", "state", "team", "exact-role-cli"), {
+				recursive: true,
+			});
+			await writeFile(
+				join(
+					cwd,
+					".omx",
+					"state",
+					"team",
+					"exact-role-cli",
+					"worker-agents.md",
+				),
+				"# Base worker instructions\n",
+			);
 
-      await hardenTeamTestAuthority(cwd);
-      await initTeamState('exact-role-cli', 'task', 'executor', 1, cwd);
-      await createTask(
-        'exact-role-cli',
-        {
-        subject: 'architecture follow-up',
-        description: 'exact-role scale-up regression',
-        status: 'pending',
-        owner: 'worker-3',
-        role: 'architect',
-        },
-        cwd,
-      );
+			await hardenTeamTestAuthority(cwd);
+			await initTeamState("exact-role-cli", "task", "executor", 1, cwd);
+			await createTask(
+				"exact-role-cli",
+				{
+					subject: "architecture follow-up",
+					description: "exact-role scale-up regression",
+					status: "pending",
+					owner: "worker-3",
+					role: "architect",
+				},
+				cwd,
+			);
 
-      const config = await readTeamConfig('exact-role-cli', cwd);
-      assert.ok(config);
-      if (!config) return;
-      config.tmux_session = 'omx-team-exact-role-cli';
-      config.leader_pane_id = '%11';
-      config.workers[0]!.pane_id = '%21';
-      config.next_worker_index = 3;
-      await saveTeamConfig(config, cwd);
+			const config = await readTeamConfig("exact-role-cli", cwd);
+			assert.ok(config);
+			if (!config) return;
+			config.tmux_session = "omx-team-exact-role-cli";
+			config.leader_pane_id = "%11";
+			config.workers[0]!.pane_id = "%21";
+			config.next_worker_index = 3;
+			await saveTeamConfig(config, cwd);
 
-      const manifestPath = join(
-        cwd,
-        '.omx',
-        'state',
-        'team',
-        'exact-role-cli',
-        'manifest.v2.json',
-      );
-      const manifest = JSON.parse(await readFile(manifestPath, 'utf-8')) as {
-        policy?: Record<string, unknown>;
-      };
-      manifest.policy = {
-        ...(manifest.policy ?? {}),
-        dispatch_mode: 'transport_direct',
-      };
-      await writeFile(manifestPath, JSON.stringify(manifest, null, 2));
+			const manifestPath = join(
+				cwd,
+				".omx",
+				"state",
+				"team",
+				"exact-role-cli",
+				"manifest.v2.json",
+			);
+			const manifest = JSON.parse(await readFile(manifestPath, "utf-8")) as {
+				policy?: Record<string, unknown>;
+			};
+			manifest.policy = {
+				...(manifest.policy ?? {}),
+				dispatch_mode: "transport_direct",
+			};
+			await writeFile(manifestPath, JSON.stringify(manifest, null, 2));
 
-      const result = await scaleUp(
-        'exact-role-cli',
-        1,
-        'executor',
-        [
-          {
-            subject: 'architecture follow-up',
-            description: 'exact-role scale-up regression',
-            owner: 'worker-3',
-            role: 'architect',
-          },
-        ],
-        cwd,
-        {
-          OMX_TEAM_SCALING_ENABLED: '1',
-          OMX_TEAM_SKIP_READY_WAIT: '1',
-          OMX_TEAM_WORKER_LAUNCH_ARGS: '--no-alt-screen',
-          OMX_TEAM_WORKER_INHERITED_MODEL: 'claude-sonnet-4-6',
-        },
-      );
-      assert.equal(result.ok, true);
-      if (!result.ok) return;
+			const result = await scaleUp(
+				"exact-role-cli",
+				1,
+				"executor",
+				[
+					{
+						subject: "architecture follow-up",
+						description: "exact-role scale-up regression",
+						owner: "worker-3",
+						role: "architect",
+					},
+				],
+				cwd,
+				{
+					OMX_TEAM_SCALING_ENABLED: "1",
+					OMX_TEAM_SKIP_READY_WAIT: "1",
+					OMX_TEAM_WORKER_LAUNCH_ARGS: "--no-alt-screen",
+					OMX_TEAM_WORKER_INHERITED_MODEL: "claude-sonnet-4-6",
+				},
+			);
+			assert.equal(result.ok, true);
+			if (!result.ok) return;
 
-      const workerIdentity = JSON.parse(
-        await readFile(
-          join(
-            cwd,
-            '.omx',
-            'state',
-            'team',
-            'exact-role-cli',
-            'workers',
-            'worker-3',
-            'identity.json',
-          ),
-          'utf-8',
-        ),
-      ) as { worker_cli?: string; role?: string };
-      assert.equal(workerIdentity.role, 'architect');
-      assert.equal(workerIdentity.worker_cli, 'codex');
+			const workerIdentity = JSON.parse(
+				await readFile(
+					join(
+						cwd,
+						".omx",
+						"state",
+						"team",
+						"exact-role-cli",
+						"workers",
+						"worker-3",
+						"identity.json",
+					),
+					"utf-8",
+				),
+			) as { worker_cli?: string; role?: string };
+			assert.equal(workerIdentity.role, "architect");
+			assert.equal(workerIdentity.worker_cli, "codex");
 
-      const startupScript = await readFile(
-        join(
-          cwd,
-          '.omx',
-          'state',
-          'team',
-          'exact-role-cli',
-          'runtime',
-          'worker-3-startup.sh',
-        ),
-        'utf-8',
-      );
-      assert.match(startupScript, /codex/);
-      assert.doesNotMatch(startupScript, /\bclaude\b/);
-      assert.doesNotMatch(startupScript, /\bgemini\b/);
+			const startupScript = await readFile(
+				join(
+					cwd,
+					".omx",
+					"state",
+					"team",
+					"exact-role-cli",
+					"runtime",
+					"worker-3-startup.sh",
+				),
+				"utf-8",
+			);
+			assert.match(startupScript, /codex/);
+			assert.doesNotMatch(startupScript, /\bclaude\b/);
+			assert.doesNotMatch(startupScript, /\bgemini\b/);
 
-      const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
-      assert.match(tmuxLog, /worker-3-startup\.sh/);
-      assert.doesNotMatch(tmuxLog, /\bclaude\b/);
-      assert.doesNotMatch(tmuxLog, /\bgemini\b/);
-    } finally {
-      if (typeof previousPath === 'string') process.env[pathKey] = previousPath;
-      else delete process.env[pathKey];
-      clearTeamTestAuthority();
-      await rm(cwd, { recursive: true, force: true });
-      await rm(fakeBinDir, { recursive: true, force: true });
-    }
-  });
-  it('injects exact authenticated authority into an existing tmux server without persisting it', async () => {
-    const cwd = await realpath(await mkdtemp(
-      join(tmpdir(), 'omx-runtime-identity-authority-tmux-'),
-    ));
-    const fakeBinDir = await mkdtemp(
-      join(tmpdir(), 'omx-runtime-identity-authority-tmux-bin-'),
-    );
-    const capabilityMarkerPath = join(
-      fakeBinDir,
-      'authority-capability-received',
-    );
-    const authorityImportMapPath = join(fakeBinDir, 'authority-import-map.json');
-    const injectionCanaryPath = join(fakeBinDir, 'provider-injection-canary');
-    const tmuxArgvLogPath = join(fakeBinDir, 'tmux-argv.jsonl');
-    const authorityRestoreMarkerPath = join(
-      fakeBinDir,
-      'authority-environment-restored',
-    );
-    const authorityEnvKeys = [
-      'OMX_STARTUP_CWD',
-      'OMX_STATE_AUTHORITY_PATH',
-      'OMX_STATE_AUTHORITY_ID',
-      'OMX_STATE_AUTHORITY_GENERATION_ID',
-      'OMX_STATE_AUTHORITY_WORKSPACE_DIGEST',
-      'OMX_STATE_AUTHORITY_CAPABILITY',
-    ];
-    const providerEnvKey = 'OMX_TEST_PROVIDER_SECRET';
-    const providerValue =
-      `provider secret "quoted" \\ $HOME $(touch ${injectionCanaryPath}); literal-end`;
+			const tmuxLog = await readFile(tmuxLogPath, "utf-8");
+			assert.match(tmuxLog, /worker-3-startup\.sh/);
+			assert.doesNotMatch(tmuxLog, /\bclaude\b/);
+			assert.doesNotMatch(tmuxLog, /\bgemini\b/);
+		} finally {
+			if (typeof previousPath === "string") process.env[pathKey] = previousPath;
+			else delete process.env[pathKey];
+			clearTeamTestAuthority();
+			await rm(cwd, { recursive: true, force: true });
+			await rm(fakeBinDir, { recursive: true, force: true });
+		}
+	});
+	it("injects exact authenticated authority into an existing tmux server without persisting it", async () => {
+		const cwd = await realpath(
+			await mkdtemp(join(tmpdir(), "omx-runtime-identity-authority-tmux-")),
+		);
+		const fakeBinDir = await mkdtemp(
+			join(tmpdir(), "omx-runtime-identity-authority-tmux-bin-"),
+		);
+		const capabilityMarkerPath = join(
+			fakeBinDir,
+			"authority-capability-received",
+		);
+		const injectionCanaryPath = join(fakeBinDir, "provider-injection-canary");
+		const tmuxArgvLogPath = join(fakeBinDir, "tmux-argv.jsonl");
+		const authorityEnvKeys = [
+			"OMX_STARTUP_CWD",
+			"OMX_STATE_AUTHORITY_PATH",
+			"OMX_STATE_AUTHORITY_ID",
+			"OMX_STATE_AUTHORITY_GENERATION_ID",
+			"OMX_STATE_AUTHORITY_WORKSPACE_DIGEST",
+			"OMX_STATE_AUTHORITY_CAPABILITY",
+		];
+		const providerEnvKey = "OMX_TEST_PROVIDER_SECRET";
+		const providerValue = `provider secret "quoted" \\ $HOME $(touch ${injectionCanaryPath}); literal-end`;
 
     const pathKey = pathEnvironmentKey();
     const previousPath = process.env[pathKey];
@@ -723,87 +717,20 @@ if (command === 'list-panes') {
   console.log('%1\\tzsh\\tzsh\\n%2\\tzsh\\tzsh\\n%3\\tzsh\\tzsh');
   process.exit(0);
 }
-if (command === 'show-environment') {
-  const requestedName = args.at(-1) || '';
-  if (requestedName.startsWith('OMX_TMUX_IMPORT_') && fs.existsSync(${JSON.stringify(authorityImportMapPath)})) {
-    const bindings = JSON.parse(fs.readFileSync(${JSON.stringify(authorityImportMapPath)}, 'utf8'));
-    const targetName = Object.keys(bindings).find((candidate) => bindings[candidate] === requestedName);
-    if (targetName) {
-      console.log(requestedName + '=' + (process.env['OMX_TEST_EXPECTED_' + targetName] || ''));
-      process.exit(0);
-    }
-  }
-  console.log('OMX_TEST_PROVIDER_SECRET=previous-provider-$HOME-\${OMX_LITERAL_PREVIOUS_SECRET}');
-  process.exit(0);
-}
-if (command === 'source-file') {
+if (command === 'show-environment' || command === 'source-file' || command === 'set-environment') {
   fs.appendFileSync(${JSON.stringify(tmuxArgvLogPath)}, JSON.stringify(args) + '\\n');
-  const input = fs.readFileSync(0, 'utf8');
-  const required = [
-    'OMX_STARTUP_CWD',
-    'OMX_STATE_AUTHORITY_PATH',
-    'OMX_STATE_AUTHORITY_ID',
-    'OMX_STATE_AUTHORITY_GENERATION_ID',
-    'OMX_STATE_AUTHORITY_WORKSPACE_DIGEST',
-    'OMX_STATE_AUTHORITY_CAPABILITY',
-    'OMX_TEST_PROVIDER_SECRET',
-  ];
-  const quote = (value) => '"' + value.replace(/\\\\/g, '\\\\\\\\').replace(/"/g, '\\\\"').replace(/\\$/g, '\\\\$') + '"';
-  const lines = input.split(/\\r?\\n/).filter(Boolean);
-  const bindings = {};
-  const claimedSources = new Set();
-  let exact = args.length === 2 && args[1] === '-';
-  for (const targetName of required) {
-    const expected = process.env['OMX_TEST_EXPECTED_' + targetName];
-    const parsed = lines
-      .filter((line) => line.endsWith(' ' + quote(expected || '')))
-      .map((line) => line.match(/^set-environment -t "[^"]+" (OMX_TMUX_IMPORT_[A-Za-z0-9_]+) /))
-      .find((match) => match && !claimedSources.has(match[1]));
-    if (!parsed) exact = false;
-    else {
-      bindings[targetName] = parsed[1];
-      claimedSources.add(parsed[1]);
-    }
-  }
-  exact = exact && required.every((key) => !new RegExp('set-environment -t "[^"]+" ' + key + ' ').test(input));
-  if (exact) fs.writeFileSync(${JSON.stringify(authorityImportMapPath)}, JSON.stringify(bindings));
-  const restoresInheritedEnvironment = input.includes(' OMX_TMUX_IMPORT_')
-    && input.includes(' -u ')
-    && required.every((key) => !new RegExp('set-environment -t "[^"]+" ' + key + ' ').test(input));
-  if (restoresInheritedEnvironment) fs.writeFileSync(${JSON.stringify(join(fakeBinDir, 'authority-environment-restored'))}, 'restored');
-  process.exit(0);
+  process.exit(1);
 }
-if (command === 'set-environment') {
-  if (args.includes('-u') && fs.existsSync(${JSON.stringify(authorityImportMapPath)})) {
-    const sourceName = args.at(-1) || '';
-    const bindings = JSON.parse(fs.readFileSync(${JSON.stringify(authorityImportMapPath)}, 'utf8'));
-    for (const targetName of Object.keys(bindings)) {
-      if (bindings[targetName] === sourceName) delete bindings[targetName];
-    }
-    fs.writeFileSync(${JSON.stringify(authorityImportMapPath)}, JSON.stringify(bindings));
-  }
-  process.exit(0);
-}
+if (command === 'wait-for' || command === 'run-shell') process.exit(0);
+
 if (command === 'split-window') {
   fs.appendFileSync(${JSON.stringify(tmuxArgvLogPath)}, JSON.stringify(args) + '\\n');
-  if (!fs.existsSync(${JSON.stringify(authorityImportMapPath)}) || args.some((value) => value === '-e')) process.exit(1);
+  if ( args.some((value) => value === '-e')) process.exit(1);
   const startupCommand = args.at(-1) || '';
-  if (!startupCommand.includes('omx_import_assignment=$(')) {
+  if (!startupCommand.includes('omx_import_file=')) {
     console.log('hud-pane');
     process.exit(0);
   }
-  const bindings = JSON.parse(fs.readFileSync(${JSON.stringify(authorityImportMapPath)}, 'utf8'));
-  const exactBindings = Object.entries(bindings).every(([targetName, sourceName]) => {
-    const firstAssignmentIndex = startupCommand.indexOf('omx_import_assignment=$(');
-    const sourceIndex = startupCommand.indexOf(String(sourceName), firstAssignmentIndex);
-    const exportIndex = startupCommand.indexOf('export "' + targetName + '=', sourceIndex);
-    const nextSourceIndex = startupCommand.indexOf('omx_import_assignment=$(', sourceIndex + String(sourceName).length);
-    return firstAssignmentIndex >= 0
-      && sourceIndex >= firstAssignmentIndex
-      && exportIndex > sourceIndex
-      && (nextSourceIndex < 0 || exportIndex < nextSourceIndex);
-  });
-  if (!exactBindings) process.exit(1);
   const execution = spawnSync('sh', ['-c', startupCommand], {
     cwd: ${JSON.stringify(cwd)},
     env: process.env,
@@ -885,178 +812,173 @@ fs.writeFileSync(${JSON.stringify(capabilityMarkerPath)}, 'received');`,
         Object.fromEntries(
           Object.entries(workerTransport).map(([key, value]) => [
             `OMX_TEST_EXPECTED_${key}`,
-            value,
-          ]),
-        ),
-      );
-      process.env.OMX_SESSION_ID = sessionId;
+						value,
+					]),
+				),
+			);
+			process.env.OMX_SESSION_ID = sessionId;
 
-      // Exercise a manually assembled child transport against the persisted authority.
-      runtime = await withoutTeamWorkerEnv(() =>
-        rawStartTeam(
-          'pre-existing-tmux-authority',
-          'propagate authority to an existing tmux leader worker',
-          'executor',
-          1,
-          [
-            {
-              subject: 'authority handoff',
-              description: 'authority handoff',
-              owner: 'worker-1',
-            },
-          ],
-          cwd,
-        ),
-      );
+			// Exercise a manually assembled child transport against the persisted authority.
+			runtime = await withoutTeamWorkerEnv(() =>
+				rawStartTeam(
+					"pre-existing-tmux-authority",
+					"propagate authority to an existing tmux leader worker",
+					"executor",
+					1,
+					[
+						{
+							subject: "authority handoff",
+							description: "authority handoff",
+							owner: "worker-1",
+						},
+					],
+					cwd,
+				),
+			);
 
-      assert.equal(await readFile(capabilityMarkerPath, 'utf8'), 'received');
-      assert.equal(
-        await readFile(authorityRestoreMarkerPath, 'utf8'),
-        'restored',
-      );
-      assert.equal(existsSync(injectionCanaryPath), false);
-      assert.deepEqual(
-        JSON.parse(await readFile(authorityImportMapPath, 'utf8')),
-        {},
-      );
-      const tmuxArgv = (await readFile(tmuxArgvLogPath, 'utf8'))
-        .trim()
-        .split('\n')
-        .filter(Boolean)
-        .map((line) => JSON.parse(line) as string[]);
-      const authoritySourceArgv = tmuxArgv.find(
-        (args) => args[0] === 'source-file',
-      );
-      assert.deepEqual(authoritySourceArgv, ['source-file', '-']);
-      const workerSplitArgv = tmuxArgv.find(
-        (args) => args[0] === 'split-window',
-      );
-      assert.ok(workerSplitArgv);
-      assert.equal(workerSplitArgv.includes('-e'), false);
-      for (const argv of tmuxArgv) {
-        assert.equal(
-          argv.some((value) => value.includes(authorityCapability)),
-          false,
-        );
-        assert.equal(
-          argv.some((value) => value.includes(providerValue)),
-          false,
-        );
-        assert.equal(
-          argv.some((value) =>
-            Object.keys(workerTransport).some((key) =>
-              value.startsWith(`${key}=`),
-            ),
-          ),
-          false,
-        );
-      }
-      const teamRoot = join(
-        authority.canonical_state_root,
-        'team',
-        runtime.teamName,
-      );
-      const startupScriptPath = join(
-        teamRoot,
-        'runtime',
-        'worker-1-startup.sh',
-      );
-      assert.equal(existsSync(startupScriptPath), true, 'expected the managed worker startup script');
-      const startupScript = await readFile(startupScriptPath, 'utf8');
-      const persistedWorkerFiles = await readRegularFilesRecursively(teamRoot);
-      for (const value of persistedWorkerFiles) {
-        assert.equal(value.includes(authorityCapability), false);
-        assert.equal(value.includes(providerValue), false);
-      }
-      for (const key of [
-        'OMX_STARTUP_CWD',
-        'OMX_STATE_AUTHORITY_PATH',
-        'OMX_STATE_AUTHORITY_ID',
-        'OMX_STATE_AUTHORITY_GENERATION_ID',
-        'OMX_STATE_AUTHORITY_WORKSPACE_DIGEST',
-        'OMX_STATE_AUTHORITY_CAPABILITY',
-        providerEnvKey,
-      ]) {
-        assert.doesNotMatch(startupScript, new RegExp(key));
-      }
-      await shutdownTeam(runtime.teamName, cwd, { force: true });
-      runtime = null;
+			assert.equal(await readFile(capabilityMarkerPath, "utf8"), "received");
+			assert.equal(existsSync(injectionCanaryPath), false);
+			const tmuxArgv = (await readFile(tmuxArgvLogPath, "utf8"))
+				.trim()
+				.split("\n")
+				.filter(Boolean)
+				.map((line) => JSON.parse(line) as string[]);
+			assert.equal(
+				tmuxArgv.some((args) =>
+					["source-file", "show-environment", "set-environment"].includes(
+						args[0] ?? "",
+					),
+				),
+				false,
+			);
+			const workerSplitArgv = tmuxArgv.find(
+				(args) => args[0] === "split-window",
+			);
+			assert.ok(workerSplitArgv);
+			assert.equal(workerSplitArgv.includes("-e"), false);
+			for (const argv of tmuxArgv) {
+				assert.equal(
+					argv.some((value) => value.includes(authorityCapability)),
+					false,
+				);
+				assert.equal(
+					argv.some((value) => value.includes(providerValue)),
+					false,
+				);
+				assert.equal(
+					argv.some((value) =>
+						Object.keys(workerTransport).some((key) =>
+							value.startsWith(`${key}=`),
+						),
+					),
+					false,
+				);
+			}
+			const teamRoot = join(
+				authority.canonical_state_root,
+				"team",
+				runtime.teamName,
+			);
+			const startupScriptPath = join(
+				teamRoot,
+				"runtime",
+				"worker-1-startup.sh",
+			);
+			assert.equal(
+				existsSync(startupScriptPath),
+				true,
+				"expected the managed worker startup script",
+			);
+			const startupScript = await readFile(startupScriptPath, "utf8");
+			const persistedWorkerFiles = await readRegularFilesRecursively(teamRoot);
+			for (const value of persistedWorkerFiles) {
+				assert.equal(value.includes(authorityCapability), false);
+				assert.equal(value.includes(providerValue), false);
+			}
+			for (const key of [
+				"OMX_STARTUP_CWD",
+				"OMX_STATE_AUTHORITY_PATH",
+				"OMX_STATE_AUTHORITY_ID",
+				"OMX_STATE_AUTHORITY_GENERATION_ID",
+				"OMX_STATE_AUTHORITY_WORKSPACE_DIGEST",
+				"OMX_STATE_AUTHORITY_CAPABILITY",
+				providerEnvKey,
+			]) {
+				assert.doesNotMatch(startupScript, new RegExp(key));
+			}
+			await shutdownTeam(runtime.teamName, cwd, { force: true });
+			runtime = null;
 
-      await rm(capabilityMarkerPath, { force: true });
-      await rm(authorityRestoreMarkerPath, { force: true });
-      await writeFile(tmuxArgvLogPath, '');
-      Object.assign(
-        process.env,
-        Object.fromEntries(
-          authorityEnvKeys.map((key) => [key, `ambient-${key}`]),
-        ),
-      );
-      const directSession = createTeamSession(
-        'authority-client-environment',
-        1,
-        cwd,
-        [],
-        [{ env: workerAuthorityTransport, workerCli: 'codex' }],
-      );
-      assert.deepEqual(directSession.workerPaneIds, ['%2']);
-      assert.equal(await readFile(capabilityMarkerPath, 'utf8'), 'received');
-      assert.equal(
-        await readFile(authorityRestoreMarkerPath, 'utf8'),
-        'restored',
-      );
-      assert.equal(existsSync(injectionCanaryPath), false);
-      assert.deepEqual(
-        JSON.parse(await readFile(authorityImportMapPath, 'utf8')),
-        {},
-      );
-      const directTmuxArgv = (await readFile(tmuxArgvLogPath, 'utf8'))
-        .trim()
-        .split('\n')
-        .filter(Boolean)
-        .map((line) => JSON.parse(line) as string[]);
-      assert.deepEqual(
-        directTmuxArgv.find((args) => args[0] === 'source-file'),
-        ['source-file', '-'],
-      );
-      const directSplitArgv = directTmuxArgv.find(
-        (args) => args[0] === 'split-window',
-      );
-      assert.ok(directSplitArgv);
-      assert.equal(directSplitArgv.includes('-e'), false);
-      assert.equal(
-        directTmuxArgv.some((args) =>
-          args.some(
-            (value) =>
-              value.includes(authorityCapability) ||
-              value.includes(providerValue),
-          ),
-        ),
-        false,
-      );
+			await rm(capabilityMarkerPath, { force: true });
+			await writeFile(tmuxArgvLogPath, "");
+			Object.assign(
+				process.env,
+				Object.fromEntries(
+					authorityEnvKeys.map((key) => [key, `ambient-${key}`]),
+				),
+			);
+			const directSession = createTeamSession(
+				"authority-client-environment",
+				1,
+				cwd,
+				[],
+				[{ env: workerAuthorityTransport, workerCli: "codex" }],
+			);
+			assert.deepEqual(directSession.workerPaneIds, ["%2"]);
+			assert.equal(await readFile(capabilityMarkerPath, "utf8"), "received");
+			assert.equal(existsSync(injectionCanaryPath), false);
+			const directTmuxArgv = (await readFile(tmuxArgvLogPath, "utf8"))
+				.trim()
+				.split("\n")
+				.filter(Boolean)
+				.map((line) => JSON.parse(line) as string[]);
+			assert.equal(
+				directTmuxArgv.some((args) =>
+					["source-file", "show-environment", "set-environment"].includes(
+						args[0] ?? "",
+					),
+				),
+				false,
+			);
+			const directSplitArgv = directTmuxArgv.find(
+				(args) => args[0] === "split-window",
+			);
+			assert.ok(directSplitArgv);
+			assert.equal(directSplitArgv.includes("-e"), false);
+			assert.equal(
+				directTmuxArgv.some((args) =>
+					args.some(
+						(value) =>
+							value.includes(authorityCapability) ||
+							value.includes(providerValue),
+					),
+				),
+				false,
+			);
 
-      await rm(capabilityMarkerPath, { force: true });
-      await writeFile(tmuxArgvLogPath, '');
-      const incompleteTransport: Record<string, string> = {
-        ...workerAuthorityTransport,
-      };
-      delete incompleteTransport.OMX_STATE_AUTHORITY_CAPABILITY;
-      assert.throws(
-        () =>
-          createTeamSession(
-            'authority-client-environment-incomplete',
-            1,
-            cwd,
-            [],
-            [{ env: incompleteTransport, workerCli: 'codex' }],
-          ),
-        /authority transport is incomplete/,
-      );
-      assert.equal(existsSync(capabilityMarkerPath), false);
-      assert.equal(await readFile(tmuxArgvLogPath, 'utf8'), '');
+			await rm(capabilityMarkerPath, { force: true });
+			await writeFile(tmuxArgvLogPath, "");
+			const incompleteTransport: Record<string, string> = {
+				...workerAuthorityTransport,
+			};
+			delete incompleteTransport.OMX_STATE_AUTHORITY_CAPABILITY;
+			assert.throws(
+				() =>
+					createTeamSession(
+						"authority-client-environment-incomplete",
+						1,
+						cwd,
+						[],
+						[{ env: incompleteTransport, workerCli: "codex" }],
+					),
+				/authority transport is incomplete/,
+			);
+			assert.equal(existsSync(capabilityMarkerPath), false);
+			assert.equal(await readFile(tmuxArgvLogPath, "utf8"), "");
 
-      const unsafeTransport = {
-        ...workerAuthorityTransport,
-        OMX_STATE_AUTHORITY_CAPABILITY: `${authorityCapability}\nunsafe`,
+			const unsafeTransport = {
+				...workerAuthorityTransport,
+				OMX_STATE_AUTHORITY_CAPABILITY: `${authorityCapability}\nunsafe`,
       };
       assert.throws(
         () =>

@@ -35,7 +35,7 @@ export async function dispatchHookEventRuntime(input: HookRuntimeDispatchInput):
     cwd: input.cwd,
     allowTeamWorkerSideEffects: input.allowTeamWorkerSideEffects,
     enabled,
-  });
+  stateRoot: input.stateRoot,});
 
   return {
     dispatched: true,

@@ -210,7 +210,7 @@ export interface HookDispatchOptions {
   allowTeamWorkerSideEffects?: boolean;
   sideEffectsEnabled?: boolean;
   enabled?: boolean;
-}
+stateRoot?: string;}
 
 export interface HookValidateOptions {
   cwd?: string;
@@ -224,7 +224,7 @@ export interface HookRuntimeDispatchInput {
   allowTeamWorkerSideEffects?: boolean;
   skipNativeStopTeamLeaderAttention?: boolean;
   sideEffectsEnabled?: boolean;
-}
+stateRoot?: string;}
 
 export interface HookRuntimeDispatchResult {
   dispatched: boolean;

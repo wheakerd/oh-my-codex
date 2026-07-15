@@ -1,7 +1,8 @@
-import { spawnSync, execFile } from 'child_process';
+import { spawn,spawnSync, execFile , type ChildProcess} from 'child_process';
 import { promisify } from 'util';
-import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'fs';
-import { homedir } from 'os';
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync,readFileSync,
+	rmSync, statSync, writeFileSync } from 'fs';
+import { homedir , tmpdir} from 'os';
 import { dirname, isAbsolute, join, resolve, sep } from 'path';
 import {
   CODEX_BYPASS_FLAG,
@@ -1155,404 +1156,272 @@ function buildModelInstructionsOverride(cwd: string, env: NodeJS.ProcessEnv): st
   return `${MODEL_INSTRUCTIONS_FILE_KEY}="${escapeTomlString(filePath)}"`;
 }
 
-function readTmuxWorkerAmbientEnv(env: NodeJS.ProcessEnv = process.env): Record<string, string> {
-  const inherited: Record<string, string> = {};
-  for (const key of TMUX_WORKER_AMBIENT_ENV_ALLOWLIST) {
-    const value = env[key];
-    if (typeof value !== 'string' || value.trim() === '') continue;
-    inherited[key] = value;
-  }
-  return inherited;
+function readTmuxWorkerAmbientEnv(
+	env: NodeJS.ProcessEnv = process.env,
+): Record<string, string> {
+	const inherited: Record<string, string> = {};
+	for (const key of TMUX_WORKER_AMBIENT_ENV_ALLOWLIST) {
+		const value = env[key];
+		if (typeof value !== "string" || value.trim() === "") continue;
+		inherited[key] = value;
+	}
+	return inherited;
 }
 
 function splitWorkerStartupEnvForTmux(
-  startupEnv: Record<string, string>,
-  childOnlyEnvNames: readonly string[] = TMUX_CHILD_ONLY_AUTHORITY_ENV,
+	startupEnv: Record<string, string>,
+	childOnlyEnvNames: readonly string[] = TMUX_CHILD_ONLY_AUTHORITY_ENV,
 ): Record<string, string> {
-  const childEnv = { ...startupEnv };
-  for (const key of childOnlyEnvNames) delete childEnv[key];
-  return childEnv;
+	const childEnv = { ...startupEnv };
+	for (const key of childOnlyEnvNames) delete childEnv[key];
+	return childEnv;
 }
 
-
-function tmuxChildOnlyAuthorityTransport(env: Record<string, string>): Record<string, string> | null {
-  const values = TMUX_CHILD_ONLY_AUTHORITY_ENV.map((key) => [key, env[key]] as const);
-  const present = values.filter(([, value]) => typeof value === 'string' && value.trim() !== '');
-  if (present.length === 0) return null;
-  if (present.length !== TMUX_CHILD_ONLY_AUTHORITY_ENV.length) {
-    throw new Error('inherited worker authority transport is incomplete');
-  }
-  return Object.fromEntries(present) as Record<string, string>;
+function tmuxChildOnlyAuthorityTransport(
+	env: Record<string, string>,
+): Record<string, string> | null {
+	const values = TMUX_CHILD_ONLY_AUTHORITY_ENV.map(
+		(key) => [key, env[key]] as const,
+	);
+	const present = values.filter(
+		([, value]) => typeof value === "string" && value.trim() !== "",
+	);
+	if (present.length === 0) return null;
+	if (present.length !== TMUX_CHILD_ONLY_AUTHORITY_ENV.length) {
+		throw new Error("inherited worker authority transport is incomplete");
+	}
+	return Object.fromEntries(present) as Record<string, string>;
 }
 
 function tmuxClientEnvWithoutAuthority(
-  env: NodeJS.ProcessEnv = process.env,
-  childOnlyEnvNames: readonly string[] = TMUX_CHILD_ONLY_AUTHORITY_ENV,
+	env: NodeJS.ProcessEnv = process.env,
+	childOnlyEnvNames: readonly string[] = TMUX_CHILD_ONLY_AUTHORITY_ENV,
 ): NodeJS.ProcessEnv {
-  const clientEnv = { ...env };
-  for (const key of new Set([...TMUX_CHILD_ONLY_AUTHORITY_ENV, ...childOnlyEnvNames])) {
-    delete clientEnv[key];
-  }
-  return clientEnv;
-}
-
-function quoteTmuxSourceArgument(value: string, description: string): string {
-  if (value.length === 0 || /[\u0000-\u001F\u007F]/.test(value)) {
-    throw new Error(`unsafe ${description} for tmux environment transport`);
-  }
-  return `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\$/g, '\\$')}"`;
-}
-
-type TmuxEnvironmentSnapshot = Map<string, { kind: 'value'; value: string } | { kind: 'unset' } | { kind: 'inherited' }>;
-
-function captureTmuxSessionEnvironment(sessionName: string, variableNames: readonly string[]): TmuxEnvironmentSnapshot {
-  quoteTmuxSourceArgument(sessionName, 'session target');
-  const shown = runTmux(['show-environment', '-t', sessionName], tmuxClientEnvWithoutAuthority(process.env, variableNames), undefined, false);
-  if (!shown.ok) {
-    throw new Error(`failed to capture tmux session environment: ${shown.stderr}`);
-  }
-  const environment = new Map<string, string | null>();
-  for (const line of shown.stdout.split('\n')) {
-    if (line.startsWith('-')) {
-      environment.set(line.slice(1), null);
-      continue;
-    }
-    const separator = line.indexOf('=');
-    if (separator > 0) environment.set(line.slice(0, separator), line.slice(separator + 1));
-  }
-  const snapshot: TmuxEnvironmentSnapshot = new Map();
-  for (const name of variableNames) {
-    const value = environment.get(name);
-    if (typeof value === 'string') quoteTmuxSourceArgument(value, `existing environment value for ${name}`);
-    snapshot.set(name, value === undefined
-      ? { kind: 'inherited' }
-      : value === null
-        ? { kind: 'unset' }
-        : { kind: 'value', value });
-  }
-  return snapshot;
-}
-
-function runTmuxSourceCommands(commands: string[], childOnlyEnvNames: readonly string[]): void {
-  const result = runTmux(
-    ['source-file', '-'],
-    tmuxClientEnvWithoutAuthority(process.env, childOnlyEnvNames),
-    `${commands.join('\n')}\n`,
-  );
-  if (!result.ok) throw new Error('failed to update tmux session environment');
-}
-
-function tmuxSetEnvironmentCommand(sessionName: string, name: string, value: string): string {
-  assertShellEnvKey(name);
-  return `set-environment -t ${quoteTmuxSourceArgument(sessionName, 'session target')} ${name} ${quoteTmuxSourceArgument(value, `environment value for ${name}`)}`;
-}
-
-function tmuxRestoreEnvironmentCommands(sessionName: string, snapshot: TmuxEnvironmentSnapshot): string[] {
-  const target = quoteTmuxSourceArgument(sessionName, 'session target');
-  return [...snapshot].map(([name, previous]) => {
-    assertShellEnvKey(name);
-    if (previous.kind === 'value') return tmuxSetEnvironmentCommand(sessionName, name, previous.value);
-    return `set-environment -t ${target} ${previous.kind === 'unset' ? '-r' : '-u'} ${name}`;
-  });
+	const clientEnv = { ...env };
+	for (const key of new Set([
+		...TMUX_CHILD_ONLY_AUTHORITY_ENV,
+		...childOnlyEnvNames,
+	])) {
+		delete clientEnv[key];
+	}
+	return clientEnv;
 }
 
 const TMUX_ONE_SHOT_IMPORT_TIMEOUT_MS = 5_000;
-const OMX_ONE_SHOT_IMPORT_RESTORE_FAILURE_OPTION =
-  '@omx_one_shot_import_restore_failure';
-
-/**
- * Reject imports into a session whose one-shot transport cleanup previously
- * failed. A watchdog sets this session-scoped latch only after clearing all
- * imported names; it remains quarantined until the session is destroyed.
- */
-export function assertTmuxOneShotImportSessionHealthy(
-  sessionName: string,
-  variableNames: readonly string[] = TMUX_CHILD_ONLY_AUTHORITY_ENV,
-): void {
-  quoteTmuxSourceArgument(sessionName, 'session target');
-  const result = runTmux(
-    ['show-option', '-qv', '-t', sessionName, OMX_ONE_SHOT_IMPORT_RESTORE_FAILURE_OPTION],
-    tmuxClientEnvWithoutAuthority(process.env, variableNames),
-  );
-  if (!result.ok) {
-    throw new Error(`failed to inspect tmux one-shot import quarantine: ${result.stderr}`);
-  }
-  if (result.stdout.trim() !== '') {
-    throw new Error('refusing tmux one-shot import into a quarantined session after restore failure');
-  }
-}
-
-
 
 type TmuxOneShotImportEntry = {
-  sourceName: string;
-  targetName: string;
-  value: string;
+	targetName: string;
+	value: string;
 };
 
 interface TmuxOneShotWorkerEnvironmentImport {
-  wrapCommand: (command: string) => string;
-  prepare: () => void;
-  waitForAcknowledgement: () => void;
-  restore: () => void;
+	wrapCommand: (command: string) => string;
+	prepare: () => void;
+	waitForAcknowledgement: () => void;
+	restore: () => void;
 }
 
-function restoreTmuxSessionEnvironment(
-  sessionName: string,
-  snapshot: TmuxEnvironmentSnapshot,
-  variableNames: readonly string[],
+function writeTmuxOneShotImportFile(
+	entries: readonly TmuxOneShotImportEntry[],
+): {
+	directory: string;
+	path: string;
+} {
+	const directory = mkdtempSync(join(tmpdir(), "omx-tmux-import-"));
+	const path = join(directory, "environment.sh");
+	try {
+		chmodSync(directory, 0o700);
+		const contents = entries
+			.map(
+				({ targetName, value }) =>
+					`export ${targetName}=${shellQuoteSingle(value)}`,
+			)
+			.join("\n");
+		writeFileSync(path, `${contents}\n`, {
+			encoding: "utf-8",
+			mode: 0o600,
+			flag: "wx",
+		});
+		chmodSync(path, 0o600);
+		return { directory, path };
+	} catch (error) {
+		rmSync(directory, { recursive: true, force: true });
+		throw error;
+	}
+}
+
+function removeTmuxOneShotImportFile(
+	file: { directory: string; path: string } | null,
 ): void {
-  let lastError: unknown;
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    try {
-      runTmuxSourceCommands(
-        tmuxRestoreEnvironmentCommands(sessionName, snapshot),
-        variableNames,
-      );
-      return;
-    } catch (error) {
-      lastError = error;
-    }
-  }
-  throw new Error("failed to restore tmux one-shot import environment", {
-    cause: lastError,
-  });
+	if (!file) return;
+	rmSync(file.directory, {
+		recursive: true,
+		force: true,
+		maxRetries: 3,
+		retryDelay: 25,
+	});
 }
 
-function clearTmuxOneShotImportEnvironment(
-  sessionName: string,
-  variableNames: readonly string[],
+function armTmuxOneShotImportWatchdog(
+	file: { directory: string; path: string },
+	environmentNames: readonly string[],
 ): void {
-  quoteTmuxSourceArgument(sessionName, 'session target');
-  for (const name of variableNames) assertShellEnvKey(name);
-
-  let lastError: string | undefined;
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    let failed = false;
-    for (const name of variableNames) {
-      const result = runTmux(
-        ['set-environment', '-u', '-t', sessionName, '--', name],
-        tmuxClientEnvWithoutAuthority(process.env, variableNames),
-      );
-      if (!result.ok) {
-        failed = true;
-        lastError = result.stderr;
-      }
-    }
-    if (!failed) return;
-  }
-  throw new Error(
-    `failed to clear tmux one-shot import environment: ${lastError ?? 'unknown tmux error'}`,
-  );
+	let watchdog: ChildProcess;
+	try {
+		watchdog = spawn(
+			"/bin/sh",
+			[
+				"-c",
+				'sleep "$1"; rm -rf -- "$2"',
+				"omx-tmux-import-watchdog",
+				String(TMUX_ONE_SHOT_IMPORT_TIMEOUT_MS / 1000),
+				file.directory,
+			],
+			{
+				detached: true,
+				stdio: "ignore",
+				env: tmuxClientEnvWithoutAuthority(process.env, environmentNames),
+			},
+		);
+	} catch (error) {
+		removeTmuxOneShotImportFile(file);
+		throw new Error("failed to arm tmux one-shot import cleanup watchdog", {
+			cause: error,
+		});
+	}
+	watchdog.once("error", () => removeTmuxOneShotImportFile(file));
+	watchdog.unref();
 }
-
-function reportTmuxOneShotImportWatchdogFailure(
-  sessionName: string,
-  variableNames: readonly string[],
-  restoreError: unknown,
-): void {
-  // Quarantine before attempting cleanup. A retry must never race a failed
-  // restoration while a bearer might remain visible in tmux session state.
-  const evidence = runTmux(
-    [
-      'set-option',
-      '-t',
-      sessionName,
-      OMX_ONE_SHOT_IMPORT_RESTORE_FAILURE_OPTION,
-      '1',
-    ],
-    tmuxClientEnvWithoutAuthority(process.env, variableNames),
-  );
-  let cleanupError: unknown;
-  try {
-    clearTmuxOneShotImportEnvironment(sessionName, variableNames);
-  } catch (error) {
-    cleanupError = error;
-  }
-  const details = [
-    restoreError instanceof Error ? restoreError.message : String(restoreError),
-    ...(cleanupError
-      ? [cleanupError instanceof Error ? cleanupError.message : String(cleanupError)]
-      : []),
-  ].join('; ');
-  if (!evidence.ok) {
-    const terminated = runTmux(
-      ['kill-session', '-t', sessionName],
-      tmuxClientEnvWithoutAuthority(process.env, variableNames),
-    );
-    process.stderr.write(
-      `[omx] tmux one-shot import watchdog failed closed after bounded cleanup retries: ${details}; failed to persist tmux failure evidence: ${evidence.stderr}; ${
-        terminated.ok
-          ? 'terminated the unquarantinable tmux session'
-          : `failed to terminate tmux session: ${terminated.stderr}`
-      }\n`,
-    );
-  } else {
-    process.stderr.write(
-      `[omx] tmux one-shot import watchdog failed closed after bounded cleanup retries: ${details}\n`,
-    );
-  }
-  process.exitCode = 1;
-}
-
 
 /**
- * Runs in a first-party background process started by tmux before an import.
- * Its snapshot remains process-local and it restores the shared session state
- * even when the initiating OMX process is killed before its local cleanup.
+ * Builds a pane-local environment handoff. The bearer values reside only in a
+ * 0600 owner-private file which the pane consumes and deletes before launch;
+ * tmux receives only this non-secret path in its command argv.
  */
-export function restoreTmuxOneShotImportEnvironmentAfterDelay(
-  sessionName: string,
-  variableNames: string[],
-  readyChannel: string,
-  timeoutMs: number = TMUX_ONE_SHOT_IMPORT_TIMEOUT_MS,
-): void {
-  const snapshot = captureTmuxSessionEnvironment(sessionName, variableNames);
-  const ready = runTmux(
-    ["wait-for", "-S", readyChannel],
-    tmuxClientEnvWithoutAuthority(process.env, variableNames),
-  );
-  if (!ready.ok) {
-    throw new Error(`failed to acknowledge tmux one-shot import watchdog: ${ready.stderr}`);
-  }
-  setTimeout(() => {
-    try {
-      restoreTmuxSessionEnvironment(sessionName, snapshot, variableNames);
-    } catch (error) {
-      reportTmuxOneShotImportWatchdogFailure(
-        sessionName,
-        variableNames,
-        error,
-      );
-    }
-  }, timeoutMs);
-
-}
-
-
 export function buildTmuxOneShotWorkerImportCommand(
-  sessionName: string,
-  entries: readonly Pick<TmuxOneShotImportEntry, "sourceName" | "targetName">[],
-  acknowledgementChannel: string,
-  command: string,
+	importFilePath: string,
+	targetNames: readonly string[],
+	acknowledgementChannel: string,
+	command: string,
 ): string {
-  const environmentNames = [
-    ...new Set(
-      entries.flatMap(({ sourceName, targetName }) => [sourceName, targetName]),
-    ),
-  ];
-  const tmuxControl = 'PATH="$omx_tmux_control_path" tmux';
-  const importSteps = entries.flatMap(({ sourceName, targetName }) => [
-    `omx_import_assignment=$(${tmuxControl} show-environment -t ${shellQuoteSingle(sessionName)} ${shellQuoteSingle(sourceName)}) || omx_import_failed=1;`,
-    `if [ "$omx_import_failed" -eq 0 ]; then case "$omx_import_assignment" in ${shellQuoteSingle(`${sourceName}=`)}*) export "${targetName}=\${omx_import_assignment#*=}";; *) omx_import_failed=1;; esac; fi;`,
-  ]);
-  const cleanupSteps = entries.map(({ sourceName }) => (
-    `${tmuxControl} set-environment -u -t ${shellQuoteSingle(sessionName)} -- ${shellQuoteSingle(sourceName)} || omx_import_failed=1; unset ${shellQuoteSingle(sourceName)};`
-  ));
-  const normalizedCommand = command.trimStart();
-  const launchCommand = /^exec(?:\s|$)/.test(normalizedCommand)
-    ? normalizedCommand
-    : `exec ${command}`;
-  const wrapped = [
-    "omx_tmux_control_path=$PATH;",
-    environmentNames.length > 0
-      ? `unset ${environmentNames.map(shellQuoteSingle).join(" ")};`
-      : "",
-    "omx_import_failed=0;",
-    ...importSteps,
-    ...cleanupSteps,
-    `${tmuxControl} wait-for -S ${shellQuoteSingle(acknowledgementChannel)} || omx_import_failed=1;`,
-    'if [ "$omx_import_failed" -ne 0 ]; then exit 1; fi;',
-    launchCommand,
-  ].filter(Boolean).join(" ");
-  return `/bin/sh -c ${shellQuoteSingle(wrapped)}`;
+	const normalizedCommand = command.trimStart();
+	const launchCommand = /^exec(?:\s|$)/.test(normalizedCommand)
+		? normalizedCommand
+		: `exec ${command}`;
+	const wrapped = [
+		`omx_import_file=${shellQuoteSingle(importFilePath)};`,
+		'omx_import_dir=$(dirname -- "$omx_import_file");',
+		'omx_import_cleanup() { rm -f -- "$omx_import_file"; rmdir -- "$omx_import_dir" 2>/dev/null || true; };',
+		"trap omx_import_cleanup EXIT HUP INT TERM;",
+		'if [ ! -f "$omx_import_file" ]; then exit 1; fi;',
+		targetNames.length > 0
+			? `unset ${targetNames.map(shellQuoteSingle).join(" ")};`
+			: "",
+		'. "$omx_import_file" || exit 1;',
+		"omx_import_cleanup;",
+		"trap - EXIT HUP INT TERM;",
+		`env ${targetNames.map((name) => `-u ${shellQuoteSingle(name)}`).join(" ")} tmux wait-for -S ${shellQuoteSingle(acknowledgementChannel)} || exit 1;`,
+		launchCommand,
+	]
+		.filter(Boolean)
+		.join(" ");
+	return `/bin/sh -c ${shellQuoteSingle(wrapped)}`;
 }
 
 /**
- * Builds a pane-local environment handoff. tmux session environments are shared
- * by every client, so authority transport values must never be staged there.
+ * Creates an owner-private, one-use pane transport. No bearer bytes are ever
+ * inserted into tmux server/session environment state or tmux client argv.
  */
 function createTmuxOneShotWorkerEnvironmentImport(
-  sessionName: string,
-  environment: Record<string, string>,
+	_sessionName: string,
+	environment: Record<string, string>,
 ): TmuxOneShotWorkerEnvironmentImport {
-  const nonce = `${process.pid}_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
-  const entries = Object.entries(environment).map(([targetName, value], index) => {
-    assertShellEnvKey(targetName);
-    if (value.length === 0 || /[\u0000-\u001F\u007F]/.test(value)) {
-      throw new Error(`unsafe environment value for ${targetName}`);
-    }
-    return {
-      targetName,
-      value,
-      sourceName: `OMX_TMUX_IMPORT_${nonce}_${index}`,
-    };
-  });
-  const sourceNames = entries.map(({ sourceName }) => sourceName);
-  const acknowledgementChannel = `omx-tmux-import-${nonce}`;
-  let snapshot: TmuxEnvironmentSnapshot | null = null;
-  return {
-    wrapCommand: (command) => buildTmuxOneShotWorkerImportCommand(
-      sessionName,
-      entries,
-      acknowledgementChannel,
-      command,
-    ),
-    prepare: () => {
-      assertTmuxOneShotImportSessionHealthy(sessionName, sourceNames);
-      snapshot = captureTmuxSessionEnvironment(sessionName, sourceNames);
-      runTmuxSourceCommands(
-        entries.map(({ sourceName, value }) => tmuxSetEnvironmentCommand(sessionName, sourceName, value)),
-        sourceNames,
-      );
-    },
-    waitForAcknowledgement: () => {
-      const acknowledged = runTmux(
-        ['wait-for', acknowledgementChannel],
-        tmuxClientEnvWithoutAuthority(process.env, sourceNames),
-      );
-      if (!acknowledged.ok) throw new Error(`failed to acknowledge tmux one-shot import: ${acknowledged.stderr}`);
-    },
-    restore: () => {
-      if (!snapshot) return;
-      restoreTmuxSessionEnvironment(sessionName, snapshot, sourceNames);
-      snapshot = null;
-    },
-  };
+	const nonce = `${process.pid}_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+	const entries = Object.entries(environment).map(([targetName, value]) => {
+		assertShellEnvKey(targetName);
+		if (value.length === 0 || /[\u0000-\u001F\u007F]/.test(value)) {
+			throw new Error(`unsafe environment value for ${targetName}`);
+		}
+		return { targetName, value };
+	});
+	const acknowledgementChannel = `omx-tmux-import-${nonce}`;
+	let file: { directory: string; path: string } | null = null;
+	return {
+		wrapCommand: (command) => {
+			if (!file) throw new Error("tmux one-shot import has not been prepared");
+			return buildTmuxOneShotWorkerImportCommand(
+				file.path,
+				entries.map(({ targetName }) => targetName),
+				acknowledgementChannel,
+				command,
+			);
+		},
+		prepare: () => {
+			if (file) throw new Error("tmux one-shot import is already prepared");
+			file = writeTmuxOneShotImportFile(entries);
+			armTmuxOneShotImportWatchdog(
+				file,
+				entries.map(({ targetName }) => targetName),
+			);
+		},
+		waitForAcknowledgement: () => {
+			const acknowledged = runTmux(
+				["wait-for", acknowledgementChannel],
+				tmuxClientEnvWithoutAuthority(
+					process.env,
+					entries.map(({ targetName }) => targetName),
+				),
+			);
+			if (!acknowledged.ok)
+				throw new Error(
+					`failed to acknowledge tmux one-shot import: ${acknowledged.stderr}`,
+				);
+		},
+		restore: () => {
+			removeTmuxOneShotImportFile(file);
+			file = null;
+		},
+	};
 }
 
-
-export function scrubTeamWorkerHudOwnershipEnv<T extends Record<string, string | undefined>>(env: T): T {
-  const scrubbed = { ...env };
-  delete scrubbed[OMX_TMUX_HUD_OWNER_ENV];
-  delete scrubbed[OMX_TMUX_HUD_LEADER_PANE_ENV];
-  return scrubbed;
+export function scrubTeamWorkerHudOwnershipEnv<
+	T extends Record<string, string | undefined>,
+>(env: T): T {
+	const scrubbed = { ...env };
+	delete scrubbed[OMX_TMUX_HUD_OWNER_ENV];
+	delete scrubbed[OMX_TMUX_HUD_LEADER_PANE_ENV];
+	return scrubbed;
 }
 
 function hasConfigOverride(args: readonly string[], key: string): boolean {
-  return someConfigOverrideBeforeEndOfOptions(args, (value) => {
-    const trimmed = value.trim();
-    return trimmed.startsWith(key) && /^\s*=/.test(trimmed.slice(key.length));
-  });
+	return someConfigOverrideBeforeEndOfOptions(args, (value) => {
+		const trimmed = value.trim();
+		return trimmed.startsWith(key) && /^\s*=/.test(trimmed.slice(key.length));
+	});
 }
 
 function shouldDisableOmxMcpForTeamWorker(env: NodeJS.ProcessEnv): boolean {
-  const raw = env[OMX_TEAM_WORKER_MCP_COMPAT_ENV]?.trim().toLowerCase();
-  return !(raw === '1' || raw === 'true' || raw === 'on' || raw === 'compat');
+	const raw = env[OMX_TEAM_WORKER_MCP_COMPAT_ENV]?.trim().toLowerCase();
+	return !(raw === "1" || raw === "true" || raw === "on" || raw === "compat");
 }
 
 function resolveCodexConfigPath(env: NodeJS.ProcessEnv): string {
-  const codexHomeOverride = env.CODEX_HOME?.trim();
-  const codexHomePath = codexHomeOverride
-    ? (isAbsolute(codexHomeOverride) ? codexHomeOverride : resolve(codexHomeOverride))
-    : join(homedir(), '.codex');
-  return join(codexHomePath, 'config.toml');
+	const codexHomeOverride = env.CODEX_HOME?.trim();
+	const codexHomePath = codexHomeOverride
+		? isAbsolute(codexHomeOverride)
+			? codexHomeOverride
+			: resolve(codexHomeOverride)
+		: join(homedir(), ".codex");
+	return join(codexHomePath, "config.toml");
 }
 
-function codexConfigDeclaresMcpServer(serverName: string, env: NodeJS.ProcessEnv): boolean {
-  try {
-    const config = readFileSync(resolveCodexConfigPath(env), 'utf-8');
-    const escaped = serverName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+function codexConfigDeclaresMcpServer(
+	serverName: string,
+	env: NodeJS.ProcessEnv,
+): boolean {
+	try {
+		const config = readFileSync(resolveCodexConfigPath(env), "utf-8");
+		const escaped = serverName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     return new RegExp(`^\\s*\\[\\s*mcp_servers\\s*\\.\\s*(?:"${escaped}"|'${escaped}'|${escaped})\\s*\\]\\s*$`, 'm')
       .test(config);
   } catch {
@@ -2163,76 +2032,97 @@ export function createTeamSession(
       for (const [key, value] of Object.entries(providerTransport)) {
         const authorityValue = authorityTransport?.[key];
         if (authorityValue !== undefined && authorityValue !== value) {
-          throw new Error(`provider environment key conflicts with authority transport: ${key}`);
-        }
-      }
-      const tmuxChildEnvironment = { ...(authorityTransport ?? {}), ...providerTransport };
-      const tmuxChildOnlyEnvNames = [...new Set([...TMUX_CHILD_ONLY_AUTHORITY_ENV, ...Object.keys(providerTransport)])];
-      trustWorkerMiseConfigIfAvailable(workerCwd);
-      const workerCommand = writeWorkerStartupScriptCommand(
-        safeTeamName,
-        i,
-        launchArgsForWorker,
-        workerCwd,
-        workerEnv,
-        workerCliPlan[i - 1],
-        startup.initialPrompt,
-        startup.workerRole,
-        tmuxChildOnlyEnvNames,
-      ) ?? buildWorkerStartupCommand(
-        safeTeamName,
-        i,
-        launchArgsForWorker,
-        workerCwd,
-        workerEnv,
-        workerCliPlan[i - 1],
-        startup.initialPrompt,
-        startup.workerRole,
-        tmuxChildOnlyEnvNames,
-      );
-      const workerImport = Object.keys(tmuxChildEnvironment).length > 0
-        ? createTmuxOneShotWorkerEnvironmentImport(sessionName, tmuxChildEnvironment)
-        : null;
-      const cmd = workerImport?.wrapCommand(workerCommand) ?? workerCommand;
-      // First split creates the right side from leader. Remaining splits stack on the right.
-      const splitDirection = i === 1 ? '-h' : '-v';
-      const splitTarget = i === 1 ? leaderPaneId : (rightStackRootPaneId ?? leaderPaneId);
-      let split: { ok: true; stdout: string } | { ok: false; stderr: string } = {
-        ok: false,
-        stderr: 'worker pane creation did not run',
-      };
-      let paneId = '';
-      let restoreEnvironmentError: unknown;
-      try {
-        workerImport?.prepare();
-        split = runTmux([
-          'split-window',
-          splitDirection,
-          '-t',
-          splitTarget,
-          '-d',
-          '-P',
-          '-F',
-          '#{pane_id}',
-          '-c',
-          tmuxWorkerCwd,
-          cmd,
-        ], tmuxClientEnvWithoutAuthority(process.env, tmuxChildOnlyEnvNames));
-        if (split.ok) {
-          paneId = split.stdout.split('\n')[0]?.trim() ?? '';
-          if (paneId.startsWith('%')) rollbackPaneIds.push(paneId);
-          workerImport?.waitForAcknowledgement();
-        }
-      } finally {
-        try {
-          workerImport?.restore();
-        } catch (error) {
-          restoreEnvironmentError = error;
-        }
-      }
-      if (!split.ok) {
-        if (restoreEnvironmentError) throw restoreEnvironmentError;
-        throw new Error(`failed to create worker pane ${i}: ${split.stderr}`);
+          throw new Error(`provider environment key conflicts with authority transport: ${key}`,
+					);
+				}
+			}
+			const tmuxChildEnvironment = {
+				...(authorityTransport ?? {}),
+				...providerTransport,
+			};
+			const tmuxChildOnlyEnvNames = [
+				...new Set([
+					...TMUX_CHILD_ONLY_AUTHORITY_ENV,
+					...Object.keys(providerTransport),
+				]),
+			];
+			trustWorkerMiseConfigIfAvailable(workerCwd);
+			const workerCommand =
+				writeWorkerStartupScriptCommand(
+					safeTeamName,
+					i,
+					launchArgsForWorker,
+					workerCwd,
+					workerEnv,
+					workerCliPlan[i - 1],
+					startup.initialPrompt,
+					startup.workerRole,
+					tmuxChildOnlyEnvNames,
+				) ??
+				buildWorkerStartupCommand(
+					safeTeamName,
+					i,
+					launchArgsForWorker,
+					workerCwd,
+					workerEnv,
+					workerCliPlan[i - 1],
+					startup.initialPrompt,
+					startup.workerRole,
+					tmuxChildOnlyEnvNames,
+				);
+			const workerImport =
+				Object.keys(tmuxChildEnvironment).length > 0
+					? createTmuxOneShotWorkerEnvironmentImport(
+							sessionName,
+							tmuxChildEnvironment,
+						)
+					: null;
+			let cmd = workerCommand;
+			// First split creates the right side from leader. Remaining splits stack on the right.
+			const splitDirection = i === 1 ? "-h" : "-v";
+			const splitTarget =
+				i === 1 ? leaderPaneId : (rightStackRootPaneId ?? leaderPaneId);
+			let split: { ok: true; stdout: string } | { ok: false; stderr: string } =
+				{
+					ok: false,
+					stderr: "worker pane creation did not run",
+				};
+			let paneId = "";
+			let restoreEnvironmentError: unknown;
+			try {
+				workerImport?.prepare();
+				cmd = workerImport?.wrapCommand(workerCommand) ?? workerCommand;
+				split = runTmux(
+					[
+						"split-window",
+						splitDirection,
+						"-t",
+						splitTarget,
+						"-d",
+						"-P",
+						"-F",
+						"#{pane_id}",
+						"-c",
+						tmuxWorkerCwd,
+						cmd,
+					],
+					tmuxClientEnvWithoutAuthority(process.env, tmuxChildOnlyEnvNames),
+				);
+				if (split.ok) {
+					paneId = split.stdout.split("\n")[0]?.trim() ?? "";
+					if (paneId.startsWith("%")) rollbackPaneIds.push(paneId);
+					workerImport?.waitForAcknowledgement();
+				}
+			} finally {
+				try {
+					workerImport?.restore();
+				} catch (error) {
+					restoreEnvironmentError = error;
+				}
+			}
+			if (!split.ok) {
+				if (restoreEnvironmentError) throw restoreEnvironmentError;
+				throw new Error(`failed to create worker pane ${i}: ${split.stderr}`);
       }
       if (!paneId || !paneId.startsWith('%')) {
         if (restoreEnvironmentError) throw restoreEnvironmentError;

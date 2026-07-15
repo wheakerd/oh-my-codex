@@ -1,7 +1,7 @@
 import { spawn } from "child_process";
 import { existsSync } from "fs";
 import { appendFile, mkdir } from "fs/promises";
-import { join } from "path";
+import { dirname,join } from "path";
 import { getPackageRoot } from "../../utils/package.js";
 import { omxRoot } from "../../utils/paths.js";
 import {
@@ -31,18 +31,20 @@ interface RunnerResult {
 const RESULT_PREFIX = "__OMX_PLUGIN_RESULT__ ";
 const RUNNER_SIGKILL_GRACE_MS = 250;
 
-function hooksLogPath(cwd: string): string {
+function hooksLogPath(cwd: string, stateRoot?: string): string {
 	const day = new Date().toISOString().slice(0, 10);
-	return join(omxRoot(cwd), "logs", `hooks-${day}.jsonl`);
+	return join(dirname(stateRoot ?? join(omxRoot(cwd), "state")), "logs", `hooks-${day}.jsonl`,
+	);
 }
 
 async function appendHooksLog(
 	cwd: string,
 	payload: Record<string, unknown>,
+	stateRoot?: string,
 ): Promise<void> {
-	await mkdir(join(omxRoot(cwd), "logs"), { recursive: true });
+	await mkdir(dirname(hooksLogPath(cwd, stateRoot)), { recursive: true });
 	await appendFile(
-		hooksLogPath(cwd),
+		hooksLogPath(cwd, stateRoot),
 		`${JSON.stringify({ timestamp: new Date().toISOString(), ...payload })}\n`,
 	).catch((error: unknown) => {
 		console.warn("[omx] warning: failed to append hook dispatch log entry", {
@@ -266,6 +268,7 @@ async function runPluginRunner(
 				pluginPath: plugin.path,
 				event,
 				sideEffectsEnabled,
+				stateRoot: options.stateRoot,
 			}),
 		);
 		child.stdin.end();
@@ -286,10 +289,12 @@ function shouldForceEnableRuntimeHookDispatch(
 
 function shouldDedupeHookEvent(event: HookEventEnvelope): boolean {
 	if (event.source !== "native") return false;
-	return event.event === "session-start"
-		|| event.event === "stop"
-		|| event.event === "session-end"
-		|| event.event === "keyword-detector";
+	return (
+		event.event === "session-start" ||
+		event.event === "stop" ||
+		event.event === "session-end" ||
+		event.event === "keyword-detector"
+	);
 }
 
 function buildHookEventFingerprint(event: HookEventEnvelope): string {
@@ -309,6 +314,7 @@ export async function dispatchHookEvent(
 	options: HookDispatchOptions = {},
 ): Promise<HookDispatchResult> {
 	const cwd = options.cwd || process.cwd();
+	const stateRoot = options.stateRoot ?? join(omxRoot(cwd), "state");
 	const env = options.env || process.env;
 	const runtimeHookDispatchEnabled =
 		shouldForceEnableRuntimeHookDispatch(event) || isHookPluginsEnabled(env);
@@ -324,13 +330,17 @@ export async function dispatchHookEvent(
 	};
 
 	if (!enabled) {
-		await appendHooksLog(cwd, {
-			type: "hook_dispatch",
-			event: event.event,
-			source: event.source,
-			enabled: false,
-			reason: "plugins_disabled",
-		});
+		await appendHooksLog(
+			cwd,
+			{
+				type: "hook_dispatch",
+				event: event.event,
+				source: event.source,
+				enabled: false,
+				reason: "plugins_disabled",
+			},
+			stateRoot,
+		);
 		return summary;
 	}
 
@@ -338,25 +348,29 @@ export async function dispatchHookEvent(
 		? buildHookEventFingerprint(event)
 		: "";
 	if (
-		dedupeFingerprint
-		&& !shouldSendLifecycleHookBroadcast(
-			join(omxRoot(cwd), "state"),
+		dedupeFingerprint &&
+		!shouldSendLifecycleHookBroadcast(
+			stateRoot,
 			event.session_id,
 			event.event,
 			dedupeFingerprint,
 		)
 	) {
 		summary.reason = "deduped";
-		await appendHooksLog(cwd, {
-			type: "hook_dispatch",
-			event: event.event,
-			source: event.source,
-			enabled: true,
-			reason: "deduped",
-			session_id: event.session_id || null,
-			thread_id: event.thread_id || null,
-			turn_id: event.turn_id || null,
-		});
+		await appendHooksLog(
+			cwd,
+			{
+				type: "hook_dispatch",
+				event: event.event,
+				source: event.source,
+				enabled: true,
+				reason: "deduped",
+				session_id: event.session_id || null,
+				thread_id: event.thread_id || null,
+				turn_id: event.turn_id || null,
+			},
+			stateRoot,
+		);
 		return summary;
 	}
 
@@ -373,28 +387,32 @@ export async function dispatchHookEvent(
 		const result = await runPluginRunner(
 			plugin,
 			event,
-			{ ...options, cwd, env },
+			{ ...options, cwd, env, stateRoot },
 			sideEffectsEnabled,
 		);
 		summary.results.push(result);
 
-		await appendHooksLog(cwd, {
-			type: "hook_plugin_dispatch",
-			event: event.event,
-			source: event.source,
-			plugin: plugin.id,
-			file: plugin.file,
-			ok: result.ok,
-			status: result.status,
-			reason: result.reason,
-			error: result.error,
-			duration_ms: result.duration_ms,
-		});
+		await appendHooksLog(
+			cwd,
+			{
+				type: "hook_plugin_dispatch",
+				event: event.event,
+				source: event.source,
+				plugin: plugin.id,
+				file: plugin.file,
+				ok: result.ok,
+				status: result.status,
+				reason: result.reason,
+				error: result.error,
+				duration_ms: result.duration_ms,
+			},
+			stateRoot,
+		);
 	}
 
 	if (dedupeFingerprint && summary.results.some((result) => result.ok)) {
 		recordLifecycleHookBroadcastSent(
-			join(omxRoot(cwd), "state"),
+			stateRoot,
 			event.session_id,
 			event.event,
 			dedupeFingerprint,

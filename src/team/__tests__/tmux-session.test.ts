@@ -31,7 +31,6 @@ import {
   isNativeWindows,
   isTmuxAvailable,
   readPaneTeamOwnerTagResult,
-  restoreTmuxOneShotImportEnvironmentAfterDelay,
   isWorkerPaneOpen,
   restoreStandaloneHudPane,
   translatePathForMsys,
@@ -62,7 +61,6 @@ import {
   evaluateStartupDirectTriggerSafetyCapture,
   mitigateCopyModeUnderlineArtifacts,
   buildTmuxOneShotWorkerImportCommand,
-  assertTmuxOneShotImportSessionHealthy,
 
 } from '../tmux-session.js';
 
@@ -3896,227 +3894,140 @@ case "$1" in
     ;;
 esac
 `,
-      async () => {
-        assert.equal(await waitForWorkerReadyAsync('omx-team-x', 1, 1), false);
-      },
-    );
+			async () => {
+				assert.equal(await waitForWorkerReadyAsync("omx-team-x", 1, 1), false);
+			},
+		);
 
-    await withEmptyPath(async () => {
-      assert.equal(await waitForWorkerReadyAsync('omx-team-x', 1, 1), false);
-    });
-  });
+		await withEmptyPath(async () => {
+			assert.equal(await waitForWorkerReadyAsync("omx-team-x", 1, 1), false);
+		});
+	});
 });
 
-describe('tmux one-shot worker environment import', () => {
-  it('builds a value-free one-shot import command with explicit acknowledgement and cleanup', () => {
-    const command = buildTmuxOneShotWorkerImportCommand(
-      'team-session',
-      [{
-        sourceName: 'OMX_TMUX_IMPORT_nonce_0',
-        targetName: 'OMX_STATE_AUTHORITY_CAPABILITY',
-      }],
-      'omx-tmux-import-ack-nonce',
-      'exec worker-command',
-    );
-    assert.match(command, /unset[\s\S]*OMX_TMUX_IMPORT_nonce_0[\s\S]*OMX_STATE_AUTHORITY_CAPABILITY/);
-    assert.match(command, /tmux show-environment[\s\S]*team-session[\s\S]*OMX_TMUX_IMPORT_nonce_0/);
-    assert.match(command, /tmux set-environment -u[\s\S]*team-session[\s\S]*OMX_TMUX_IMPORT_nonce_0/);
-    assert.doesNotMatch(command, /env -u/);
-    assert.match(command, /tmux wait-for -S[\s\S]*omx-tmux-import-ack-nonce/);
-    assert.match(command, /exec worker-command/);
-    assert.doesNotMatch(command, /exec exec worker-command/);
+describe("tmux one-shot worker environment import", () => {
+	it("builds a pane-private file import that never touches tmux environment state", () => {
+		const secret = "hostile-bearer-$(touch should-not-run)";
+		const command = buildTmuxOneShotWorkerImportCommand(
+			"/tmp/omx-tmux-import-private/environment.sh",
+			["OMX_STATE_AUTHORITY_CAPABILITY", "OMX_TEST_PROVIDER_SECRET"],
+			"omx-tmux-import-ack-nonce",
+			"exec worker-command",
+		);
 
-  });
-
-  it('scrubs the authority tuple from synchronous, asynchronous, and direct tmux clients', async () => {
-    const authorityEnv = {
-      OMX_STARTUP_CWD: 'hostile-startup-cwd',
-      OMX_STATE_AUTHORITY_PATH: '/tmp/hostile/state-authority.json',
-      OMX_STATE_AUTHORITY_ID: 'hostile-authority-id',
-      OMX_STATE_AUTHORITY_GENERATION_ID: 'hostile-generation-id',
-      OMX_STATE_AUTHORITY_WORKSPACE_DIGEST: 'hostile-workspace-digest',
-      OMX_STATE_AUTHORITY_CAPABILITY: 'hostile-bearer-$(touch should-not-run)',
-    };
-    const previous = Object.fromEntries(
-      Object.keys(authorityEnv).map((key) => [key, process.env[key]]),
-    );
-    Object.assign(process.env, authorityEnv);
-    try {
-      await withMockTmuxFixture(
-        'omx-tmux-authority-scrub-',
-        (logPath) => `#!/bin/sh
-set -eu
-for key in OMX_STARTUP_CWD OMX_STATE_AUTHORITY_PATH OMX_STATE_AUTHORITY_ID OMX_STATE_AUTHORITY_GENERATION_ID OMX_STATE_AUTHORITY_WORKSPACE_DIGEST OMX_STATE_AUTHORITY_CAPABILITY; do
-  if printenv "$key" >/dev/null; then
-    printf 'leaked:%s=%s\\n' "$key" "$(printenv "$key")" >> "${logPath}"
-  fi
-done
-printf '%s\\n' "$*" >> "${logPath}"
-case "$1" in
-  -V)
-    echo 'tmux 3.4'
-    ;;
-  show-option)
-    echo 'team-owner'
-    ;;
-  list-panes)
-    echo '0'
-    ;;
-  capture-pane)
-    echo 'How can I help you today?'
-    ;;
-esac
+		assert.match(command, /omx_import_file=/);
+		assert.match(command, /trap omx_import_cleanup EXIT HUP INT TERM/);
+		assert.match(command, /if \[ ! -f "\$omx_import_file" \]; then exit 1; fi/);
+		assert.match(command, /\. "\$omx_import_file" \|\| exit 1/);
+		assert.match(command, /rm -f -- "\$omx_import_file"/);
+		assert.match(command, /rmdir -- "\$omx_import_dir"/);
+		assert.match(
+			command,
+			/env -u [\s\S]*OMX_STATE_AUTHORITY_CAPABILITY[\s\S]*-u [\s\S]*OMX_TEST_PROVIDER_SECRET[\s\S]*tmux wait-for/,
+		);
+		assert.match(command, /tmux wait-for -S[\s\S]*omx-tmux-import-ack-nonce/);
+		assert.match(command, /exec worker-command/);
+		assert.doesNotMatch(
+			command,
+			/show-environment|set-environment|source-file/,
+		);
+		assert.doesNotMatch(
+			command,
+			new RegExp(secret.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
+		);
+	});
+	it("consumes and removes the private transport before its tmux acknowledgement", async () => {
+		const root = await mkdtemp(join(tmpdir(), "omx-tmux-private-import-"));
+		const importDirectory = join(root, "private");
+		const importFile = join(importDirectory, "environment.sh");
+		const fakeBin = join(root, "bin");
+		const tmuxLog = join(root, "tmux.log");
+		try {
+			await mkdir(importDirectory, { recursive: true, mode: 0o700 });
+			await mkdir(fakeBin, { recursive: true, mode: 0o700 });
+			await chmod(importDirectory, 0o700);
+			await writeFile(
+				importFile,
+				"export OMX_STATE_AUTHORITY_CAPABILITY='private-bearer'\n",
+				{ mode: 0o600 },
+			);
+			await writeFile(
+				join(fakeBin, "tmux"),
+				`#!/bin/sh
+if [ -n "${"$"}OMX_STATE_AUTHORITY_CAPABILITY" ]; then
+  printf 'bearer-leaked' > ${JSON.stringify(tmuxLog)}
+  exit 1
+fi
+printf '%s' "${"$"}*" > ${JSON.stringify(tmuxLog)}
 `,
-        async ({ logPath }) => {
-          assert.equal(isTmuxAvailable(), true);
-          assert.equal(isWorkerPaneOpen('team-session', 1), true);
-          assert.deepEqual(readPaneTeamOwnerTagResult('%1'), {
-            status: 'value',
-            value: 'team-owner',
-          });
-          assert.deepEqual(
-            await evaluateStartupDirectTriggerSafety('team-session', 1),
-            { safe: true, reason: 'ready_prompt' },
-          );
-          assert.doesNotMatch(await readFile(logPath, 'utf-8'), /leaked:/);
-        },
-      );
-    } finally {
-      for (const [key, value] of Object.entries(previous)) {
-        if (typeof value === 'string') process.env[key] = value;
-        else delete process.env[key];
-      }
-    }
-  });
+				{ mode: 0o700 },
+			);
+			await chmod(join(fakeBin, "tmux"), 0o700);
 
-  it('restores a watchdog snapshot without evaluating hostile tmux values', async () => {
-    const state = await mkdtemp(join(tmpdir(), 'omx-tmux-watchdog-success-'));
-    const markerPath = join(state, 'hostile-value-executed');
-    const sourceName = 'OMX_TMUX_IMPORT_watchdog_0';
-    const sessionName = `team;$(touch ${markerPath})`;
-    try {
-      await withMockTmuxFixture(
-        'omx-tmux-watchdog-success-bin-',
-        (logPath) => `#!/bin/sh
-set -eu
-printf '%s\\n' "$*" >> "${logPath}"
-case "$1" in
-  show-environment)
-    printf '%s\\n' '-${sourceName}'
-    ;;
-  wait-for)
-    ;;
-  source-file)
-    cat >> "${logPath}"
-    ;;
-esac
-`,
-        async ({ logPath }) => {
-          restoreTmuxOneShotImportEnvironmentAfterDelay(
-            sessionName,
-            [sourceName],
-            'watchdog-ready',
-            1,
-          );
-          await new Promise((resolve) => setTimeout(resolve, 25));
-          const log = await readFile(logPath, 'utf-8');
-          assert.match(log, /source-file -/);
-          assert.match(log, new RegExp(`set-environment -t .* -r ${sourceName}`));
-          assert.equal(fs.existsSync(markerPath), false);
-        },
-      );
-    } finally {
-      await rm(state, { recursive: true, force: true });
-    }
-  });
+			const command = buildTmuxOneShotWorkerImportCommand(
+				importFile,
+				["OMX_STATE_AUTHORITY_CAPABILITY"],
+				"omx-tmux-import-ack-private",
+				"exec /bin/sh -c 'test \"$OMX_STATE_AUTHORITY_CAPABILITY\" = private-bearer'",
+			);
+			const result = spawnSync("/bin/sh", ["-c", command], {
+				encoding: "utf-8",
+				env: {
+					...process.env,
+					PATH: `${fakeBin}${delimiter}${process.env.PATH ?? ""}`,
+				},
+			});
 
-  it('quarantines the session after watchdog restore failure and blocks the next import preflight', async () => {
+			assert.equal(result.status, 0, result.stderr);
+			assert.equal(fs.existsSync(importFile), false);
+			assert.equal(fs.existsSync(importDirectory), false);
+			assert.equal(
+				await readFile(tmuxLog, "utf-8"),
+				"wait-for -S omx-tmux-import-ack-private",
+			);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
 
-    const state = await mkdtemp(join(tmpdir(), 'omx-tmux-watchdog-timeout-'));
-    const markerPath = join(state, 'hostile-timeout-executed');
-    const sourceName = 'OMX_TMUX_IMPORT_watchdog_timeout_0';
-    const providerSourceName = 'OMX_TMUX_IMPORT_watchdog_timeout_1';
+	it("fails closed before worker launch when the one-use file is absent", async () => {
+		const root = await mkdtemp(
+			join(tmpdir(), "omx-tmux-private-import-missing-"),
+		);
+		const marker = join(root, "worker-ran");
+		try {
+			const command = buildTmuxOneShotWorkerImportCommand(
+				join(root, "missing", "environment.sh"),
+				["OMX_STATE_AUTHORITY_CAPABILITY"],
+				"omx-tmux-import-ack-missing",
+				`exec/bin/sh
+ -c 'touch ${marker}'`,
+			);
+			const result = spawnSync("/bin/sh", ["-c", command], {
+				encoding: "utf-8",
+			});
 
-    const sessionName = `team;$(touch ${markerPath})`;
-    const previousExitCode = process.exitCode;
-    process.exitCode = undefined;
-    try {
-      await withMockTmuxFixture(
-        'omx-tmux-watchdog-timeout-bin-',
-        (logPath) => `#!/bin/sh
-set -eu
-printf '%s\\n' "$*" >> "${logPath}"
-case "$1" in
-  show-environment)
-    printf '%s\\n' '-${sourceName}'
-    printf '%s\\n' '-${providerSourceName}'
-
-
-    ;;
-  wait-for)
-    ;;
-  source-file)
-    cat >/dev/null
-    exit 1
-    ;;
-  set-environment)
-    ;;
-  set-option)
-    printf '1\n' > "${logPath}.quarantine"
-    ;;
-  show-option)
-    if [ -f "${logPath}.quarantine" ]; then cat "${logPath}.quarantine"; fi
-    ;;
-
-esac
-`,
-        async ({ logPath }) => {
-          restoreTmuxOneShotImportEnvironmentAfterDelay(
-            sessionName,
-            [sourceName, providerSourceName],
-            'watchdog-ready-timeout',
-            1,
-          );
-          await new Promise((resolve) => setTimeout(resolve, 25));
-          const log = await readFile(logPath, 'utf-8');
-          assert.equal((log.match(/^source-file -$/gm) ?? []).length, 3);
-          assert.match(
-            log,
-            new RegExp(`set-environment -u -t .* -- ${sourceName}`),
-          );
-          assert.match(
-            log,
-            new RegExp(`set-environment -u -t .* -- ${providerSourceName}`),
-          );
-          assert.match(log, /set-option -t .* @omx_one_shot_import_restore_failure 1/);
-          assert.equal(process.exitCode, 1);
-          assert.throws(
-            () => assertTmuxOneShotImportSessionHealthy(
-              sessionName,
-              [sourceName, providerSourceName],
-            ),
-            /quarantined session/,
-          );
-          assert.equal(fs.existsSync(markerPath), false);
-        },
-      );
-    } finally {
-      process.exitCode = previousExitCode;
-      await rm(state, { recursive: true, force: true });
-    }
-  });
+			assert.notEqual(result.status, 0);
+			assert.equal(fs.existsSync(marker), false);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
 });
 
-describe('createTeamSession tmux instance tagging', () => {
-  it('rejects incompatible non-Codex and mixed Codex plans before any direct tmux mutation', async () => {
-    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-direct-policy-preflight-'));
-    const previousTmux = process.env.TMUX;
-    const previousTmuxPane = process.env.TMUX_PANE;
-    const previousBypassInstructions = process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
-    try {
-      await withMockTmuxFixture(
-        'omx-tmux-direct-policy-preflight-',
-        (logPath) => `#!/bin/sh
+describe("createTeamSession tmux instance tagging", () => {
+	it("rejects incompatible non-Codex and mixed Codex plans before any direct tmux mutation", async () => {
+		const cwd = await mkdtemp(
+			join(tmpdir(), "omx-team-direct-policy-preflight-"),
+		);
+		const previousTmux = process.env.TMUX;
+		const previousTmuxPane = process.env.TMUX_PANE;
+		const previousBypassInstructions =
+			process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+		try {
+			await withMockTmuxFixture(
+				"omx-tmux-direct-policy-preflight-",
+				(logPath) => `#!/bin/sh
 set -eu
 printf '%s\n' "$*" >> "${logPath}"
 case "\${1:-}" in

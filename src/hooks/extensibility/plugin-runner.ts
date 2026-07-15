@@ -11,6 +11,7 @@ interface RunnerRequest {
   pluginPath: string;
   event: HookEventEnvelope;
   sideEffectsEnabled?: boolean;
+	stateRoot?: string;
 }
 
 interface RunnerResult {
@@ -51,36 +52,43 @@ async function main(): Promise<void> {
 
   try {
     const moduleUrl = `${pathToFileURL(request.pluginPath).href}?t=${Date.now()}`;
-    const loaded = await import(moduleUrl) as HookPluginModule;
-    if (typeof loaded.onHookEvent !== 'function') {
-      finish({ ok: false, plugin: pluginId, reason: 'invalid_export' }, 1);
-      return;
-    }
+		const loaded = (await import(moduleUrl)) as HookPluginModule;
+		if (typeof loaded.onHookEvent !== "function") {
+			finish({ ok: false, plugin: pluginId, reason: "invalid_export" }, 1);
+			return;
+		}
 
-    const sdk = createHookPluginSdk({
-      cwd: request.cwd,
-      pluginName: pluginId,
-      event: request.event,
-      sideEffectsEnabled: request.sideEffectsEnabled !== false,
-    });
+		const sdk = createHookPluginSdk({
+			cwd: request.cwd,
+			pluginName: pluginId,
+			event: request.event,
+			sideEffectsEnabled: request.sideEffectsEnabled !== false,
+			stateRoot: request.stateRoot,
+		});
 
-    await Promise.resolve(loaded.onHookEvent(request.event, sdk));
-    finish({ ok: true, plugin: pluginId, reason: 'ok' }, 0);
-  } catch (error) {
-    finish({
-      ok: false,
-      plugin: pluginId,
-      reason: 'runner_error',
-      error: error instanceof Error ? error.message : String(error),
-    }, 1);
-  }
+		await Promise.resolve(loaded.onHookEvent(request.event, sdk));
+		finish({ ok: true, plugin: pluginId, reason: "ok" }, 0);
+	} catch (error) {
+		finish(
+			{
+				ok: false,
+				plugin: pluginId,
+				reason: "runner_error",
+				error: error instanceof Error ? error.message : String(error),
+			},
+			1,
+		);
+	}
 }
 
 await main().catch((error) => {
-  finish({
-    ok: false,
-    plugin: 'unknown',
-    reason: 'runner_error',
-    error: error instanceof Error ? error.message : String(error),
-  }, 1);
+	finish(
+		{
+			ok: false,
+			plugin: "unknown",
+			reason: "runner_error",
+			error: error instanceof Error ? error.message : String(error),
+		},
+		1,
+	);
 });

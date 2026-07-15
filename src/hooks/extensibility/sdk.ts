@@ -10,7 +10,7 @@ interface HookPluginSdkOptions {
   pluginName: string;
   event: HookEventEnvelope;
   sideEffectsEnabled?: boolean;
-}
+stateRoot?: string;}
 
 export function createHookPluginSdk(options: HookPluginSdkOptions): HookPluginSdk {
   const pluginName = sanitizeHookPluginName(options.pluginName);
@@ -20,9 +20,10 @@ export function createHookPluginSdk(options: HookPluginSdkOptions): HookPluginSd
       ...options,
       pluginName,
     }),
-    log: createHookPluginLogger(options.cwd, pluginName, options.event),
-    state: createHookPluginStateApi(options.cwd, pluginName),
-    omx: createHookPluginOmxApi(options.cwd),
+    log: createHookPluginLogger(options.cwd, pluginName, options.event,
+			options.stateRoot,),
+    state: createHookPluginStateApi(options.cwd, pluginName, options.stateRoot),
+    omx: createHookPluginOmxApi(options.cwd, options.stateRoot),
   };
 }
 
