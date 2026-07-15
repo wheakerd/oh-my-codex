@@ -3341,20 +3341,18 @@ function isTypedAgentRolePayload(payload: CodexHookPayload): boolean {
   return agentRole !== "" && resolveInstalledRoleName(agentRole) !== null;
 }
 
-// #3181: detect a runtime-set native subagent PreToolUse. The thread_spawn provenance
-// is set by the runtime (not agent-controlled tool arguments), so its presence marks a
-// child/subagent turn that must never be attested as the session leader.
+// #3181: detect a runtime-set native subagent PreToolUse. The runtime sets
+// source.subagent.thread_spawn (not agent-controlled tool arguments), so the mere
+// STRUCTURAL PRESENCE of that carrier — even if its parent id is blank, malformed, or
+// null — marks a child/subagent turn that must never be attested as the session leader.
+// This is a negative security decision, so it fails closed on any present carrier rather
+// than requiring a well-formed parent id.
 function hasSubagentThreadSpawnProvenance(payload: CodexHookPayload): boolean {
-  const source = safeObject(payload.source);
-  const subagent = safeObject(source?.subagent);
-  const threadSpawn = safeObject(subagent?.thread_spawn);
-  const parentThreadId = safeString(
-    threadSpawn?.parent_thread_id
-      ?? threadSpawn?.parentThreadId
-      ?? threadSpawn?.leader_thread_id
-      ?? threadSpawn?.leaderThreadId,
-  ).trim();
-  return parentThreadId !== "";
+  const source = payload.source;
+  if (!source || typeof source !== "object") return false;
+  const subagent = (source as Record<string, unknown>).subagent;
+  if (!subagent || typeof subagent !== "object") return false;
+  return Object.prototype.hasOwnProperty.call(subagent, "thread_spawn");
 }
 
 // #3181: positive counter-evidence guard. A thread durably tracked as a subagent in ANY
@@ -10278,6 +10276,8 @@ export async function dispatchCodexNativeHook(
         // the non-subagent SessionStart reconcile branch, so the leader thread id is the
         // reconciled native session id. Best-effort: never block SessionStart.
         if (canonicalSessionId && resolvedNativeSessionId
+          && readPayloadAgentRole(payload) === ""
+          && !hasSubagentThreadSpawnProvenance(payload)
           && !(await isThreadTrackedAsSubagent(cwd, resolvedNativeSessionId))) {
           try {
             attestLeaderThread(cwd, {
@@ -10598,7 +10598,7 @@ export async function dispatchCodexNativeHook(
       allowImplicitSessionSideEffects
       && !canonicalSessionId
       && nativeSessionId
-      && !isTypedAgentRolePayload(payload)
+      && readPayloadAgentRole(payload) === ""
       && !hasSubagentThreadSpawnProvenance(payload)
     ) {
       const preToolUseLeaderThreadId = readPayloadThreadId(payload);

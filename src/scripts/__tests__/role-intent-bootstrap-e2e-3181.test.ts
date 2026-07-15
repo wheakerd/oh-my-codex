@@ -151,4 +151,70 @@ describe('#3181 end-to-end fresh App turn bootstrap', () => {
       await rm(cwd, { recursive: true, force: true });
     }
   });
+
+  it('never bootstraps a leader from a PreToolUse carrying a malformed/blank thread_spawn carrier', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-3181-e2e-malformed-spawn-'));
+    const priorEnv = { OMX_SESSION_ID: process.env.OMX_SESSION_ID, CODEX_SESSION_ID: process.env.CODEX_SESSION_ID, SESSION_ID: process.env.SESSION_ID };
+    try {
+      delete process.env.OMX_SESSION_ID;
+      delete process.env.CODEX_SESSION_ID;
+      delete process.env.SESSION_ID;
+      const childThreadId = 'codex-native-malformed-spawn';
+      // Present-but-malformed thread_spawn carrier (blank parent id) is still child
+      // provenance and must veto leader bootstrap: no pointer, no attestation.
+      await dispatchCodexNativeHook(
+        {
+          hook_event_name: 'PreToolUse',
+          cwd,
+          session_id: childThreadId,
+          thread_id: childThreadId,
+          tool_name: 'Bash',
+          tool_use_id: 'tool-malformed-spawn',
+          source: { subagent: { thread_spawn: { parent_thread_id: '' } } },
+          tool_input: { command: 'omx ralplan role-intent write --role architect --parent-thread "$CODEX_THREAD_ID" --json' },
+        },
+        { cwd, sessionOwnerPid: process.pid },
+      );
+      const state = await readSubagentTrackingState(cwd);
+      assert.equal(state.sessions[childThreadId]?.leader_attested_at, undefined, 'malformed thread_spawn must not attest as leader');
+    } finally {
+      if (priorEnv.OMX_SESSION_ID !== undefined) process.env.OMX_SESSION_ID = priorEnv.OMX_SESSION_ID;
+      if (priorEnv.CODEX_SESSION_ID !== undefined) process.env.CODEX_SESSION_ID = priorEnv.CODEX_SESSION_ID;
+      if (priorEnv.SESSION_ID !== undefined) process.env.SESSION_ID = priorEnv.SESSION_ID;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('never bootstraps a leader from a PreToolUse carrying an explicit non-installed agent_role', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-3181-e2e-unknown-role-'));
+    const priorEnv = { OMX_SESSION_ID: process.env.OMX_SESSION_ID, CODEX_SESSION_ID: process.env.CODEX_SESSION_ID, SESSION_ID: process.env.SESSION_ID };
+    try {
+      delete process.env.OMX_SESSION_ID;
+      delete process.env.CODEX_SESSION_ID;
+      delete process.env.SESSION_ID;
+      const childThreadId = 'codex-native-unknown-role';
+      // An explicit but non-installed agent role is still role provenance and must veto
+      // leader bootstrap even though it does not resolve to an installed OMX agent.
+      await dispatchCodexNativeHook(
+        {
+          hook_event_name: 'PreToolUse',
+          cwd,
+          session_id: childThreadId,
+          thread_id: childThreadId,
+          agent_role: 'collaboration-child',
+          tool_name: 'Bash',
+          tool_use_id: 'tool-unknown-role',
+          tool_input: { command: 'omx ralplan role-intent write --role architect --parent-thread "$CODEX_THREAD_ID" --json' },
+        },
+        { cwd, sessionOwnerPid: process.pid },
+      );
+      const state = await readSubagentTrackingState(cwd);
+      assert.equal(state.sessions[childThreadId]?.leader_attested_at, undefined, 'explicit non-installed agent_role must not attest as leader');
+    } finally {
+      if (priorEnv.OMX_SESSION_ID !== undefined) process.env.OMX_SESSION_ID = priorEnv.OMX_SESSION_ID;
+      if (priorEnv.CODEX_SESSION_ID !== undefined) process.env.CODEX_SESSION_ID = priorEnv.CODEX_SESSION_ID;
+      if (priorEnv.SESSION_ID !== undefined) process.env.SESSION_ID = priorEnv.SESSION_ID;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
 });
