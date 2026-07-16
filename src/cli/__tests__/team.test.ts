@@ -1412,6 +1412,11 @@ describe('teamCommand shutdown --force parsing', () => {
         1,
         wd,
       );
+      const config = await readTeamConfig('team-shutdown-mode-state', wd);
+      assert.ok(config);
+      if (!config) return;
+      config.tmux_session = '';
+      await saveTeamConfig(config, wd);
 
       console.log = (...args: unknown[]) => logs.push(args.map(String).join(' '));
       console.warn = (...args: unknown[]) => warns.push(args.map(String).join(' '));
@@ -1467,6 +1472,11 @@ describe('teamCommand shutdown --force parsing', () => {
         1,
         wd,
       );
+      const config = await readTeamConfig(teamName, wd);
+      assert.ok(config);
+      if (!config) return;
+      config.tmux_session = '';
+      await saveTeamConfig(config, wd);
 
       await teamCommand(['shutdown', teamName, '--force']);
 
@@ -1514,6 +1524,11 @@ describe('teamCommand shutdown --force parsing', () => {
         1,
         wd,
       );
+      const config = await readTeamConfig(teamName, wd);
+      assert.ok(config);
+      if (!config) return;
+      config.tmux_session = '';
+      await saveTeamConfig(config, wd);
 
       await teamCommand(['shutdown', teamName, '--force']);
 
@@ -1566,6 +1581,11 @@ describe('teamCommand shutdown --force parsing', () => {
         1,
         wd,
       );
+      const config = await readTeamConfig(teamName, wd);
+      assert.ok(config);
+      if (!config) return;
+      config.tmux_session = '';
+      await saveTeamConfig(config, wd);
 
       await teamCommand(['shutdown', teamName, '--force']);
 

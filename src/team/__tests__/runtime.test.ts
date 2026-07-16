@@ -9854,6 +9854,91 @@ esac
     }
   });
 
+  it('shutdownTeam clears mismatched restored-HUD config before repeated detached recovery leaves a live non-HUD pane untouched', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-shutdown-restored-hud-mismatched-detached-'));
+    const teamName = 'hud-mismatch-detached';
+    try {
+      await withMockTmuxFixture(
+        {
+          dirPrefix: 'omx-runtime-shutdown-restored-hud-mismatched-detached-bin-',
+          tmuxScript: (tmuxLogPath) => `#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "${tmuxLogPath}"
+case "$1" in
+  -V)
+    echo 'tmux 3.4'
+    ;;
+  list-panes)
+    case "$*" in
+      *"-a -F #{pane_id}"*)
+        printf '%%11\\t0\\t2000000011\\n%%44\\t0\\t2000000044\\n%%45\\t0\\t2000000045\\n'
+        ;;
+      *"-t %11 -F #{pane_id}"*"#{pane_current_command}"*)
+        printf '%%11\\tzsh\\tzsh\\n%%44\\tnode\\tnot-a-hud\\n%%45\\tnode\\tnot-a-hud\\n'
+        ;;
+      *) exit 1 ;;
+    esac
+    ;;
+  show-option)
+    case "$*" in
+      *"-p -t %11 @omx_team_pane_owner_id"*|*"-p -t %45 @omx_team_pane_owner_id"*)
+        printf 'team:hud-mismatch-detached\\n'
+        ;;
+      *) exit 1 ;;
+    esac
+    ;;
+  *) exit 1 ;;
+esac
+`,
+        },
+        async ({ tmuxLogPath }) => {
+          await initTeamState(teamName, 'restored HUD mismatch detached recovery test', 'executor', 1, cwd);
+          const config = await readTeamConfig(teamName, cwd);
+          assert.ok(config);
+          if (!config) return;
+          config.tmux_session = 'leader';
+          config.tmux_pane_owner_id = 'team:hud-mismatch-detached';
+          config.leader_pane_id = '%11';
+          config.leader_pane_pid = 2000000011;
+          config.hud_pane_id = '%45';
+          config.hud_pane_pid = 2000000045;
+          config.workers = [];
+          config.worker_count = 0;
+          await saveTeamConfig(config, cwd);
+          const debtPath = join(cwd, '.omx', 'state', 'team', teamName, '.restored-hud-cleanup-debt.json');
+          await writeFile(debtPath, `${JSON.stringify({
+            schema_version: 1,
+            operation: 'restored_hud_cleanup',
+            pane_id: '%44',
+            pane_pid: 2000000044,
+            leader_pane_id: '%11',
+            leader_pane_pid: 2000000011,
+            leader_pane_owner_id: 'team:hud-mismatch-detached',
+            hud_owner_leader_pane_id: '%11',
+          })}\n`);
+
+          for (let attempt = 0; attempt < 2; attempt++) {
+            await assert.rejects(
+              () => shutdownTeam(teamName, cwd, { force: true }),
+              /restored_hud_cleanup_debt_unresolved:%44/,
+            );
+            const persisted = await readTeamConfig(teamName, cwd);
+            assert.ok(persisted);
+            assert.equal(persisted?.hud_pane_id, null);
+            assert.equal(persisted?.hud_pane_pid, null);
+            assert.equal(existsSync(debtPath), true);
+          }
+
+          const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
+          assert.doesNotMatch(tmuxLog, /kill-pane -t %44|kill-pane -t %45|kill-session|resize-pane|select-pane|send-keys|run-shell/);
+          assert.doesNotMatch(tmuxLog, /show-option -p -t %45 @omx_team_pane_owner_id/);
+        },
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it('shutdownTeam preserves unpersisted legacy worker-looking panes without owner tags', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-shutdown-unpersisted-legacy-worker-'));
     const teamName = 'team-unpersisted-legacy-worker';

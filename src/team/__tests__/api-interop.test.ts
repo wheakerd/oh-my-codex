@@ -30,8 +30,9 @@ import {
   updateWorkerHeartbeat,
   writeMonitorSnapshot,
   writeWorkerStatus,
+  readTeamConfig,
+  saveTeamConfig,
 } from '../state.js';
-
 async function setupTeam(name: string): Promise<{ cwd: string; cleanup: () => Promise<void> }> {
   const cwd = await mkdtemp(join(tmpdir(), `omx-interop-${name}-`));
   const previousTeamStateRoot = process.env.OMX_TEAM_STATE_ROOT;
@@ -142,6 +143,43 @@ process.stdout.write(JSON.stringify({ event: 'ok' }) + '\\n');
     else delete process.env.OMX_RUNTIME_BRIDGE;
   }
 
+}
+async function markTeamSessionAuthoritativelyAbsent(teamName: string, cwd: string): Promise<void> {
+  const config = await readTeamConfig(teamName, cwd);
+  assert.ok(config, 'team config should exist');
+  if (!config) throw new Error('missing team config');
+
+  // These API cleanup fixtures model an initialized but never materialized
+  // interactive team. An empty configured session is canonical evidence that
+  // no detached session exists; it authorizes state cleanup but never a tmux
+  // effect.
+  config.tmux_session = '';
+  config.leader_pane_id = null;
+  config.leader_pane_pid = null;
+  config.hud_pane_id = null;
+  config.hud_pane_pid = null;
+  for (const worker of config.workers) {
+    worker.pane_id = '';
+    worker.pid = undefined;
+  }
+  await saveTeamConfig(config, cwd);
+
+  const manifest = await readTeamManifestV2(teamName, cwd);
+  assert.ok(manifest, 'team manifest should exist');
+  if (!manifest) throw new Error('missing team manifest');
+  await writeTeamManifestV2({
+    ...manifest,
+    tmux_session: '',
+    leader_pane_id: null,
+    leader_pane_pid: null,
+    hud_pane_id: null,
+    hud_pane_pid: null,
+    workers: manifest.workers.map((worker) => ({
+      ...worker,
+      pane_id: '',
+      pid: undefined,
+    })),
+  }, cwd);
 }
 
 async function readTeamDeliveryLog(cwd: string): Promise<Array<Record<string, unknown>>> {
@@ -2118,6 +2156,8 @@ describe('executeTeamApiOperation: cleanup', () => {
   it('routes normal cleanup through shutdownTeam', async () => {
     const { cwd, cleanup } = await setupTeam('cleanup-team');
     try {
+      await markTeamSessionAuthoritativelyAbsent('cleanup-team', cwd);
+
       const result = await executeTeamApiOperation('cleanup', {
         team_name: 'cleanup-team',
       }, cwd);
@@ -2134,6 +2174,8 @@ describe('executeTeamApiOperation: cleanup', () => {
   it('deactivates lingering team mode state after cleanup removes canonical team state', async () => {
     const { cwd, cleanup } = await setupTeam('cleanup-mode-sync');
     try {
+      await markTeamSessionAuthoritativelyAbsent('cleanup-mode-sync', cwd);
+
       const stateDir = join(cwd, '.omx', 'state');
       const sessionId = 'sess-cleanup-mode-sync';
       await mkdir(join(stateDir, 'sessions', sessionId), { recursive: true });
@@ -2237,6 +2279,7 @@ describe('executeTeamApiOperation: cleanup', () => {
   it('allows cleanup with confirm_issues when failed tasks remain', async () => {
     const { cwd, cleanup } = await setupTeam('cleanup-confirm-issues');
     try {
+      await markTeamSessionAuthoritativelyAbsent('cleanup-confirm-issues', cwd);
       await createTask('cleanup-confirm-issues', {
         subject: 'failed task',
         description: 'requires explicit confirmation',

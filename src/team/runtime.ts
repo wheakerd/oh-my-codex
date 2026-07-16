@@ -2424,7 +2424,6 @@ type ExactPaneProcessProbe =
  */
 function reproveExactPaneAfterProcessEsrcH(
   paneId: string,
-  authorizedPanePid: number,
 ): ExactPaneProcessProbe {
   const proof = readExactPaneProofSync(paneId);
   if (proof.status === 'unavailable') return { status: 'unavailable', proof };
@@ -2449,7 +2448,7 @@ function signalExactPaneProcess(
     return { status: 'alive' };
   } catch (error) {
     return (error as NodeJS.ErrnoException).code === 'ESRCH'
-      ? reproveExactPaneAfterProcessEsrcH(paneId, authorizedPanePid)
+      ? reproveExactPaneAfterProcessEsrcH(paneId)
       : { status: 'unknown' };
   }
 }
@@ -2467,7 +2466,7 @@ function probeExactPaneProcess(
     return proof.status === 'gone' ? { status: 'stopped' } : { status: 'alive' };
   } catch (error) {
     return (error as NodeJS.ErrnoException).code === 'ESRCH'
-      ? reproveExactPaneAfterProcessEsrcH(paneId, authorizedPanePid)
+      ? reproveExactPaneAfterProcessEsrcH(paneId)
       : { status: 'unknown' };
   }
 }
@@ -4518,16 +4517,13 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
       if (!(error instanceof Error) || !error.message.startsWith('restored_hud_cleanup_debt_unresolved:')) {
         throw error;
       }
+      // The config identity is not the debt identity. Remove it durably before
+      // replaying the pinned obligation: a later detached-session teardown must
+      // not treat a live, same-PID/owner non-HUD pane as the restored HUD.
+      config.hud_pane_id = null;
+      config.hud_pane_pid = undefined;
+      await saveTeamConfig(config, cwd);
       reconcileRestoredHudCleanupDebtSync(cwd, restoredHudDebtRoot);
-      // A crash can leave the old shared HUD identity in config after the
-      // restored pane debt has been replayed. Only an exact absent/dead proof
-      // permits forgetting that stale config reference; a live or unavailable
-      // pane remains subject to the normal fail-closed teardown path below.
-      if (readExactPaneProofSync(configuredRestoredHudPaneId).status === 'gone') {
-        config.hud_pane_id = null;
-        config.hud_pane_pid = undefined;
-        await saveTeamConfig(config, cwd);
-      }
     }
   } else {
     reconcileRestoredHudCleanupDebtSync(cwd, restoredHudDebtRoot);
