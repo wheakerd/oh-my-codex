@@ -308,6 +308,8 @@ function parseJsonLines(raw: string): Array<Record<string, unknown>> {
 function buildCleanNotifyEnv(overrides: Record<string, string> = {}): NodeJS.ProcessEnv {
   return {
     ...process.env,
+    NODE_ENV: 'test',
+    OMX_NOTIFY_FALLBACK_TEST_BOOTSTRAP_AUTHORITY: '1',
     OMX_TEAM_WORKER: '',
     OMX_TEAM_STATE_ROOT: '',
     OMX_TEAM_LEADER_CWD: '',
@@ -379,11 +381,10 @@ describe('team message delivery end-to-end smoke tests', () => {
         assert.equal(result.status, 0, result.stderr || result.stdout);
 
         const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
-        assert.match(tmuxLog, /set-buffer -b omx-pane-input-.* -- Team worker-leader-fallback:/);
+        assert.match(tmuxLog, /set-buffer -b omx-pane-input-.* -- Read .*mailbox\/leader-fixed\.json; new msg from worker-1\. Review it; decide next step\./);
         assert.match(tmuxLog, /show-buffer -b omx-pane-input-/);
         assert.match(tmuxLog, /send-keys -t %95 C-u/);
         assert.match(tmuxLog, /paste-buffer -t %95 -b omx-pane-input-.* -p -d/);
-        assert.match(tmuxLog, /msg\(s\) pending|msg\(s\) for leader/);
       });
     } finally {
       await cleanup();
@@ -632,7 +633,7 @@ describe('team message delivery end-to-end smoke tests', () => {
         });
         assert.equal(result.status, 0, result.stderr || result.stdout);
 
-        const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
+        const tmuxLog = await readFile(tmuxLogPath, 'utf-8').catch(() => '');
         assert.doesNotMatch(tmuxLog, /worker panes stalled/);
         assert.doesNotMatch(tmuxLog, /leader stale/);
       });

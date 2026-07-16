@@ -738,6 +738,17 @@ function buildWatcherFixtureEnv(
 	};
 }
 
+function buildWatcherBootstrapEnv(
+	cwd: string,
+	overrides: Record<string, string> = {},
+): NodeJS.ProcessEnv {
+	return {
+		...buildCleanNotifyEnv(),
+		OMX_SESSION_ID: watcherFixtureSessionIds.get(cwd) ?? "notify-fallback-control",
+		...overrides,
+	};
+}
+
 describe("notify-fallback watcher", () => {
 	it("uses offset-bounded rollout reads instead of re-reading whole tracked files", async () => {
 		const source = await readFile(
@@ -1100,7 +1111,7 @@ describe("notify-fallback watcher", () => {
 				{
 					cwd: wd,
 					stdio: "ignore",
-					env: buildWatcherFixtureEnv(wd, { HOME: tempHome }),
+					env: buildWatcherBootstrapEnv(wd, { HOME: tempHome }),
 				},
 			);
 
@@ -1235,7 +1246,7 @@ describe("notify-fallback watcher", () => {
 				{
 					cwd: wd,
 					stdio: "ignore",
-					env: buildWatcherFixtureEnv(wd, { HOME: tempHome }),
+					env: buildWatcherBootstrapEnv(wd, { HOME: tempHome }),
 				},
 			);
 
@@ -1387,7 +1398,7 @@ describe("notify-fallback watcher", () => {
 				{
 					cwd: wd,
 					stdio: "ignore",
-					env: buildWatcherFixtureEnv(wd, { HOME: tempHome }),
+					env: buildWatcherBootstrapEnv(wd, { HOME: tempHome }),
 				},
 			);
 
@@ -1501,6 +1512,7 @@ describe("notify-fallback watcher", () => {
 		const wd = await mkdtemp(join(tmpdir(), "omx-fallback-authority-noop-"));
 		try {
 			hardenTestAuthorityTreeSync(wd);
+			await mkdir(join(wd, ".omx", "state", "sessions"), { recursive: true });
 			await mkdir(join(wd, ".omx", "logs"), { recursive: true });
 			hardenTestAuthorityTreeSync(wd);
 			await mkdir(join(wd, ".omx", "state"), { recursive: true });
@@ -1527,7 +1539,7 @@ describe("notify-fallback watcher", () => {
 					"--poll-ms",
 					"50",
 				],
-				{ encoding: "utf-8", env: buildCleanNotifyEnv() },
+				{ encoding: "utf-8", env: buildWatcherBootstrapEnv(wd) },
 			);
 			assert.equal(result.status, 0, result.stderr || result.stdout);
 
@@ -3773,7 +3785,7 @@ exit 0
 				import.meta.url,
 			).pathname;
 			const env = {
-				...buildCleanNotifyEnv(),
+				...buildWatcherFixtureEnv(wd),
 				PATH: `${fakeBinDir}:${process.env.PATH || ""}`,
 			};
 
@@ -6478,6 +6490,7 @@ exit 0
 			`notify-fallback-${new Date().toISOString().split("T")[0]}.jsonl`,
 		);
 		let child: ReturnType<typeof spawn> | undefined;
+		const childStderr: Buffer[] = [];
 
 		try {
 			await installWatcherFixtureAuthority(wd, "sess-parent-exit");
@@ -6511,13 +6524,14 @@ exit 0
 				],
 				{
 					cwd: wd,
-					stdio: "ignore",
+					stdio: ["ignore", "ignore", "pipe"],
 					env: buildWatcherFixtureEnv(wd, { HOME: tempHome }),
 				},
 			);
+			child.stderr?.on("data", (chunk: Buffer) => childStderr.push(chunk));
 
 			await waitForExit(child, 4000);
-			assert.equal(child.exitCode, 0);
+			assert.equal(child.exitCode, 0, Buffer.concat(childStderr).toString("utf8"));
 
 			const logEntries = (await readFile(logPath, "utf-8"))
 				.trim()

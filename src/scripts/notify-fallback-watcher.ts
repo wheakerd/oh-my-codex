@@ -1590,8 +1590,9 @@ async function registerPidFile(): Promise<void> {
 	if (testBootstrappedAuthority) return;
 	const existingRecord = await readPidFileRecord(pidFilePath);
 	const existingPid = existingRecord?.pid ?? null;
-	const recordMatchesAuthority = !!retainedAuthority
-		&& recordMatchesNotifyWatcherAuthority(existingRecord!, retainedAuthority, cwd);
+	const recordMatchesAuthority = existingRecord !== null
+		&& !!retainedAuthority
+		&& recordMatchesNotifyWatcherAuthority(existingRecord, retainedAuthority, cwd);
 	if (existingPid && existingPid !== process.pid && recordMatchesAuthority && isPidAlive(existingPid)) {
 		throw new Error("an authenticated notify fallback watcher is already active");
 	}
