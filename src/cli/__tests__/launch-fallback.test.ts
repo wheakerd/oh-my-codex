@@ -20,7 +20,7 @@ import {
 import { DETACHED_TMUX_HISTORY_LIMIT } from '../index.js';
 import { writeSessionEnd, writeSessionStart } from '../../hooks/session.js';
 
-const CLI_SPAWN_TIMEOUT_MS = 60_000;
+const CLI_SPAWN_TIMEOUT_MS = 120_000;
 
 function buildRunOmxEnv(envOverrides: Record<string, string>): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env };
