@@ -99,10 +99,7 @@ import {
   LONG_CONFIG_FLAG,
 } from "./constants.js";
 import { resolveCommittedAuthorityRuntimeStateScope } from "../mcp/state-paths.js";
-import {
-  evaluateRalphCompletionAuditEvidence,
-  isRalphCompletePhase,
-} from "../ralph/completion-audit.js";
+import { evaluateRalphCompletionAuditEvidence, isRalphCompletePhase } from "../ralph/completion-audit.js";
 import { normalizeTerminalWorkflowState } from "../state/terminal-normalization.js";
 import { executeStateOperation } from "../state/operations.js";
 import {
@@ -2445,6 +2442,7 @@ function isMissingTmuxLaunchNoise(error: unknown): boolean {
   return error instanceof Error && /spawnSync tmux ENOENT/i.test(error.message);
 }
 
+
 function logCliOperationFailure(error: unknown): void {
   if (isMissingTmuxLaunchNoise(error)) return;
   process.stderr.write(`[cli/index] operation failed: ${error}
@@ -4537,15 +4535,15 @@ export async function launchWithHud(args: string[]): Promise<void> {
     preparedCodexHome.projectLocalCodexHomeForCleanup;
 
   // ── Phase 1: preLaunch ──────────────────────────────────────────────────
-authority = await preLaunch(
-  cwd,
-  sessionId,
-  notifyTempResult.contract,
-  codexHomeOverride,
-  enableNotifyFallbackAuthority,
-  worktreeDirty,
-  authority,
-);
+  authority = await preLaunch(
+    cwd,
+    sessionId,
+    notifyTempResult.contract,
+    codexHomeOverride,
+    enableNotifyFallbackAuthority,
+    worktreeDirty,
+    authority,
+  );
 
   // ── Phase 2: run ────────────────────────────────────────────────────────
   let postLaunchHandledExternally = false;
@@ -5766,16 +5764,39 @@ function buildTmuxExtendedKeysReleaseShellSnippet(cwd: string): string {
   return `if [ -n "\${OMX_TMUX_EXTENDED_KEYS_LEASE:-}" ]; then ${buildTmuxExtendedKeysHelperCommand(cwd, "release")} "\${OMX_TMUX_EXTENDED_KEYS_LEASE}" >/dev/null 2>&1 || true; fi;`;
 }
 
-const DETACHED_TMUX_MANAGED_ENV_NAMES = new Set([
+const DETACHED_SESSION_PANE_ENV_KEYS = new Set([
+  "TERM",
+  "TERM_PROGRAM",
+  "TERM_PROGRAM_VERSION",
   "TMUX",
   "TMUX_PANE",
-  "TERM",
+  "COLUMNS",
+  "LINES",
+]);
+
+const DETACHED_TMUX_MANAGED_ENV_NAMES = new Set([
+  ...DETACHED_SESSION_PANE_ENV_KEYS,
   "TERMCAP",
   "PWD",
   "OLDPWD",
   "SHLVL",
   "_",
 ]);
+
+export function serializeDetachedSessionParentEnv(
+  env: NodeJS.ProcessEnv,
+): string {
+  const lines: string[] = [];
+  for (const key of Object.keys(env).sort()) {
+    if (!SHELL_ENV_NAME_PATTERN.test(key)) continue;
+    if (DETACHED_SESSION_PANE_ENV_KEYS.has(key)) continue;
+    const value = env[key];
+    if (typeof value !== "string") continue;
+    if (value.includes("\0")) continue;
+    lines.push(`export ${key}=${quoteShellArg(value)}`);
+  }
+  return `${lines.join("\n")}\n`;
+}
 
 function detachedTmuxEnvironmentNames(env: NodeJS.ProcessEnv): string[] {
   return Object.keys(env)
@@ -5785,7 +5806,7 @@ function detachedTmuxEnvironmentNames(env: NodeJS.ProcessEnv): string[] {
         !DETACHED_TMUX_MANAGED_ENV_NAMES.has(key),
     )
     .filter((key) => {
-    const value = env[key];
+      const value = env[key];
       return typeof value === "string" && !value.includes("\0");
     })
     .sort();
@@ -8579,9 +8600,9 @@ export async function reapStaleNotifyFallbackWatcher(
 
     // Re-resolve and re-read immediately before signaling: a replaced record,
     // authority rollover, or PID reuse is never an eligible signal target.
-    const current = await (deps.resolveCurrentAuthority
-      ? deps.resolveCurrentAuthority(authority.observed_cwd)
-      : resolveStateAuthorityForGuard({ startup_cwd: authority.observed_cwd, observed_cwd: authority.observed_cwd }));
+    const resolveCurrentAuthority = deps.resolveCurrentAuthority
+      ?? ((observedCwd: string) => resolveStateAuthorityForGuard({ startup_cwd: observedCwd, observed_cwd: observedCwd }));
+    const current = await resolveCurrentAuthority(authority.observed_cwd);
     if (current.generation.generation_id !== authority.generation.generation_id
       || current.generation.authority_id !== authority.generation.authority_id
       || current.workspace_identity.digest !== authority.workspace_identity.digest
