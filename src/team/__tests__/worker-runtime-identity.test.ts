@@ -5,6 +5,9 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import { existsSync } from 'fs';
 import {
+  appendTeamLifecycleResource,
+  createTeamLifecycleGeneration,
+  finalizeTeamLifecycleGeneration,
   initTeamState,
   createTask,
   readTeamConfig,
@@ -22,6 +25,22 @@ import { resolveTeamLowComplexityDefaultModel } from '../model-contract.js';
 function expectedLowComplexityModel(codexHomeOverride?: string): string {
   return resolveTeamLowComplexityDefaultModel(codexHomeOverride);
 }
+async function activateScaleUpLifecycle(teamName: string, cwd: string, config: NonNullable<Awaited<ReturnType<typeof readTeamConfig>>>): Promise<void> {
+  const token = `scale-up-${teamName}`;
+  assert.equal(await createTeamLifecycleGeneration({
+    version: 1, token, team_name: teamName, canonical_session_id: `session-${teamName}`, native_session_ids: [],
+    tmux_session_name: null, tmux_session_birth: null, tmux_context: null,
+    team_pane_owner_id: `team:${teamName}`, hook_generation: `hook-${teamName}`,
+    status: 'preparing', created_at: new Date().toISOString(), resources: [],
+  }, cwd), true);
+  assert.equal(await appendTeamLifecycleResource(teamName, token, {
+    kind: 'leader', id: config.leader_pane_id ?? '%11', created: true, pane_birth: 'session-birth-1', role: 'leader', acquired_at: new Date().toISOString(),
+  }, cwd), true);
+  assert.equal(await finalizeTeamLifecycleGeneration(teamName, token, 'active', cwd, {
+    tmux_session_name: config.tmux_session, tmux_session_birth: 'session-birth-1', tmux_context: `${config.tmux_session}:0`,
+  }), true);
+}
+
 
 function withoutTeamWorkerEnv<T>(fn: () => T): T {
   const prev = process.env.OMX_TEAM_WORKER;
@@ -218,7 +237,7 @@ process.on('SIGTERM', () => process.exit(0));
           '    echo ""',
           '    ;;',
           '  show-option)',
-          '    if [ "${2:-}" = "-qv" ] && [ "${3:-}" = "-p" ]; then cat "$state_dir/${5:-}_${6:-}" 2>/dev/null || true; else echo "session-birth-1"; fi',
+          '    if [ "${2:-}" = "-qv" ] && [ "${3:-}" = "-p" ]; then if [ -f "$state_dir/${5:-}_${6:-}" ]; then cat "$state_dir/${5:-}_${6:-}"; else echo "session-birth-1"; fi; else echo "session-birth-1"; fi',
           '    ;;',
           '  set-option)',
           '    if [ "${2:-}" = "-p" ]; then printf "%s" "${6:-}" > "$state_dir/${4:-}_${5:-}"; fi',
@@ -257,6 +276,7 @@ process.on('SIGTERM', () => process.exit(0));
       config.workers[0]!.pane_id = '%21';
       config.tmux_pane_owner_id = 'team:low-role-scale';
       await saveTeamConfig(config, cwd);
+      await activateScaleUpLifecycle('low-role-scale', cwd, config);
 
       const manifestPath = join(cwd, '.omx', 'state', 'team', 'low-role-scale', 'manifest.v2.json');
       const manifest = JSON.parse(await readFile(manifestPath, 'utf-8')) as { policy?: Record<string, unknown> };
@@ -330,7 +350,7 @@ process.on('SIGTERM', () => process.exit(0));
           '    echo ""',
           '    ;;',
           '  show-option)',
-          '    if [ "${2:-}" = "-qv" ] && [ "${3:-}" = "-p" ]; then cat "$state_dir/${5:-}_${6:-}" 2>/dev/null || true; else echo "session-birth-1"; fi',
+          '    if [ "${2:-}" = "-qv" ] && [ "${3:-}" = "-p" ]; then if [ -f "$state_dir/${5:-}_${6:-}" ]; then cat "$state_dir/${5:-}_${6:-}"; else echo "session-birth-1"; fi; else echo "session-birth-1"; fi',
           '    ;;',
           '  set-option)',
           '    if [ "${2:-}" = "-p" ]; then printf "%s" "${6:-}" > "$state_dir/${4:-}_${5:-}"; fi',
@@ -365,6 +385,7 @@ process.on('SIGTERM', () => process.exit(0));
       config.tmux_pane_owner_id = 'team:exact-role-cli';
       config.next_worker_index = 3;
       await saveTeamConfig(config, cwd);
+      await activateScaleUpLifecycle('exact-role-cli', cwd, config);
 
       const manifestPath = join(cwd, '.omx', 'state', 'team', 'exact-role-cli', 'manifest.v2.json');
       const manifest = JSON.parse(await readFile(manifestPath, 'utf-8')) as { policy?: Record<string, unknown> };
