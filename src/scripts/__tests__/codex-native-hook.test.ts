@@ -26001,18 +26001,21 @@ PY`,
   it("does not block Stop once the deep-interview question obligation is satisfied or cleared", async () => {
     for (const status of ["satisfied", "cleared"] as const) {
       const cwd = await mkdtemp(join(tmpdir(), `omx-native-hook-stop-deep-interview-question-${status}-`));
+      const sessionId = `sess-stop-deep-interview-question-${status}`;
+      let restoreAuthority = () => {};
       try {
+        restoreAuthority = await establishCommittedTestStateAuthority(cwd, sessionId);
         const stateDir = join(cwd, ".omx", "state");
-        await mkdir(join(stateDir, "sessions", `sess-stop-deep-interview-question-${status}`), { recursive: true });
-        await writeJson(join(stateDir, "session.json"), { session_id: `sess-stop-deep-interview-question-${status}` });
-        await writeJson(join(stateDir, "sessions", `sess-stop-deep-interview-question-${status}`, "skill-active-state.json"), {
+        await mkdir(join(stateDir, "sessions", sessionId), { recursive: true });
+        await writeJson(join(stateDir, "session.json"), { session_id: sessionId });
+        await writeJson(join(stateDir, "sessions", sessionId, "skill-active-state.json"), {
           version: 1,
           active: true,
           skill: "deep-interview",
           phase: "planning",
-          session_id: `sess-stop-deep-interview-question-${status}`,
+          session_id: sessionId,
         });
-        await writeJson(join(stateDir, "sessions", `sess-stop-deep-interview-question-${status}`, "deep-interview-state.json"), {
+        await writeJson(join(stateDir, "sessions", sessionId, "deep-interview-state.json"), {
           active: true,
           mode: "deep-interview",
           current_phase: "intent-first",
@@ -26031,7 +26034,7 @@ PY`,
           {
             hook_event_name: "Stop",
             cwd,
-            session_id: `sess-stop-deep-interview-question-${status}`,
+            session_id: sessionId,
           },
           { cwd },
         );
@@ -26039,6 +26042,7 @@ PY`,
         assert.equal(result.omxEventName, "stop");
         assert.equal(result.outputJson, null);
       } finally {
+        restoreAuthority();
         await rm(cwd, { recursive: true, force: true });
       }
     }
