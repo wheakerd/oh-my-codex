@@ -4013,6 +4013,77 @@ printf '%s' "${"$"}*" > ${JSON.stringify(tmuxLog)}
 			await rm(root, { recursive: true, force: true });
 		}
 	});
+	it("times out a missing one-shot acknowledgement, rolls back the worker pane, and keeps transport bytes out of tmux", async () => {
+		const cwd = await mkdtemp(join(tmpdir(), "omx-tmux-import-ack-timeout-"));
+		const previousTmux = process.env.TMUX;
+		const previousTmuxPane = process.env.TMUX_PANE;
+		const previousWorkerCli = process.env.OMX_TEAM_WORKER_CLI;
+		const previousBypassInstructions = process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+		try {
+			const authorityTransport = await workerStartupTransport(cwd);
+			await withMockTmuxFixture(
+				"omx-tmux-import-ack-timeout-bin-",
+				(logPath) => `#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "${logPath}"
+case "${"$"}{1:-}" in
+  -V)
+    echo "tmux 3.4"
+    ;;
+  display-message)
+    echo "leader:0 %1"
+    ;;
+  list-panes)
+    printf "%%1\\tnode\\t'codex'\\n"
+    ;;
+  split-window)
+    echo "%2"
+    ;;
+  wait-for)
+    sleep 10
+    ;;
+  *)
+    ;;
+esac
+`,
+				async ({ logPath }) => {
+					const fakeBinDir = dirname(logPath);
+					const codexPath = join(fakeBinDir, "codex");
+					await writeFile(codexPath, "#!/bin/sh\nexit 0\n");
+					await chmod(codexPath, 0o755);
+					process.env.TMUX = "leader-session,stub,0";
+					process.env.TMUX_PANE = "%1";
+					process.env.OMX_TEAM_WORKER_CLI = "codex";
+					process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = "0";
+
+					const startedAt = Date.now();
+					assert.throws(
+						() => createTeamSession("Missing Import Ack", 1, cwd, [], [], { authorityTransport }),
+						/failed to acknowledge tmux one-shot import/,
+					);
+					assert.ok(Date.now() - startedAt < 8_000, "missing acknowledgement must be bounded");
+
+					const tmuxLog = await readFile(logPath, "utf-8");
+					assert.match(tmuxLog, /wait-for omx-tmux-import-/);
+					assert.match(tmuxLog, /kill-pane -t %2/);
+					for (const value of Object.values(authorityTransport)) {
+						if (value === cwd) continue;
+						assert.doesNotMatch(tmuxLog, new RegExp(escapeRegExp(value)));
+					}
+				},
+			);
+		} finally {
+			if (typeof previousTmux === "string") process.env.TMUX = previousTmux;
+			else delete process.env.TMUX;
+			if (typeof previousTmuxPane === "string") process.env.TMUX_PANE = previousTmuxPane;
+			else delete process.env.TMUX_PANE;
+			if (typeof previousWorkerCli === "string") process.env.OMX_TEAM_WORKER_CLI = previousWorkerCli;
+			else delete process.env.OMX_TEAM_WORKER_CLI;
+			if (typeof previousBypassInstructions === "string") process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT = previousBypassInstructions;
+			else delete process.env.OMX_BYPASS_DEFAULT_SYSTEM_PROMPT;
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
 });
 
 describe("createTeamSession tmux instance tagging", () => {

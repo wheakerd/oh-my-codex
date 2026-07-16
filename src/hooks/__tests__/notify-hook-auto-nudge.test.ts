@@ -6,10 +6,10 @@ import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildTmuxSessionName } from '../../cli/index.js';
-import { classifyKeywordInput, recordSkillActivation } from '../keyword-detector.js';
+import { classifyKeywordInput, recordSkillActivation, type RecordSkillActivationInput } from '../keyword-detector.js';
 import { recordNotifySkillActivation, recordNotifySkillActivationNonFatal } from '../../scripts/notify-hook.js';
 import { normalizeSkillActiveState } from '../../scripts/notify-hook/auto-nudge.js';
-import { initializeStateAuthority, mintStateAuthorityTransportCapability } from '../../state/authority.js';
+import { initializeStateAuthority, mintStateAuthorityTransportCapability, resolveStateAuthorityForGuard, type RootFilesystemIdentity } from '../../state/authority.js';
 import { buildStateAuthorityTransportEnv } from '../../state/transport-env.js';
 import { hardenTestAuthorityTreeSync } from '../../team/__tests__/authority-fixture.js';
 
@@ -27,19 +27,31 @@ const INHERITED_OMX_ENV_KEYS = [
 ] as const;
 
 const fixtureAuthorityEnv = new Map<string, NodeJS.ProcessEnv>();
+const fixtureAuthorityIdentity = new Map<string, RootFilesystemIdentity>();
 
 async function initializeNotifyFixtureAuthority(cwd: string, sessionId = 'sess-managed'): Promise<void> {
   await mkdir(join(cwd, '.omx'), { recursive: true, mode: 0o700 });
   await chmod(join(cwd, '.omx'), 0o700);
-  const authority = await initializeStateAuthority({
+  await initializeStateAuthority({
     startup_cwd: cwd,
     observed_cwd: cwd,
     launch_id: `notify-auto-nudge-${sessionId}-${Date.now()}`,
     session_binding: { canonical_session_id: sessionId },
   });
+  await writeJson(join(cwd, '.omx', 'state', 'session.json'), {
+    session_id: sessionId,
+    started_at: new Date().toISOString(),
+    cwd,
+  });
+  const authority = await resolveStateAuthorityForGuard({
+    startup_cwd: cwd,
+    observed_cwd: cwd,
+    session_id: sessionId,
+  });
   await mintStateAuthorityTransportCapability(authority);
   await chmod(authority.canonical_state_root, 0o700);
   fixtureAuthorityEnv.set(cwd, buildStateAuthorityTransportEnv(authority, { ...process.env, OMX_SESSION_ID: sessionId }));
+  fixtureAuthorityIdentity.set(cwd, authority.generation.root_identity);
 }
 
 describe('notify lifecycle owner normalization', () => {
@@ -61,8 +73,19 @@ async function withTempWorkingDir(run: (cwd: string) => Promise<void>): Promise<
     await run(cwd);
   } finally {
     fixtureAuthorityEnv.delete(cwd);
+    fixtureAuthorityIdentity.delete(cwd);
     await rm(cwd, { recursive: true, force: true });
   }
+}
+
+async function recordFixtureSkillActivation(
+  cwd: string,
+  input: RecordSkillActivationInput,
+) {
+  return recordSkillActivation({
+    ...input,
+    expectedRootIdentity: fixtureAuthorityIdentity.get(cwd),
+  });
 }
 
 async function writeJson(path: string, value: unknown): Promise<void> {
@@ -2604,7 +2627,7 @@ exit 0
       }, {
         recordSkillActivation: async (input) => {
           markedWriterCalls += 1;
-          return recordSkillActivation(input);
+          return recordFixtureSkillActivation(cwd, input);
         },
       });
       assert.equal(markedWriterCalls, 1);
@@ -2616,7 +2639,7 @@ exit 0
         { text: '$ralplan $autopilot plan this change', skill: 'ralplan' },
         { text: '$ralph $autopilot ship this change', skill: 'ralph' },
       ]) {
-        const orderedSessionId = `sess-notify-primary-${orderedCase.skill}`;
+        const orderedSessionId = 'sess-managed';
         const orderedThreadId = `thread-notify-primary-${orderedCase.skill}`;
         const orderedTurnId = `turn-notify-primary-${orderedCase.skill}`;
         const orderedSessionDir = join(stateDir, 'sessions', orderedSessionId);
@@ -2669,7 +2692,7 @@ exit 0
         }, {
           recordSkillActivation: async (input) => {
             orderedWriterCalls += 1;
-            return recordSkillActivation(input);
+            return recordFixtureSkillActivation(cwd, input);
           },
         });
 
@@ -2751,7 +2774,7 @@ exit 0
           writerCalls += 1;
           writerText = input.text;
           writerClassification = input.classification;
-          writerResult = await recordSkillActivation(input);
+          writerResult = await recordFixtureSkillActivation(cwd, input);
           return writerResult;
         },
       });
@@ -2803,7 +2826,7 @@ exit 0
             rejectedWriterCalls += 1;
             rejectedWriterText = input.text;
             rejectedWriterClassification = input.classification;
-            rejectedWriterResult = await recordSkillActivation(input);
+            rejectedWriterResult = await recordFixtureSkillActivation(cwd, input);
             return rejectedWriterResult;
           },
         });
@@ -2824,7 +2847,7 @@ exit 0
   it('G1a-N preserves ordered multi-skill classification and seeds only the ralplan primary when Team is enabled', async () => {
     await withTempWorkingDir(async (cwd) => {
       const stateDir = join(cwd, '.omx', 'state');
-      const sessionId = 'sess-g1a-notify-ordered';
+      const sessionId = 'sess-managed';
       const threadId = 'thread-g1a-notify-ordered';
       const turnId = 'turn-g1a-notify-ordered';
       const sessionDir = join(stateDir, 'sessions', sessionId);
@@ -2852,7 +2875,7 @@ exit 0
           recordSkillActivation: async (input) => {
             writerCalls += 1;
             writerClassification = input.classification;
-            return recordSkillActivation(input);
+            return recordFixtureSkillActivation(cwd, input);
           },
         });
 
@@ -2875,7 +2898,7 @@ exit 0
   it('G1c-N deduplicates exact canonical and alias Autopilot invocations across classifier, writer, canonical state, and detail state', async () => {
     await withTempWorkingDir(async (cwd) => {
       const stateDir = join(cwd, '.omx', 'state');
-      const sessionId = 'sess-g1c-notify-duplicate';
+      const sessionId = 'sess-managed';
       const threadId = 'thread-g1c-notify-duplicate';
       const turnId = 'turn-g1c-notify-duplicate';
       const sessionDir = join(stateDir, 'sessions', sessionId);
@@ -2900,7 +2923,7 @@ exit 0
         recordSkillActivation: async (input) => {
           writerCalls += 1;
           writerClassification = input.classification;
-          return recordSkillActivation(input);
+          return recordFixtureSkillActivation(cwd, input);
         },
       });
 
@@ -3050,7 +3073,7 @@ exit 0
           writerCalls += 1;
           writerText = input.text;
           writerClassification = input.classification;
-          return recordSkillActivation(input);
+          return recordFixtureSkillActivation(cwd, input);
         },
       });
 
@@ -3118,7 +3141,7 @@ exit 0
           writerCalls += 1;
           writerText = input.text;
           writerClassification = input.classification;
-          return recordSkillActivation(input);
+          return recordFixtureSkillActivation(cwd, input);
         },
       });
 

@@ -879,6 +879,8 @@ async function emitCanonicalWorkerEvent(
   context: Record<string, unknown>,
 ): Promise<void> {
   try {
+    const authority = await resolveValidatedTeamAuthority(cwd);
+    if (!authority) return;
     const { buildNativeHookEvent } = await import(
       '../hooks/extensibility/events.js'
     );
@@ -890,7 +892,10 @@ async function emitCanonicalWorkerEvent(
       scope: 'team-runtime',
       ...context,
     });
-    await dispatchHookEvent(event, { cwd });
+    await dispatchHookEvent(event, {
+      cwd,
+      stateRoot: authority.canonical_state_root,
+    });
   } catch {
     // best effort only
   }

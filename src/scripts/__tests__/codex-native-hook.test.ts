@@ -14,7 +14,7 @@ import {
 	writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { delimiter, dirname, join, resolve, sep } from "node:path";
+import { delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import { after, afterEach, beforeEach, describe, it } from "node:test";
 const ORIGINAL_TEST_UMASK = process.umask(0o077);
@@ -399,12 +399,18 @@ async function dispatchCodexNativeHook(
 			: typeof payload.cwd === "string"
 				? payload.cwd
 				: undefined;
-	if (
-		activeCommittedAuthorityFixture &&
-		cwd &&
-		resolve(cwd) !== activeCommittedAuthorityFixture.cwd
-	) {
-		activeCommittedAuthorityFixture.restore();
+	if (activeCommittedAuthorityFixture && cwd) {
+		const fixtureRelativeCwd = relative(
+			activeCommittedAuthorityFixture.cwd,
+			resolve(cwd),
+		);
+		if (
+			fixtureRelativeCwd === ".." ||
+			fixtureRelativeCwd.startsWith(`..${sep}`) ||
+			isAbsolute(fixtureRelativeCwd)
+		) {
+			activeCommittedAuthorityFixture.restore();
+		}
 	}
 	const payloadSessionId =
 		typeof payload.session_id === "string" ? payload.session_id.trim() : "";
@@ -4568,6 +4574,7 @@ PY`,
 						},
 					},
 				},
+				pending_role_intents: [],
 			});
 
 			const result = await dispatchCodexNativeHook(
@@ -10482,7 +10489,7 @@ ${JSON.stringify({
 			assert.equal(result.omxEventName, "keyword-detector");
 			assert.equal(result.skillState, null);
 			assert.equal(result.outputJson?.continue, false);
-			assert.match(String(result.outputJson?.systemMessage ?? ""), /cannot establish mutation authority on Windows/i);
+			assert.match(String(result.outputJson?.systemMessage ?? ""), /owner and DACL custody could not be verified/i);
 		} finally {
 			if (originalPlatform)
 				Object.defineProperty(process, "platform", originalPlatform);
@@ -10583,7 +10590,7 @@ ${JSON.stringify({
 			assert.equal(result.omxEventName, "keyword-detector");
 			assert.equal(result.skillState, null);
 			assert.equal(result.outputJson?.continue, false);
-			assert.match(String(result.outputJson?.systemMessage ?? ""), /cannot establish mutation authority on Windows/i);
+			assert.match(String(result.outputJson?.systemMessage ?? ""), /owner and DACL custody could not be verified/i);
 		} finally {
 			if (originalPlatform)
 				Object.defineProperty(process, "platform", originalPlatform);
@@ -31988,10 +31995,12 @@ PY`,
 
   it("blocks Main-root ralph conductor source writes while allowing .omx workflow state writes", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-ralph-conductor-write-"));
+    let restoreOuterAuthority: (() => void) | undefined;
     try {
       const stateDir = join(cwd, ".omx", "state");
       const sessionId = "sess-ralph-conductor-write";
       await mkdir(join(stateDir, "sessions", sessionId), { recursive: true });
+      restoreOuterAuthority = await establishCommittedTestStateAuthority(cwd, sessionId);
       await writeJson(join(stateDir, "session.json"), { session_id: sessionId });
       await writeSessionSkillActiveState(stateDir, sessionId, "ralph", "executing");
       await writeJson(join(stateDir, "sessions", sessionId, "ralph-state.json"), {
@@ -32016,11 +32025,22 @@ PY`,
       assert.match(String(blocked.outputJson?.reason ?? ""), /ralph phase: executing/);
 
       const nativeMappedCwd = await mkdtemp(join(tmpdir(), "omx-native-hook-ralph-conductor-native-write-"));
+      let restoreNativeAuthority: (() => void) | undefined;
       try {
         const nativeMappedStateDir = join(nativeMappedCwd, ".omx", "state");
         const canonicalSessionId = "omx-canonical-ralph-conductor-write";
         const nativeSessionId = "codex-native-ralph-conductor-write";
-        await writeNativeMappedSessionState(nativeMappedCwd, nativeMappedStateDir, canonicalSessionId, nativeSessionId);
+        restoreNativeAuthority = await establishCommittedTestStateAuthority(
+          nativeMappedCwd,
+          canonicalSessionId,
+          [nativeSessionId],
+        );
+        await writeJson(join(nativeMappedStateDir, "session.json"), {
+          session_id: canonicalSessionId,
+          native_session_id: nativeSessionId,
+          cwd: nativeMappedCwd,
+        });
+        await refreshTestAuthorityTransport(nativeMappedCwd, canonicalSessionId);
         await writeSessionSkillActiveState(nativeMappedStateDir, canonicalSessionId, "ralph", "executing");
         await writeJson(join(nativeMappedStateDir, "sessions", canonicalSessionId, "ralph-state.json"), {
           active: true,
@@ -32043,6 +32063,7 @@ PY`,
         assert.equal(nativeMappedBlocked.outputJson?.decision, "block");
         assert.match(String(nativeMappedBlocked.outputJson?.reason ?? ""), /ralph phase: executing/);
       } finally {
+        restoreNativeAuthority?.();
         await rm(nativeMappedCwd, { recursive: true, force: true });
       }
 
@@ -32059,6 +32080,7 @@ PY`,
       );
       assert.equal(allowed.outputJson, null);
     } finally {
+      restoreOuterAuthority?.();
       await rm(cwd, { recursive: true, force: true });
     }
   });

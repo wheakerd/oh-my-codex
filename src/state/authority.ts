@@ -1,4 +1,5 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import {
   closeSync,
   constants as fsConstants,
@@ -1945,12 +1946,77 @@ function validateRootFilesystemIdentity(
   }
 }
 
+interface WindowsAuthorityCustodyRule {
+  sid: string;
+  type: 'Allow' | 'Deny';
+  rights: number;
+}
+
+interface WindowsAuthorityCustody {
+  owner: string;
+  current: string;
+  rules: WindowsAuthorityCustodyRule[];
+}
+
+/**
+ * Node's stat metadata deliberately does not expose Windows security descriptors.
+ * Query the kernel-backed .NET ACL API through the inbox PowerShell host instead
+ * of treating POSIX mode bits as Windows authorization evidence.
+ */
+function readWindowsAuthorityCustody(directory: string): WindowsAuthorityCustody {
+  const script = [
+    '$ErrorActionPreference = "Stop"',
+    '$acl = Get-Acl -LiteralPath $args[0]',
+    '$sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value',
+    '$rules = @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]) | ForEach-Object {',
+    '  [ordered]@{ sid = $_.IdentityReference.Value; type = $_.AccessControlType.ToString(); rights = [int64]$_.FileSystemRights }',
+    '})',
+    '[ordered]@{ owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value; current = $sid; rules = $rules } | ConvertTo-Json -Compress -Depth 3',
+  ].join('; ');
+  try {
+    const raw = execFileSync('powershell.exe', [
+      '-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script, directory,
+    ], { encoding: 'utf8', windowsHide: true, maxBuffer: 64 * 1024 }).trim();
+    const custody = JSON.parse(raw) as Partial<WindowsAuthorityCustody>;
+    if (typeof custody.owner !== 'string' || typeof custody.current !== 'string'
+      || !Array.isArray(custody.rules)
+      || custody.rules.some((rule) => !rule || typeof rule.sid !== 'string'
+        || (rule.type !== 'Allow' && rule.type !== 'Deny')
+        || !Number.isSafeInteger(rule.rights))) {
+      throw new Error('malformed owner/DACL response');
+    }
+    return custody as WindowsAuthorityCustody;
+  } catch {
+    authorityError(AUTHORITY_DIAGNOSTIC_CODES.rootCapabilityWeak, `${directory} owner and DACL custody could not be verified`);
+  }
+}
+
+function assertSecureWindowsAuthorityCustody(directory: string, label: string): void {
+  const custody = readWindowsAuthorityCustody(directory);
+  // SYSTEM and the local Administrators group are OS recovery principals, not
+  // ordinary peer identities. CREATOR OWNER resolves to the child owner.
+  const trustedPrincipals = new Set([custody.current, 'S-1-5-18', 'S-1-5-32-544', 'S-1-3-0']);
+  const fullControl = 0x1f01ff;
+  const mutationRights = 0x0d0156;
+  // FileSystemRights can preserve unmapped generic access bits. Treat raw
+  // GENERIC_WRITE and GENERIC_ALL as mutation authority rather than allowing
+  // an untrusted ACE to evade the explicit-rights mask.
+  const genericMutationRights = 0x50000000;
+  if (custody.owner !== custody.current
+    || !custody.rules.some((rule) => rule.type === 'Allow'
+      && rule.sid === custody.current && (rule.rights & fullControl) === fullControl)
+    || custody.rules.some((rule) => rule.type === 'Allow'
+      && !trustedPrincipals.has(rule.sid)
+      && ((rule.rights & mutationRights) !== 0
+        || (rule.rights & genericMutationRights) !== 0))) {
+    authorityError(AUTHORITY_DIAGNOSTIC_CODES.rootCapabilityWeak, `${label} is not exclusively owned and DACL-custodied by the current Windows user`);
+  }
+}
+
 function assertSecureStateRootCustody(identity: RootFilesystemIdentity, label: string): void {
   if (identity.platform === 'win32') {
-    authorityError(
-      AUTHORITY_DIAGNOSTIC_CODES.rootCapabilityWeak,
-      `${label} cannot establish mutation authority on Windows until owner and DACL custody are verified`,
-    );
+    assertSecureWindowsAuthorityCustody(identity.canonical_path, label);
+    return;
   }
   const permissions = Number(identity.mode) & 0o777;
   if ((permissions & 0o022) !== 0) {
@@ -4203,6 +4269,62 @@ export function validateStateAuthorityJournal(journal: StateAuthorityOperationJo
   if (!/^[0-9a-f]{64}$/i.test(journal.effects_digest) || !Array.isArray(journal.completed_steps)) {
     authorityError(AUTHORITY_DIAGNOSTIC_CODES.journalMalformed, 'authority journal has an invalid effects digest or completed steps');
   }
+  for (const completedStep of journal.completed_steps) {
+    safeIdentifier(completedStep, 'journal completed step');
+  }
+  if (journal.kind === 'launch_transport_publish'
+    && journal.status === 'committed'
+    && !journal.completed_steps.includes('persistent-transport-verified')) {
+    authorityError(
+      AUTHORITY_DIAGNOSTIC_CODES.journalMalformed,
+      'committed launch transport journal is missing persistent transport verification evidence',
+    );
+  }
+  const createdAt = Date.parse(journal.created_at);
+  const updatedAt = Date.parse(journal.updated_at);
+  if (!Number.isFinite(createdAt) || !Number.isFinite(updatedAt) || updatedAt < createdAt) {
+    authorityError(AUTHORITY_DIAGNOSTIC_CODES.journalMalformed, 'authority journal has invalid or non-monotonic timestamps');
+  }
+}
+function assertMonotonicStateAuthorityJournalWrite(
+  current: StateAuthorityOperationJournal,
+  next: StateAuthorityOperationJournal,
+): void {
+  const immutableFields: readonly (keyof StateAuthorityOperationJournal)[] = [
+    'schema_version',
+    'authority_protocol_version',
+    'operation_id',
+    'kind',
+    'authority_id',
+    'generation_id',
+    'binding_revision',
+    'binding_id',
+    'workspace_identity_digest',
+    'expected_anchor_revision',
+    'fencing_token',
+    'created_at',
+    'effects_digest',
+  ];
+  if (immutableFields.some((field) => current[field] !== next[field])) {
+    authorityError(AUTHORITY_DIAGNOSTIC_CODES.journalConflict, 'authority journal immutable tuple changed during persistence');
+  }
+  if (Date.parse(next.updated_at) < Date.parse(current.updated_at)) {
+    authorityError(AUTHORITY_DIAGNOSTIC_CODES.journalConflict, 'authority journal timestamp regressed during persistence');
+  }
+  const nextSteps = new Set(next.completed_steps);
+  if (current.completed_steps.some((step) => !nextSteps.has(step))) {
+    authorityError(AUTHORITY_DIAGNOSTIC_CODES.journalConflict, 'authority journal completed-step evidence regressed during persistence');
+  }
+  if (current.status !== next.status) {
+    validateJournalTransition(current.status, next.status);
+  } else if (current.status === 'committed' || current.status === 'aborted') {
+    const unchanged = current.updated_at === next.updated_at
+      && current.blocked_reason === next.blocked_reason
+      && current.completed_steps.length === next.completed_steps.length;
+    if (!unchanged) {
+      authorityError(AUTHORITY_DIAGNOSTIC_CODES.journalConflict, 'terminal authority journal cannot be rewritten');
+    }
+  }
 }
 
 export function createStateAuthorityJournal(input: Omit<StateAuthorityOperationJournal, 'schema_version' | 'authority_protocol_version' | 'status' | 'created_at' | 'updated_at' | 'completed_steps'> & {
@@ -4264,6 +4386,10 @@ export async function writeStateAuthorityJournal(
   expectedRootIdentity?: RootFilesystemIdentity,
 ): Promise<void> {
   validateStateAuthorityJournal(journal);
+  if (existsSync(path)) {
+    const current = await readStateAuthorityJournal(path);
+    assertMonotonicStateAuthorityJournalWrite(current, journal);
+  }
   await assertPathHasNoSymlinkComponents(path, 'authority journal');
   await atomicWriteAuthorityJson(path, journal, authorityRoot
     ? { authority_root: authorityRoot, ...(expectedRootIdentity ? { expected_root_identity: expectedRootIdentity } : {}) }

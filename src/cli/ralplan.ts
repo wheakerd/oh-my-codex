@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 
-import { resolveRuntimeStateScope } from '../mcp/state-paths.js';
+import { StateAuthorityError } from '../state/authority.js';
+import { resolveAuthorityRuntimeStateScope } from '../mcp/state-paths.js';
 import { ensureLeaderAndRecordIntent, type PendingRoleIntent, readSubagentTrackingStateStrict, recordNativeLeaderIntent } from '../subagents/tracker.js';
 import {
   ROLE_INTENT_CORRELATION_TOKEN_PATTERN,
@@ -41,7 +42,7 @@ export interface RalplanCommandDependencies {
   cwd?: () => string;
   stdout?: (line: string) => void;
   stderr?: (line: string) => void;
-  resolveSessionScope?: typeof resolveRuntimeStateScope;
+  resolveSessionScope?: typeof resolveAuthorityRuntimeStateScope;
   recordNativeLeaderIntent?: typeof recordNativeLeaderIntent;
   ensureLeaderAndRecordIntent?: typeof ensureLeaderAndRecordIntent;
   generateCorrelationToken?: () => string;
@@ -64,8 +65,15 @@ export async function ralplanCommand(
 
   const parsed = parseRoleIntentWriteArgs(args.slice(2));
   const cwd = (deps.cwd ?? process.cwd)();
-  const resolveSessionScope = deps.resolveSessionScope ?? resolveRuntimeStateScope;
-  const currentScope = await resolveSessionScope(cwd);
+  const resolveSessionScope = deps.resolveSessionScope ?? resolveAuthorityRuntimeStateScope;
+  let currentScope: Awaited<ReturnType<typeof resolveAuthorityRuntimeStateScope>>;
+  try {
+    currentScope = await resolveSessionScope(cwd);
+  } catch (error) {
+    if (!(error instanceof StateAuthorityError)) throw error;
+    emitRoleIntentFailure('native_anchor_unavailable', parsed.json, stdout, stderr);
+    return;
+  }
   if (!currentScope.sessionId) {
     // #3181: no authenticated canonical session pointer exists in this turn, so there
     // is no verifiable native anchor to bootstrap from. Fail closed with a distinct
@@ -74,9 +82,16 @@ export async function ralplanCommand(
     return;
   }
 
-  const requestedScope = parsed.sessionId === undefined
-    ? currentScope
-    : await resolveSessionScope(cwd, parsed.sessionId);
+  let requestedScope = currentScope;
+  if (parsed.sessionId !== undefined) {
+    try {
+      requestedScope = await resolveSessionScope(cwd, parsed.sessionId);
+    } catch (error) {
+      if (!(error instanceof StateAuthorityError)) throw error;
+      emitRoleIntentFailure('native_anchor_unavailable', parsed.json, stdout, stderr);
+      return;
+    }
+  }
   if (requestedScope.sessionId !== currentScope.sessionId) {
     emitRoleIntentFailure('session_not_current', parsed.json, stdout, stderr);
     return;
@@ -84,12 +99,9 @@ export async function ralplanCommand(
 
   // #3181: a durable native-hook leader attestation (leader_thread_id + leader_attested_at)
   // authorizes the in-turn atomic self-heal path, but ONLY when a usable current session
-  // pointer maps to this session. resolveRuntimeStateScope will select an env-provided
-  // session id (OMX_SESSION_ID/CODEX_SESSION_ID/SESSION_ID) even with no usable pointer or
-  // a pointer owned by another session; in that case it omits metadata. Requiring metadata
-  // that maps to currentScope.sessionId prevents a stale/foreign process from selecting an
-  // attested session by environment alone and publishing/binding into it (shared state
-  // root). Without a usable pointer, fall back to the legacy native-session path only.
+  // The committed-authority resolver rejects ambient/cwd-selected roots and returns
+  // metadata only from the authenticated canonical session. A missing or foreign
+  // pointer therefore cannot bootstrap or retarget leader intent state.
   const hasUsableCurrentPointer = Boolean(
     currentScope.metadata && currentScope.metadata.sessionId === currentScope.sessionId,
   );

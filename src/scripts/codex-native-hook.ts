@@ -10553,8 +10553,9 @@ export async function dispatchCodexNativeHook(
   }
   // Child hooks resolve only committed inherited authority. They never establish
   // or migrate state, and raw root environment variables cannot retarget it.
-  const workspaceCwd = authority?.workspace_identity.canonical_path
-    ?? resolveWorkspaceIdentity(cwd).canonical_path;
+  const workspaceCwd = authority
+    ? dirname(authority.generation.canonical_omx_root)
+    : resolveWorkspaceIdentity(cwd).canonical_path;
   const stateDir = authority?.canonical_state_root ?? canonicalHookStateDirectory(workspaceCwd);
   if (authority) {
     try {

@@ -831,6 +831,7 @@ async function main() {
   }
 
   let skillSyncResult: Awaited<ReturnType<typeof syncSkillStateFromTurn>> | null = null;
+  let hookStateRoot: string | null = null;
 
   // 4.45. Skill activation tracking: update skill-active-state.json before any nudge logic.
   if (isTeamWorker || canWriteLeaderScopedState) {
@@ -880,6 +881,7 @@ async function main() {
         observed_cwd: cwd,
         session_id: getEffectiveSessionId() || undefined,
       });
+      hookStateRoot = lifecycleAuthority.canonical_state_root;
       skillSyncResult = await syncSkillStateFromTurn(
         stateDir,
         payload,
@@ -970,7 +972,7 @@ async function main() {
       turn_id: turnIdForHooks,
       mode: modeForHooks,
     });
-    await dispatchHookEvent(event, { cwd });
+    if (hookStateRoot) await dispatchHookEvent(event, { cwd, stateRoot: hookStateRoot });
 
     for (const signal of deriveAssistantSignalEvents(outputPreview)) {
       const derivedEvent = buildDerivedHookEvent(signal.event, buildOperationalContext({
@@ -993,7 +995,7 @@ async function main() {
         confidence: signal.confidence,
         parser_reason: signal.parser_reason,
       });
-      await dispatchHookEvent(derivedEvent, { cwd });
+      if (hookStateRoot) await dispatchHookEvent(derivedEvent, { cwd, stateRoot: hookStateRoot });
     }
   } catch {
     // Non-fatal: extensibility modules may not be built yet
@@ -1054,9 +1056,11 @@ async function main() {
               turn_id: safeString(payload['turn-id'] || payload.turn_id || ''),
               mode: safeString(payload.mode || ''),
             });
-            const hookDispatchResult = await dispatchHookEvent(event, { cwd });
-            if (hookDispatchResult.results.some((result) => result.ok)) {
-              recordSessionIdleHookEventSent(stateDir, notifySessionId, idleFingerprint);
+            if (hookStateRoot) {
+              const hookDispatchResult = await dispatchHookEvent(event, { cwd, stateRoot: hookStateRoot });
+              if (hookDispatchResult.results.some((result) => result.ok)) {
+                recordSessionIdleHookEventSent(stateDir, notifySessionId, idleFingerprint);
+              }
             }
           } catch {
             // Non-fatal

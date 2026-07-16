@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import assert from 'node:assert/strict';
 import { chmod, link, lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from 'node:fs/promises';
 
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 
 import { existsSync, realpathSync } from 'node:fs';
 import { hostname, tmpdir } from 'node:os';
@@ -46,6 +46,7 @@ import {
   rolloverStateAuthorityToAlternateRoot,
   publishStateAuthorityLaunchTransport,
   readStateAuthorityJournal,
+  writeStateAuthorityJournal,
   resolveWorkspaceIdentity,
   transitionStateAuthorityJournal,
   validateAlternateRootBootstrapIntent,
@@ -1083,6 +1084,82 @@ describe('state authority foundation', () => {
     assert.equal(committed.status, 'committed');
     assert.throws(() => transitionStateAuthorityJournal(committed, 'aborted'), /cannot transition/);
   });
+  it('rejects non-monotonic persisted journal overwrites and unverified launch commits', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'omx-authority-journal-monotonic-'));
+    const path = join(directory, 'journal.json');
+    try {
+      const prepared = createStateAuthorityJournal({
+        operation_id: 'operation-monotonic-journal',
+        kind: 'generation_establish',
+        authority_id: 'authority-monotonic-journal',
+        generation_id: 'generation-monotonic-journal',
+        binding_revision: 1,
+        workspace_identity_digest: 'b'.repeat(64),
+        expected_anchor_revision: 0,
+        fencing_token: 1,
+        effects_digest: 'c'.repeat(64),
+        now: new Date(0),
+      });
+      await writeStateAuthorityJournal(path, prepared);
+      const applying = transitionStateAuthorityJournal(prepared, 'applying', {
+        completed_step: 'prepared-effect',
+        now: new Date(2),
+      });
+      await writeStateAuthorityJournal(path, applying);
+      await assert.rejects(
+        writeStateAuthorityJournal(path, { ...applying, authority_id: 'forged-authority', updated_at: new Date(3).toISOString() }),
+        /immutable tuple changed/,
+      );
+      await assert.rejects(
+        writeStateAuthorityJournal(path, { ...applying, completed_steps: [], updated_at: new Date(3).toISOString() }),
+        /completed-step evidence regressed/,
+      );
+      await assert.rejects(
+        writeStateAuthorityJournal(path, { ...applying, updated_at: new Date(1).toISOString() }),
+        /timestamp regressed/,
+      );
+      await assert.rejects(
+        writeStateAuthorityJournal(path, {
+          ...prepared,
+          completed_steps: [...applying.completed_steps],
+          updated_at: new Date(3).toISOString(),
+        }),
+        /cannot transition/,
+      );
+
+      const committed = transitionStateAuthorityJournal(applying, 'committed', { now: new Date(4) });
+      await writeStateAuthorityJournal(path, committed);
+      await assert.rejects(
+        writeStateAuthorityJournal(path, { ...committed, updated_at: new Date(5).toISOString() }),
+        /terminal authority journal cannot be rewritten/,
+      );
+
+      const launchPrepared = createStateAuthorityJournal({
+        operation_id: 'operation-unverified-launch-journal',
+        kind: 'launch_transport_publish',
+        authority_id: 'authority-unverified-launch-journal',
+        generation_id: 'generation-unverified-launch-journal',
+        binding_revision: 1,
+        binding_id: 'binding-unverified-launch-journal',
+        workspace_identity_digest: 'd'.repeat(64),
+        expected_anchor_revision: 0,
+        fencing_token: 1,
+        effects_digest: 'e'.repeat(64),
+        now: new Date(0),
+      });
+      const unverifiedCommit = transitionStateAuthorityJournal(
+        transitionStateAuthorityJournal(launchPrepared, 'applying', { now: new Date(1) }),
+        'committed',
+        { now: new Date(2) },
+      );
+      await assert.rejects(
+        writeStateAuthorityJournal(join(directory, 'unverified-launch.json'), unverifiedCommit),
+        /missing persistent transport verification evidence/,
+      );
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
   it('fails closed instead of establishing a pristine lineage when an anchor disappears after generation evidence exists', async () => {
     const workspace = await mkdtemp(join(tmpdir(), 'omx-authority-missing-anchor-evidence-'));
     try {
@@ -1160,6 +1237,70 @@ describe('state authority foundation', () => {
     } finally {
       await rm(workspace, { recursive: true, force: true });
       await rm(outside, { recursive: true, force: true });
+    }
+  });
+  it('accepts current-owner-only Windows DACL custody and rejects untrusted raw generic mutation ACEs', { skip: process.platform !== 'win32' }, async () => {
+    const secureWorkspace = await mkdtemp(join(tmpdir(), 'omx-authority-win32-secure-custody-'));
+    const genericWriteWorkspace = await mkdtemp(join(tmpdir(), 'omx-authority-win32-generic-write-custody-'));
+    const genericAllWorkspace = await mkdtemp(join(tmpdir(), 'omx-authority-win32-generic-all-custody-'));
+    const setCustody = (directory: string, rawGenericRights?: number) => {
+      const script = [
+        '$ErrorActionPreference = "Stop"',
+        '$acl = Get-Acl -LiteralPath $args[0]',
+        '$current = [Security.Principal.WindowsIdentity]::GetCurrent().User',
+        '$acl.SetOwner($current)',
+        '$acl.SetAccessRuleProtection($true, $false)',
+        '$inheritance = [Security.AccessControl.InheritanceFlags]"ContainerInherit, ObjectInherit"',
+        '$allow = [Security.AccessControl.AccessControlType]::Allow',
+        '$acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($current, "FullControl", $inheritance, "None", $allow)))',
+        'if ($args.Count -gt 1) {',
+        '  $untrusted = New-Object Security.Principal.SecurityIdentifier("S-1-5-32-545")',
+        '  $rawRights = [Security.AccessControl.FileSystemRights]([int]$args[1])',
+        '  $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($untrusted, $rawRights, $inheritance, "None", $allow)))',
+        '}',
+        'Set-Acl -LiteralPath $args[0] -AclObject $acl',
+        'if ($args.Count -gt 1) {',
+        '  $installed = Get-Acl -LiteralPath $args[0]',
+        '  $untrustedSid = "S-1-5-32-545"',
+        '  $rawMask = [int64]$args[1]',
+        '  $hasRawAce = @($installed.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]) | Where-Object { $_.IdentityReference.Value -eq $untrustedSid -and ([int64]$_.FileSystemRights -band $rawMask) -ne 0 }).Count -gt 0',
+        '  if (-not $hasRawAce) { throw "raw generic mutation ACE was not preserved" }',
+        '}',
+      ].join('; ');
+      execFileSync('powershell.exe', [
+        '-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script, directory,
+        ...(rawGenericRights === undefined ? [] : [String(rawGenericRights)]),
+      ], { encoding: 'utf8', windowsHide: true });
+    };
+    try {
+      setCustody(secureWorkspace);
+      const authority = await initializeStateAuthority({
+        startup_cwd: secureWorkspace,
+        launch_id: 'win32-secure-custody',
+        session_binding: { canonical_session_id: 'win32-secure-custody-session' },
+      });
+      assert.equal(authority.workspace_identity.canonical_path, realpathSync.native(secureWorkspace));
+
+      for (const [workspace, rawGenericRights, name] of [
+        [genericWriteWorkspace, 0x40000000, 'write'],
+        [genericAllWorkspace, 0x10000000, 'all'],
+      ] as const) {
+        setCustody(workspace, rawGenericRights);
+        await assert.rejects(
+          initializeStateAuthority({
+            startup_cwd: workspace,
+            launch_id: `win32-generic-${name}-custody`,
+            session_binding: { canonical_session_id: `win32-generic-${name}-custody-session` },
+          }),
+          (error: unknown) => error instanceof Error
+            && 'code' in error
+            && error.code === AUTHORITY_DIAGNOSTIC_CODES.rootCapabilityWeak,
+        );
+      }
+    } finally {
+      await rm(secureWorkspace, { recursive: true, force: true });
+      await rm(genericWriteWorkspace, { recursive: true, force: true });
+      await rm(genericAllWorkspace, { recursive: true, force: true });
     }
   });
 

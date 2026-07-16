@@ -1371,6 +1371,9 @@ function createTmuxOneShotWorkerEnvironmentImport(
 					process.env,
 					entries.map(({ targetName }) => targetName),
 				),
+				undefined,
+				true,
+				TMUX_ONE_SHOT_IMPORT_TIMEOUT_MS,
 			);
 			if (!acknowledged.ok)
 				throw new Error(

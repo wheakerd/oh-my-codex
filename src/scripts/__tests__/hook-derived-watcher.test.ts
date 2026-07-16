@@ -2,11 +2,18 @@ import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import { existsSync } from 'node:fs';
-import { appendFile, mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
+import { appendFile, chmod, mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
+import { initializeStateAuthority, mintStateAuthorityTransportCapability, resolveStateAuthorityForGuard, rolloverStateAuthorityToAlternateRoot } from '../../state/authority.js';
+import { buildStateAuthorityTransportEnv } from '../../state/transport-env.js';
 
+const TEST_AUTHORITY_ISSUER = {
+  kind: 'first-party-launcher' as const,
+  package_version: 'test',
+  package_digest: '0'.repeat(64),
+};
 function todaySessionDir(baseHome: string): string {
   const now = new Date();
   return join(
@@ -32,6 +39,29 @@ async function waitFor(predicate: () => Promise<boolean>, timeoutMs: number = 30
   throw new Error(`waitFor timed out after ${timeoutMs}ms`);
 }
 
+async function authenticatedWatcherEnv(cwd: string, sessionId: string): Promise<NodeJS.ProcessEnv> {
+  await mkdir(join(cwd, '.omx'), { recursive: true, mode: 0o700 });
+  await chmod(join(cwd, '.omx'), 0o700);
+  await initializeStateAuthority({
+    startup_cwd: cwd,
+    observed_cwd: cwd,
+    launch_id: `hook-derived-watcher-${sessionId}`,
+    session_binding: { canonical_session_id: sessionId },
+  });
+  await writeFile(join(cwd, '.omx', 'state', 'session.json'), `${JSON.stringify({
+    session_id: sessionId,
+    started_at: new Date().toISOString(),
+    cwd,
+  })}\n`);
+  const authority = await resolveStateAuthorityForGuard({
+    startup_cwd: cwd,
+    observed_cwd: cwd,
+    session_id: sessionId,
+  });
+  await mintStateAuthorityTransportCapability(authority);
+  return buildStateAuthorityTransportEnv(authority, { ...process.env, OMX_SESSION_ID: sessionId });
+}
+
 describe('hook-derived-watcher', () => {
   it('uses offset-bounded rollout reads instead of re-reading whole tracked files', async () => {
     const source = await readFile(new URL('../hook-derived-watcher.js', import.meta.url), 'utf-8');
@@ -47,7 +77,7 @@ describe('hook-derived-watcher', () => {
     assert.doesNotMatch(source, /stat\(path\)\.catch\(\(\) => \(\{ size: 0 \}\)\)/);
   });
 
-  it('stores watcher state and logs under boxed runtime root when OMX_ROOT is set', async () => {
+  it('stores watcher state and logs under the committed authority root', async () => {
     const base = await mkdtemp(join(tmpdir(), 'omx-hook-derived-boxed-'));
     const homeDir = join(base, 'home');
     const cwd = join(base, 'cwd');
@@ -56,6 +86,25 @@ describe('hook-derived-watcher', () => {
     try {
       await mkdir(todaySessionDir(homeDir), { recursive: true });
       await mkdir(cwd, { recursive: true });
+      await authenticatedWatcherEnv(cwd, 'hook-derived-boxed-session');
+      await mkdir(boxedRoot, { recursive: true, mode: 0o700 });
+      const initial = await resolveStateAuthorityForGuard({
+        startup_cwd: cwd,
+        observed_cwd: cwd,
+        session_id: 'hook-derived-boxed-session',
+      });
+      const active = await rolloverStateAuthorityToAlternateRoot({
+        context: initial,
+        proposed_state_root: join(boxedRoot, '.omx', 'state'),
+        creation_root: boxedRoot,
+        launch_id: 'hook-derived-boxed-alternate',
+        consumer_kind: 'boxed',
+        issuer: TEST_AUTHORITY_ISSUER,
+      });
+      await mintStateAuthorityTransportCapability(active);
+      const authorityEnv = buildStateAuthorityTransportEnv(active, {
+        OMX_SESSION_ID: 'hook-derived-boxed-session',
+      });
       const watcherScript = new URL('../hook-derived-watcher.js', import.meta.url).pathname;
       const result = spawnSync(
         process.execPath,
@@ -63,7 +112,7 @@ describe('hook-derived-watcher', () => {
         {
           cwd,
           env: {
-            ...process.env,
+            ...authorityEnv,
             HOME: homeDir,
             OMX_ROOT: boxedRoot,
             OMXBOX_ACTIVE: '1',
@@ -100,6 +149,7 @@ describe('hook-derived-watcher', () => {
     try {
       await mkdir(todaySessionDir(homeDir), { recursive: true });
       await mkdir(join(cwd, '.omx', 'hooks'), { recursive: true });
+      const authorityEnv = await authenticatedWatcherEnv(cwd, 'hook-derived-array-session');
 
       await writeFile(
         join(cwd, '.omx', 'hooks', 'capture-needs-input.mjs'),
@@ -153,7 +203,7 @@ export async function onHookEvent(event) {
         {
           cwd,
           env: {
-            ...process.env,
+            ...authorityEnv,
             HOME: homeDir,
             OMX_HOOK_DERIVED_SIGNALS: '1',
             OMX_HOOK_PLUGINS: '1',
@@ -190,6 +240,7 @@ export async function onHookEvent(event) {
     try {
       await mkdir(todaySessionDir(homeDir), { recursive: true });
       await mkdir(join(cwd, '.omx', 'hooks'), { recursive: true });
+      const authorityEnv = await authenticatedWatcherEnv(cwd, 'hook-derived-utf8-session');
 
       await writeFile(
         join(cwd, '.omx', 'hooks', 'capture-needs-input.mjs'),
@@ -223,7 +274,7 @@ export async function onHookEvent(event) {
           cwd,
           stdio: 'ignore',
           env: {
-            ...process.env,
+            ...authorityEnv,
             HOME: homeDir,
             OMX_HOOK_DERIVED_SIGNALS: '1',
             OMX_HOOK_PLUGINS: '1',
@@ -278,6 +329,98 @@ export async function onHookEvent(event) {
       const raw = await readFile(hookLogPath, 'utf-8');
       assert.match(raw, /turn-hook-utf8/);
       assert.match(raw, /Can you preserve split emoji 🧪 please\?/);
+    } finally {
+      await rm(base, { recursive: true, force: true });
+    }
+  });
+
+  it('terminates before dispatching after a committed alternate-root rollover', async () => {
+    const base = await mkdtemp(join(tmpdir(), 'omx-hook-derived-rollover-'));
+    const homeDir = join(base, 'home');
+    const cwd = join(base, 'cwd');
+    const alternateRoot = join(base, 'alternate', 'state');
+    const hookLogPath = join(cwd, '.omx', 'hook-events.jsonl');
+    const sessionId = 'hook-derived-rollover-session';
+    try {
+      await mkdir(todaySessionDir(homeDir), { recursive: true });
+      await mkdir(join(cwd, '.omx', 'hooks'), { recursive: true });
+      const authorityEnv = await authenticatedWatcherEnv(cwd, sessionId);
+      await writeFile(join(cwd, '.omx', 'hooks', 'capture-rollover.mjs'), `import { appendFile } from 'node:fs/promises';
+export async function onHookEvent(event) {
+  await appendFile(${JSON.stringify(hookLogPath)}, JSON.stringify(event) + '\\n');
+}
+`);
+      const rolloutPath = join(todaySessionDir(homeDir), 'rollout-hook-derived-rollover.jsonl');
+      await writeFile(rolloutPath, `${JSON.stringify({ type: 'session_meta', payload: { id: 'thread-hook-rollover', cwd } })}\n`);
+      const watcherScript = new URL('../hook-derived-watcher.js', import.meta.url).pathname;
+      const child = spawn(process.execPath, [watcherScript, '--cwd', cwd, '--poll-ms', '75'], {
+        cwd,
+        stdio: 'ignore',
+        env: { ...authorityEnv, HOME: homeDir, OMX_HOOK_DERIVED_SIGNALS: '1', OMX_HOOK_PLUGINS: '1' },
+      });
+      const watcherStatePath = join(cwd, '.omx', 'state', 'hook-derived-watcher-state.json');
+      await waitFor(async () => existsSync(watcherStatePath));
+
+      const initial = await resolveStateAuthorityForGuard({ startup_cwd: cwd, observed_cwd: cwd, session_id: sessionId });
+      await rolloverStateAuthorityToAlternateRoot({
+        context: initial,
+        proposed_state_root: alternateRoot,
+        creation_root: join(base, 'alternate'),
+        launch_id: 'hook-derived-rollover-alternate',
+        consumer_kind: 'boxed',
+        issuer: TEST_AUTHORITY_ISSUER,
+      });
+      await appendFile(rolloutPath, `${JSON.stringify({
+        timestamp: new Date().toISOString(),
+        type: 'event_msg',
+        payload: { type: 'assistant_message', turn_id: 'turn-after-rollover', content: 'Can you continue?' },
+      })}\n`);
+      const [exitCode] = await once(child, 'exit') as [number | null];
+      assert.notEqual(exitCode, 0, 'watcher must fail closed after rollover');
+      assert.equal(existsSync(hookLogPath), false, 'watcher dispatched after its authority tuple changed');
+    } finally {
+      await rm(base, { recursive: true, force: true });
+    }
+  });
+  it('terminates without recreating a replaced committed state root', async () => {
+    const base = await mkdtemp(join(tmpdir(), 'omx-hook-derived-root-replaced-'));
+    const homeDir = join(base, 'home');
+    const cwd = join(base, 'cwd');
+    const hookLogPath = join(cwd, '.omx', 'hook-events.jsonl');
+    const sessionId = 'hook-derived-root-replaced-session';
+    const stateDir = join(cwd, '.omx', 'state');
+    try {
+      await mkdir(todaySessionDir(homeDir), { recursive: true });
+      await mkdir(join(cwd, '.omx', 'hooks'), { recursive: true });
+      const authorityEnv = await authenticatedWatcherEnv(cwd, sessionId);
+      await writeFile(join(cwd, '.omx', 'hooks', 'capture-replaced.mjs'), `import { appendFile } from 'node:fs/promises';
+export async function onHookEvent(event) {
+  await appendFile(${JSON.stringify(hookLogPath)}, JSON.stringify(event) + '\\n');
+}
+`);
+      const rolloutPath = join(todaySessionDir(homeDir), 'rollout-hook-derived-root-replaced.jsonl');
+      await writeFile(rolloutPath, `${JSON.stringify({ type: 'session_meta', payload: { id: 'thread-hook-replaced', cwd } })}\n`);
+      const watcherScript = new URL('../hook-derived-watcher.js', import.meta.url).pathname;
+      const child = spawn(process.execPath, [watcherScript, '--cwd', cwd, '--poll-ms', '75'], {
+        cwd,
+        stdio: 'ignore',
+        env: { ...authorityEnv, HOME: homeDir, OMX_HOOK_DERIVED_SIGNALS: '1', OMX_HOOK_PLUGINS: '1' },
+      });
+      const watcherStatePath = join(stateDir, 'hook-derived-watcher-state.json');
+      await waitFor(async () => existsSync(watcherStatePath));
+
+      await rm(stateDir, { recursive: true, force: true });
+      await mkdir(stateDir, { recursive: true, mode: 0o700 });
+      await appendFile(rolloutPath, `${JSON.stringify({
+        timestamp: new Date().toISOString(),
+        type: 'event_msg',
+        payload: { type: 'assistant_message', turn_id: 'turn-after-root-replacement', content: 'Continue?' },
+      })}\n`);
+
+      const [exitCode] = await once(child, 'exit') as [number | null];
+      assert.notEqual(exitCode, 0, 'watcher must fail closed after state-root replacement');
+      assert.equal(existsSync(watcherStatePath), false, 'watcher recreated state in a replacement root');
+      assert.equal(existsSync(hookLogPath), false, 'watcher dispatched after state-root replacement');
     } finally {
       await rm(base, { recursive: true, force: true });
     }

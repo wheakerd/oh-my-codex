@@ -5,7 +5,7 @@ import {
   isCanonicalClaimantToken,
   isCanonicalCorrelationToken,
   isRoleIntentOwnedByCwd,
-  listBoundAdaptedRoleIntents,
+  listBoundAdaptedRoleIntentsStrict,
   OMX_ADAPTED_PROVENANCE,
   type SubagentTrackingState,
 } from './tracker.js';
@@ -43,12 +43,12 @@ export function recoverAdaptedRoleBindings(cwd: string, stateDir: string, nowMs?
   const normalizedNowMs = normalizeNowMs(nowMs);
   const canonicalOrigin = canonicalizeOriginCwd(cwd);
   if (canonicalOrigin === null) return;
-  for (const intent of listBoundAdaptedRoleIntents(cwd, normalizedNowMs, true)) {
+  for (const intent of listBoundAdaptedRoleIntentsStrict(cwd, normalizedNowMs, true, stateDir) ?? []) {
     // Fail-closed origin authentication: under a shared OMX_ROOT/OMX_STATE_ROOT/
     // OMX_TEAM_STATE_ROOT the tracker is shared across workspaces. Only recover, publish a
     // marker for, and complete an intent that belongs to THIS canonical origin workspace; a
     // foreign workspace's retained journal is left untouched.
-    if (!isRoleIntentOwnedByCwd(cwd, intent)) continue;
+    if (!isRoleIntentOwnedByCwd(cwd, intent, stateDir)) continue;
     try {
       if (!isCanonicalCorrelationToken(intent.correlation_token)) continue;
       if (Object.hasOwn(intent, 'binding_claimant_token') && !isCanonicalClaimantToken(intent.binding_claimant_token)) continue;
@@ -62,6 +62,7 @@ export function recoverAdaptedRoleBindings(cwd: string, stateDir: string, nowMs?
         correlationToken: intent.correlation_token,
         ...(Object.hasOwn(intent, 'binding_claimant_token') ? { claimantToken: intent.binding_claimant_token as string } : {}),
         nowMs: normalizedNowMs,
+        stateDir,
       });
     } catch {
       // A later hook invocation retries each retained binding independently.
@@ -82,6 +83,7 @@ export function bindAndPublishAdaptedRole(
     parentThreadId: input.parentThreadId,
     correlationToken: input.correlationToken,
     nowMs,
+    stateDir,
   }, bind);
   if (!binding) return null;
 
@@ -100,6 +102,7 @@ export function bindAndPublishAdaptedRole(
     correlationToken: input.correlationToken,
     claimantToken: binding.claimantToken,
     nowMs,
+    stateDir,
   });
   return { role: binding.role };
 }

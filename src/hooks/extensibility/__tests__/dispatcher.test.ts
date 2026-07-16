@@ -126,6 +126,59 @@ describe("dispatchHookEvent", () => {
 		}
 	});
 
+	it("scrubs authority transport from every plugin process", async () => {
+		const cwd = await mkdtemp(join(tmpdir(), "omx-dispatch-scrub-"));
+		const capturePath = join(cwd, "plugin-env.json");
+		try {
+			const dir = join(cwd, ".omx", "hooks");
+			await mkdir(dir, { recursive: true });
+			await writeFile(join(dir, "capture.mjs"), `
+				import { writeFileSync } from "node:fs";
+				export async function onHookEvent() {
+					writeFileSync(process.env.OMX_TEST_PLUGIN_ENV_FILE, JSON.stringify({
+						root: process.env.OMX_ROOT,
+						stateRoot: process.env.OMX_STATE_ROOT,
+						teamRoot: process.env.OMX_TEAM_STATE_ROOT,
+						startupCwd: process.env.OMX_STARTUP_CWD,
+						authorityPath: process.env.OMX_STATE_AUTHORITY_PATH,
+						authorityId: process.env.OMX_STATE_AUTHORITY_ID,
+						generationId: process.env.OMX_STATE_AUTHORITY_GENERATION_ID,
+						workspaceDigest: process.env.OMX_STATE_AUTHORITY_WORKSPACE_DIGEST,
+						capability: process.env.OMX_STATE_AUTHORITY_CAPABILITY,
+						mixedCapability: process.env.omx_state_authority_capability,
+						mixedRoot: process.env.Omx_State_Root,
+						launchId: process.env.OMX_CODEX_LAUNCH_ID,
+						benign: process.env.OMX_TEST_PLUGIN_BENIGN,
+					}));
+				}
+			`);
+			const result = await dispatchHookEvent(buildHookEvent("session-start"), {
+				cwd,
+				env: {
+					OMX_HOOK_PLUGINS: "1",
+					OMX_ROOT: "/forged/root",
+					OMX_STATE_ROOT: "/forged/state",
+					OMX_TEAM_STATE_ROOT: "/forged/team",
+					OMX_STARTUP_CWD: "/forged/startup",
+					OMX_STATE_AUTHORITY_PATH: "/secret/authority",
+					OMX_STATE_AUTHORITY_ID: "authority-id",
+					OMX_STATE_AUTHORITY_GENERATION_ID: "generation-id",
+					OMX_STATE_AUTHORITY_WORKSPACE_DIGEST: "workspace-digest",
+					OMX_STATE_AUTHORITY_CAPABILITY: "secret-capability",
+					omx_state_authority_capability: "mixed-secret-capability",
+					Omx_State_Root: "/mixed/forged/state",
+					OMX_CODEX_LAUNCH_ID: "secret-launch-id",
+					OMX_TEST_PLUGIN_ENV_FILE: capturePath,
+					OMX_TEST_PLUGIN_BENIGN: "preserved",
+				},
+			});
+			assert.equal(result.results[0]?.ok, true);
+			assert.deepEqual(JSON.parse(await readFile(capturePath, "utf8")), { benign: "preserved" });
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
 	it("routes native plugin state and lifecycle dedupe through the supplied committed state root", async () => {
 		const cwd = await mkdtemp(join(tmpdir(), "omx-dispatch-authority-root-"));
 		const stateRoot = join(cwd, "nested-authority", "state");

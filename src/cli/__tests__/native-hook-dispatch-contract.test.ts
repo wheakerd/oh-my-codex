@@ -8,7 +8,7 @@ describe('native hook dispatch contract', () => {
     const source = await readFile(join(process.cwd(), 'src', 'cli', 'index.ts'), 'utf-8');
     assert.match(
       source,
-      /async function emitNativeHookEvent[\s\S]*?await dispatchHookEvent\(payload,\s*\{\s*cwd,\s*enabled:\s*true,\s*\}\);/,
+      /async function emitNativeHookEvent[\s\S]*?resolveCommittedAuthorityRuntimeStateScope\(cwd\)[\s\S]*?await dispatchHookEvent\(payload,\s*\{\s*cwd,\s*stateRoot:\s*authorityScope\.authority\.canonical_state_root,\s*enabled:\s*true,\s*\}\);/,
     );
   });
 });

@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { safeString } from './utils.js';
 import { resolveBridgeStateDir, resolveRuntimeBinaryPath } from '../../runtime/bridge.js';
 import { appendTeamDeliveryLog } from '../../team/delivery-log.js';
+import { resolveStateAuthorityForGuard } from '../../state/authority.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -206,6 +207,11 @@ const LEADER_NOTIFICATION_DEFERRED_TYPE = 'leader_notification_deferred';
 
 async function emitOperationalHookEvent(cwd, eventName, context) {
   try {
+    const authority = await resolveStateAuthorityForGuard({
+      startup_cwd: cwd,
+      observed_cwd: cwd,
+      session_id: process.env.OMX_SESSION_ID || undefined,
+    });
     const { buildNativeHookEvent } = await import('../../hooks/extensibility/events.js');
     const { dispatchHookEvent } = await import('../../hooks/extensibility/dispatcher.js');
     const event = buildNativeHookEvent(eventName, {
@@ -213,7 +219,7 @@ async function emitOperationalHookEvent(cwd, eventName, context) {
       scope: 'team-dispatch',
       ...context,
     });
-    await dispatchHookEvent(event, { cwd });
+    await dispatchHookEvent(event, { cwd, stateRoot: authority.canonical_state_root });
   } catch {
     // best effort only
   }

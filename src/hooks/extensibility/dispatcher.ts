@@ -30,6 +30,27 @@ interface RunnerResult {
 
 const RESULT_PREFIX = "__OMX_PLUGIN_RESULT__ ";
 const RUNNER_SIGKILL_GRACE_MS = 250;
+const PLUGIN_SCRUBBED_ENV_KEYS = [
+	"OMX_ROOT",
+	"OMX_STATE_ROOT",
+	"OMX_TEAM_STATE_ROOT",
+	"OMX_STARTUP_CWD",
+	"OMX_STATE_AUTHORITY_PATH",
+	"OMX_STATE_AUTHORITY_ID",
+	"OMX_STATE_AUTHORITY_GENERATION_ID",
+	"OMX_STATE_AUTHORITY_WORKSPACE_DIGEST",
+	"OMX_STATE_AUTHORITY_CAPABILITY",
+	"OMX_CODEX_LAUNCH_ID",
+] as const;
+
+function pluginRunnerEnvironment(optionsEnv?: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+	const env = { ...process.env, ...(optionsEnv || {}) };
+	const denied = new Set(PLUGIN_SCRUBBED_ENV_KEYS.map((key) => key.toUpperCase()));
+	for (const key of Object.keys(env)) {
+		if (denied.has(key.toUpperCase())) delete env[key];
+	}
+	return env;
+}
 
 function hooksLogPath(cwd: string, stateRoot?: string): string {
 	const day = new Date().toISOString().slice(0, 10);
@@ -98,10 +119,7 @@ async function runPluginRunner(
 			cwd: options.cwd,
 			stdio: ["pipe", "pipe", "pipe"],
 			windowsHide: true,
-			env: {
-				...process.env,
-				...(options.env || {}),
-			},
+			env: pluginRunnerEnvironment(options.env),
 		});
 
 		let stdout = "";

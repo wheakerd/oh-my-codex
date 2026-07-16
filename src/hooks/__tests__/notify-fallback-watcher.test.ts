@@ -740,7 +740,7 @@ describe("notify-fallback watcher", () => {
 		assert.match(source, /async function readFileDelta/);
 		assert.match(source, /while \(totalBytesRead < length\)/);
 		assert.match(source, /nextOffset: offset \+ totalBytesRead/);
-		assert.match(source, /new StringDecoder\('utf8'\)/);
+		assert.match(source, /new StringDecoder\(["']utf8["']\)/);
 		assert.match(source, /decoder\.write\(bytes\)/);
 		assert.match(
 			source,
@@ -748,7 +748,7 @@ describe("notify-fallback watcher", () => {
 		);
 		assert.match(
 			source,
-			/if \(currentSize < meta\.offset\) \{\s*meta\.offset = 0;\s*meta\.partial = '';/,
+			/if \(currentSize < meta\.offset\) \{\s*meta\.offset = 0;\s*meta\.partial = ["']{2};/,
 		);
 		assert.doesNotMatch(
 			source,
@@ -819,6 +819,7 @@ describe("notify-fallback watcher", () => {
 							},
 						},
 					},
+					pending_role_intents: [],
 				}),
 			);
 
@@ -4317,6 +4318,7 @@ exit 0
 								},
 							},
 						},
+						pending_role_intents: [],
 					},
 					null,
 					2,
@@ -8271,7 +8273,7 @@ describe("notify fallback delivery protocol wiring", () => {
 		assert.match(source, /authorityDeadlineAtMs/);
 		assert.match(
 			source,
-			/setTimeout\(\(\) => \{ void stopForTimeout\(false\); \}, 10_000\)/,
+			/setTimeout\(\(\) => \{\s*void stopForTimeout\(false\);\s*\}, 10_000\)/,
 		);
 		assert.match(source, /compactNotifyFallbackDeliveries\(stateDir\)/);
 		assert.doesNotMatch(source, /spawnSync\(process\.execPath, \[notifyScript/);

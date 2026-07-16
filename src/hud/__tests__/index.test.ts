@@ -191,7 +191,7 @@ describe('runWatchMode', () => {
 
     assert.deepEqual(seenConfigCwds, ['/home/tools/calc.noninteractive-aborted-20260527T233204Z']);
     assert.deepEqual(seenStateCwds, ['/home/tools/calc.noninteractive-aborted-20260527T233204Z']);
-    assert.deepEqual(seenAuthorityCwds, ['/home/tools/calc.noninteractive-aborted-20260527T233204Z']);
+    assert.deepEqual(seenAuthorityCwds, ['/home/tools/calc']);
   });
 
   it('restores cursor and clears interval on SIGINT', async () => {

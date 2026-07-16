@@ -6,6 +6,7 @@ import { buildHookEvent } from '../hooks/extensibility/events.js';
 import { dispatchHookEvent } from '../hooks/extensibility/dispatcher.js';
 import { discoverHookPlugins, isHookPluginsEnabled } from '../hooks/extensibility/loader.js';
 import type { HookPluginDescriptor } from '../hooks/extensibility/types.js';
+import { resolveCommittedAuthorityRuntimeStateScope } from '../mcp/state-paths.js';
 
 const HELP = `
 Usage:
@@ -18,6 +19,32 @@ Notes:
   - This command is additive. Existing \`omx tmux-hook\` behavior is unchanged.
   - Plugins are enabled by default. Disable with OMX_HOOK_PLUGINS=0.
 `;
+const AUTHORITY_TRANSPORT_ENV_KEYS = [
+  'OMX_ROOT',
+  'OMX_STATE_ROOT',
+  'OMX_TEAM_STATE_ROOT',
+  'OMX_STARTUP_CWD',
+  'OMX_STATE_AUTHORITY_PATH',
+  'OMX_STATE_AUTHORITY_ID',
+  'OMX_STATE_AUTHORITY_GENERATION_ID',
+  'OMX_STATE_AUTHORITY_WORKSPACE_DIGEST',
+  'OMX_STATE_AUTHORITY_CAPABILITY',
+] as const;
+
+async function dispatchWithoutAuthorityTransport<T>(dispatch: () => Promise<T>): Promise<T> {
+  const inherited = new Map(AUTHORITY_TRANSPORT_ENV_KEYS.map((key) => [key, process.env[key]]));
+  for (const key of AUTHORITY_TRANSPORT_ENV_KEYS) delete process.env[key];
+  try {
+    return await dispatch();
+  } finally {
+    for (const key of AUTHORITY_TRANSPORT_ENV_KEYS) {
+      const value = inherited.get(key);
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+}
+
 
 const SAMPLE_PLUGIN = `export async function onHookEvent(event, sdk) {
   if (event.event !== 'turn-complete') return;
@@ -182,6 +209,7 @@ function pluginStatusFromResult(result: Record<string, unknown>): string {
 async function testHooks(): Promise<void> {
   const cwd = process.cwd();
   const discovered = await discoverHookPlugins(cwd);
+  const authorityScope = await resolveCommittedAuthorityRuntimeStateScope(cwd);
 
   const event = buildHookEvent('turn-complete', {
     source: 'native',
@@ -193,15 +221,15 @@ async function testHooks(): Promise<void> {
     turn_id: `turn-${Date.now()}`,
   });
 
-  const rawResult = await dispatchHookEvent(event, {
+  const rawResult = await dispatchWithoutAuthorityTransport(() => dispatchHookEvent(event, {
     cwd,
+    stateRoot: authorityScope.authority.canonical_state_root,
     event,
     env: {
-      ...process.env,
       OMX_HOOK_PLUGINS: '1',
     },
     allowInTeamWorker: false,
-  } as never);
+  } as never));
   const result = normalizeDispatchResult(rawResult);
 
   console.log('hooks test dispatch complete');

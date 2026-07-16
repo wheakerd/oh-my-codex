@@ -11,6 +11,14 @@ import {
   parseCommandResult,
   parseExecCommandArgs,
 } from './notify-hook/operational-events.js';
+import {
+  captureRootFilesystemIdentity,
+  readWorkspaceAuthorityAnchor,
+  resolveStateAuthorityForGuard,
+  sameRootFilesystemIdentity,
+  type RootFilesystemIdentity,
+  type WorkspaceIdentity,
+} from '../state/authority.js';
 
 function argValue(name: string, fallback = ''): string {
   const idx = process.argv.indexOf(name);
@@ -28,13 +36,64 @@ const runOnce = process.argv.includes('--once');
 const pollMs = Math.max(250, asNumber(argValue('--poll-ms', process.env.OMX_HOOK_DERIVED_POLL_MS || '800'), 800));
 const maxFileAgeMs = Math.max(10_000, asNumber(argValue('--file-age-ms', process.env.OMX_HOOK_DERIVED_FILE_AGE_MS || '90000'), 90000));
 
-const runtimeRoot = resolve(process.env.OMX_ROOT || process.env.OMX_STATE_ROOT || cwd);
-const omxDir = join(runtimeRoot, '.omx');
-const logsDir = join(omxDir, 'logs');
-const stateDir = join(omxDir, 'state');
-const watcherStatePath = join(stateDir, 'hook-derived-watcher-state.json');
-const logPath = join(logsDir, `hook-derived-watcher-${new Date().toISOString().split('T')[0]}.jsonl`);
+let stateDir = '';
+let logPath = '';
+let watcherStatePath = '';
 
+interface AuthenticatedAuthorityTuple {
+  workspaceIdentity: WorkspaceIdentity;
+  rootIdentity: RootFilesystemIdentity;
+  stateRoot: string;
+  generationId: string;
+  bindingId: string;
+}
+
+let authorityTuple: AuthenticatedAuthorityTuple | undefined;
+
+async function retainActiveAuthorityTuple(): Promise<AuthenticatedAuthorityTuple> {
+  const authority = await resolveStateAuthorityForGuard({
+    startup_cwd: cwd,
+    observed_cwd: cwd,
+    session_id: process.env.OMX_SESSION_ID || undefined,
+  });
+  const binding = authority.session_binding;
+  const anchor = await readWorkspaceAuthorityAnchor(authority.workspace_identity);
+  if (!binding || !anchor?.active_lease
+    || anchor.active_generation_id !== authority.generation.generation_id
+    || anchor.active_lease.generation_id !== authority.generation.generation_id
+    || anchor.active_lease.binding_id !== binding.binding_id
+    || binding.lifecycle !== 'active') {
+    throw new Error('active authority binding is no longer valid');
+  }
+  return {
+    rootIdentity: authority.generation.root_identity,
+    workspaceIdentity: authority.workspace_identity,
+    stateRoot: authority.canonical_state_root,
+    generationId: authority.generation.generation_id,
+    bindingId: binding.binding_id,
+  };
+}
+
+async function hasRetainedActiveAuthority(): Promise<boolean> {
+  if (!authorityTuple) return false;
+  try {
+    const anchor = await readWorkspaceAuthorityAnchor(authorityTuple.workspaceIdentity);
+    const currentRootIdentity = await captureRootFilesystemIdentity(authorityTuple.stateRoot);
+    if (!sameRootFilesystemIdentity(currentRootIdentity, authorityTuple.rootIdentity)) return false;
+    return Boolean(anchor?.active_lease)
+      && anchor?.active_generation_id === authorityTuple.generationId
+      && anchor.active_lease?.generation_id === authorityTuple.generationId
+      && anchor.active_lease?.binding_id === authorityTuple.bindingId;
+  } catch {
+    return false;
+  }
+}
+
+async function requireRetainedActiveAuthority(): Promise<void> {
+  if (await hasRetainedActiveAuthority()) return;
+  stopping = true;
+  throw new Error('watcher authority changed or terminalized');
+}
 interface FileMeta {
   threadId: string;
   sessionId: string;
@@ -107,8 +166,9 @@ function extractMessageText(payload: Record<string, unknown>): string {
   return '';
 }
 
-function derivedLog(entry: Record<string, unknown>): Promise<void> {
-  return appendFile(logPath, `${JSON.stringify({ timestamp: new Date().toISOString(), ...entry })}\n`).catch(() => {});
+async function derivedLog(entry: Record<string, unknown>): Promise<void> {
+  await requireRetainedActiveAuthority();
+  await appendFile(logPath, `${JSON.stringify({ timestamp: new Date().toISOString(), ...entry })}\n`).catch(() => {});
 }
 
 function parseJsonLine(line: string): Record<string, unknown> | null {
@@ -312,11 +372,13 @@ function inferOperationalCall(parsed: Record<string, unknown> | null, meta: File
 }
 
 async function dispatchDerivedEvent(event: Record<string, unknown>): Promise<void> {
+  await requireRetainedActiveAuthority();
   try {
     const { dispatchHookEvent } = await import('../hooks/extensibility/dispatcher.js');
     await dispatchHookEvent(event as unknown as Parameters<typeof dispatchHookEvent>[0], {
       cwd,
       allowTeamWorkerSideEffects: false,
+      stateRoot: stateDir,
     });
     await derivedLog({
       type: 'derived_event_dispatch',
@@ -361,6 +423,7 @@ interface OperationalEventInput {
 }
 
 async function dispatchOperationalEvent(input: OperationalEventInput): Promise<void> {
+  await requireRetainedActiveAuthority();
   try {
     const { buildDerivedHookEvent } = await import('../hooks/extensibility/events.js');
     const { dispatchHookEvent } = await import('../hooks/extensibility/dispatcher.js');
@@ -389,6 +452,7 @@ async function dispatchOperationalEvent(input: OperationalEventInput): Promise<v
     await dispatchHookEvent(event, {
       cwd,
       allowTeamWorkerSideEffects: false,
+      stateRoot: stateDir,
     });
     await derivedLog({
       type: 'operational_event_dispatch',
@@ -570,7 +634,7 @@ async function pollFiles(): Promise<void> {
 }
 
 async function writeState(): Promise<void> {
-  await mkdir(stateDir, { recursive: true }).catch(() => {});
+  await requireRetainedActiveAuthority();
   const tracked = Array.from(fileState.values()).reduce((sum, item) => sum + item.dispatched, 0);
   const state = {
     pid: process.pid,
@@ -588,6 +652,7 @@ async function writeState(): Promise<void> {
 async function flushOnce(reason: string): Promise<void> {
   if (flushedOnShutdown) return;
   flushedOnShutdown = true;
+  await requireRetainedActiveAuthority();
   await ensureTrackedFiles();
   await pollFiles();
   await writeState();
@@ -596,17 +661,16 @@ async function flushOnce(reason: string): Promise<void> {
 
 async function tick(): Promise<void> {
   if (stopping) return;
+  await requireRetainedActiveAuthority();
   await ensureTrackedFiles();
   await pollFiles();
   await writeState();
-  setTimeout(tick, pollMs);
+  if (!stopping) setTimeout(tick, pollMs);
 }
 
-function shutdown(signal: string): void {
+function shutdown(_signal: string): void {
   stopping = true;
-  flushOnce(`signal:${signal}`)
-    .finally(() => derivedLog({ type: 'watcher_stop', signal }))
-    .finally(() => process.exit(0));
+  process.exit(0);
 }
 
 async function main(): Promise<void> {
@@ -614,8 +678,14 @@ async function main(): Promise<void> {
     process.exit(0);
   }
 
-  await mkdir(dirname(logPath), { recursive: true }).catch(() => {});
-  await mkdir(stateDir, { recursive: true }).catch(() => {});
+  authorityTuple = await retainActiveAuthorityTuple();
+  stateDir = authorityTuple.stateRoot;
+  const logsDir = join(dirname(stateDir), 'logs');
+  logPath = join(logsDir, `hook-derived-watcher-${new Date().toISOString().split('T')[0]}.jsonl`);
+  watcherStatePath = join(stateDir, 'hook-derived-watcher-state.json');
+
+  await requireRetainedActiveAuthority();
+  await mkdir(logsDir, { recursive: true }).catch(() => {});
 
   await derivedLog({
     type: 'watcher_start',
@@ -639,11 +709,13 @@ async function main(): Promise<void> {
 }
 
 main().catch(async (err) => {
-  await mkdir(dirname(logPath), { recursive: true }).catch(() => {});
-  await derivedLog({
-    type: 'watcher_error',
-    reason: 'fatal',
-    error: err instanceof Error ? err.message : 'unknown_error',
-  });
+  if (logPath && !stopping) {
+    await mkdir(dirname(logPath), { recursive: true }).catch(() => {});
+    await derivedLog({
+      type: 'watcher_error',
+      reason: 'fatal',
+      error: err instanceof Error ? err.message : 'unknown_error',
+    });
+  }
   process.exit(1);
 });

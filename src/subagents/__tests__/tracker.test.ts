@@ -7,8 +7,7 @@ import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 import { getBaseStateDir } from '../../state/paths.js';
-import { canonicalizeOriginCwd } from '../../leader/contract.js';
-import { __setCrossProcessPublishBarrierForTest, __setCrossProcessQuarantineBarrierForTest, CrossProcessLockLostError, bindPendingRoleIntentUnderLock, buildSubagentResumeLedger, completeAdaptedRoleBinding, CROSS_PROCESS_LOCK_ARTIFACT_SWEEP_CAP, CROSS_PROCESS_LOCK_LEASE_MS, createSubagentTrackingState, crossProcessLockPath, consumePendingRoleIntent, recordSubagentTurn, NATIVE_SUBAGENT_PROVENANCE, OMX_ADAPTED_PROVENANCE, readProcessStartIdentity, readSubagentTrackingState, recordPendingRoleIntent, selectReusableSubagentEntry, summarizeSubagentSession, withCrossProcessFileLockSync } from '../tracker.js';
+import { __setCrossProcessPublishBarrierForTest, __setCrossProcessQuarantineBarrierForTest, CrossProcessLockLostError, bindPendingRoleIntentUnderLock, buildSubagentResumeLedger, completeAdaptedRoleBinding, CROSS_PROCESS_LOCK_ARTIFACT_SWEEP_CAP, CROSS_PROCESS_LOCK_LEASE_MS, createSubagentTrackingState, crossProcessLockPath, consumePendingRoleIntent, recordSubagentTurn, recordSubagentTurnForSession, NATIVE_SUBAGENT_PROVENANCE, OMX_ADAPTED_PROVENANCE, readProcessStartIdentity, readSubagentTrackingState, recordPendingRoleIntent, selectReusableSubagentEntry, summarizeSubagentSession, withCrossProcessFileLockSync } from '../tracker.js';
 import { subagentTrackingPath } from '../tracker.js';
 import { NATIVE_SUBAGENT_ROLE_ROUTING_MARKER_FILE, readRoleRoutingMarker, writeRoleRoutingMarker } from '../role-routing-marker.js';
 const credentialDigest = (value: string) => createHash('sha256').update(value).digest('hex');
@@ -1599,7 +1598,7 @@ describe('subagents/tracker', () => {
       }, (state) => state);
       assert.equal(binding?.alreadyBound, false);
       assert.ok(binding?.claimantToken);
-      assert.equal((await readSubagentTrackingState(cwd)).pending_role_intents[0]?.origin_cwd, canonicalizeOriginCwd(cwd));
+      assert.equal((await readSubagentTrackingState(cwd)).pending_role_intents[0]?.origin_cwd, cwd);
       assert.equal(completeAdaptedRoleBinding(cwd, {
         sessionId: legacyIntent.session_id,
         parentThreadId: legacyIntent.parent_thread_id,
@@ -1680,7 +1679,7 @@ describe('subagents/tracker', () => {
         alreadyBound: true,
       });
       assert.equal(bindCalled, false);
-      assert.equal((await readSubagentTrackingState(cwd)).pending_role_intents[0]?.origin_cwd, canonicalizeOriginCwd(cwd));
+      assert.equal((await readSubagentTrackingState(cwd)).pending_role_intents[0]?.origin_cwd, cwd);
     } finally {
       if (previousOmxRoot === undefined) delete process.env.OMX_ROOT;
       else process.env.OMX_ROOT = previousOmxRoot;
@@ -2061,6 +2060,46 @@ describe('subagents/tracker', () => {
     }
   });
 
+  it('rejects corrupt persisted lifecycle tracking without overwriting it', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-subagent-tracker-'));
+    const stateDir = join(cwd, 'explicit-state-dir');
+    const path = subagentTrackingPath(cwd, stateDir);
+    const corrupt = '{ not valid JSON\n';
+    try {
+      await mkdir(stateDir, { recursive: true });
+      await writeFile(path, corrupt);
+
+      await assert.rejects(
+        recordSubagentTurnForSession(cwd, {
+          sessionId: 'sess-corrupt-tracker',
+          threadId: 'thread-corrupt-tracker',
+        }, stateDir),
+        /Subagent tracking state is unavailable/,
+      );
+      assert.equal(readFileSync(path, 'utf-8'), corrupt);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('initializes missing lifecycle tracking state in the explicit state directory', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-subagent-tracker-'));
+    const stateDir = join(cwd, 'explicit-state-dir');
+    const path = subagentTrackingPath(cwd, stateDir);
+    try {
+      const recorded = await recordSubagentTurnForSession(cwd, {
+        sessionId: 'sess-missing-tracker',
+        threadId: 'thread-missing-tracker',
+      }, stateDir);
+
+      assert.equal(recorded.sessions['sess-missing-tracker']?.threads['thread-missing-tracker']?.kind, 'leader');
+      assert.equal(existsSync(path), true);
+      assert.equal((await readSubagentTrackingState(cwd, stateDir)).sessions['sess-missing-tracker']?.threads['thread-missing-tracker']?.kind, 'leader');
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it('serializes lifecycle tracking writes with pending role intent records and consumes', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-subagent-tracker-'));
     const sessionId = 'sess-role-intent-lifecycle-race';
@@ -2120,6 +2159,111 @@ describe('subagents/tracker', () => {
     }
   });
 
+  it('fails closed and preserves every parseable malformed tracker ledger for role mutations', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-subagent-tracker-strict-mutations-'));
+    const nowMs = Date.now();
+    const scope = {
+      sessionId: 'strict-session',
+      parentThreadId: 'strict-parent',
+      correlationToken: canonicalCorrelationToken('strict-correlation'),
+      nowMs,
+    };
+    const validSession = {
+      session_id: 'valid-session',
+      updated_at: new Date(nowMs).toISOString(),
+      threads: {},
+    };
+    const validIntent = {
+      role: 'architect',
+      session_id: scope.sessionId,
+      parent_thread_id: scope.parentThreadId,
+      correlation_token: scope.correlationToken,
+      created_at: new Date(nowMs).toISOString(),
+      expires_at: new Date(nowMs + 60_000).toISOString(),
+    };
+    const malformedLedgers: Array<[string, object]> = [
+      ['root', {}],
+      ['session', { schemaVersion: 1, sessions: { 'invalid-session': {} }, pending_role_intents: [] }],
+      ['thread', {
+        schemaVersion: 1,
+        sessions: { 'valid-session': { ...validSession, threads: { 'invalid-thread': {} } } },
+        pending_role_intents: [],
+      }],
+      ['intent', { schemaVersion: 1, sessions: {}, pending_role_intents: [{}] }],
+      ['correlation credential', {
+        schemaVersion: 1,
+        sessions: {},
+        pending_role_intents: [{ ...validIntent, correlation_token: null }],
+      }],
+      ['claimant credential', {
+        schemaVersion: 1,
+        sessions: {},
+        pending_role_intents: [{
+          ...validIntent,
+          binding_state: 'bound',
+          binding_claimant_token: { forged: true },
+          bound_at: new Date(nowMs).toISOString(),
+        }],
+      }],
+    ];
+    const writeLedger = async (ledger: object) => {
+      const raw = `${JSON.stringify(ledger)}\n`;
+      await mkdir(getBaseStateDir(cwd), { recursive: true });
+      await writeFile(subagentTrackingPath(cwd), raw);
+      return raw;
+    };
+    const assertPreserved = (raw: string, label: string) =>
+      assert.equal(readFileSync(subagentTrackingPath(cwd), 'utf-8'), raw, label);
+    try {
+      for (const [kind, ledger] of malformedLedgers) {
+        let raw = await writeLedger(ledger);
+        assert.deepEqual(
+          recordPendingRoleIntent(cwd, { role: 'architect', ...scope }),
+          { ok: false, reason: 'tracking_unavailable' },
+          `${kind}: record`,
+        );
+        assertPreserved(raw, `${kind}: record`);
+
+        raw = await writeLedger(ledger);
+        let bindCalled = false;
+        assert.equal(
+          bindPendingRoleIntentUnderLock(cwd, scope, (state) => {
+            bindCalled = true;
+            return state;
+          }),
+          null,
+          `${kind}: bind`,
+        );
+        assert.equal(bindCalled, false, `${kind}: bind callback`);
+        assertPreserved(raw, `${kind}: bind`);
+
+        raw = await writeLedger(ledger);
+        assert.equal(consumePendingRoleIntent(cwd, scope), null, `${kind}: consume`);
+        assertPreserved(raw, `${kind}: consume`);
+
+        raw = await writeLedger(ledger);
+        assert.equal(completeAdaptedRoleBinding(cwd, scope), 'not_found', `${kind}: complete`);
+        assertPreserved(raw, `${kind}: complete`);
+      }
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+  it('allows role-intent mutation when the tracker ledger is genuinely absent', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-subagent-tracker-absent-mutations-'));
+    try {
+      const result = recordPendingRoleIntent(cwd, {
+        role: 'architect',
+        sessionId: 'absent-session',
+        parentThreadId: 'absent-parent',
+        correlationToken: canonicalCorrelationToken('absent-correlation'),
+      });
+      assert.equal(result.ok, true);
+      assert.equal(existsSync(subagentTrackingPath(cwd)), true);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
   it('does not consume expired pending role intents', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-subagent-tracker-'));
     try {
@@ -2175,7 +2319,7 @@ describe('subagents/tracker', () => {
       assert.equal(completeAdaptedRoleBinding(cwd, {
         sessionId: scope.session_id, parentThreadId: scope.parent_thread_id,
         correlationToken: canonicalCorrelationToken('validtoken'), claimantToken: canonicalClaimantToken('claimant'), nowMs,
-      }), 'claimant_mismatch');
+      }), 'not_found');
       assert.equal((await readSubagentTrackingState(cwd)).pending_role_intents.length, 2);
 
       await writeFile(subagentTrackingPath(cwd), `${JSON.stringify({
@@ -2229,9 +2373,14 @@ describe('subagents/tracker', () => {
       await writeFile(subagentTrackingPath(cwd), raw);
       return raw;
     };
-    const assertRetainedMismatch = async (label: string, journal: object, input: Parameters<typeof completeAdaptedRoleBinding>[1]) => {
+    const assertRetainedMismatch = async (
+      label: string,
+      journal: object,
+      input: Parameters<typeof completeAdaptedRoleBinding>[1],
+      expected: 'claimant_mismatch' | 'not_found' = 'claimant_mismatch',
+    ) => {
       const raw = await writeJournal(journal);
-      assert.equal(completeAdaptedRoleBinding(cwd, input), 'claimant_mismatch', label);
+      assert.equal(completeAdaptedRoleBinding(cwd, input), expected, label);
       assert.equal(readFileSync(subagentTrackingPath(cwd), 'utf-8'), raw, label);
     };
     try {
@@ -2264,11 +2413,11 @@ describe('subagents/tracker', () => {
       assert.deepEqual((await readSubagentTrackingState(cwd)).pending_role_intents, []);
 
       for (const persistedCorrelation of ['', ' ', null, 1, true, [], {}]) {
-        await assertRetainedMismatch('claimed persisted correlation', { ...claimed, correlation_token: persistedCorrelation }, { ...scope, correlationToken, claimantToken });
-        await assertRetainedMismatch('claimant-less persisted correlation', { ...claimantLess, correlation_token: persistedCorrelation }, { ...scope, correlationToken });
+        await assertRetainedMismatch('claimed persisted correlation', { ...claimed, correlation_token: persistedCorrelation }, { ...scope, correlationToken, claimantToken }, 'not_found');
+        await assertRetainedMismatch('claimant-less persisted correlation', { ...claimantLess, correlation_token: persistedCorrelation }, { ...scope, correlationToken }, 'not_found');
       }
       for (const persistedClaimant of ['', ' ', null, 1, true, [], {}]) {
-        await assertRetainedMismatch('claimed persisted claimant', { ...claimed, binding_claimant_token: persistedClaimant }, { ...scope, correlationToken, claimantToken });
+        await assertRetainedMismatch('claimed persisted claimant', { ...claimed, binding_claimant_token: persistedClaimant }, { ...scope, correlationToken, claimantToken }, 'not_found');
       }
     } finally {
       await rm(cwd, { recursive: true, force: true });
@@ -2296,7 +2445,7 @@ describe('subagents/tracker', () => {
         role: 'architect', sessionId: 'valid-origin-session', parentThreadId: 'valid-origin-parent', correlationToken: canonicalCorrelationToken('validorigintoken'),
       });
       assert.equal(recorded.ok, true);
-      assert.equal(recorded.ok && recorded.intent.origin_cwd, canonicalizeOriginCwd(validCwd));
+      assert.equal(recorded.ok && recorded.intent.origin_cwd, validCwd);
       const state = await readSubagentTrackingState(validCwd);
       assert.deepEqual(state.pending_role_intents, recorded.ok ? [recorded.intent] : []);
       assert.equal(existsSync(subagentTrackingPath(validCwd)), true);

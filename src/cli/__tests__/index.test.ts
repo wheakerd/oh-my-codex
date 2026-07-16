@@ -3528,6 +3528,13 @@ describe("tmux HUD pane helpers", () => {
 });
 
 describe("detached tmux new-session sequencing", () => {
+  it("does not commit a no-op launch journal before detached tmux environment publication", async () => {
+    const source = await readFile(join(process.cwd(), "src", "cli", "index.ts"), "utf8");
+    assert.doesNotMatch(source, /detached-leader-launch-barrier/);
+    assert.doesNotMatch(source, /publishDetachedLeaderLaunchBarrier/);
+    assert.doesNotMatch(source, /pre-launch-authority-barrier/);
+    assert.doesNotMatch(source, /publishPreLaunchAuthorityBarrier/);
+  });
   it("buildDetachedSessionBootstrapSteps uses shared HUD height and split-capture ordering", () => {
     const steps = buildDetachedSessionBootstrapSteps(
       "omx-demo",

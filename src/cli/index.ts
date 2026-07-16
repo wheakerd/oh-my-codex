@@ -829,7 +829,6 @@ export async function establishAlternateSurfaceAuthority(
   if (!sessionId) {
     throw new Error("alternate surface authority is missing its committed session binding");
   }
-  await publishPreLaunchAuthorityBarrier(authority, sessionId);
   publishStateAuthorityTransport(authority);
   return authority;
 }
@@ -6215,99 +6214,8 @@ function configureDetachedTmuxSessionEnvironment(
   return () => restoreDetachedTmuxSessionEnvironment(sessionName, snapshot);
 }
 
-async function publishDetachedSessionEnvironmentNames(
-  sessionId: string,
-  authority: ImmutableResolvedStateAuthorityContext,
-  env: NodeJS.ProcessEnv = process.env,
-): Promise<string[]> {
-  const environmentNames = detachedTmuxEnvironmentNames(env);
-  const bindingKey = `detached-tmux-env-names-${createHash("sha256").update(sessionId).digest("hex").slice(0, 32)}`;
-  const effects = {
-    effect: "detached-tmux-env-names",
-    environment_names_digest: createHash("sha256")
-      .update(JSON.stringify(environmentNames))
-      .digest("hex"),
-      session_id_digest: createHash("sha256").update(sessionId).digest("hex"),
-  };
-  const effectsDigest = launchTransportEffectsDigest(
-    authority,
-    bindingKey,
-    effects,
-  );
-  const publication = await publishStateAuthorityLaunchTransport({
-    context: authority,
-    binding_key: bindingKey,
-    effects,
-    publish: async (context, publication) => {
-      await validateCommittedStateAuthorityLaunchTransportPublication(
-        context,
-        publication,
-      );
-      return publication;
-    },
-    verify: async (context, publication) => {
-      await validateCommittedStateAuthorityLaunchTransportPublication(
-        context,
-        publication,
-      );
-      if (
-        JSON.stringify(detachedTmuxEnvironmentNames(env)) !==
-        JSON.stringify(environmentNames)
-      ) {
-        throw new Error(
-          "detached tmux client environment changed after its committed env-name publication.",
-      );
-      }
-    },
-  });
-  await validateCommittedStateAuthorityLaunchTransportJournal(authority, {
-    operation_id: publication.operation_id,
-    effects_digest: effectsDigest,
-  });
-  return environmentNames;
-}
 
-async function publishDetachedLeaderLaunchBarrier(
-  authority: ImmutableResolvedStateAuthorityContext,
-  sessionId: string,
-  leaderPaneId: string,
-): Promise<void> {
-  const bindingKey = `detached-leader-${createHash("sha256").update(`${sessionId}\u0000${leaderPaneId}`).digest("hex").slice(0, 32)}`;
-  const effects = {
-    effect: "detached-leader-launch-barrier",
-    leader_pane_id_digest: createHash("sha256")
-      .update(leaderPaneId)
-      .digest("hex"),
-    session_id_digest: createHash("sha256").update(sessionId).digest("hex"),
-  };
-  const effectsDigest = launchTransportEffectsDigest(
-    authority,
-    bindingKey,
-    effects,
-  );
-  const publication = await publishStateAuthorityLaunchTransport({
-    context: authority,
-    binding_key: bindingKey,
-    effects,
-    publish: async (context, publication) => {
-      await validateCommittedStateAuthorityLaunchTransportPublication(
-        context,
-        publication,
-      );
-      return publication;
-    },
-    verify: async (context, publication) => {
-      await validateCommittedStateAuthorityLaunchTransportPublication(
-        context,
-        publication,
-      );
-    },
-  });
-  await validateCommittedStateAuthorityLaunchTransportJournal(authority, {
-    operation_id: publication.operation_id,
-    effects_digest: effectsDigest,
-  });
-}
+
 
 export function withTmuxExtendedKeys<T>(
   cwd: string,
@@ -7252,44 +7160,6 @@ async function resolveCommittedPreLaunchAuthority(
   return authority;
 }
 
-async function publishPreLaunchAuthorityBarrier(
-  authority: ImmutableResolvedStateAuthorityContext,
-  sessionId: string,
-): Promise<void> {
-  const bindingKey = `pre-launch-${createHash("sha256").update(sessionId).digest("hex").slice(0, 32)}`;
-  const effects = {
-    effect: "pre-launch-authority-barrier",
-    session_id_digest: createHash("sha256").update(sessionId).digest("hex"),
-    workspace_identity_digest: authority.workspace_identity.digest,
-  };
-  const effectsDigest = launchTransportEffectsDigest(
-    authority,
-    bindingKey,
-    effects,
-  );
-  const publication = await publishStateAuthorityLaunchTransport({
-    context: authority,
-    binding_key: bindingKey,
-    effects,
-    publish: async (context, publication) => {
-      await validateCommittedStateAuthorityLaunchTransportPublication(
-        context,
-        publication,
-      );
-      return publication;
-    },
-    verify: async (context, publication) => {
-      await validateCommittedStateAuthorityLaunchTransportPublication(
-        context,
-        publication,
-      );
-    },
-  });
-  await validateCommittedStateAuthorityLaunchTransportJournal(authority, {
-    operation_id: publication.operation_id,
-    effects_digest: effectsDigest,
-  });
-}
 
 /**
  * preLaunch: Prepare environment before Codex starts.
@@ -7315,7 +7185,6 @@ export async function preLaunch(
     sessionId,
     cwd,
   );
-  await publishPreLaunchAuthorityBarrier(committedAuthority, sessionId);
 
   // 1. Best-effort launch-safe orphan cleanup
   try {
@@ -7342,7 +7211,6 @@ export async function preLaunch(
     sessionId,
     cwd,
   );
-  await publishPreLaunchAuthorityBarrier(refreshedAuthority, sessionId);
   publishStateAuthorityTransport(refreshedAuthority);
 
   // 3. Generate runtime overlay + write session-scoped model instructions file
@@ -7582,9 +7450,7 @@ async function runCodex(
   let detachedTmuxEnvironment: NodeJS.ProcessEnv | undefined;
   if (detachedSessionName) {
     detachedTmuxEnvironment = { ...codexEnvWithNotify, ...runtimeHookEnv };
-    detachedTmuxEnvKeys = await publishDetachedSessionEnvironmentNames(
-      sessionId,
-      launchAuthority,
+    detachedTmuxEnvKeys = detachedTmuxEnvironmentNames(
       detachedTmuxEnvironment,
     );
     detachedTmuxEnvironmentImports = createDetachedTmuxEnvironmentImports(
@@ -7899,12 +7765,6 @@ async function runCodex(
                   operation_id: publication.operation_id,
                   effects_digest: effectsDigest,
                 },
-              );
-            } else {
-              await publishDetachedLeaderLaunchBarrier(
-                launchAuthority,
-                sessionId,
-                detachedLeaderPaneId,
               );
             }
             if (leaderWaitChannel) {
@@ -8522,6 +8382,7 @@ async function emitNativeHookEvent(
     context?: Record<string, unknown>;
   } = {},
 ): Promise<void> {
+  const authorityScope = await resolveCommittedAuthorityRuntimeStateScope(cwd);
   const payload = buildHookEvent(event, {
     source: "native",
     context: opts.context || {},
@@ -8532,6 +8393,7 @@ async function emitNativeHookEvent(
   });
   await dispatchHookEvent(payload, {
     cwd,
+    stateRoot: authorityScope.authority.canonical_state_root,
     enabled: true,
   });
 }

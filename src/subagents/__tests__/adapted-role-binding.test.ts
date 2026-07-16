@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
@@ -383,10 +383,10 @@ describe('adapted role binding', () => {
           parentThreadId: 'parent-boundat',
           correlationToken: canonicalCorrelationToken('token-boundat'),
         }),
-        'claimant_mismatch',
+        'not_found',
       );
       assert.equal(listBoundAdaptedRoleIntents(cwd).length, 1);
-      // The exact stored token still completes.
+      // Strict readers preserve the malformed journal and deny even an exact stored token.
       assert.equal(
         completeAdaptedRoleBinding(cwd, {
           sessionId: 'session-boundat',
@@ -394,7 +394,7 @@ describe('adapted role binding', () => {
           correlationToken: canonicalCorrelationToken('token-boundat'),
           claimantToken: canonicalClaimantToken('stored-claimant'),
         }),
-        'completed',
+        'not_found',
       );
     } finally {
       await rm(cwd, { recursive: true, force: true });
@@ -882,14 +882,65 @@ describe('adapted role binding', () => {
         recoverAdaptedRoleBindings(cwd, stateDir, NOW_MS);
         assert.equal(readRoleRoutingMarker(stateDir, {
           cwd, sessionId: base.session_id, parentThreadId: base.parent_thread_id, nowMs: NOW_MS,
-        })?.session_id, base.session_id);
-        assert.equal((await readSubagentTrackingState(cwd)).pending_role_intents.length, 1);
+        }), null);
+        assert.equal((await readSubagentTrackingState(cwd)).pending_role_intents.length, 2);
       }
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
   });
 
+  it('recovers only from the explicit committed tracker root for a nested cwd', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'omx-adapted-explicit-root-'));
+    const cwd = join(workspace, 'nested');
+    const stateDir = join(workspace, 'authority', 'state');
+    const localStateDir = getBaseStateDir(cwd);
+    const intent = {
+      role: 'architect',
+      session_id: 'explicit-root-session',
+      parent_thread_id: 'explicit-root-parent',
+      correlation_token: canonicalCorrelationToken('explicit-root-token'),
+      created_at: new Date(NOW_MS).toISOString(),
+      expires_at: new Date(NOW_MS + 60_000).toISOString(),
+      binding_state: 'bound' as const,
+      binding_claimant_token: canonicalClaimantToken('explicit-root-claimant'),
+      bound_at: new Date(NOW_MS).toISOString(),
+      origin_cwd: cwd,
+    };
+    const { origin_cwd: _ignoredOrigin, ...originlessDecoy } = {
+      ...intent,
+      session_id: 'originless-decoy-session',
+      parent_thread_id: 'originless-decoy-parent',
+      correlation_token: canonicalCorrelationToken('originless-decoy-token'),
+      binding_claimant_token: canonicalClaimantToken('originless-decoy-claimant'),
+    };
+    const previousStateRoot = process.env.OMX_STATE_ROOT;
+    try {
+      await mkdir(cwd, { recursive: true });
+      await mkdir(stateDir, { recursive: true });
+      await mkdir(localStateDir, { recursive: true });
+      const localTrackerPath = subagentTrackingPath(cwd);
+      await writeFile(subagentTrackingPath(cwd, stateDir), `${JSON.stringify({ schemaVersion: 1, sessions: {}, pending_role_intents: [intent, originlessDecoy] })}\n`);
+      const localRaw = `${JSON.stringify({ schemaVersion: 1, sessions: {}, pending_role_intents: [{ ...originlessDecoy, session_id: 'local-originless-decoy' }] })}\n`;
+      await writeFile(localTrackerPath, localRaw);
+      process.env.OMX_STATE_ROOT = localStateDir;
+
+      recoverAdaptedRoleBindings(cwd, stateDir, NOW_MS);
+
+      assert.deepEqual((await readSubagentTrackingState(cwd, stateDir)).pending_role_intents, [originlessDecoy]);
+      assert.equal(await readFile(localTrackerPath, 'utf8'), localRaw);
+      assert.equal(readRoleRoutingMarker(stateDir, {
+        cwd,
+        sessionId: intent.session_id,
+        parentThreadId: intent.parent_thread_id,
+        nowMs: NOW_MS,
+      })?.session_id, intent.session_id);
+    } finally {
+      if (previousStateRoot === undefined) delete process.env.OMX_STATE_ROOT;
+      else process.env.OMX_STATE_ROOT = previousStateRoot;
+      await rm(workspace, { recursive: true, force: true });
+    }
+  });
   it('fails closed on a malformed caller origin but migrates a cwd-partitioned originless journal', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-adapted-binding-'));
     const stateDir = getBaseStateDir(cwd);
