@@ -1173,6 +1173,22 @@ export const AUTHORITY_CALLSITE_INVENTORY = [
     phase1,
   ),
   entry(
+    'src/scripts/notify-fallback-watcher.ts',
+    'retainActiveAuthority',
+    'bootstrap-only',
+    'notifications',
+    'Treats ambient Team root as diagnostic candidate evidence, then authenticates inherited authority transport before retaining watcher effects.',
+    phase0,
+  ),
+  entry(
+    'src/scripts/notify-fallback-watcher.ts',
+    'withRetainedAuthorityTransaction',
+    'authority-context',
+    'notifications',
+    'Revalidates retained watcher authority under the state-authority transaction before mutation.',
+    phase1,
+  ),
+  entry(
     'src/cli/ralplan.ts',
     'ralplanCommand',
     'authority-context',
@@ -1203,6 +1219,46 @@ export const AUTHORITY_CALLSITE_INVENTORY = [
     'notifications',
     'Direct worker-root environment evidence is a bounded no-local-fallback candidate; the normal notify path validates authority before mutation.',
     phase0,
+  ),
+  entry(
+    'src/scripts/notify-hook.ts',
+    'resolveNotifyWorkerMutationAuthority',
+    'authority-context',
+    'notifications',
+    'Resolves persisted authority and validates the worker Team root before notification mutation.',
+    phase1,
+  ),
+  entry(
+    'src/scripts/notify-hook/team-worker.ts',
+    'assertWorkerNotificationAuthority',
+    'authority-context',
+    'notifications',
+    'Authenticates persisted authority and validates the worker Team root before notification effects.',
+    phase1,
+  ),
+  entry(
+    'src/scripts/notify-hook/team-worker.ts',
+    'maybeNotifyLeaderAllWorkersIdle',
+    'authority-context',
+    'notifications',
+    'Requires the classified worker-notification authority assertion before all-workers-idle effects.',
+    phase1,
+  ),
+  entry(
+    'src/scripts/notify-hook/team-worker.ts',
+    'validateBeforeEffect',
+    'authority-context',
+    'notifications',
+    'Revalidates worker notification authority immediately before mutation effects.',
+    phase1,
+  ),
+  entry(
+    'src/scripts/notify-hook/team-worker.ts',
+    'maybeNotifyLeaderWorkerIdle',
+    'authority-context',
+    'notifications',
+    'Requires the classified worker-notification authority assertion before worker-idle effects.',
+    phase1,
   ),
   entry(
     'src/scripts/codex-native-hook.ts',
@@ -1889,14 +1945,6 @@ export const AUTHORITY_CALLSITE_INVENTORY = [
   ),
   entry(
     'src/cli/index.ts',
-    'notifyFallbackPidPath',
-    'authority-context',
-    'cli-launch',
-    'Fallback watcher PID state belongs under the committed authority root.',
-    phase1,
-  ),
-  entry(
-    'src/cli/index.ts',
     'hookDerivedWatcherPidPath',
     'authority-context',
     'cli-launch',
@@ -1918,6 +1966,14 @@ export const AUTHORITY_CALLSITE_INVENTORY = [
     'cli-launch',
     'Watcher startup must create state only after launch authority is committed.',
     phase2,
+  ),
+  entry(
+    'src/cli/index.ts',
+    'reapStaleNotifyFallbackWatcher',
+    'authority-context',
+    'cli-launch',
+    'Re-resolves committed authority immediately before considering a watcher PID record eligible for signaling.',
+    phase1,
   ),
   entry(
     'src/cli/team.ts',
@@ -4784,6 +4840,14 @@ export const AUTHORITY_CALLSITE_INVENTORY = [
   ),
   entry(
     'src/team/state.ts',
+    'initTeamStatePinned',
+    'authority-context',
+    'team-runtime',
+    'Initializes Team state only under a supplied persisted authority and its authenticated leader session.',
+    phase1,
+  ),
+  entry(
+    'src/team/state.ts',
     'leaderAttentionPath',
     'authority-context',
     'team-runtime',
@@ -6211,6 +6275,19 @@ export const AUTHORITY_DYNAMIC_CALL_WAIVERS: readonly AuthorityDynamicCallWaiver
     expiry_or_removal_condition:
       'Remove when session status receives resolved skill-state paths instead of an injectable path reader.',
   },
+  {
+    path: 'src/cli/index.ts',
+    symbol: 'reapStaleNotifyFallbackWatcher',
+    source_range: '8605:27-8605:74',
+    classification: 'authority-context',
+    owner: 'cli-launch',
+    rationale:
+      'Watcher reap tests may inject the final authority revalidation resolver; production defaults to resolveStateAuthorityForGuard before any PID decision.',
+    bounded_targets: ['resolveCurrentAuthority'],
+    migration_phase: 'phase-1-committed-authority-resolution',
+    expiry_or_removal_condition:
+      'Remove when watcher reap receives a concrete revalidated authority rather than an injectable resolver.',
+  },
 ];
 
 /**
@@ -6432,7 +6509,7 @@ export const AUTHORITY_DYNAMIC_ENV_ACCESS_WAIVERS: readonly AuthorityDynamicEnvA
     {
       path: 'src/team/state.ts',
       symbol: 'readEnvValue',
-      source_range: '606:19-606:27',
+      source_range: '616:19-616:27',
       target_text: 'key',
       classification: 'out-of-scope',
       owner: 'team-runtime',
@@ -6531,7 +6608,7 @@ export const AUTHORITY_DYNAMIC_ENV_ACCESS_WAIVERS: readonly AuthorityDynamicEnvA
     {
       path: 'src/cli/index.ts',
       symbol: 'prependOmxRuntimeCommandShimToEnv',
-      source_range: '2853:21-2853:36',
+      source_range: '2862:21-2862:36',
       target_text: 'variant',
       classification: 'authority-context',
       owner: 'cli-launch',
@@ -6542,7 +6619,7 @@ export const AUTHORITY_DYNAMIC_ENV_ACCESS_WAIVERS: readonly AuthorityDynamicEnvA
     {
       path: 'src/cli/index.ts',
       symbol: 'prependOmxRuntimeCommandShimToEnv',
-      source_range: '2861:14-2861:29',
+      source_range: '2870:14-2870:29',
       target_text: 'variant',
       classification: 'authority-context',
       owner: 'cli-launch',
@@ -6553,7 +6630,7 @@ export const AUTHORITY_DYNAMIC_ENV_ACCESS_WAIVERS: readonly AuthorityDynamicEnvA
     {
       path: 'src/cli/index.ts',
       symbol: 'prependOmxRuntimeCommandShimToEnv',
-      source_range: '2863:5-2863:20',
+      source_range: '2872:5-2872:20',
       target_text: 'pathKey',
       classification: 'authority-context',
       owner: 'cli-launch',
@@ -6564,7 +6641,7 @@ export const AUTHORITY_DYNAMIC_ENV_ACCESS_WAIVERS: readonly AuthorityDynamicEnvA
     {
       path: 'src/cli/index.ts',
       symbol: 'serializeDetachedSessionParentEnv',
-      source_range: '5784:19-5784:27',
+      source_range: '5793:19-5793:27',
       target_text: 'key',
       classification: 'authority-context',
       owner: 'cli-launch',
@@ -6575,7 +6652,7 @@ export const AUTHORITY_DYNAMIC_ENV_ACCESS_WAIVERS: readonly AuthorityDynamicEnvA
     {
       path: 'src/cli/index.ts',
       symbol: 'detachedTmuxEnvironmentNames',
-      source_range: '5800:21-5800:29',
+      source_range: '5809:21-5809:29',
       target_text: 'key',
       classification: 'authority-context',
       owner: 'cli-launch',
@@ -6586,13 +6663,24 @@ export const AUTHORITY_DYNAMIC_ENV_ACCESS_WAIVERS: readonly AuthorityDynamicEnvA
     {
       path: 'src/cli/index.ts',
       symbol: 'configureDetachedTmuxSessionEnvironment',
-      source_range: '6180:25-6180:40',
+      source_range: '6189:25-6189:40',
       target_text: 'targetName',
       classification: 'authority-context',
       owner: 'cli-launch',
       rationale: 'Reads a separately validated detached-session environment name after authority transport publication.',
       migration_phase: 'phase-2-postcommit-transport',
       expiry_or_removal_condition: 'Remove when detached tmux configuration receives a structured environment map.',
+    },
+    {
+      path: 'src/scripts/notify-fallback-watcher.ts',
+      symbol: 'retainActiveAuthority',
+      source_range: '270:17-270:34',
+      target_text: 'name',
+      classification: 'bootstrap-only',
+      owner: 'notifications',
+      rationale: 'Copies only fixed authenticated authority transport keys into the retained watcher transaction environment.',
+      migration_phase: 'phase-0-inventory-and-denial',
+      expiry_or_removal_condition: 'Remove when retained watcher authority transport is represented as a typed record instead of ProcessEnv.',
     },
     {
       path: 'src/cli/hooks.ts',
@@ -6892,7 +6980,6 @@ export const AUTHORITY_TRANSITIVE_HELPER_KEYS: readonly string[] = [
   'src/cli/index.ts::omxRuntimeCommandShimPath',
   'src/cli/index.ts::ensureOmxRuntimeCommandShim',
   'src/cli/index.ts::tmuxExtendedKeysLeaseRoot',
-  'src/cli/index.ts::notifyFallbackPidPath',
   'src/cli/index.ts::hookDerivedWatcherPidPath',
   'src/cli/index.ts::startNotifyFallbackWatcher',
   'src/cli/index.ts::startHookDerivedWatcher',

@@ -358,6 +358,7 @@ export async function onHookEvent(event) {
         stdio: 'ignore',
         env: { ...authorityEnv, HOME: homeDir, OMX_HOOK_DERIVED_SIGNALS: '1', OMX_HOOK_PLUGINS: '1' },
       });
+      const childExit = once(child, 'exit') as Promise<[number | null]>;
       const watcherStatePath = join(cwd, '.omx', 'state', 'hook-derived-watcher-state.json');
       await waitFor(async () => existsSync(watcherStatePath));
 
@@ -375,7 +376,7 @@ export async function onHookEvent(event) {
         type: 'event_msg',
         payload: { type: 'assistant_message', turn_id: 'turn-after-rollover', content: 'Can you continue?' },
       })}\n`);
-      const [exitCode] = await once(child, 'exit') as [number | null];
+      const [exitCode] = await childExit;
       assert.notEqual(exitCode, 0, 'watcher must fail closed after rollover');
       assert.equal(existsSync(hookLogPath), false, 'watcher dispatched after its authority tuple changed');
     } finally {
@@ -406,6 +407,7 @@ export async function onHookEvent(event) {
         stdio: 'ignore',
         env: { ...authorityEnv, HOME: homeDir, OMX_HOOK_DERIVED_SIGNALS: '1', OMX_HOOK_PLUGINS: '1' },
       });
+      const childExit = once(child, 'exit') as Promise<[number | null]>;
       const watcherStatePath = join(stateDir, 'hook-derived-watcher-state.json');
       await waitFor(async () => existsSync(watcherStatePath));
 
@@ -417,7 +419,7 @@ export async function onHookEvent(event) {
         payload: { type: 'assistant_message', turn_id: 'turn-after-root-replacement', content: 'Continue?' },
       })}\n`);
 
-      const [exitCode] = await once(child, 'exit') as [number | null];
+      const [exitCode] = await childExit;
       assert.notEqual(exitCode, 0, 'watcher must fail closed after state-root replacement');
       assert.equal(existsSync(watcherStatePath), false, 'watcher recreated state in a replacement root');
       assert.equal(existsSync(hookLogPath), false, 'watcher dispatched after state-root replacement');

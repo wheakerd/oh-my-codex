@@ -59,6 +59,7 @@ import {
   resolveStateAuthorityForGuard,
   mintStateAuthorityTransportCapability,
   rolloverStateAuthorityToAlternateRoot,
+  validateStateAuthorityTransportCapability,
 } from "../../state/authority.js";
 import { buildStateAuthorityTransportEnv } from "../../state/transport-env.js";
 
@@ -35850,7 +35851,19 @@ export async function onHookEvent() {
 				),
 			) as Record<string, string | null>;
 			for (const value of Object.values(captured)) assert.equal(value, null);
-			assert.equal(process.env.OMX_STATE_AUTHORITY_CAPABILITY, capability);
+      const restoredCapability = process.env.OMX_STATE_AUTHORITY_CAPABILITY;
+      assert.ok(restoredCapability);
+      const restoredAuthority = await resolveStateAuthorityForGuard({
+        startup_cwd: cwd,
+        observed_cwd: cwd,
+        session_id: sessionId,
+      });
+      assert.equal(process.env.OMX_STATE_AUTHORITY_PATH, restoredAuthority.authority_path);
+      assert.equal(process.env.OMX_STATE_AUTHORITY_ID, restoredAuthority.generation.authority_id);
+      assert.equal(process.env.OMX_STATE_AUTHORITY_GENERATION_ID, restoredAuthority.generation.generation_id);
+      assert.equal(process.env.OMX_STATE_AUTHORITY_WORKSPACE_DIGEST, restoredAuthority.workspace_identity.digest);
+      await validateStateAuthorityTransportCapability(restoredAuthority, restoredCapability);
+      if (restoredAuthority.session_binding?.binding_revision === 1) assert.equal(restoredCapability, capability);
 		} finally {
 			restoreAuthorityTransport?.();
 			await rm(cwd, { recursive: true, force: true });
