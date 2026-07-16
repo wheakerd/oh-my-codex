@@ -7944,7 +7944,7 @@ esac
   });
 
   it('does not kill after journal publication when the stable authority drifts', async () => {
-    const cases: readonly ('incarnation' | 'config' | 'owner')[] = ['incarnation', 'config', 'owner'];
+    const cases: readonly ('incarnation' | 'config' | 'generation' | 'owner')[] = ['incarnation', 'config', 'generation', 'owner'];
     for (const drift of cases) {
       const cwd = await mkdtemp(join(tmpdir(), `omx-runtime-detached-journal-${drift}-`));
       try {
@@ -7995,6 +7995,12 @@ esac
               const manifestPath = join(cwd, '.omx', 'state', 'team', teamName, 'manifest.v2.json');
               const current = JSON.parse(await readFile(manifestPath, 'utf8')) as Record<string, unknown>;
               current.created_at = '2026-01-01T00:00:00.000Z';
+              await writeFile(manifestPath, JSON.stringify(current));
+            }
+            if (drift === 'generation') {
+              const manifestPath = join(cwd, '.omx', 'state', 'team', teamName, 'manifest.v2.json');
+              const current = JSON.parse(await readFile(manifestPath, 'utf8')) as { config_generation?: number };
+              current.config_generation = (current.config_generation ?? 0) + 1;
               await writeFile(manifestPath, JSON.stringify(current));
             }
           });

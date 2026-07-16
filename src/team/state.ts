@@ -1232,40 +1232,63 @@ export async function initTeamState(
 
 async function writeConfig(cfg: TeamConfig, cwd: string): Promise<void> {
   const normalized = normalizeTeamConfig(cfg);
-  const p = teamConfigPath(normalized.name, cwd);
-  await writeAtomic(p, JSON.stringify(normalized, null, 2));
+  const configPath = teamConfigPath(normalized.name, cwd);
+  const oldConfigBytes = await readFile(configPath, 'utf8');
 
   // Keep v2 manifest in sync when present. Don't create it implicitly here to preserve migration behavior.
-  const existing = await readTeamManifestV2(normalized.name, cwd);
-  if (existing) {
-    const merged: TeamManifestV2 = {
-      ...existing,
-      task: normalized.task,
-      tmux_session: normalized.tmux_session,
-      tmux_session_id: normalized.tmux_session_id,
-      tmux_session_created: normalized.tmux_session_created,
-      worker_count: normalized.worker_count,
-      workers: normalized.workers,
-      lifecycle_profile: normalized.lifecycle_profile,
-      next_task_id: normalizeNextTaskId(normalized.next_task_id),
-      leader_cwd: normalized.leader_cwd,
-      team_state_root: normalized.team_state_root,
-      workspace_mode: normalized.workspace_mode,
-      worktree_mode: normalized.worktree_mode,
-      leader_pane_id: normalized.leader_pane_id,
-      leader_pane_pid: normalized.leader_pane_pid,
-      hud_pane_pid: normalized.hud_pane_pid,
-      hud_pane_id: normalized.hud_pane_id,
-      tmux_pane_owner_id: normalized.tmux_pane_owner_id,
-      resize_hook_name: normalized.resize_hook_name,
-      resize_hook_target: normalized.resize_hook_target,
-      next_worker_index: normalized.next_worker_index ?? existing.next_worker_index,
-      display_name: normalized.display_name ?? existing.display_name,
-      requested_name: normalized.requested_name ?? existing.requested_name,
-      identity_source: normalized.identity_source ?? existing.identity_source,
-      config_generation: normalized.config_generation,
-    };
-    await writeTeamManifestV2(merged, cwd);
+  const existing = await readTeamManifestV2Raw(normalized.name, cwd);
+  if (!existing) {
+    await writeAtomic(configPath, JSON.stringify(normalized, null, 2));
+    return;
+  }
+
+  const merged: TeamManifestV2 = {
+    ...existing,
+    task: normalized.task,
+    tmux_session: normalized.tmux_session,
+    tmux_session_id: normalized.tmux_session_id,
+    tmux_session_created: normalized.tmux_session_created,
+    worker_count: normalized.worker_count,
+    workers: normalized.workers,
+    lifecycle_profile: normalized.lifecycle_profile,
+    next_task_id: normalizeNextTaskId(normalized.next_task_id),
+    leader_cwd: normalized.leader_cwd,
+    team_state_root: normalized.team_state_root,
+    workspace_mode: normalized.workspace_mode,
+    worktree_mode: normalized.worktree_mode,
+    leader_pane_id: normalized.leader_pane_id,
+    leader_pane_pid: normalized.leader_pane_pid,
+    hud_pane_pid: normalized.hud_pane_pid,
+    hud_pane_id: normalized.hud_pane_id,
+    tmux_pane_owner_id: normalized.tmux_pane_owner_id,
+    resize_hook_name: normalized.resize_hook_name,
+    resize_hook_target: normalized.resize_hook_target,
+    next_worker_index: normalized.next_worker_index ?? existing.next_worker_index,
+    display_name: normalized.display_name ?? existing.display_name,
+    requested_name: normalized.requested_name ?? existing.requested_name,
+    identity_source: normalized.identity_source ?? existing.identity_source,
+    config_generation: normalized.config_generation,
+  };
+  const manifestPath = teamManifestV2Path(normalized.name, cwd);
+  const files: MembershipTransactionFile[] = [
+    { path: configPath, oldBytes: oldConfigBytes, newBytes: JSON.stringify(normalized, null, 2) },
+    { path: manifestPath, oldBytes: await readFile(manifestPath, 'utf8'), newBytes: JSON.stringify(merged, null, 2) },
+  ];
+  const journalPath = membershipTransactionPath(normalized.name, cwd);
+  const journal: MembershipTransactionJournal = { schemaVersion: 1, phase: 'prepared', files };
+  await writeAtomic(journalPath, JSON.stringify(journal, null, 2));
+  try {
+    await applyMembershipTransactionFiles(files, true);
+    journal.phase = 'committed';
+    await writeAtomic(journalPath, JSON.stringify(journal, null, 2));
+    await removeDurableFile(journalPath);
+  } catch (error) {
+    try {
+      await recoverTeamMembershipTaskTransaction(normalized.name, cwd);
+    } catch {
+      // The prepared journal is the durable recovery authority.
+    }
+    throw error;
   }
 }
 

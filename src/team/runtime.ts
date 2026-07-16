@@ -603,8 +603,11 @@ function detachedConfigIdentity(teamName: string, cwd: string, config: TeamConfi
     const teamRoot = join(canonicalDetachedStateRoot(config, cwd), 'team', teamName);
     const configBytes = readFileSync(join(teamRoot, 'config.json'), 'utf8');
     const manifestBytes = readFileSync(join(teamRoot, 'manifest.v2.json'), 'utf8');
-    JSON.parse(configBytes);
-    JSON.parse(manifestBytes);
+    const parsedConfig = JSON.parse(configBytes) as { config_generation?: unknown };
+    const parsedManifest = JSON.parse(manifestBytes) as { config_generation?: unknown };
+    if (!Number.isSafeInteger(parsedConfig.config_generation)
+      || !Number.isSafeInteger(parsedManifest.config_generation)
+      || parsedConfig.config_generation !== parsedManifest.config_generation) return null;
     return createHash('sha256').update(JSON.stringify({
       version: 2,
       team_name: teamName,

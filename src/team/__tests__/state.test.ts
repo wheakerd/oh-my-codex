@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmod, mkdtemp, rm, writeFile, readFile, mkdir, open, utimes, symlink } from 'fs/promises';
+import { chmod, mkdtemp, rm, writeFile, readFile, mkdir, open, rename, utimes, symlink } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { existsSync, readFileSync } from 'fs';
@@ -308,6 +308,40 @@ describe('team state', () => {
       stale.task = 'stale overwrite';
       await assert.rejects(() => saveTeamConfig(stale, cwd), /team_config_stale_generation:team-generation:0:1/);
       assert.equal((await readTeamConfig('team-generation', cwd))?.task, 'newer canonical value');
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('recovers an interrupted config-first save to one old generation before exposing state', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-config-pair-recovery-'));
+    try {
+      const teamName = 'config-pair-recovery';
+      await initTeamState(teamName, 'old task', 'executor', 1, cwd);
+      const teamRoot = join(cwd, '.omx', 'state', 'team', teamName);
+      const manifestPath = join(teamRoot, 'manifest.v2.json');
+      const config = await readTeamConfig(teamName, cwd);
+      assert.ok(config);
+      if (!config) throw new Error('missing config');
+      config.task = 'new task';
+
+      setWriteAtomicRenameForTests(async (from, to) => {
+        if (to === manifestPath) throw new Error('injected_manifest_publish_failure');
+        await rename(from, to);
+      });
+      await assert.rejects(() => saveTeamConfig(config, cwd), /injected_manifest_publish_failure/);
+      assert.equal(existsSync(join(teamRoot, '.membership-task-transaction.json')), true);
+
+      resetWriteAtomicRenameForTests();
+      const [recoveredConfig, recoveredManifest] = await Promise.all([
+        readTeamConfig(teamName, cwd),
+        readTeamManifestV2(teamName, cwd),
+      ]);
+      assert.equal(recoveredConfig?.task, 'old task');
+      assert.equal(recoveredConfig?.config_generation ?? 0, 0);
+      assert.equal(recoveredManifest?.task, 'old task');
+      assert.equal(recoveredManifest?.config_generation ?? 0, 0);
+      assert.equal(existsSync(join(teamRoot, '.membership-task-transaction.json')), false);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
