@@ -66,7 +66,10 @@ function runOmx(
     encoding: 'utf-8',
     timeout: CLI_SPAWN_TIMEOUT_MS,
     killSignal: 'SIGKILL',
-    env: buildRunOmxEnv(envOverrides),
+    env: {
+      ...buildRunOmxEnv(envOverrides),
+      ...(process.platform === 'win32' ? {} : { PWD: cwd }),
+    },
   });
   return {
     status: result.status,
