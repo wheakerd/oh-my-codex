@@ -151,6 +151,7 @@ async function createLaunchFixture(
     join(fakeBin, 'codex'),
     '#!/bin/sh\nprintf \'fake-codex:%s\\n\' "$*"\n',
   );
+  await writeExecutable(join(fakeBin, 'ps'), '#!/bin/sh\nexit 0\n');
   await writeExecutable(join(fakeBin, 'tmux'), tmuxScript(tmuxLogPath));
 
   return {
