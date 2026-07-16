@@ -123,6 +123,19 @@ jobs:
           import { readFileSync, writeFileSync } from 'node:fs';
           writeFileSync('authority-evidence/package-json.sha256', `${createHash('sha256').update(readFileSync('package.json')).digest('hex')}\n`);
           NODE
+          for log in \
+            build.log \
+            authority-integration.log \
+            doctor-platform.log \
+            authority-recovery-concurrency-e2e.log \
+            hotswap-rollover.log \
+            team-tmux-transport.log \
+            watcher-notify-subagent.log \
+            native-agents.log \
+            packed-install.log
+          do
+            printf 'status=not-run\nreason=an earlier authority step failed or this lane has not started\n' > "authority-evidence/$log"
+          done
       - name: Install dependencies
         shell: bash
         run: npm ci --ignore-scripts
