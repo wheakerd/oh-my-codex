@@ -2,18 +2,23 @@ import { createHash } from 'node:crypto';
 import { after, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
-import { chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { chmod, mkdir, mkdtemp as mkdtempRaw, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { basename, delimiter, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 const ORIGINAL_TEST_UMASK = process.umask(0o077);
 after(() => process.umask(ORIGINAL_TEST_UMASK));
+
+async function mkdtemp(prefix: string): Promise<string> {
+  return realpath(await mkdtempRaw(prefix));
+}
 import { HUD_TMUX_HEIGHT_LINES } from '../../hud/constants.js';
 import {
   canonicalizeExistingAuthorityPath,
 } from '../../state/authority.js';
 import { DETACHED_TMUX_HISTORY_LIMIT } from '../index.js';
+import { writeSessionEnd, writeSessionStart } from '../../hooks/session.js';
 
 const CLI_SPAWN_TIMEOUT_MS = 60_000;
 
@@ -159,6 +164,75 @@ async function createLaunchFixture(
       OMX_HOOK_DERIVED_SIGNALS: '0',
       OMX_ROOT: '',
       OMX_STATE_ROOT: '',
+    },
+  };
+}
+
+function startHeldOmx(
+  cwd: string,
+  envOverrides: Record<string, string>,
+): ReturnType<typeof spawn> {
+  const testDir = dirname(fileURLToPath(import.meta.url));
+  const repoRoot = join(testDir, '..', '..', '..');
+  return spawn(process.execPath, [join(repoRoot, 'dist', 'cli', 'omx.js'), '--direct', '--version'], {
+    cwd,
+    env: buildRunOmxEnv(envOverrides),
+    stdio: 'inherit',
+  });
+}
+
+async function waitForPath(path: string, expectedLines: number = 1): Promise<void> {
+  for (let attempt = 0; attempt < 300; attempt += 1) {
+    if (existsSync(path)) {
+      const contents = await readFile(path, 'utf-8').catch(() => '');
+      if (contents.trim().split('\n').filter(Boolean).length >= expectedLines) return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error(`timed out waiting for ${path}`);
+}
+
+async function stopHeldOmx(child: ReturnType<typeof spawn>, releasePath: string): Promise<void> {
+  await rm(releasePath, { force: true });
+  await new Promise<void>((resolve, reject) => {
+    child.once('error', reject);
+    child.once('exit', () => resolve());
+  });
+}
+
+async function createHeldCodexFixture(wd: string): Promise<{
+  env: Record<string, string>;
+  releasePath: string;
+  rootsPath: string;
+}> {
+  const home = join(wd, 'home');
+  const fakeBin = join(wd, 'bin');
+  const releasePath = join(wd, 'hold');
+  const rootsPath = join(wd, 'roots.log');
+  await mkdir(home, { recursive: true });
+  await mkdir(fakeBin, { recursive: true });
+  await writeFile(releasePath, 'hold\n');
+  await writeExecutable(
+    join(fakeBin, 'codex'),
+    `#!/bin/sh
+printf '%s\\n' "$OMX_ROOT" >> "${rootsPath}"
+while [ -f "${releasePath}" ]; do sleep 1; done
+`,
+  );
+  await writeExecutable(join(fakeBin, 'ps'), '#!/bin/sh\nexit 0\n');
+  return {
+    releasePath,
+    rootsPath,
+    env: {
+      HOME: home,
+      PATH: `${fakeBin}:/usr/bin:/bin`,
+      OMX_AUTO_UPDATE: '0',
+      OMX_NOTIFY_FALLBACK: '0',
+      OMX_HOOK_DERIVED_SIGNALS: '0',
+      OMX_ROOT: '',
+      OMX_STATE_ROOT: '',
+      TMUX: '',
+      TMUX_PANE: '',
     },
   };
 }

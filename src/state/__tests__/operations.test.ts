@@ -1,12 +1,16 @@
 import { after, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmod, mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp as mkdtempRaw, readFile, readdir, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 const ORIGINAL_TEST_UMASK = process.umask(0o077);
 after(() => process.umask(ORIGINAL_TEST_UMASK));
+
+async function mkdtemp(prefix: string): Promise<string> {
+  return realpath(await mkdtempRaw(prefix));
+}
 
 import {
   executeStateOperation as executeStateOperationRaw,

@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import assert from 'node:assert/strict';
-import { chmod, link, lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, link, lstat, mkdir, mkdtemp as mkdtempRaw, readFile, readdir, rename, rm, symlink, writeFile } from 'node:fs/promises';
 
 import { execFileSync, spawn } from 'node:child_process';
 
@@ -11,6 +11,10 @@ import { dirname, join } from 'node:path';
 import { after, describe, it } from 'node:test';
 const ORIGINAL_TEST_UMASK = process.umask(0o077);
 after(() => process.umask(ORIGINAL_TEST_UMASK));
+
+async function mkdtemp(prefix: string): Promise<string> {
+  return realpathSync(await mkdtempRaw(prefix));
+}
 
 import {
   AUTHORITY_DIAGNOSTIC_CODES,

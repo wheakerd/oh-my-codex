@@ -1,13 +1,17 @@
 import { after, afterEach, before, describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, readFileSync, utimesSync } from "node:fs";
-import { chmod, lstat, mkdir, mkdtemp, readFile, readdir as fsReaddir, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp as mkdtempRaw, readFile, readdir as fsReaddir, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { basename, delimiter, dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { once } from "node:events";
 import { spawnSync } from "node:child_process";
 import TOML from "@iarna/toml";
+
+async function mkdtemp(prefix: string): Promise<string> {
+  return realpath(await mkdtempRaw(prefix));
+}
 import {
   HELP,
   normalizeCodexLaunchArgs,
