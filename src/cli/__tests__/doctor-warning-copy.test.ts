@@ -5,6 +5,7 @@ import {
 	link,
 	mkdir,
 	mkdtemp,
+	realpath,
 	readFile,
 	rename,
 	rm,
@@ -2594,7 +2595,7 @@ command = "node"
 				res.stdout.match(/\[!!\] GPT-5\.6 multi-agent compatibility:/g)?.length,
 				1,
 			);
-			assert.match(res.stdout, new RegExp(`project scope config at ${configPath}`));
+			assert.match(res.stdout, new RegExp(`project scope config at ${join(await realpath(wd), ".codex", "config.toml")}`));
 			assert.match(res.stdout, /features\.multi_agent \(custom; custom-value\)/);
 			assert.match(res.stdout, /agents\.max_threads \(custom; custom-value\)/);
 			assert.match(res.stdout, /agents\.max_depth \(custom; custom-value\)/);

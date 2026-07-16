@@ -7,6 +7,7 @@ import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 import { getBaseStateDir } from '../../state/paths.js';
+import { canonicalizeOriginCwd } from '../../leader/contract.js';
 import { __setCrossProcessPublishBarrierForTest, __setCrossProcessQuarantineBarrierForTest, CrossProcessLockLostError, bindPendingRoleIntentUnderLock, buildSubagentResumeLedger, completeAdaptedRoleBinding, CROSS_PROCESS_LOCK_ARTIFACT_SWEEP_CAP, CROSS_PROCESS_LOCK_LEASE_MS, createSubagentTrackingState, crossProcessLockPath, consumePendingRoleIntent, recordSubagentTurn, NATIVE_SUBAGENT_PROVENANCE, OMX_ADAPTED_PROVENANCE, readProcessStartIdentity, readSubagentTrackingState, recordPendingRoleIntent, selectReusableSubagentEntry, summarizeSubagentSession, withCrossProcessFileLockSync } from '../tracker.js';
 import { subagentTrackingPath } from '../tracker.js';
 import { NATIVE_SUBAGENT_ROLE_ROUTING_MARKER_FILE, readRoleRoutingMarker, writeRoleRoutingMarker } from '../role-routing-marker.js';
@@ -1598,7 +1599,7 @@ describe('subagents/tracker', () => {
       }, (state) => state);
       assert.equal(binding?.alreadyBound, false);
       assert.ok(binding?.claimantToken);
-      assert.equal((await readSubagentTrackingState(cwd)).pending_role_intents[0]?.origin_cwd, cwd);
+      assert.equal((await readSubagentTrackingState(cwd)).pending_role_intents[0]?.origin_cwd, canonicalizeOriginCwd(cwd));
       assert.equal(completeAdaptedRoleBinding(cwd, {
         sessionId: legacyIntent.session_id,
         parentThreadId: legacyIntent.parent_thread_id,
@@ -1679,7 +1680,7 @@ describe('subagents/tracker', () => {
         alreadyBound: true,
       });
       assert.equal(bindCalled, false);
-      assert.equal((await readSubagentTrackingState(cwd)).pending_role_intents[0]?.origin_cwd, cwd);
+      assert.equal((await readSubagentTrackingState(cwd)).pending_role_intents[0]?.origin_cwd, canonicalizeOriginCwd(cwd));
     } finally {
       if (previousOmxRoot === undefined) delete process.env.OMX_ROOT;
       else process.env.OMX_ROOT = previousOmxRoot;
@@ -2295,7 +2296,7 @@ describe('subagents/tracker', () => {
         role: 'architect', sessionId: 'valid-origin-session', parentThreadId: 'valid-origin-parent', correlationToken: canonicalCorrelationToken('validorigintoken'),
       });
       assert.equal(recorded.ok, true);
-      assert.equal(recorded.ok && recorded.intent.origin_cwd, validCwd);
+      assert.equal(recorded.ok && recorded.intent.origin_cwd, canonicalizeOriginCwd(validCwd));
       const state = await readSubagentTrackingState(validCwd);
       assert.deepEqual(state.pending_role_intents, recorded.ok ? [recorded.intent] : []);
       assert.equal(existsSync(subagentTrackingPath(validCwd)), true);

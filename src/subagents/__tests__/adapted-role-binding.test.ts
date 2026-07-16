@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 import { getBaseStateDir } from '../../state/paths.js';
+import { canonicalizeOriginCwd } from '../../leader/contract.js';
 import {
   bindAndPublishAdaptedRole,
   recoverAdaptedRoleBindings,
@@ -440,10 +441,10 @@ describe('adapted role binding', () => {
       assert.deepEqual(state.pending_role_intents, []);
       assert.equal(readRoleRoutingMarker(sharedStateDir, {
         cwd: cwdA, sessionId: scope.sessionId, parentThreadId: scope.parentThreadId, nowMs: NOW_MS,
-      })?.cwd, cwdA);
+      })?.cwd, canonicalizeOriginCwd(cwdA));
       assert.equal(readRoleRoutingMarker(sharedStateDir, {
         cwd: cwdB, sessionId: scope.sessionId, parentThreadId: scope.parentThreadId, nowMs: NOW_MS,
-      })?.cwd, cwdB);
+      })?.cwd, canonicalizeOriginCwd(cwdB));
     } finally {
       if (previousStateRoot === undefined) delete process.env.OMX_STATE_ROOT;
       else process.env.OMX_STATE_ROOT = previousStateRoot;
@@ -937,7 +938,7 @@ describe('adapted role binding', () => {
       }, callback);
       assert.equal(legacyBinding?.alreadyBound, false);
       assert.ok(legacyBinding?.claimantToken);
-      assert.equal((await readSubagentTrackingState(cwd)).pending_role_intents[0]?.origin_cwd, cwd);
+      assert.equal((await readSubagentTrackingState(cwd)).pending_role_intents[0]?.origin_cwd, canonicalizeOriginCwd(cwd));
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

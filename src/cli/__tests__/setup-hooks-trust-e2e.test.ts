@@ -123,9 +123,33 @@ function omxMetadataSnapshot(hooks: readonly CodexHookMetadata[]): unknown[] {
 function foreignMetadataSnapshot(hooks: readonly CodexHookMetadata[], marker: string) {
   return hookMetadataSnapshot(hooks.filter((hook) => hook.command.includes(marker)));
 }
+function isObservedCodexVersionMismatch(error: Error): boolean {
+  if (!error.message.startsWith('Unsupported installed Codex version')) return false;
+  const observations = error.message.split('\n').slice(1).filter(Boolean);
+  return observations.length > 0 && observations.every((line) =>
+    /: stdout="codex-cli \d+\.\d+\.\d+\\n" stderr=/.test(line)
+  );
+}
+
+function skipUnsupportedInstalledCodex(t: { skip: (message?: string) => void }, error: unknown): boolean {
+  if (error instanceof CodexExecutableNotFoundError) {
+    t.skip('codex executable is absent; installed-Codex boundary is unavailable');
+    return true;
+  }
+  if (error instanceof Error && isObservedCodexVersionMismatch(error)) {
+    t.skip(error.message);
+    return true;
+  }
+  return false;
+}
 
 
 test('Linux installed-Codex hooks/list preserves full foreign metadata through uninstall (no macOS claim)', async (t) => {
+  if (process.platform !== 'linux') {
+    t.skip('This regression records Linux-only Codex evidence and makes no macOS claim.');
+    return;
+  }
+
   const root = await mkdtemp(join(tmpdir(), 'omx-setup-hooks-trust-e2e-'));
   const projectDir = resolve(root, 'project');
   const home = join(root, 'home');
@@ -154,22 +178,12 @@ test('Linux installed-Codex hooks/list preserves full foreign metadata through u
     );
     assert.equal(preSetupForeignRawSnapshot.length, 2, 'pre-approved foreign coordinates should be recorded');
 
-    // Linux-only evidence is recorded by this regression; it deliberately makes no macOS claim.
-    let codexVersion: string;
     try {
-      codexVersion = probeCodexVersion(projectDir, env);
+      probeCodexVersion(projectDir, env);
     } catch (error) {
-      if (error instanceof CodexExecutableNotFoundError) {
-        t.skip('codex executable is absent; installed-Codex boundary is the only skipped condition');
-        return;
-      }
+      if (skipUnsupportedInstalledCodex(t, error)) return;
       throw error;
     }
-    assert.equal(
-      process.platform,
-      'linux',
-      `This regression records Linux-only Codex evidence (${codexVersion}) and makes no macOS claim.`,
-    );
 
     const foreignApprovalServer = await CodexAppServer.start({ cwd: projectDir, env });
     try {
@@ -288,11 +302,11 @@ test('Linux installed-Codex hooks/list preserves full foreign metadata through u
 });
 
 test('Linux installed-Codex preserves managed-first foreign order and fails unsafe uninstall without writes', async (t) => {
-  assert.equal(
-    process.platform,
-    'linux',
-    'This Linux-only managed-first regression makes no macOS evidence claim.',
-  );
+  if (process.platform !== 'linux') {
+    t.skip('This regression records Linux-only Codex evidence and makes no macOS claim.');
+    return;
+  }
+
   const root = await mkdtemp(join(tmpdir(), 'omx-setup-hooks-managed-first-e2e-'));
   const projectDir = resolve(root, 'project');
   const home = join(root, 'home');
@@ -312,10 +326,7 @@ test('Linux installed-Codex preserves managed-first foreign order and fails unsa
     try {
       probeCodexVersion(projectDir, env);
     } catch (error) {
-      if (error instanceof CodexExecutableNotFoundError) {
-        t.skip('codex executable is absent; installed-Codex boundary is the only skipped condition');
-        return;
-      }
+      if (skipUnsupportedInstalledCodex(t, error)) return;
       throw error;
     }
 

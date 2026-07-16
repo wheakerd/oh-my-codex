@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { join, dirname } from "node:path";
@@ -206,7 +206,7 @@ describe("omx setup/uninstall shared ownership for native hooks", () => {
       const firstHooks = await readFile(hooksPath, "utf-8");
       const configPath = join(codexDir, "config.toml");
       const firstConfig = await readFile(configPath, "utf-8");
-      const escapedHooksPath = hooksPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const escapedHooksPath = (await realpath(hooksPath)).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
       for (const eventName of MANAGED_HOOK_EVENTS) {
         assert.match(
           firstConfig,

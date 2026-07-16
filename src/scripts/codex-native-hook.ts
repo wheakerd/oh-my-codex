@@ -3304,6 +3304,32 @@ function readPayloadThreadId(payload: CodexHookPayload): string {
   return safeString(payload.owner_codex_thread_id ?? payload.thread_id ?? payload.threadId).trim();
 }
 
+// #3181 leader bootstrap accepts only a single, self-consistent native thread binding.
+// `readPayloadThreadId` remains precedence-based for compatibility at ordinary call sites;
+// this stricter predicate is intentionally limited to the attestation boundary.
+function hasUnambiguousNativeLeaderThreadBinding(payload: CodexHookPayload, nativeSessionId: string): boolean {
+  const expected = nativeSessionId.trim();
+  if (!expected) return false;
+  const directThreadIds = ["thread_id", "threadId"] as const;
+  if (!directThreadIds.some((key) => safeString(payload[key]).trim() === expected)) return false;
+  return (["owner_codex_thread_id", ...directThreadIds] as const)
+    .every((key) => !Object.prototype.hasOwnProperty.call(payload, key) || safeString(payload[key]).trim() === expected);
+}
+
+function hasOnlyEmptyLeaderRoleCarriers(payload: CodexHookPayload): boolean {
+  const aliases = (carrier: Record<string, unknown>): boolean => [
+    "agent_role",
+    "agentRole",
+    "agent_type",
+    "agentType",
+  ].every((key) => !Object.prototype.hasOwnProperty.call(carrier, key)
+    || (typeof carrier[key] === "string" && carrier[key].trim() === ""));
+  const source = safeObject(payload.source);
+  const subagent = safeObject(source.subagent);
+  const threadSpawn = safeObject(subagent.thread_spawn);
+  return aliases(payload) && aliases(subagent) && aliases(threadSpawn);
+}
+
 function readPayloadAgentRole(payload: CodexHookPayload): string {
   const directRole = safeString(
     payload.agent_role
@@ -10576,46 +10602,55 @@ export async function dispatchCodexNativeHook(
     }
   } else if (hookEventName === "PreToolUse") {
     // #3181 Phase-1 (PreToolUse): this hook fires before the shell tool call that runs
-    // the first in-turn `omx ralplan role-intent write`. On a fresh App/outside-tmux
-    // turn where SessionStart did not establish the pointer, reconcile the canonical
-    // pointer and attest the leader here so the first command can bootstrap. Strictly
-    // gated to a fresh (absent-pointer) LEADER turn: no canonical session yet, a present
-    // native session id, a leader-shaped thread (absent or equal to the native session
-    // id), and no subagent/typed-role provenance. Best-effort; never blocks PreToolUse.
-    if (
-      allowImplicitSessionSideEffects
-      && !canonicalSessionId
+    // the first in-turn `omx ralplan role-intent write`. A positively-provenanced
+    // leader-shaped turn may bootstrap an absent canonical pointer, or attest the
+    // already SessionStart-reconciled canonical session. Never reconcile, replace, or
+    // attest a usable pointer whose captured native binding does not exactly match.
+    const canonicalNativeSessionId = currentSessionState
+      ? normalizeSessionId(currentSessionState.native_session_id)
+      : null;
+    const hasPositiveLeaderProvenance = allowImplicitSessionSideEffects
       && nativeSessionId
-      && readPayloadAgentRole(payload) === ""
+      && hasUnambiguousNativeLeaderThreadBinding(payload, nativeSessionId)
+      && hasOnlyEmptyLeaderRoleCarriers(payload)
       && !hasSubagentThreadSpawnProvenance(payload)
-    ) {
-      const preToolUseLeaderThreadId = readPayloadThreadId(payload);
-      if (
-        preToolUseLeaderThreadId
-        && preToolUseLeaderThreadId === nativeSessionId
-        && !(await isThreadTrackedAsSubagent(cwd, nativeSessionId))
-      ) {
-        try {
-          const ownerOmxSessionId = await resolveVerifiedOwnerOmxSessionId();
-          const sessionState = await reconcileNativeSessionStart(cwd, nativeSessionId, {
-            context: pointerContext,
-            pid: options.sessionOwnerPid ?? resolveSessionOwnerPid(payload),
-            ...(ownerOmxSessionId ? { ownerOmxSessionId, ownerAliasVerified: true } : {}),
+      && !(await isThreadTrackedAsSubagent(cwd, nativeSessionId));
+    if (hasPositiveLeaderProvenance && pointer.status === "absent") {
+      try {
+        const ownerOmxSessionId = await resolveVerifiedOwnerOmxSessionId();
+        const sessionState = await reconcileNativeSessionStart(cwd, nativeSessionId, {
+          context: pointerContext,
+          pid: options.sessionOwnerPid ?? resolveSessionOwnerPid(payload),
+          ...(ownerOmxSessionId ? { ownerOmxSessionId, ownerAliasVerified: true } : {}),
+        });
+        const bootstrapSessionId = safeString(sessionState.session_id).trim();
+        const bootstrapLeaderThreadId = safeString(sessionState.native_session_id).trim() || nativeSessionId;
+        if (bootstrapSessionId && bootstrapLeaderThreadId) {
+          canonicalSessionId = bootstrapSessionId;
+          attestLeaderThread(cwd, {
+            sessionId: bootstrapSessionId,
+            leaderThreadId: bootstrapLeaderThreadId,
+            source: 'native-pretooluse',
           });
-          const bootstrapSessionId = safeString(sessionState.session_id).trim();
-          const bootstrapLeaderThreadId = safeString(sessionState.native_session_id).trim() || nativeSessionId;
-          if (bootstrapSessionId && bootstrapLeaderThreadId) {
-            canonicalSessionId = bootstrapSessionId;
-            attestLeaderThread(cwd, {
-              sessionId: bootstrapSessionId,
-              leaderThreadId: bootstrapLeaderThreadId,
-              source: 'native-pretooluse',
-            });
-          }
-        } catch {
-          // Best-effort bootstrap; PreToolUse must never fail on this.
         }
+      } catch {
+        // Best-effort bootstrap; PreToolUse must never fail on this.
       }
+    } else if (
+      hasPositiveLeaderProvenance
+      && pointer.status === "usable"
+      && currentSessionState
+      && canonicalNativeSessionId === nativeSessionId
+      && canonicalSessionId
+    ) {
+      // SessionStart established this native binding but intentionally did not attest.
+      // Attest only the existing canonical session; reconciliation here could replace a
+      // foreign/stale pointer before the mismatch checks above reject it.
+      attestLeaderThread(cwd, {
+        sessionId: canonicalSessionId,
+        leaderThreadId: nativeSessionId,
+        source: 'native-pretooluse',
+      });
     }
     const payloadSessionId = readPayloadSessionId(payload);
     const rootPointerConflict = await readLiveRootSessionPointerConflict(stateDir, payloadSessionId);

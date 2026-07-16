@@ -1461,6 +1461,88 @@ function runPackedTransportRegressions(hookScript: string, smokeCwd: string): vo
       validateHookStdout(eventName, result.stdout as string);
     }
 
+    // #3181: exercise the installed hook and installed CLI as separate processes. This
+    // stays hermetic and bounded: no model, app-server, or network surface is involved.
+    const roleIntentCwd = join(smokeCwd, 'issue-3181-role-intent');
+    const roleIntentHome = join(roleIntentCwd, 'home');
+    const roleIntentCodexHome = join(roleIntentCwd, 'codex-home');
+    const roleIntentNativeSessionId = 'packed-issue-3181-native-leader';
+    mkdirSync(roleIntentHome, { recursive: true });
+    mkdirSync(roleIntentCodexHome, { recursive: true });
+    const roleIntentEnvironment = {
+      ...buildPackedRegressionEnvironment({ name: 'issue-3181-role-intent' }),
+      HOME: roleIntentHome,
+      CODEX_HOME: roleIntentCodexHome,
+    };
+    const sessionStartResult = run(process.execPath, [realpathSync(hookScript)], {
+      cwd: roleIntentCwd,
+      env: roleIntentEnvironment,
+      input: JSON.stringify({ hook_event_name: 'SessionStart', cwd: roleIntentCwd, session_id: roleIntentNativeSessionId }),
+    });
+    validateHookStdout('SessionStart', String(sessionStartResult.stdout || ''));
+    const sessionStartTracking: { sessions?: Record<string, { leader_attested_at?: string }> } = existsSync(join(roleIntentCwd, '.omx', 'state', 'subagent-tracking.json'))
+      ? JSON.parse(readFileSync(join(roleIntentCwd, '.omx', 'state', 'subagent-tracking.json'), 'utf-8')) as {
+        sessions?: Record<string, { leader_attested_at?: string }>;
+      }
+      : {};
+    if (sessionStartTracking.sessions?.[roleIntentNativeSessionId]?.leader_attested_at) {
+      throw new Error('installed #3181 SessionStart must not attest a leader');
+    }
+    const preToolUseResult = run(process.execPath, [realpathSync(hookScript)], {
+      cwd: roleIntentCwd,
+      env: roleIntentEnvironment,
+      input: JSON.stringify({
+        hook_event_name: 'PreToolUse',
+        cwd: roleIntentCwd,
+        session_id: roleIntentNativeSessionId,
+        thread_id: roleIntentNativeSessionId,
+        tool_name: 'Bash',
+        tool_use_id: 'packed-issue-3181-pretooluse',
+        tool_input: { command: 'omx ralplan role-intent write --role architect --parent-thread "$CODEX_THREAD_ID" --json' },
+      }),
+    });
+    validateHookStdout('PreToolUse', String(preToolUseResult.stdout || ''));
+    const roleIntentTracking = JSON.parse(readFileSync(join(roleIntentCwd, '.omx', 'state', 'subagent-tracking.json'), 'utf-8')) as {
+      sessions?: Record<string, { leader_thread_id?: string; leader_attested_at?: string; leader_attest_source?: string }>;
+      pending_role_intents?: Array<{ role?: string; correlation_token?: string }>;
+    };
+    const roleIntentLeader = roleIntentTracking.sessions?.[roleIntentNativeSessionId];
+    if (
+      roleIntentLeader?.leader_thread_id !== roleIntentNativeSessionId
+      || !roleIntentLeader.leader_attested_at
+      || roleIntentLeader.leader_attest_source !== 'native-pretooluse'
+    ) {
+      throw new Error('installed #3181 PreToolUse did not attest the canonical native leader with native-pretooluse provenance');
+    }
+    const roleIntentCliResult = run(process.execPath, [realpathSync(join(packageRoot, 'dist', 'cli', 'omx.js')), 'ralplan', 'role-intent', 'write', '--role', 'architect', '--parent-thread', roleIntentNativeSessionId, '--json'], {
+      cwd: roleIntentCwd,
+      env: roleIntentEnvironment,
+    });
+    if (roleIntentCliResult.status !== 0) throw new Error(`installed #3181 role-intent CLI failed: ${String(roleIntentCliResult.stderr || '')}`);
+    const roleIntentReceipt = JSON.parse(String(roleIntentCliResult.stdout || '{}')) as {
+      ok?: boolean;
+      intent?: { role?: string; correlation_token?: string };
+      spawn_task_name?: string;
+    };
+    const finalRoleIntentTracking = JSON.parse(readFileSync(join(roleIntentCwd, '.omx', 'state', 'subagent-tracking.json'), 'utf-8')) as {
+      pending_role_intents?: Array<{ role?: string; correlation_token?: string }>;
+    };
+    if (!roleIntentReceipt.ok || roleIntentReceipt.intent?.role !== 'architect' || !roleIntentReceipt.intent.correlation_token) {
+      throw new Error('installed #3181 role-intent CLI did not authorize an Architect receipt');
+    }
+    const spawnTaskName = roleIntentReceipt.spawn_task_name || '';
+    if (!/^omx_role_intent_[a-z0-9_]+$/.test(spawnTaskName)) {
+      throw new Error('installed #3181 role-intent CLI returned an invalid App-compatible spawn_task_name');
+    }
+    if (
+      finalRoleIntentTracking.pending_role_intents?.length !== 1
+      || finalRoleIntentTracking.pending_role_intents[0]?.role !== 'architect'
+      || finalRoleIntentTracking.pending_role_intents[0]?.correlation_token !== roleIntentReceipt.intent.correlation_token
+      || !spawnTaskName.endsWith(roleIntentReceipt.intent.correlation_token)
+    ) {
+      throw new Error('installed #3181 must leave exactly one correlated Architect pending intent/receipt');
+    }
+
     for (const [caseIndex, testCase] of PACKED_INSTALL_NATIVE_HOOK_REGRESSION_PROMPTS.entries()) {
       const caseCwd = join(smokeCwd, testCase.name);
       const sessionId = `packed-regression-${caseIndex}`;
