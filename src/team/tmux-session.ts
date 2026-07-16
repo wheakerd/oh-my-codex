@@ -389,6 +389,17 @@ function establishTmuxBirths(sessionName: string, leaderPaneId: string): Establi
       : null;
   }
 
+  // A missing receipt is ambiguous: the publish command may have committed and
+  // another process may already have adopted the complete pair. Preserve and
+  // adopt any complete read-back pair before considering compensation.
+  const publishedSessionTag = runTmux(['show-options', '-qv', '-t', sessionName, OMX_INSTANCE_OPTION]);
+  const publishedPaneTag = runTmux(['show-option', '-qv', '-p', '-t', leaderPaneId, OMX_PANE_INSTANCE_OPTION]);
+  const publishedSessionBirth = publishedSessionTag.ok ? publishedSessionTag.stdout.trim() : '';
+  const publishedPaneBirth = publishedPaneTag.ok ? publishedPaneTag.stdout.trim() : '';
+  if (publishedSessionBirth && publishedPaneBirth) {
+    return { sessionBirth: publishedSessionBirth, paneBirth: publishedPaneBirth };
+  }
+
   // tmux can report a command failure after the first write has committed. Undo
   // only our exact pair (or exact half-pair) in one server-side CAS; a changed
   // value is a concurrent replacement and must survive recovery.
@@ -405,6 +416,7 @@ function establishTmuxBirths(sessionName: string, leaderPaneId: string): Establi
     `display-message -p ${compensationRejected}`,
   ]);
   return null;
+
 }
 
 function appendNoUnderlineStyleFlags(style: string): string {
@@ -657,6 +669,21 @@ function findExactTeamHudPaneIds(target: string, candidate: ExactTeamHudCandidat
       && pane.sessionInstanceId === candidate.tmuxSessionInstanceId)
     .map((pane) => pane.paneId);
 }
+function findBorrowableStandaloneHudPaneIds(target: string, candidate: ExactTeamHudCandidate | null): string[] {
+  if (!candidate) return [];
+  return listPanes(target)
+    .filter((pane) => pane.paneId !== candidate.leaderPaneId)
+    .filter((pane) => hudPaneMatchesOwner(pane, {
+      sessionId: candidate.sessionId,
+      sessionIds: candidate.sessionIds,
+      leaderPaneId: candidate.leaderPaneId,
+    }))
+    .filter((pane) => !readNewPaneTeamOwnerTag(pane.paneId)
+      && !readTeamPaneBirth(pane.paneId)
+      && !readTeamPaneRole(pane.paneId))
+    .map((pane) => pane.paneId);
+}
+
 
 /** Kills only an immutable journaled HUD generation, with tmux evaluating every identity immediately before kill. */
 export function killExactTeamHudPane(
@@ -676,7 +703,7 @@ export function killExactTeamHudPane(
   const condition = `#{&&:#{==:#{pane_id},${escapeTmuxFormatLiteral(paneId)}},#{==:#{pane_start_command},${escapeTmuxFormatLiteral(receipt.command)}},#{==:#{@omx_pane_instance_id},${escapeTmuxFormatLiteral(receipt.pane_birth)}},#{==:#{@omx_instance_id},${escapeTmuxFormatLiteral(candidate.tmuxSessionInstanceId)}},#{==:#{session_name},${escapeTmuxFormatLiteral(sessionName)}},#{==:#{@omx_team_pane_owner_id},${escapeTmuxFormatLiteral(teamOwnerId)}},#{==:#{@omx_team_pane_birth},${escapeTmuxFormatLiteral(receipt.pane_birth)}},#{==:#{@omx_team_pane_role},${escapeTmuxFormatLiteral('hud')}}}`;
   const result = runTmux([
     'if-shell', '-t', paneId, '-F', condition,
-    `kill-pane -t ${paneId} \\; display-message -p ${appliedReceipt}`,
+    `kill-pane -t ${shellQuoteSingle(paneId)} \\; display-message -p ${appliedReceipt}`,
     `display-message -p ${rejectedReceipt}`,
   ]);
   return result.ok && result.stdout.split('\n').some((line) => line.trim() === appliedReceipt);
@@ -988,7 +1015,7 @@ function resolveHudHeightLines(heightLines: number): number {
 }
 
 function buildHudResizeCommand(hudPaneId: string, heightLines: number = HUD_TMUX_TEAM_HEIGHT_LINES): string {
-  return `resize-pane -t ${buildHudPaneTarget(hudPaneId)} -y ${resolveHudHeightLines(heightLines)}`;
+  return `resize-pane -t ${shellQuoteSingle(buildHudPaneTarget(hudPaneId))} -y ${resolveHudHeightLines(heightLines)}`;
 }
 
 
@@ -1049,14 +1076,14 @@ function buildGuardedTeamResizeCommand(hudPaneId: string, heightLines: number, e
   const condition = buildTeamHookCondition(evidence);
   if (condition === '#{==:0,1}') return ':';
   const resizeCommand = buildHudResizeCommand(hudPaneId, heightLines);
-  const guarded = `if-shell -t ${buildHudPaneTarget(hudPaneId)} -F ${shellQuoteSingle(condition)} ${shellQuoteSingle(resizeCommand)} ''`;
+  const guarded = `if-shell -t ${shellQuoteSingle(buildHudPaneTarget(hudPaneId))} -F ${shellQuoteSingle(condition)} ${shellQuoteSingle(resizeCommand)} ''`;
   return buildBestEffortShellCommand(buildNestedTmuxShellCommand(guarded));
 }
 
 function buildTeamHookCommand(hookCommand: string, evidence?: TeamHudHookEvidence): string {
   if (!hasCompleteTeamHudHookEvidence(evidence)) return 'run-shell -b :';
   const condition = buildTeamHookCondition(evidence);
-  return `if-shell -t ${buildHudPaneTarget(evidence.hudPaneId)} -F ${shellQuoteSingle(condition)} ${shellQuoteSingle(`run-shell -b ${hookCommand}`)} '' # omx-generation=${evidence.generation}`;
+  return `if-shell -t ${shellQuoteSingle(buildHudPaneTarget(evidence.hudPaneId))} -F ${shellQuoteSingle(condition)} ${shellQuoteSingle(`run-shell -b ${hookCommand}`)} '' # omx-generation=${evidence.generation}`;
 }
 
 
@@ -1173,7 +1200,9 @@ export function registerHudHooksTransactionally(
   if (priorGeneration && !/^[0-9a-f-]{36}$/.test(priorGeneration)) return false;
   if (priorGeneration) {
     const priorActive = runTmux(['show-options', '-qv', '-t', hookTarget, teamHookActiveOption(priorGeneration)]);
-    if (priorActive.ok && priorActive.stdout.trim() === '1' && hasVerifiedTeamHookPair(hookTarget, priorGeneration)) return true;
+    if (priorActive.ok && priorActive.stdout.trim() === '1' && hasVerifiedTeamHookPair(hookTarget, priorGeneration)) {
+      return priorGeneration === generation;
+    }
   }
 
   // The new pair is intentionally inert until both append receipts have been observed.
@@ -1189,10 +1218,10 @@ export function registerHudHooksTransactionally(
   const receipt = randomUUID();
   const condition = `#{==:#{${generationOption}},${escapeTmuxFormatLiteral(priorGeneration)}}`;
   const publish = [
-    `set-option -t ${hookTarget} ${generationOption} ${generation}`,
-    `set-option -t ${hookTarget} ${teamHookActiveOption(generation)} 1`,
-    ...(priorGeneration ? [`set-option -t ${hookTarget} ${teamHookActiveOption(priorGeneration)} 0`] : []),
-    `set-option -t ${hookTarget} ${receiptOption} ${receipt}`,
+    `set-option -t ${shellQuoteSingle(hookTarget)} ${generationOption} ${generation}`,
+    `set-option -t ${shellQuoteSingle(hookTarget)} ${teamHookActiveOption(generation)} 1`,
+    ...(priorGeneration ? [`set-option -t ${shellQuoteSingle(hookTarget)} ${teamHookActiveOption(priorGeneration)} 0`] : []),
+    `set-option -t ${shellQuoteSingle(hookTarget)} ${receiptOption} ${receipt}`,
   ].join(' \\; ');
   if (!runTmux(['if-shell', '-t', hookTarget, '-F', condition, publish, '']).ok) return false;
   const applied = runTmux(['show-options', '-qv', '-t', hookTarget, receiptOption]);
@@ -1219,7 +1248,7 @@ export function unregisterHudHooksTransactionally(
   const receiptOption = teamHookReceiptOption(hookTarget);
   const receipt = randomUUID();
   const condition = `#{==:#{${teamHookGenerationOption(hookTarget)}},${escapeTmuxFormatLiteral(generation)}}`;
-  const deactivate = `set-option -t ${hookTarget} ${teamHookActiveOption(generation)} 0 \\; set-option -t ${hookTarget} ${receiptOption} ${receipt}`;
+  const deactivate = `set-option -t ${shellQuoteSingle(hookTarget)} ${teamHookActiveOption(generation)} 0 \\; set-option -t ${shellQuoteSingle(hookTarget)} ${receiptOption} ${receipt}`;
   if (!runTmux(['if-shell', '-t', hookTarget, '-F', condition, deactivate, '']).ok) return false;
   const applied = runTmux(['show-options', '-qv', '-t', hookTarget, receiptOption]);
   return applied.ok && applied.stdout.trim() === receipt;
@@ -2154,9 +2183,17 @@ export function createTeamSession(
       created: false,
       acquired_at: new Date().toISOString(),
     });
-    const [retainedHudPaneId, ...duplicateHudPaneIds] = hasExactHudAuthority
+    const exactHudPaneIds = hasExactHudAuthority
       ? findExactTeamHudPaneIds(teamTarget, hudExactCandidate)
       : [];
+    const standaloneHudPaneIds = hasExactHudAuthority && exactHudPaneIds.length === 0
+      ? findBorrowableStandaloneHudPaneIds(teamTarget, hudExactCandidate)
+      : [];
+    const retainedHudPaneId = exactHudPaneIds[0] ?? standaloneHudPaneIds[0] ?? null;
+    const duplicateHudPaneIds = exactHudPaneIds.length > 0
+      ? exactHudPaneIds.slice(1)
+      : standaloneHudPaneIds.slice(1);
+    const retainedHudIsBorrowed = Boolean(retainedHudPaneId && exactHudPaneIds.length === 0);
     // A duplicate's command and live tags prove only that it resembles this
     // generation. They are not a transferable lifecycle receipt, so killing it
     // would risk an ABA-reused pane. Stop before provisioning workers rather
@@ -2166,27 +2203,42 @@ export function createTeamSession(
     }
     if (retainedHudPaneId) {
       const retainedHudPane = listPanes(teamTarget).find((pane) => pane.paneId === retainedHudPaneId);
-      const retainedHudPaneBirth = readTeamPaneBirth(retainedHudPaneId);
-      const retainedHudPaneRole = readTeamPaneRole(retainedHudPaneId);
-      if (
-        !retainedHudPane?.startCommand.trim()
-        || !retainedHudPane.paneInstanceId?.trim()
-        || retainedHudPane.sessionInstanceId !== hudExactCandidate?.tmuxSessionInstanceId
-        || !retainedHudPaneBirth
-        || retainedHudPaneRole !== 'hud'
-        || readNewPaneTeamOwnerTag(retainedHudPaneId) !== teamPaneOwnerId
-      ) {
-        throw new Error(`failed to capture exact retained HUD receipt for ${retainedHudPaneId}`);
+      if (retainedHudIsBorrowed) {
+        // A pre-Team standalone HUD has no Team lifecycle receipt. Its own
+        // immutable pane birth and command make it durable borrowed recovery
+        // evidence, never rollback or teardown authority for this Team.
+        options.journalResource?.({
+          kind: 'hud',
+          id: retainedHudPaneId,
+          created: false,
+          pane_birth: retainedHudPane?.paneInstanceId,
+          command: retainedHudPane?.startCommand,
+          role: 'hud',
+          acquired_at: new Date().toISOString(),
+        });
+      } else {
+        const retainedHudPaneBirth = readTeamPaneBirth(retainedHudPaneId);
+        const retainedHudPaneRole = readTeamPaneRole(retainedHudPaneId);
+        if (
+          !retainedHudPane?.startCommand.trim()
+          || !retainedHudPane.paneInstanceId?.trim()
+          || retainedHudPane.sessionInstanceId !== hudExactCandidate?.tmuxSessionInstanceId
+          || !retainedHudPaneBirth
+          || retainedHudPaneRole !== 'hud'
+          || readNewPaneTeamOwnerTag(retainedHudPaneId) !== teamPaneOwnerId
+        ) {
+          throw new Error(`failed to capture exact retained HUD receipt for ${retainedHudPaneId}`);
+        }
+        options.journalResource?.({
+          kind: 'hud',
+          id: retainedHudPaneId,
+          created: false,
+          pane_birth: retainedHudPaneBirth,
+          command: retainedHudPane.startCommand,
+          role: 'hud',
+          acquired_at: new Date().toISOString(),
+        });
       }
-      options.journalResource?.({
-        kind: 'hud',
-        id: retainedHudPaneId,
-        created: false,
-        pane_birth: retainedHudPaneBirth,
-        command: retainedHudPane.startCommand,
-        role: 'hud',
-        acquired_at: new Date().toISOString(),
-      });
     }
     const omxEntry = resolveOmxCliEntryPath();
     const canRecreateTeamHud = hasExactHudAuthority && Boolean(omxEntry && omxEntry.trim() !== '');
@@ -2473,7 +2525,7 @@ export function createTeamSession(
       const condition = `#{&&:#{==:#{pane_id},${escapeTmuxFormatLiteral(paneId)}},#{==:#{pane_start_command},${escapeTmuxFormatLiteral(command)}},#{==:#{@omx_instance_id},${escapeTmuxFormatLiteral(rollbackSessionBirth)}},#{==:#{@omx_team_pane_owner_id},${escapeTmuxFormatLiteral(rollbackTeamPaneOwnerId)}},#{==:#{@omx_team_pane_birth},${escapeTmuxFormatLiteral(paneBirth)}},#{==:#{@omx_team_pane_role},${escapeTmuxFormatLiteral(role)}}}`;
       runTmux([
         'if-shell', '-t', paneId, '-F', condition,
-        `kill-pane -t ${paneId} \\; display-message -p ${appliedReceipt}`,
+        `kill-pane -t ${shellQuoteSingle(paneId)} \\; display-message -p ${appliedReceipt}`,
         `display-message -p ${rejectedReceipt}`,
       ]);
     }
@@ -3616,7 +3668,7 @@ export async function teardownWorkerPanes(
     const condition = `#{&&:#{==:#{pane_id},${escapeTmuxFormatLiteral(paneId)}},#{==:#{pane_start_command},${escapeTmuxFormatLiteral(receipt.command)}},#{==:#{session_name},${escapeTmuxFormatLiteral(sessionName)}},#{==:#{@omx_instance_id},${escapeTmuxFormatLiteral(sessionBirth)}},#{==:#{@omx_team_pane_owner_id},${escapeTmuxFormatLiteral(teamOwnerId)}},#{==:#{@omx_team_pane_birth},${escapeTmuxFormatLiteral(receipt.pane_birth)}},#{==:#{@omx_team_pane_role},${escapeTmuxFormatLiteral('worker')}}}`;
     const result = await runTmuxAsync([
       'if-shell', '-t', paneId, '-F', condition,
-      `kill-pane -t ${paneId} \\; display-message -p ${appliedReceipt}`,
+      `kill-pane -t ${shellQuoteSingle(paneId)} \\; display-message -p ${appliedReceipt}`,
       `display-message -p ${rejectedReceipt}`,
     ]);
     if (result.ok && result.stdout.split('\n').some((line) => line.trim() === appliedReceipt)) summary.kill.succeeded += 1;

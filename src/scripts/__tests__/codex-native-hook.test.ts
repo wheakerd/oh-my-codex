@@ -10503,6 +10503,9 @@ export async function onHookEvent(event) {
 `#!/usr/bin/env bash
 set -euo pipefail
 printf '%s\n' "$*" >> ${JSON.stringify(tmuxLog)}
+log_file=${JSON.stringify(tmuxLog)}
+state_dir="$log_file.state"
+mkdir -p "$state_dir"
 cmd="$1"
 shift || true
 case "$cmd" in
@@ -10524,6 +10527,20 @@ case "$cmd" in
       '#S') printf 'omx-hud-reconcile\n' ;;
     esac
     ;;
+  set-option)
+    target=""
+    pane_scope=0
+    val="\${@: -1}"
+    opt="\${@: -2:1}"
+    while [[ "$#" -gt 0 ]]; do
+      case "$1" in
+        -p) pane_scope=1; shift ;;
+        -t) target="$2"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    if [[ "$pane_scope" == 1 && -n "$target" ]]; then printf '%s' "$val" > "$state_dir/\${target}_\${opt}"; fi
+    ;;
   show-option|show-options)
     target=""
     pane_scope=0
@@ -10535,7 +10552,9 @@ case "$cmd" in
         *) shift ;;
       esac
     done
-    if [[ "$pane_scope" == 1 && ( "$target" == '%1' || "$target" == '%9' ) && "$option" == '@omx_pane_instance_id' ]]; then
+    if [[ "$pane_scope" == 1 && -n "$target" && -f "$state_dir/\${target}_\${option}" ]]; then
+      cat "$state_dir/\${target}_\${option}"
+    elif [[ "$pane_scope" == 1 && "$target" == '%1' && "$option" == '@omx_pane_instance_id' ]]; then
       printf 'sess-hud-1\n'
     elif [[ "$pane_scope" == 0 && "$target" == 'omx-hud-reconcile' && "$option" == '@omx_instance_id' ]]; then
       printf 'sess-hud-1\n'
@@ -10684,6 +10703,9 @@ esac
 `#!/usr/bin/env bash
 set -euo pipefail
 printf '%s\n' "$*" >> ${JSON.stringify(tmuxLog)}
+log_file=${JSON.stringify(tmuxLog)}
+state_dir="$log_file.state"
+mkdir -p "$state_dir"
 cmd="$1"
 shift || true
 case "$cmd" in
@@ -10705,6 +10727,20 @@ case "$cmd" in
       '#S') printf 'omx-hud-reuse\n' ;;
     esac
     ;;
+  set-option)
+    target=""
+    pane_scope=0
+    val="\${@: -1}"
+    opt="\${@: -2:1}"
+    while [[ "$#" -gt 0 ]]; do
+      case "$1" in
+        -p) pane_scope=1; shift ;;
+        -t) target="$2"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    if [[ "$pane_scope" == 1 && -n "$target" ]]; then printf '%s' "$val" > "$state_dir/\${target}_\${opt}"; fi
+    ;;
   show-option|show-options)
     target=""
     pane_scope=0
@@ -10716,7 +10752,9 @@ case "$cmd" in
         *) shift ;;
       esac
     done
-    if [[ "$pane_scope" == 1 && ( "$target" == '%1' || "$target" == '%9' ) && "$option" == '@omx_pane_instance_id' ]]; then
+    if [[ "$pane_scope" == 1 && -n "$target" && -f "$state_dir/\${target}_\${option}" ]]; then
+      cat "$state_dir/\${target}_\${option}"
+    elif [[ "$pane_scope" == 1 && "$target" == '%1' && "$option" == '@omx_pane_instance_id' ]]; then
       printf 'omx-canonical-hud-reuse\n'
     elif [[ "$pane_scope" == 0 && "$target" == 'omx-hud-reuse' && "$option" == '@omx_instance_id' ]]; then
       printf 'omx-canonical-hud-reuse\n'

@@ -222,6 +222,8 @@ async function writeSuccessfulScaleUpTmuxStub(
       '#!/bin/sh',
       'set -eu',
       `printf '%s\n' "$*" >> "${tmuxLogPath}"`,
+      `state_dir="${tmuxLogPath}.state"`,
+      'mkdir -p "$state_dir"',
       'case "${1:-}" in',
       '  -V)',
       '    echo "tmux 3.2a"',
@@ -236,6 +238,15 @@ async function writeSuccessfulScaleUpTmuxStub(
       '    ;;',
       '  capture-pane)',
       '    echo ""',
+      '    ;;',
+      '  show-options)',
+      '    echo "session-birth-1"',
+      '    ;;',
+      '  set-option)',
+      '    if [ "${2:-}" = "-p" ]; then printf "%s" "${6:-}" > "$state_dir/${4:-}_${5:-}"; fi',
+      '    ;;',
+      '  show-option)',
+      '    if [ "${2:-}" = "-qv" ] && [ "${3:-}" = "-p" ]; then cat "$state_dir/${5:-}_${6:-}" 2>/dev/null || true; else echo "session-birth-1"; fi',
       '    ;;',
       'esac',
       'exit 0',
@@ -255,6 +266,7 @@ async function configureScaleUpTeamForDirectDispatch(teamName: string, cwd: stri
   config.tmux_session = `omx-team-${teamName}`;
   config.leader_pane_id = '%11';
   config.workers[0]!.pane_id = '%21';
+  config.tmux_pane_owner_id = `team:${teamName}`;
   await saveTeamConfig(config, cwd);
 
   const manifestPath = join(cwd, '.omx', 'state', 'team', teamName, 'manifest.v2.json');
@@ -754,6 +766,8 @@ exit 0
           '#!/bin/sh',
           'set -eu',
           `printf '\%s\n' "$*" >> "${tmuxLogPath}"`,
+          `state_dir="${tmuxLogPath}.state"`,
+          'mkdir -p "$state_dir"',
           'case "${1:-}" in',
           '  -V)',
           '    echo "tmux 3.2a"',
@@ -768,6 +782,12 @@ exit 0
           '    ;;',
           '  capture-pane)',
           '    echo ""',
+          '    ;;',
+          '  show-option)',
+          '    if [ "${2:-}" = "-qv" ] && [ "${3:-}" = "-p" ]; then cat "$state_dir/${5:-}_${6:-}" 2>/dev/null || true; else echo "session-birth-1"; fi',
+          '    ;;',
+          '  set-option)',
+          '    if [ "${2:-}" = "-p" ]; then printf "%s" "${6:-}" > "$state_dir/${4:-}_${5:-}"; fi',
           '    ;;',
           'esac',
           'exit 0',
@@ -797,6 +817,7 @@ exit 0
       config.tmux_session = 'omx-team-scale-up-role';
       config.leader_pane_id = '%11';
       config.workers[0]!.pane_id = '%21';
+      config.tmux_pane_owner_id = 'team:scale-up-role';
       await saveTeamConfig(config, cwd);
 
       const manifestPath = join(cwd, '.omx', 'state', 'team', 'scale-up-role', 'manifest.v2.json');
@@ -1002,6 +1023,11 @@ printf '%s\\n' "$@" > '${capturePath}'
           '        ;;',
           '    esac',
           '    ;;',
+          '  show-option)',
+          '    case "$*" in',
+          '      *"@omx_instance_id"*) echo "session-birth-1" ;;',
+          '    esac',
+          '    ;;',
           '  list-panes)',
           '    echo "42424"',
           '    ;;',
@@ -1029,17 +1055,17 @@ printf '%s\\n' "$@" > '${capturePath}'
       );
       assert.equal(result.ok, false);
       if (result.ok) return;
-      assert.match(result.error, /Failed to tag tmux pane for worker-2/);
+      assert.match(result.error, /Failed to establish immutable tmux authority for worker-2:scale_up_rollback_teardown_unconfirmed/);
 
       const config = await readTeamConfig('scale-up-owner-tag-rollback', cwd);
       assert.equal(config?.workers.length, 1);
-      assert.equal(await readTask('scale-up-owner-tag-rollback', '1', cwd), null);
+      assert.ok(await readTask('scale-up-owner-tag-rollback', '1', cwd), 'uncertain rollback preserves task state');
 
       const tmuxCommands = await readScaleUpTmuxLogCommands(tmuxLogPath);
       assert.ok(tmuxCommands.some((command) => (
         command === 'set-option -p -t %31 @omx_team_pane_owner_id team:scale-up-owner-tag-rollback'
       )));
-      assert.ok(tmuxCommands.some((command) => command === 'kill-pane -t %31'));
+      assert.equal(tmuxCommands.some((command) => command === 'kill-pane -t %31'), false);
     } finally {
       if (typeof previousPath === 'string') process.env.PATH = previousPath;
       else delete process.env.PATH;
@@ -1477,6 +1503,8 @@ printf '%s\\n' "$@" > '${capturePath}'
           '#!/bin/sh',
           'set -eu',
           `printf '%s\n' "$*" >> "${tmuxLogPath}"`,
+          `state_dir="${tmuxLogPath}.state"`,
+          'mkdir -p "$state_dir"',
           'case "${1:-}" in',
           '  -V)',
           '    echo "tmux 3.2a"',
@@ -1491,6 +1519,12 @@ printf '%s\\n' "$@" > '${capturePath}'
           '    ;;',
           '  capture-pane)',
           '    echo ""',
+          '    ;;',
+          '  show-option)',
+          '    if [ "${2:-}" = "-qv" ] && [ "${3:-}" = "-p" ]; then cat "$state_dir/${5:-}_${6:-}" 2>/dev/null || true; else echo "session-birth-1"; fi',
+          '    ;;',
+          '  set-option)',
+          '    if [ "${2:-}" = "-p" ]; then printf "%s" "${6:-}" > "$state_dir/${4:-}_${5:-}"; fi',
           '    ;;',
           'esac',
           'exit 0',
@@ -1534,6 +1568,7 @@ printf '%s\\n' "$@" > '${capturePath}'
       config.tmux_session = 'omx-team-scale-up-project-reasoning';
       config.leader_pane_id = '%11';
       config.workers[0]!.pane_id = '%21';
+      config.tmux_pane_owner_id = 'team:scale-up-project-reasoning';
       await saveTeamConfig(config, cwd);
 
       const manifestPath = join(cwd, '.omx', 'state', 'team', 'scale-up-project-reasoning', 'manifest.v2.json');
@@ -1595,6 +1630,8 @@ printf '%s\\n' "$@" > '${capturePath}'
         tmuxStubPath,
         `#!/bin/sh
 set -eu
+state_dir="${fakeBinDir}/tmux-state"
+mkdir -p "$state_dir"
 	case "\${1:-}" in
   -V)
     echo "tmux 3.2a"
@@ -1610,6 +1647,15 @@ set -eu
     ;;
   capture-pane)
     echo ""
+    ;;
+  show-option)
+    if [ "\${2:-}" = "-qv" ] && [ "\${3:-}" = "-p" ]; then cat "$state_dir/\${5:-}_\${6:-}" 2>/dev/null || true; else echo "session-birth-1"; fi
+    ;;
+  set-option)
+    if [ "\${2:-}" = "-p" ]; then printf "%s" "\${6:-}" > "$state_dir/\${4:-}_\${5:-}"; fi
+    ;;
+  if-shell)
+    printf '%s\n' "\${6:-}" | awk '{print $NF}'
     ;;
 esac
 exit 0
@@ -1634,6 +1680,7 @@ exit 0
       config.tmux_session = 'omx-team-rollback-worktree';
       config.leader_pane_id = '%11';
       config.workers[0]!.pane_id = '%21';
+      config.tmux_pane_owner_id = 'team:rollback-worktree';
       await saveTeamConfig(config, cwd);
 
       const manifestPath = join(cwd, '.omx', 'state', 'team', 'rollback-worktree', 'manifest.v2.json');
@@ -1679,6 +1726,8 @@ exit 0
         tmuxStubPath,
         `#!/bin/sh
 set -eu
+state_dir="${fakeBinDir}/tmux-state"
+mkdir -p "$state_dir"
 	case "\${1:-}" in
   -V)
     echo "tmux 3.2a"
@@ -1691,6 +1740,12 @@ set -eu
     ;;
   capture-pane)
     echo ""
+    ;;
+  show-option)
+    if [ "\${2:-}" = "-qv" ] && [ "\${3:-}" = "-p" ]; then cat "$state_dir/\${5:-}_\${6:-}" 2>/dev/null || true; else echo "session-birth-1"; fi
+    ;;
+  set-option)
+    if [ "\${2:-}" = "-p" ]; then printf "%s" "\${6:-}" > "$state_dir/\${4:-}_\${5:-}"; fi
     ;;
 esac
 exit 0
@@ -1715,6 +1770,7 @@ exit 0
       config.tmux_session = 'omx-team-canonical-root';
       config.leader_pane_id = '%11';
       config.workers[0]!.pane_id = '%21';
+      config.tmux_pane_owner_id = 'team:canonical-root';
       await saveTeamConfig(config, cwd);
 
       const manifestPath = join(cwd, '.omx', 'state', 'team', 'canonical-root', 'manifest.v2.json');
@@ -1768,6 +1824,8 @@ exit 0
         tmuxStubPath,
         `#!/bin/sh
 set -eu
+state_dir="${fakeBinDir}/tmux-state"
+mkdir -p "$state_dir"
 case "\${1:-}" in
   -V)
     echo "tmux 3.2a"
@@ -1780,6 +1838,12 @@ case "\${1:-}" in
     ;;
   capture-pane)
     echo ""
+    ;;
+  show-option)
+    if [ "\${2:-}" = "-qv" ] && [ "\${3:-}" = "-p" ]; then cat "$state_dir/\${5:-}_\${6:-}" 2>/dev/null || true; else echo "session-birth-1"; fi
+    ;;
+  set-option)
+    if [ "\${2:-}" = "-p" ]; then printf "%s" "\${6:-}" > "$state_dir/\${4:-}_\${5:-}"; fi
     ;;
 esac
 exit 0
@@ -1807,6 +1871,7 @@ exit 0
       config.tmux_session = 'omx-team-frontier-role';
       config.leader_pane_id = '%11';
       config.workers[0]!.pane_id = '%21';
+      config.tmux_pane_owner_id = 'team:frontier-role';
       await saveTeamConfig(config, cwd);
 
       const manifestPath = join(cwd, '.omx', 'state', 'team', 'frontier-role', 'manifest.v2.json');
@@ -1851,6 +1916,8 @@ exit 0
         tmuxStubPath,
         `#!/bin/sh
 set -eu
+state_dir="${fakeBinDir}/tmux-state"
+mkdir -p "$state_dir"
 case "\${1:-}" in
   -V)
     echo "tmux 3.2a"
@@ -1863,6 +1930,12 @@ case "\${1:-}" in
     ;;
   capture-pane)
     echo ""
+    ;;
+  show-option)
+    if [ "\${2:-}" = "-qv" ] && [ "\${3:-}" = "-p" ]; then cat "$state_dir/\${5:-}_\${6:-}" 2>/dev/null || true; else echo "session-birth-1"; fi
+    ;;
+  set-option)
+    if [ "\${2:-}" = "-p" ]; then printf "%s" "\${6:-}" > "$state_dir/\${4:-}_\${5:-}"; fi
     ;;
 esac
 exit 0
@@ -1887,6 +1960,7 @@ exit 0
       config.tmux_session = 'omx-team-mini-tuned-root';
       config.leader_pane_id = '%11';
       config.workers[0]!.pane_id = '%21';
+      config.tmux_pane_owner_id = 'team:mini-tuned-root';
       await saveTeamConfig(config, cwd);
 
       const manifestPath = join(cwd, '.omx', 'state', 'team', 'mini-tuned-root', 'manifest.v2.json');
@@ -1937,6 +2011,8 @@ exit 0
         `#!/bin/sh
 set -eu
 printf '%s\\n' "$*" >> "${tmuxLogPath}"
+state_dir="${fakeBinDir}/tmux-state"
+mkdir -p "$state_dir"
 case "\${1:-}" in
   -V)
     echo "tmux 3.2a"
@@ -1949,6 +2025,12 @@ case "\${1:-}" in
     ;;
   capture-pane)
     echo ""
+    ;;
+  show-option)
+    if [ "\${2:-}" = "-qv" ] && [ "\${3:-}" = "-p" ]; then cat "$state_dir/\${5:-}_\${6:-}" 2>/dev/null || true; else echo "session-birth-1"; fi
+    ;;
+  set-option)
+    if [ "\${2:-}" = "-p" ]; then printf "%s" "\${6:-}" > "$state_dir/\${4:-}_\${5:-}"; fi
     ;;
 esac
 exit 0
@@ -1966,6 +2048,7 @@ exit 0
       config.tmux_session = 'omx-team-scale-up-layout';
       config.leader_pane_id = '%11';
       config.workers[0]!.pane_id = '%21';
+      config.tmux_pane_owner_id = 'team:scale-up-layout';
       await saveTeamConfig(config, cwd);
 
       const manifestPath = join(cwd, '.omx', 'state', 'team', 'scale-up-layout', 'manifest.v2.json');
@@ -2012,6 +2095,8 @@ exit 0
           '#!/bin/sh',
           'set -eu',
           `printf '%s\n' "$*" >> "${tmuxLogPath}"`,
+          `state_dir="${tmuxLogPath}.state"`,
+          'mkdir -p "$state_dir"',
           'case "${1:-}" in',
           '  -V)',
           '    echo "tmux 3.2a"',
@@ -2024,6 +2109,12 @@ exit 0
           '    ;;',
           '  capture-pane)',
           '    echo ""',
+          '    ;;',
+          '  show-option)',
+          '    if [ "${2:-}" = "-qv" ] && [ "${3:-}" = "-p" ]; then cat "$state_dir/${5:-}_${6:-}" 2>/dev/null || true; else echo "session-birth-1"; fi',
+          '    ;;',
+          '  set-option)',
+          '    if [ "${2:-}" = "-p" ]; then printf "%s" "${6:-}" > "$state_dir/${4:-}_${5:-}"; fi',
           '    ;;',
           'esac',
           'exit 0',
@@ -2059,6 +2150,7 @@ exit 0
       config.tmux_session = `omx-team-${teamName}`;
       config.leader_pane_id = '%11';
       config.workers[0]!.pane_id = '%21';
+      config.tmux_pane_owner_id = `team:${teamName}`;
       await saveTeamConfig(config, repo);
 
       const manifestPath = join(repo, '.omx', 'state', 'team', teamName, 'manifest.v2.json');
@@ -2113,6 +2205,8 @@ exit 0
           '#!/bin/sh',
           'set -eu',
           `printf '%s\n' "$*" >> "${tmuxLogPath}"`,
+          `state_dir="${tmuxLogPath}.state"`,
+          'mkdir -p "$state_dir"',
           'case "${1:-}" in',
           '  -V)',
           '    echo "tmux 3.2a"',
@@ -2125,6 +2219,12 @@ exit 0
           '    ;;',
           '  capture-pane)',
           '    echo ""',
+          '    ;;',
+          '  show-option)',
+          '    if [ "${2:-}" = "-qv" ] && [ "${3:-}" = "-p" ]; then cat "$state_dir/${5:-}_${6:-}" 2>/dev/null || true; else echo "session-birth-1"; fi',
+          '    ;;',
+          '  set-option)',
+          '    if [ "${2:-}" = "-p" ]; then printf "%s" "${6:-}" > "$state_dir/${4:-}_${5:-}"; fi',
           '    ;;',
           'esac',
           'exit 0',
@@ -2161,6 +2261,7 @@ exit 0
       config.tmux_session = `omx-team-${teamName}`;
       config.leader_pane_id = '%11';
       config.workers[0]!.pane_id = '%21';
+      config.tmux_pane_owner_id = `team:${teamName}`;
       await saveTeamConfig(config, repo);
 
       const manifestPath = join(repo, '.omx', 'state', 'team', teamName, 'manifest.v2.json');
@@ -2411,6 +2512,54 @@ exit 0
       assert.doesNotMatch(tmuxLog, /kill-pane -t %11/);
       assert.doesNotMatch(tmuxLog, /kill-pane -t %12/);
       assert.doesNotMatch(tmuxLog, /kill-pane -t %13/);
+    } finally {
+      if (typeof previousPath === 'string') process.env.PATH = previousPath;
+      else delete process.env.PATH;
+      await rm(cwd, { recursive: true, force: true });
+      await rm(fakeBinDir, { recursive: true, force: true });
+    }
+  });
+  it('preserves pane, worktree, and config when an exact scale-down teardown receipt is rejected', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-scale-down-rejected-receipt-'));
+    const fakeBinDir = await mkdtemp(join(tmpdir(), 'omx-scale-down-rejected-receipt-bin-'));
+    const tmuxStubPath = join(fakeBinDir, 'tmux');
+    const previousPath = process.env.PATH;
+    try {
+      await writeFile(tmuxStubPath, `#!/bin/sh
+case "${'$'}{1:-}" in
+  -V) echo 'tmux 3.2a' ;;
+  if-shell) set -- ${'$'}7; echo "${'$'}3" ;;
+  list-panes) echo '%22' ;;
+esac
+`, 'utf-8');
+      await chmod(tmuxStubPath, 0o755);
+      process.env.PATH = `${fakeBinDir}:${previousPath ?? ''}`;
+      await initTeamState('rejected-receipt', 'task', 'executor', 2, cwd);
+      const config = await readTeamConfig('rejected-receipt', cwd);
+      assert.ok(config);
+      if (!config) return;
+      const worker = config.workers[1]!;
+      worker.pane_id = '%22';
+      worker.worktree_path = join(cwd, 'worker-2-worktree');
+      config.tmux_session = 'omx-team-rejected-receipt';
+      config.tmux_pane_owner_id = 'team:rejected-receipt';
+      await mkdir(worker.worktree_path, { recursive: true });
+      await writeFile(join(worker.worktree_path, 'AGENTS.md'), 'preserve me\n');
+      await saveTeamConfig(config, cwd);
+      const receiptDir = join(cwd, '.omx', 'state', 'team', 'rejected-receipt', 'scaling-receipts');
+      await mkdir(receiptDir, { recursive: true });
+      await writeFile(join(receiptDir, 'worker-2.json'), JSON.stringify({
+        kind: 'worker', role: 'worker', id: '%22', created: true, pane_birth: 'pane-birth-22',
+        command: 'worker-command-22', acquired_at: new Date().toISOString(), session_birth: 'session-birth-1',
+        session_name: config.tmux_session, team_pane_owner_id: config.tmux_pane_owner_id,
+      }));
+
+      const result = await scaleDown('rejected-receipt', cwd, { workerNames: ['worker-2'], force: true }, {
+        OMX_TEAM_SCALING_ENABLED: '1',
+      });
+      assert.deepEqual(result, { ok: false, error: 'scale_down_teardown_rejected_or_uncertain' });
+      assert.ok((await readTeamConfig('rejected-receipt', cwd))?.workers.some((entry) => entry.name === 'worker-2'));
+      assert.equal(await readFile(join(worker.worktree_path, 'AGENTS.md'), 'utf-8'), 'preserve me\n');
     } finally {
       if (typeof previousPath === 'string') process.env.PATH = previousPath;
       else delete process.env.PATH;

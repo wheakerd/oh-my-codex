@@ -2649,6 +2649,13 @@ export async function startTeam(
   for (let i = 1; i <= workerCount; i++) {
     workerWorkspaceByName.set(`worker-${i}`, { cwd: leaderCwd });
   }
+  const lifecyclePreflight = await probeTeamLifecycleGeneration(sanitized, leaderCwd);
+  if (lifecyclePreflight.status === 'invalid' || lifecyclePreflight.status === 'read_error') {
+    throw new Error(`team_lifecycle_recovery_required:${lifecyclePreflight.status}`);
+  }
+  if (lifecyclePreflight.status === 'valid' && lifecyclePreflight.certificate.status === 'preparing') {
+    throw new Error(`team_lifecycle_recovery_required:${lifecyclePreflight.certificate.token}`);
+  }
   if (activeWorktreeMode) {
     assertCleanLeaderWorkspaceForWorkerWorktrees(leaderCwd);
   }
@@ -2683,30 +2690,8 @@ export async function startTeam(
 
   await detectAndCleanStaleTeam(sanitized, leaderCwd, workerCount, options.confirmStaleCleanup);
 
-  if (activeWorktreeMode) {
-    for (let i = 1; i <= workerCount; i++) {
-      const workerName = `worker-${i}`;
-      const planned = planWorktreeTarget({
-        cwd: leaderCwd,
-        scope: 'team',
-        mode: effectiveWorktreeMode,
-        teamName: sanitized,
-        workerName,
-      });
-      const ensured = ensureWorktree(planned);
-      provisionedWorktrees.push(ensured);
-      if (ensured.enabled) {
-        workerWorkspaceByName.set(workerName, {
-          cwd: ensured.worktreePath,
-          worktreeRepoRoot: ensured.repoRoot,
-          worktreePath: ensured.worktreePath,
-          worktreeBranch: ensured.branchName ?? undefined,
-          worktreeDetached: ensured.detached,
-          worktreeCreated: ensured.created,
-        });
-      }
-    }
-  }
+
+
 
   // 2. Team name is already sanitized above.
   let sessionName = `omx-team-${sanitized}`;
@@ -2801,6 +2786,31 @@ export async function startTeam(
         throw new Error('team_lifecycle_certificate_conflict');
       }
     }
+    if (activeWorktreeMode) {
+      for (let i = 1; i <= workerCount; i++) {
+        const workerName = `worker-${i}`;
+        const planned = planWorktreeTarget({
+          cwd: leaderCwd,
+          scope: 'team',
+          mode: effectiveWorktreeMode,
+          teamName: sanitized,
+          workerName,
+        });
+        const ensured = ensureWorktree(planned);
+        provisionedWorktrees.push(ensured);
+        if (ensured.enabled) {
+          workerWorkspaceByName.set(workerName, {
+            cwd: ensured.worktreePath,
+            worktreeRepoRoot: ensured.repoRoot,
+            worktreePath: ensured.worktreePath,
+            worktreeBranch: ensured.branchName ?? undefined,
+            worktreeDetached: ensured.detached,
+            worktreeCreated: ensured.created,
+          });
+        }
+      }
+    }
+
     await writePersistedApprovedTeamExecutionBinding(
       sanitized,
       leaderCwd,
@@ -4417,7 +4427,12 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
       leaderPaneId: effectiveLeaderPaneId,
       hudPaneId: effectiveHudPaneId,
     });
-    const workerTeardown = await teardownWorkerPanes(shutdownPaneIds, {
+    // A pane that is already absent has released its resource. Do not turn a
+    // stale pane ID into a raw kill attempt; only live panes can receive an
+    // exact receipt-validated teardown operation.
+    const liveWorkerPaneIds = new Set(listPaneIds(sessionName));
+    const liveShutdownPaneIds = shutdownPaneIds.filter((paneId) => liveWorkerPaneIds.has(paneId));
+    const workerTeardown = await teardownWorkerPanes(liveShutdownPaneIds, {
       leaderPaneId: effectiveLeaderPaneId,
       hudPaneId: restoredHudPaneId ?? (ownsHudTeardownAuthority && hooksRemoved ? effectiveHudPaneId : undefined),
       teamPaneOwnerId: tmuxPaneOwnerId,
@@ -4425,6 +4440,7 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
       sessionBirth: lifecycleCertificate?.tmux_session_birth,
       workerReceipts,
     });
+
     if (workerTeardown.kill.failed > 0) {
       retainHudLifecycleState = true;
       retainHudContainer = true;
@@ -4482,82 +4498,91 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
     }
   }
 
-  const shutdownReports = await prepareWorkerWorktreeShutdownReports(config, cwd);
-
-  const commitHygieneEntries: TeamOperationalCommitEntry[] = [];
-  for (const report of shutdownReports) {
-    const worker = config.workers.find((entry) => entry.name === report.workerName);
-    if (report.syntheticCommit) {
-      commitHygieneEntries.push({
-        recorded_at: new Date().toISOString(),
-        operation: 'shutdown_checkpoint',
-        worker_name: report.workerName,
-        task_id: worker?.assigned_tasks[0],
-        status: 'applied',
-        operational_commit: report.syntheticCommit,
-        source_commit: report.sourceRef,
-        worktree_path: report.worktreePath,
-        report_path: report.reportPath,
-        detail: 'Runtime created a shutdown checkpoint commit to preserve worker worktree changes.',
-      });
-    }
-
-    if (report.sourceRef && report.mergeOutcome !== 'skipped') {
-      commitHygieneEntries.push({
-        recorded_at: new Date().toISOString(),
-        operation: 'shutdown_merge',
-        worker_name: report.workerName,
-        task_id: worker?.assigned_tasks[0],
-        status: report.mergeOutcome === 'merged' ? 'applied' : report.mergeOutcome,
-        operational_commit: report.mergeOutcome === 'merged' ? report.leaderHeadAfter : null,
-        source_commit: report.sourceRef,
-        leader_head_before: report.leaderHeadBefore,
-        leader_head_after: report.leaderHeadAfter,
-        worktree_path: report.worktreePath,
-        report_path: report.reportPath,
-        detail: report.mergeDetail,
-      });
-    }
-  }
-
-  const artifactCwd = resolveTeamCommitHygieneArtifactCwd(config, cwd);
-  const taskView = await listTasks(sanitized, cwd).catch(() => [])
-  const internalLedger = await appendTeamCommitHygieneEntries(sanitized, commitHygieneEntries, artifactCwd)
-  const commitHygieneArtifactTeamNames = resolveCommitHygieneArtifactTeamNames(config, sanitized);
+  // Fail-closed teardown authority: an incomplete interactive release (foreign
+  // or unconfirmable panes retained, a rejected teardown CAS, or a genuine
+  // created-resource leak) must never checkpoint, merge, remove instructions,
+  // or mutate worktrees. It preserves recoverable state and reports
+  // complete:false; the retained certificate/config is the executable recovery
+  // path and retry authority. The gate below mirrors the worktree-rollback and
+  // state-cleanup gates so no destructive follow-on runs on an incomplete release.
   let commitHygieneArtifacts: TeamCommitHygieneArtifactPaths | null = null;
-  for (const artifactTeamName of commitHygieneArtifactTeamNames) {
-    const ledger = artifactTeamName === sanitized
-      ? internalLedger
-      : await appendTeamCommitHygieneEntries(artifactTeamName, internalLedger.entries, artifactCwd)
-    const commitHygieneContext = buildTeamCommitHygieneContext({
-      teamName: artifactTeamName,
-      tasks: taskView,
-      ledger,
-    })
-    const writtenArtifacts = await writeTeamCommitHygieneContext(artifactTeamName, commitHygieneContext, artifactCwd)
-    commitHygieneArtifacts ??= writtenArtifacts
-  }
+  if (createdRuntimeResourcesReleased) {
+    const shutdownReports = await prepareWorkerWorktreeShutdownReports(config, cwd);
 
-  // 5. Remove worker worktree-root instructions and team-scoped fallback instructions.
-  for (const worker of config.workers) {
-    if (!worker.worktree_path || !worker.team_state_root) continue;
+    const commitHygieneEntries: TeamOperationalCommitEntry[] = [];
+    for (const report of shutdownReports) {
+      const worker = config.workers.find((entry) => entry.name === report.workerName);
+      if (report.syntheticCommit) {
+        commitHygieneEntries.push({
+          recorded_at: new Date().toISOString(),
+          operation: 'shutdown_checkpoint',
+          worker_name: report.workerName,
+          task_id: worker?.assigned_tasks[0],
+          status: 'applied',
+          operational_commit: report.syntheticCommit,
+          source_commit: report.sourceRef,
+          worktree_path: report.worktreePath,
+          report_path: report.reportPath,
+          detail: 'Runtime created a shutdown checkpoint commit to preserve worker worktree changes.',
+        });
+      }
+
+      if (report.sourceRef && report.mergeOutcome !== 'skipped') {
+        commitHygieneEntries.push({
+          recorded_at: new Date().toISOString(),
+          operation: 'shutdown_merge',
+          worker_name: report.workerName,
+          task_id: worker?.assigned_tasks[0],
+          status: report.mergeOutcome === 'merged' ? 'applied' : report.mergeOutcome,
+          operational_commit: report.mergeOutcome === 'merged' ? report.leaderHeadAfter : null,
+          source_commit: report.sourceRef,
+          leader_head_before: report.leaderHeadBefore,
+          leader_head_after: report.leaderHeadAfter,
+          worktree_path: report.worktreePath,
+          report_path: report.reportPath,
+          detail: report.mergeDetail,
+        });
+      }
+    }
+
+    const artifactCwd = resolveTeamCommitHygieneArtifactCwd(config, cwd);
+    const taskView = await listTasks(sanitized, cwd).catch(() => [])
+    const internalLedger = await appendTeamCommitHygieneEntries(sanitized, commitHygieneEntries, artifactCwd)
+    const commitHygieneArtifactTeamNames = resolveCommitHygieneArtifactTeamNames(config, sanitized);
+    for (const artifactTeamName of commitHygieneArtifactTeamNames) {
+      const ledger = artifactTeamName === sanitized
+        ? internalLedger
+        : await appendTeamCommitHygieneEntries(artifactTeamName, internalLedger.entries, artifactCwd)
+      const commitHygieneContext = buildTeamCommitHygieneContext({
+        teamName: artifactTeamName,
+        tasks: taskView,
+        ledger,
+      })
+      const writtenArtifacts = await writeTeamCommitHygieneContext(artifactTeamName, commitHygieneContext, artifactCwd)
+      commitHygieneArtifacts ??= writtenArtifacts
+    }
+
+    // 5. Remove worker worktree-root instructions and team-scoped fallback instructions.
+    for (const worker of config.workers) {
+      if (!worker.worktree_path || !worker.team_state_root) continue;
+      try {
+        await removeWorkerWorktreeRootAgentsFile(
+          sanitized,
+          worker.name,
+          worker.team_state_root,
+          worker.worktree_path,
+        );
+      } catch (err) {
+        process.stderr.write(`[team/runtime] operation failed: ${err}\n`);
+      }
+    }
     try {
-      await removeWorkerWorktreeRootAgentsFile(
-        sanitized,
-        worker.name,
-        worker.team_state_root,
-        worker.worktree_path,
-      );
+      await removeTeamWorkerInstructionsFile(sanitized, cwd);
     } catch (err) {
       process.stderr.write(`[team/runtime] operation failed: ${err}\n`);
     }
+    restoreTeamModelInstructionsFile(sanitized);
   }
-  try {
-    await removeTeamWorkerInstructionsFile(sanitized, cwd);
-  } catch (err) {
-    process.stderr.write(`[team/runtime] operation failed: ${err}\n`);
-  }
-  restoreTeamModelInstructionsFile(sanitized);
 
   const cleanupErrors: string[] = [];
   const provisionedWorktrees = collectProvisionedShutdownWorktrees(config);

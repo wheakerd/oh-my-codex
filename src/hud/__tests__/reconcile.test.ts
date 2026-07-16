@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { OMX_TMUX_HUD_OWNER_ENV, reconcileHudForPromptSubmit as reconcileHudForPromptSubmitRaw, teardownManagedHudPane, type ReconcileHudForPromptSubmitDeps } from '../reconcile.js';
 
 import { HUD_TMUX_HEIGHT_LINES, HUD_TMUX_ULTRAGOAL_HEIGHT_LINES, HUD_TMUX_MIN_LAUNCH_WINDOW_HEIGHT_LINES } from '../constants.js';
-import { OMX_TMUX_HUD_LEADER_PANE_ENV } from '../tmux.js';
+import { OMX_TMUX_HUD_LEADER_PANE_ENV, type ExactHudPaneKillCandidate } from '../tmux.js';
 
 const noOpRegisterHudResizeHook = () => true;
 const noOpUnregisterHudResizeHook = () => true;
@@ -2280,6 +2280,94 @@ describe('reconcileHudForPromptSubmit verified lifecycle ownership', () => {
     assert.equal(result.paneId, null);
     assert.deepEqual(killed, ['%created']);
   });
+  it('mints a HUD birth distinct from the leader and uses it for post-create duplicate authority', async () => {
+    const killed: ExactHudPaneKillCandidate[] = [];
+    let listCount = 0;
+    let hudBirth = '';
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-hud-fresh-birth-'));
+    try {
+      const domain = await testReconcileDomain(cwd, { sessionId: 'logical-session', env: { TMUX_PANE: '%leader' } });
+      const opaqueDomain = {
+        ...domain,
+        claimant: {
+          ...domain.claimant,
+          tmuxSessionInstanceId: 'session-birth',
+          tmuxPaneInstanceId: 'leader-birth',
+        },
+      };
+      const result = await reconcileHudForPromptSubmit(cwd, {
+        env: { TMUX: 'socket', TMUX_PANE: '%leader', OMX_SESSION_ID: 'logical-session', [OMX_TMUX_HUD_OWNER_ENV]: '1' },
+        sessionId: 'logical-session',
+        resolveDomain: async () => opaqueDomain,
+        probeTmuxInstance: async () => ({ paneTarget: '%leader', sessionName: 'managed', paneInstanceId: 'leader-birth', sessionInstanceId: 'session-birth', instanceId: 'leader-birth', source: 'pane', paneTagStatus: 'present', sessionTagStatus: 'present', sessionId: '$1', windowId: '@1', contextStable: true }),
+        listCurrentWindowPanes: () => {
+          listCount += 1;
+          return listCount === 1
+            ? [{ paneId: '%leader', currentCommand: 'codex', startCommand: 'codex' }]
+            : [
+              { paneId: '%leader', currentCommand: 'codex', startCommand: 'codex' },
+              { paneId: '%created', currentCommand: 'node', paneInstanceId: hudBirth, sessionInstanceId: 'session-birth', startCommand: "env OMX_SESSION_ID='logical-session' OMX_TMUX_HUD_OWNER='1' OMX_TMUX_HUD_LEADER_PANE='%leader' node omx.js hud --watch" },
+              { paneId: '%duplicate', currentCommand: 'node', paneInstanceId: 'logical-session', sessionInstanceId: 'logical-session', startCommand: "env OMX_SESSION_ID='logical-session' OMX_TMUX_HUD_OWNER='1' OMX_TMUX_HUD_LEADER_PANE='%leader' node omx.js hud --watch" },
+            ];
+        },
+        createHudWatchPane: (_cwd, _cmd, options) => {
+          hudBirth = options?.instanceId ?? '';
+          return '%created';
+        },
+        killManagedHudPane: (candidate) => { killed.push(candidate); return candidate.paneId === '%created'; },
+        resizeTmuxPane: () => true,
+        resolveOmxCliEntryPath: () => '/repo/dist/cli/omx.js',
+      });
+      assert.notEqual(hudBirth, 'leader-birth');
+      assert.equal(result.status, 'failed');
+      assert.deepEqual(killed.map((candidate) => candidate.paneId), ['%duplicate', '%created']);
+      assert.equal(killed[1]?.paneInstanceId, hudBirth);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves a created pane when post-create validation finds the leader birth instead of the HUD birth', async () => {
+    const killed: string[] = [];
+    let listCount = 0;
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-hud-unreadable-birth-'));
+    try {
+      const domain = await testReconcileDomain(cwd, { sessionId: 'logical-session', env: { TMUX_PANE: '%leader' } });
+      const opaqueDomain = {
+        ...domain,
+        claimant: {
+          ...domain.claimant,
+          tmuxSessionInstanceId: 'session-birth',
+          tmuxPaneInstanceId: 'leader-birth',
+        },
+      };
+      const result = await reconcileHudForPromptSubmit(cwd, {
+        env: { TMUX: 'socket', TMUX_PANE: '%leader', OMX_SESSION_ID: 'logical-session', [OMX_TMUX_HUD_OWNER_ENV]: '1' },
+        sessionId: 'logical-session',
+        resolveDomain: async () => opaqueDomain,
+        probeTmuxInstance: async () => ({ paneTarget: '%leader', sessionName: 'managed', paneInstanceId: 'leader-birth', sessionInstanceId: 'session-birth', instanceId: 'leader-birth', source: 'pane', paneTagStatus: 'present', sessionTagStatus: 'present', sessionId: '$1', windowId: '@1', contextStable: true }),
+        listCurrentWindowPanes: () => {
+          listCount += 1;
+          return listCount === 1
+            ? [{ paneId: '%leader', currentCommand: 'codex', startCommand: 'codex' }]
+            : [
+              { paneId: '%leader', currentCommand: 'codex', startCommand: 'codex' },
+              { paneId: '%created', currentCommand: 'node', paneInstanceId: 'leader-birth', sessionInstanceId: 'session-birth', startCommand: "env OMX_SESSION_ID='logical-session' OMX_TMUX_HUD_OWNER='1' OMX_TMUX_HUD_LEADER_PANE='%leader' node omx.js hud --watch" },
+            ];
+        },
+        createHudWatchPane: () => '%created',
+        killManagedHudPane: (candidate) => { killed.push(candidate.paneId); return true; },
+        resizeTmuxPane: () => { assert.fail('unreadable created pane must not be resized'); return false; },
+        resolveOmxCliEntryPath: () => '/repo/dist/cli/omx.js',
+      });
+      assert.equal(result.status, 'failed');
+      assert.equal(result.paneId, '%created');
+      assert.deepEqual(killed, []);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it('accepts resolver-carried opaque birth evidence without widening logical aliases', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-hud-opaque-claimant-'));
     try {
@@ -2307,8 +2395,8 @@ describe('reconcileHudForPromptSubmit verified lifecycle ownership', () => {
         resizeTmuxPane: () => true,
         resolveOmxCliEntryPath: () => '/repo/dist/cli/omx.js',
       });
-      assert.equal(result.status, 'resized');
-      assert.equal(result.paneId, '%2');
+      assert.equal(result.status, 'unchanged');
+      assert.equal(result.paneId, null);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -2425,7 +2513,7 @@ describe('teardownManagedHudPane', () => {
       await rm(cwd, { recursive: true, force: true });
     }
   });
-  it('tears down an opaque birth claimant carried by the resolver', async () => {
+  it('does not tear down a HUD from the leader birth carried by an opaque resolver claimant', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-hud-teardown-opaque-'));
     const killed: string[] = [];
     try {
@@ -2441,8 +2529,8 @@ describe('teardownManagedHudPane', () => {
         ],
         killManagedHudPane: (candidate) => { killed.push(candidate.paneId); return true; }, unregisterHudResizeHook: noOpUnregisterHudResizeHook,
       });
-      assert.equal(result.status, 'removed');
-      assert.deepEqual(killed, ['%2']);
+      assert.equal(result.status, 'unchanged');
+      assert.deepEqual(killed, []);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

@@ -202,6 +202,8 @@ process.on('SIGTERM', () => process.exit(0));
           '#!/bin/sh',
           'set -eu',
           `printf '%s\n' "$*" >> "${tmuxLogPath}"`,
+          `state_dir="${tmuxLogPath}.state"`,
+          'mkdir -p "$state_dir"',
           'case "${1:-}" in',
           '  -V)',
           '    echo "tmux 3.2a"',
@@ -214,6 +216,12 @@ process.on('SIGTERM', () => process.exit(0));
           '    ;;',
           '  capture-pane)',
           '    echo ""',
+          '    ;;',
+          '  show-option)',
+          '    if [ "${2:-}" = "-qv" ] && [ "${3:-}" = "-p" ]; then cat "$state_dir/${5:-}_${6:-}" 2>/dev/null || true; else echo "session-birth-1"; fi',
+          '    ;;',
+          '  set-option)',
+          '    if [ "${2:-}" = "-p" ]; then printf "%s" "${6:-}" > "$state_dir/${4:-}_${5:-}"; fi',
           '    ;;',
           'esac',
           'exit 0',
@@ -247,6 +255,7 @@ process.on('SIGTERM', () => process.exit(0));
       config.tmux_session = 'omx-team-low-role-scale';
       config.leader_pane_id = '%11';
       config.workers[0]!.pane_id = '%21';
+      config.tmux_pane_owner_id = 'team:low-role-scale';
       await saveTeamConfig(config, cwd);
 
       const manifestPath = join(cwd, '.omx', 'state', 'team', 'low-role-scale', 'manifest.v2.json');
@@ -303,6 +312,8 @@ process.on('SIGTERM', () => process.exit(0));
           '#!/bin/sh',
           'set -eu',
           `printf '%s\n' "$*" >> "${tmuxLogPath}"`,
+          `state_dir="${tmuxLogPath}.state"`,
+          'mkdir -p "$state_dir"',
           'case "${1:-}" in',
           '  -V)',
           '    echo "tmux 3.2a"',
@@ -317,6 +328,12 @@ process.on('SIGTERM', () => process.exit(0));
           '    ;;',
           '  capture-pane)',
           '    echo ""',
+          '    ;;',
+          '  show-option)',
+          '    if [ "${2:-}" = "-qv" ] && [ "${3:-}" = "-p" ]; then cat "$state_dir/${5:-}_${6:-}" 2>/dev/null || true; else echo "session-birth-1"; fi',
+          '    ;;',
+          '  set-option)',
+          '    if [ "${2:-}" = "-p" ]; then printf "%s" "${6:-}" > "$state_dir/${4:-}_${5:-}"; fi',
           '    ;;',
           'esac',
           'exit 0',
@@ -345,6 +362,7 @@ process.on('SIGTERM', () => process.exit(0));
       config.tmux_session = 'omx-team-exact-role-cli';
       config.leader_pane_id = '%11';
       config.workers[0]!.pane_id = '%21';
+      config.tmux_pane_owner_id = 'team:exact-role-cli';
       config.next_worker_index = 3;
       await saveTeamConfig(config, cwd);
 

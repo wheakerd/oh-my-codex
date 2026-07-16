@@ -3569,12 +3569,18 @@ describe("tmux HUD pane helpers", () => {
 
   it("createHudWatchPane splits from the emitting pane target when provided", () => {
     const calls: string[][] = [];
+    let taggedInstanceId = "";
     const paneId = createSharedHudWatchPane(
       "/repo",
       "node /repo/dist/cli/omx.js hud --watch",
       { heightLines: 3, targetPaneId: "%leader" },
       (args) => {
         calls.push(args);
+        if (args[0] === "set-option") {
+          taggedInstanceId = args[args.length - 1] ?? "";
+          return "";
+        }
+        if (args[0] === "show-option") return `${taggedInstanceId}\n`;
         return "%hud\n";
       },
     );

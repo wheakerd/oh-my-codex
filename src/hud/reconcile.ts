@@ -1,4 +1,6 @@
 import { mkdir } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+
 
 import { acquireHudLifecycleLock, releaseHudLifecycleLock, type HudLifecycleLockDeps } from './lifecycle-lock.js';
 import { resolveHudControlPlaneDomain, type ResolvedHudControlPlaneDomain } from '../mcp/state-paths.js';
@@ -200,18 +202,35 @@ function hasVerifiedHudPaneInstanceIdentity(
   return tmuxSnapshotBindsCandidate(pane, [...equivalentSessionIds]);
 }
 
+function tmuxSnapshotMatchesHudBirth(
+  pane: TmuxPaneSnapshot,
+  paneBirthId: string | undefined,
+  sessionBirthId: string | undefined,
+): boolean {
+  const expectedPaneBirthId = paneBirthId?.trim() ?? '';
+  const expectedSessionBirthId = sessionBirthId?.trim() ?? '';
+  return Boolean(
+    expectedPaneBirthId
+    && expectedSessionBirthId
+    && pane.paneInstanceId?.trim() === expectedPaneBirthId
+    && pane.sessionInstanceId?.trim() === expectedSessionBirthId,
+  );
+}
+
 function planOwnedHudPaneDedupe(
   panes: TmuxPaneSnapshot[],
   currentPaneId: string | undefined,
   owner: HudPaneOwner,
   preferredPaneId: string,
   equivalentSessionIds: ReadonlySet<string>,
-  domain: ResolvedHudControlPlaneDomain,
+  sessionBirthId: string | undefined,
+  createdPaneBirthId: string | undefined,
 ): { paneId: string; duplicatePaneIds: string[]; unsafeCandidate: boolean } {
   const ownedPanes = panes
     .filter((pane) => pane.paneId !== currentPaneId)
     .filter((pane) => hudPaneMatchesOwner(pane, owner));
-  if (ownedPanes.some((pane) => !hasVerifiedHudPaneInstanceIdentity(pane, equivalentSessionIds) && !tmuxSnapshotMatchesClaimantBirth(pane, domain))) {
+  if (ownedPanes.some((pane) => !hasVerifiedHudPaneInstanceIdentity(pane, equivalentSessionIds)
+    && !(pane.paneId === preferredPaneId && tmuxSnapshotMatchesHudBirth(pane, createdPaneBirthId, sessionBirthId)))) {
     return { paneId: preferredPaneId, duplicatePaneIds: [], unsafeCandidate: true };
   }
   const ownedPaneIds = ownedPanes.map((pane) => pane.paneId);
@@ -390,7 +409,11 @@ export async function reconcileHudForPromptSubmit(
     sessionIds: equivalentSessionIds,
     leaderPaneId: currentPaneId,
   };
-  const exactHudKillCandidate = async (paneId: string, stale = false): Promise<ExactHudPaneKillCandidate | null> => {
+  const exactHudKillCandidate = async (
+    paneId: string,
+    stale = false,
+    expectedPaneBirthId?: string,
+  ): Promise<ExactHudPaneKillCandidate | null> => {
     const latestEvidence = currentPaneId
       ? await (deps.probeTmuxInstance ?? probeActualTmuxInstanceEvidence)(currentPaneId).catch(() => null)
       : null;
@@ -409,7 +432,10 @@ export async function reconcileHudForPromptSubmit(
       : Boolean(
         latestPanes.some((pane) => pane.paneId === currentPaneId && !isHudWatchPane(pane))
         && hudPaneMatchesOwner(candidate, owner)
-        && (hasVerifiedHudPaneInstanceIdentity(candidate, equivalentSessionIdSet) || tmuxSnapshotMatchesClaimantBirth(candidate, domain)),
+        && (
+          hasVerifiedHudPaneInstanceIdentity(candidate, equivalentSessionIdSet)
+          || tmuxSnapshotMatchesHudBirth(candidate, expectedPaneBirthId, latestEvidence.sessionInstanceId)
+        ),
       );
     if (!ownerMatches) return null;
     const paneInstanceId = candidate.paneInstanceId?.trim() ?? '';
@@ -425,8 +451,8 @@ export async function reconcileHudForPromptSubmit(
       sessionName: latestEvidence.sessionName,
     };
   };
-  const killOwnedHudPane = async (paneId: string, stale = false): Promise<boolean> => {
-    const candidate = await exactHudKillCandidate(paneId, stale);
+  const killOwnedHudPane = async (paneId: string, stale = false, expectedPaneBirthId?: string): Promise<boolean> => {
+    const candidate = await exactHudKillCandidate(paneId, stale, expectedPaneBirthId);
     return candidate ? killPane(candidate) : false;
   };
   const liveNonHudPaneIds = new Set(panes.filter((pane) => !isHudWatchPane(pane)).map((pane) => pane.paneId));
@@ -457,7 +483,7 @@ export async function reconcileHudForPromptSubmit(
   const ownedHudPanes = panes
     .filter((pane) => pane.paneId !== currentPaneId)
     .filter((pane) => hudPaneMatchesOwner(pane, owner));
-  if (ownedHudPanes.some((pane) => !hasVerifiedHudPaneInstanceIdentity(pane, equivalentSessionIdSet) && !tmuxSnapshotMatchesClaimantBirth(pane, domain))) {
+  if (ownedHudPanes.some((pane) => !hasVerifiedHudPaneInstanceIdentity(pane, equivalentSessionIdSet))) {
     return { status: 'unchanged', paneId: null, desiredHeight: null, duplicateCount: 0 };
   }
   const hudPaneIds = ownedHudPanes.map((pane) => pane.paneId);
@@ -560,10 +586,11 @@ export async function reconcileHudForPromptSubmit(
     removedHudPaneIds.add(paneId);
   }
 
+  const hudPaneBirthId = randomUUID();
   const createOptions: { heightLines: number; fullWidth?: boolean; targetPaneId?: string; instanceId?: string } = {
     heightLines: desiredHeight,
     targetPaneId: currentPaneId,
-    instanceId: domain.claimant.tmuxPaneInstanceId?.trim() || undefined,
+    instanceId: hudPaneBirthId,
   };
   if (createFullWidth) createOptions.fullWidth = true;
   const paneId = createPane(cwd, hudCmd, createOptions);
@@ -586,10 +613,11 @@ export async function reconcileHudForPromptSubmit(
     owner,
     paneId,
     equivalentSessionIdSet,
-    domain,
+    lockedEvidence.sessionInstanceId,
+    hudPaneBirthId,
   );
   if (postCreate.unsafeCandidate) {
-    const rolledBack = await killOwnedHudPane(paneId);
+    const rolledBack = await killOwnedHudPane(paneId, false, hudPaneBirthId);
     return {
       status: 'failed',
       paneId: rolledBack ? null : paneId,
@@ -599,7 +627,7 @@ export async function reconcileHudForPromptSubmit(
   }
   for (const duplicatePaneId of postCreate.duplicatePaneIds) {
     if (!await killOwnedHudPane(duplicatePaneId)) {
-      const rolledBack = await killOwnedHudPane(paneId);
+      const rolledBack = await killOwnedHudPane(paneId, false, hudPaneBirthId);
       return {
         status: 'failed',
         paneId: rolledBack ? null : paneId,
@@ -692,7 +720,7 @@ export async function teardownManagedHudPane(
     };
     const exactHudPaneIds = panes
       .filter((pane) => pane.paneId !== currentPaneId && isHudWatchPane(pane))
-      .filter((pane) => tmuxSnapshotBindsCandidate(pane, [...equivalentSessionIds]) || tmuxSnapshotMatchesClaimantBirth(pane, domain))
+      .filter((pane) => tmuxSnapshotBindsCandidate(pane, [...equivalentSessionIds]))
       .filter((pane) => [...equivalentSessionIds].some((sessionId) => hudPaneMatchesExactCandidate(
         pane,
         { sessionId, leaderPaneId: currentPaneId },

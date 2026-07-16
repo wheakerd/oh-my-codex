@@ -11,7 +11,7 @@
  */
 
 import { join, resolve } from 'path';
-import { mkdir, rm } from 'fs/promises';
+import { mkdir, readFile, rename, rm, writeFile } from 'fs/promises';
 import {
   sanitizeTeamName,
   isTmuxAvailable,
@@ -21,6 +21,7 @@ import {
   isWorkerAlive,
   getWorkerPanePid,
   teardownWorkerPanes,
+  listPaneIds,
   buildWorkerStartupCommand,
   trustWorkerMiseConfigIfAvailable,
   writeWorkerStartupScriptCommand,
@@ -30,6 +31,7 @@ import {
   type TeamWorkerCli,
 } from './tmux-session.js';
 import { execFileSync, spawnSync } from 'child_process';
+import { randomUUID } from 'crypto';
 import {
   teamReadConfig as readTeamConfig,
   teamSaveConfig as saveTeamConfig,
@@ -50,6 +52,7 @@ import {
   type WorkerInfo,
   type WorkerStatus,
 } from './team-ops.js';
+import type { TeamLifecycleResource } from './state.js';
 import {
   queueInboxInstruction,
   waitForDispatchReceipt,
@@ -154,6 +157,98 @@ interface ScaleUpWorkerLaunchPlan {
   readonly workerLaunchArgs: string[];
   readonly workerCli: TeamWorkerCli;
   readonly mixedTaskRoles: readonly string[];
+}
+
+interface ScaledWorkerReceipt extends TeamLifecycleResource {
+  readonly kind: 'worker';
+  readonly role: 'worker';
+  readonly id: string;
+  readonly pane_birth: string;
+  readonly command: string;
+  readonly session_birth: string;
+  readonly session_name: string;
+  readonly team_pane_owner_id: string;
+}
+
+function scaledWorkerReceiptPath(teamName: string, workerName: string, cwd: string): string {
+  return join(cwd, '.omx', 'state', 'team', teamName, 'scaling-receipts', `${workerName}.json`);
+}
+
+async function writeScaledWorkerReceipt(
+  teamName: string,
+  workerName: string,
+  cwd: string,
+  receipt: ScaledWorkerReceipt,
+): Promise<boolean> {
+  const path = scaledWorkerReceiptPath(teamName, workerName, cwd);
+  const temporaryPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    await mkdir(join(cwd, '.omx', 'state', 'team', teamName, 'scaling-receipts'), { recursive: true });
+    await writeFile(temporaryPath, `${JSON.stringify(receipt, null, 2)}\n`, { encoding: 'utf-8', flag: 'wx' });
+    await rename(temporaryPath, path);
+    return true;
+  } catch {
+    await rm(temporaryPath, { force: true }).catch(() => {});
+    return false;
+  }
+}
+
+async function readScaledWorkerReceipt(
+  teamName: string,
+  workerName: string,
+  cwd: string,
+): Promise<ScaledWorkerReceipt | null> {
+  try {
+    const value: unknown = JSON.parse(await readFile(scaledWorkerReceiptPath(teamName, workerName, cwd), 'utf-8'));
+    if (!value || typeof value !== 'object') return null;
+    const receipt = value as Partial<ScaledWorkerReceipt>;
+    return receipt.kind === 'worker'
+      && receipt.role === 'worker'
+      && typeof receipt.id === 'string'
+      && typeof receipt.pane_birth === 'string'
+      && typeof receipt.command === 'string'
+      && typeof receipt.session_birth === 'string'
+      && typeof receipt.session_name === 'string'
+      && typeof receipt.team_pane_owner_id === 'string'
+      ? receipt as ScaledWorkerReceipt
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function readTmuxSessionBirth(sessionName: string): string | null {
+  try {
+    const result = execFileSync('tmux', ['show-option', '-qv', '-t', sessionName, '@omx_instance_id'], {
+      encoding: 'utf-8', stdio: 'pipe', windowsHide: true,
+    }).trim();
+    return result || null;
+  } catch {
+    return null;
+  }
+}
+
+function tagScaledWorkerPane(
+  paneId: string,
+  ownerId: string,
+  paneBirth: string,
+): boolean {
+  try {
+    tagPaneTeamOwner(paneId, ownerId);
+    for (const [option, value] of [
+      ['@omx_team_pane_birth', paneBirth],
+      ['@omx_team_pane_role', 'worker'],
+    ] as const) {
+      execFileSync('tmux', ['set-option', '-p', '-t', paneId, option, value], { stdio: 'pipe', windowsHide: true });
+      const observed = execFileSync('tmux', ['show-option', '-qv', '-p', '-t', paneId, option], {
+        encoding: 'utf-8', stdio: 'pipe', windowsHide: true,
+      }).trim();
+      if (observed !== value) return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function buildScaleUpWorkerLaunchPlans(params: {
@@ -405,6 +500,14 @@ export async function scaleUp(
     if (!approvedExecutionGate.ok) {
       return approvedExecutionGate;
     }
+    // Immutable tmux authority is a precondition for any pane mutation, but it
+    // is checked only after the read-only approved-binding gate so a binding
+    // failure fails closed without probing or mutating tmux.
+    const sessionBirth = readTmuxSessionBirth(sessionName);
+    const teamPaneOwnerId = config.tmux_pane_owner_id?.trim();
+    if (!sessionBirth || !teamPaneOwnerId) {
+      return { ok: false, error: 'scale_up_missing_immutable_tmux_authority' };
+    }
     const persistedUltragoalContext = await readPersistedTeamUltragoalContext(
       sanitized,
       config.leader_cwd ?? leaderCwd,
@@ -425,54 +528,41 @@ export async function scaleUp(
 
     const rollbackScaleUp = async (
       error: string,
-      context: { paneId?: string; workerName?: string; worktreePath?: string } = {},
+      context: { workerName?: string; worktreePath?: string; receipt?: ScaledWorkerReceipt; unconfirmedPane?: boolean } = {},
     ): Promise<ScaleError> => {
-      for (const w of addedWorkers) {
-        const idx = config.workers.findIndex((worker) => worker.name === w.name);
-        if (idx >= 0) {
-          config.workers.splice(idx, 1);
+      const receipts = new Map<string, ScaledWorkerReceipt>();
+      for (const worker of addedWorkers) {
+        const receipt = await readScaledWorkerReceipt(sanitized, worker.name, leaderCwd);
+        if (receipt && worker.pane_id === receipt.id) receipts.set(receipt.id, receipt);
+      }
+      if (context.receipt) receipts.set(context.receipt.id, context.receipt);
+      const teardown = await teardownWorkerPanes([...receipts.keys()], {
+        leaderPaneId: config.leader_pane_id,
+        hudPaneId: config.hud_pane_id,
+        sessionName,
+        sessionBirth,
+        teamPaneOwnerId,
+        workerReceipts: Object.fromEntries(receipts),
+      });
+      if (context.unconfirmedPane || teardown.kill.succeeded !== teardown.kill.attempted || Object.values(teardown.excluded).some((count) => count > 0)) {
+        return { ok: false, error: `${error}:scale_up_rollback_teardown_unconfirmed` };
+      }
+      for (const worker of addedWorkers) {
+        const idx = config.workers.findIndex((candidate) => candidate.name === worker.name);
+        if (idx >= 0) config.workers.splice(idx, 1);
+        if (worker.worktree_path) {
+          await removeWorkerWorktreeRootAgentsFile(sanitized, worker.name, teamStateRoot, worker.worktree_path).catch(() => {});
         }
-        try {
-          if (w.pane_id) {
-            execFileSync('tmux', ['kill-pane', '-t', w.pane_id], { stdio: 'pipe',
-      windowsHide: true,
-    });
-          }
-        } catch {}
-        if (w.worktree_path) {
-          await removeWorkerWorktreeRootAgentsFile(sanitized, w.name, teamStateRoot, w.worktree_path).catch(() => {});
-        }
       }
-
-      if (
-        context.workerName &&
-        context.worktreePath &&
-        !addedWorkers.some((worker) => worker.name === context.workerName)
-      ) {
-        await removeWorkerWorktreeRootAgentsFile(
-          sanitized,
-          context.workerName,
-          teamStateRoot,
-          context.worktreePath,
-        ).catch(() => {});
+      if (context.workerName && context.worktreePath && !addedWorkers.some((worker) => worker.name === context.workerName)) {
+        await removeWorkerWorktreeRootAgentsFile(sanitized, context.workerName, teamStateRoot, context.worktreePath).catch(() => {});
       }
-
-      if (context.paneId) {
-        try {
-          execFileSync('tmux', ['kill-pane', '-t', context.paneId], { stdio: 'pipe',
-      windowsHide: true,
-    });
-        } catch {}
-      }
-
       for (const taskId of createdTaskIds) {
         await rm(join(leaderCwd, '.omx', 'state', 'team', sanitized, 'tasks', `task-${taskId}.json`), { force: true }).catch(() => {});
       }
-
       config.worker_count = config.workers.length;
       config.next_worker_index = initialNextIndex;
       await saveTeamConfig(config, leaderCwd);
-
       return { ok: false, error };
     };
 
@@ -598,20 +688,29 @@ export async function scaleUp(
       const paneId = (result.stdout || '').trim().split('\n')[0]?.trim();
       if (!paneId || !paneId.startsWith('%')) {
         return await rollbackScaleUp(`Failed to capture pane ID for ${workerName}`, {
-          paneId,
           workerName,
           worktreePath: workerWorkspace?.worktreePath,
         });
       }
-      if (config.tmux_pane_owner_id) {
-        try {
-          tagPaneTeamOwner(paneId, config.tmux_pane_owner_id);
-        } catch (error) {
-          return await rollbackScaleUp(
-            `Failed to tag tmux pane for ${workerName}: ${error instanceof Error ? error.message : String(error)}`,
-            { paneId, workerName, worktreePath: workerWorkspace?.worktreePath },
-          );
-        }
+      const paneBirth = randomUUID();
+      if (!tagScaledWorkerPane(paneId, teamPaneOwnerId, paneBirth)) {
+        return await rollbackScaleUp(`Failed to establish immutable tmux authority for ${workerName}`, {
+          workerName,
+          unconfirmedPane: true,
+          worktreePath: workerWorkspace?.worktreePath,
+        });
+      }
+      const workerReceipt: ScaledWorkerReceipt = {
+        kind: 'worker', id: paneId, created: true, pane_birth: paneBirth, command: cmd, role: 'worker',
+        acquired_at: new Date().toISOString(), session_birth: sessionBirth, session_name: sessionName,
+        team_pane_owner_id: teamPaneOwnerId,
+      };
+      if (!await writeScaledWorkerReceipt(sanitized, workerName, leaderCwd, workerReceipt)) {
+        return await rollbackScaleUp(`Failed to durably journal tmux authority for ${workerName}`, {
+          workerName,
+          worktreePath: workerWorkspace?.worktreePath,
+          receipt: workerReceipt,
+        });
       }
 
       // Intentionally avoid forcing `select-layout tiled` here.
@@ -782,9 +881,9 @@ export async function scaleUp(
       }
       if (!outcome.ok) {
         return await rollbackScaleUp(`scale_up_dispatch_failed:${workerName}:${outcome.reason}`, {
-          paneId,
           workerName,
           worktreePath: workerWorkspace?.worktreePath,
+          receipt: workerReceipt,
         });
       }
 
@@ -926,16 +1025,43 @@ export async function scaleDown(
       }
     }
 
-    // Phase 3: Kill tmux panes and remove from config
+    // Phase 3: exact receipt-authorized pane teardown before any state cleanup.
     const leaderPaneId = config.leader_pane_id;
     const hudPaneId = config.hud_pane_id;
-    const targetPaneIds = targetWorkers
-      .map((w) => w.pane_id)
-      .filter((paneId): paneId is string => typeof paneId === 'string' && paneId.trim().length > 0);
-    await teardownWorkerPanes(targetPaneIds, {
+    const livePaneIds = new Set(listPaneIds(sessionName));
+    const liveTargetWorkers = targetWorkers.filter((worker) => Boolean(worker.pane_id && livePaneIds.has(worker.pane_id)));
+    if (liveTargetWorkers.some((worker) => worker.pane_id === leaderPaneId || worker.pane_id === hudPaneId)) {
+      return { ok: false, error: 'scale_down_target_is_leader_or_hud' };
+    }
+    const receipts = await Promise.all(liveTargetWorkers.map(async (worker) => ({
+      worker,
+      receipt: await readScaledWorkerReceipt(sanitized, worker.name, leaderCwd),
+    })));
+    const invalidReceipt = receipts.find(({ worker, receipt }) => (
+      !receipt
+      || receipt.id !== worker.pane_id
+      || receipt.session_name !== sessionName
+      || receipt.team_pane_owner_id !== config.tmux_pane_owner_id
+    ));
+    if (invalidReceipt) {
+      return { ok: false, error: `scale_down_missing_exact_teardown_receipt:${invalidReceipt.worker.name}` };
+    }
+    const sessionBirth = receipts[0]?.receipt?.session_birth;
+    if (receipts.length > 0 && (!sessionBirth || receipts.some(({ receipt }) => receipt?.session_birth !== sessionBirth))) {
+      return { ok: false, error: 'scale_down_inconsistent_session_birth_receipts' };
+    }
+    const targetPaneIds = receipts.map(({ receipt }) => receipt!.id);
+    const teardown = targetPaneIds.length > 0 ? await teardownWorkerPanes(targetPaneIds, {
       leaderPaneId,
       hudPaneId,
-    });
+      sessionName,
+      sessionBirth,
+      teamPaneOwnerId: config.tmux_pane_owner_id,
+      workerReceipts: Object.fromEntries(receipts.map(({ receipt }) => [receipt!.id, receipt!])),
+    }) : { excluded: { leader: 0, hud: 0, invalid: 0 }, kill: { attempted: 0, succeeded: 0, failed: 0 } };
+    if (teardown.kill.succeeded !== targetPaneIds.length || teardown.kill.failed !== 0 || Object.values(teardown.excluded).some((count) => count > 0)) {
+      return { ok: false, error: 'scale_down_teardown_rejected_or_uncertain' };
+    }
     const detachedWorktreesToRollback: EnsureWorktreeResult[] = targetWorkers
       .filter((worker) =>
         worker.worktree_created === true
@@ -963,11 +1089,20 @@ export async function scaleDown(
       }
     }
 
-    for (const w of targetWorkers) {
-      if (w.worktree_path) {
-        await removeWorkerWorktreeRootAgentsFile(sanitized, w.name, w.team_state_root ?? config.team_state_root ?? resolveCanonicalTeamStateRoot(leaderCwd), w.worktree_path).catch(() => {});
+    for (const worker of targetWorkers) {
+      if (worker.worktree_path) {
+        try {
+          await removeWorkerWorktreeRootAgentsFile(
+            sanitized,
+            worker.name,
+            worker.team_state_root ?? config.team_state_root ?? resolveCanonicalTeamStateRoot(leaderCwd),
+            worker.worktree_path,
+          );
+        } catch (error) {
+          return { ok: false, error: `scale_down_worktree_instruction_cleanup_failed:${worker.name}:${String(error)}` };
+        }
       }
-      removedNames.push(w.name);
+      removedNames.push(worker.name);
     }
 
     // Phase 4: Update config

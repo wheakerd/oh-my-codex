@@ -2205,6 +2205,7 @@ interface MadmaxDetachedActiveRecord {
   run_dir: string;
   tmux_session_name: string;
   session_id?: string;
+  session_birth?: string;
   tmux_pane_id?: string;
 }
 
@@ -2314,6 +2315,7 @@ function readMadmaxDetachedActiveRecord(
       run_dir: parsed.run_dir,
       tmux_session_name: parsed.tmux_session_name,
       ...(typeof parsed.session_id === "string" ? { session_id: parsed.session_id } : {}),
+      ...(typeof parsed.session_birth === "string" ? { session_birth: parsed.session_birth } : {}),
       ...(typeof parsed.tmux_pane_id === "string" ? { tmux_pane_id: parsed.tmux_pane_id } : {}),
       ...(typeof parsed.worktree_cwd === "string" ? { worktree_cwd: parsed.worktree_cwd } : {}),
     };
@@ -2325,9 +2327,13 @@ function readMadmaxDetachedActiveRecord(
 function isReusableMadmaxDetachedActiveRecord(
   record: MadmaxDetachedActiveRecord,
 ): boolean {
+  // Reuse requires the immutable session birth (the published @omx_instance_id),
+  // not the logical launch session_id which is retained only as an alias. A
+  // record without a persisted session_birth predates atomic birth publication
+  // and is treated as non-reusable fail-closed.
   if (!detachedTmuxSessionExists(record.tmux_session_name)) return false;
-  if (!record.session_id || !record.tmux_pane_id) return false;
-  if (readTmuxSessionInstanceId(record.tmux_session_name) !== record.session_id) {
+  if (!record.session_birth || !record.tmux_pane_id) return false;
+  if (readTmuxSessionInstanceId(record.tmux_session_name) !== record.session_birth) {
     return false;
   }
   return tmuxPaneBelongsToSession(record.tmux_pane_id, record.tmux_session_name);
@@ -5418,9 +5424,11 @@ async function runCodex(
         }
         return { postLaunchHandledExternally: true };
       }
-      if (activeRecordPath && activeRecord) {
-        throw new TmuxLifecycleAuthorityError("madmax detached recovery record is not reusable; preserving it without exact release evidence");
-      }
+      // A present-but-non-reusable record (missing/mismatched immutable session
+      // birth, or a foreign session we cannot prove we own) must not be reused
+      // and must not mutate the foreign session. Fall through to spawn a fresh,
+      // independently-owned detached session; the fresh launch re-publishes the
+      // active record for this context with proven birth evidence.
 
       let detachedSessionBindingWrite: Promise<unknown> = Promise.resolve();
       const writeDetachedSessionBinding = (
@@ -5538,19 +5546,20 @@ async function runCodex(
             if (leaderPaneId) {
               detachedLeaderPaneId = leaderPaneId;
               setDetachedTmuxSessionHistoryLimit(sessionName, leaderPaneId);
+              const baseActiveRecord: MadmaxDetachedActiveRecord = {
+                version: 1,
+                context_key: contextKey ?? "",
+                created_at: new Date().toISOString(),
+                source_cwd: runtimeContext?.sourceCwd ?? process.env.OMX_SOURCE_CWD ?? cwd,
+                ...(runtimeContext?.worktreeCwd ? { worktree_cwd: runtimeContext.worktreeCwd } : {}),
+                argv: args,
+                run_dir: runtimeContext?.omxRoot ?? process.env.OMX_ROOT ?? cwd,
+                tmux_session_name: sessionName,
+                session_id: sessionId,
+                tmux_pane_id: leaderPaneId,
+              };
               if (activeRecordPath && contextKey) {
-                writeMadmaxDetachedActiveRecord(activeRecordPath, {
-                  version: 1,
-                  context_key: contextKey,
-                  created_at: new Date().toISOString(),
-                  source_cwd: runtimeContext?.sourceCwd ?? process.env.OMX_SOURCE_CWD ?? cwd,
-                  ...(runtimeContext?.worktreeCwd ? { worktree_cwd: runtimeContext.worktreeCwd } : {}),
-                  argv: args,
-                  run_dir: runtimeContext?.omxRoot ?? process.env.OMX_ROOT ?? cwd,
-                  tmux_session_name: sessionName,
-                  session_id: sessionId,
-                  tmux_pane_id: leaderPaneId,
-                });
+                writeMadmaxDetachedActiveRecord(activeRecordPath, baseActiveRecord);
               }
               const tmuxBinding = await establishCurrentTmuxInstanceBinding(
                 sessionId,
@@ -5561,6 +5570,15 @@ async function runCodex(
                 detachedSessionBirth = tmuxBinding.sessionInstanceId;
                 writeDetachedSessionBinding(leaderPaneId, tmuxBinding);
                 detachedHudEvidenceVerified = true;
+                // Persist the immutable session birth only after atomic birth
+                // publication/readback succeeds, so reuse compares @omx_instance_id
+                // against exact evidence and never against the logical session_id.
+                if (activeRecordPath && contextKey && tmuxBinding.sessionInstanceId) {
+                  writeMadmaxDetachedActiveRecord(activeRecordPath, {
+                    ...baseActiveRecord,
+                    session_birth: tmuxBinding.sessionInstanceId,
+                  });
+                }
               }
             }
           }

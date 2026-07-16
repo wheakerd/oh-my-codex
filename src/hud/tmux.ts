@@ -648,12 +648,10 @@ export function createHudWatchPane(
   try {
     paneId = parsePaneIdFromTmuxOutput(execTmuxSync(args));
     if (!paneId) return null;
-    const instanceId = options.instanceId?.trim();
-    if (instanceId) {
-      execTmuxSync(['set-option', '-p', '-t', paneId, '@omx_pane_instance_id', instanceId]);
-      const taggedInstanceId = execTmuxSync(['show-option', '-qv', '-p', '-t', paneId, '@omx_pane_instance_id']).trim();
-      if (taggedInstanceId !== instanceId) throw new Error('HUD pane instance tag was not persisted');
-    }
+    const instanceId = options.instanceId?.trim() || randomUUID();
+    execTmuxSync(['set-option', '-p', '-t', paneId, '@omx_pane_instance_id', instanceId]);
+    const taggedInstanceId = execTmuxSync(['show-option', '-qv', '-p', '-t', paneId, '@omx_pane_instance_id']).trim();
+    if (taggedInstanceId !== instanceId) throw new Error('HUD pane instance tag was not persisted');
     return paneId;
   } catch {
     // The split may have succeeded but its ownership tag could not be verified.

@@ -724,6 +724,53 @@ describe('runtime', () => {
     }
   });
 
+  it('startTeam blocks preparing, invalid, and unreadable lifecycle evidence before state or worktree provisioning', async () => {
+    const repo = await initRepo();
+    const teamName = 'lifecycle-start-block';
+    const sessionId = 'lifecycle-start-block-session';
+    const internalTeamName = buildInternalTeamName(teamName, resolveTeamIdentityScope({ OMX_SESSION_ID: sessionId }));
+    const previousSessionId = process.env.OMX_SESSION_ID;
+    const previousMode = process.env.OMX_TEAM_WORKER_LAUNCH_MODE;
+    try {
+      process.env.OMX_SESSION_ID = sessionId;
+      process.env.OMX_TEAM_WORKER_LAUNCH_MODE = 'prompt';
+      const certificate = {
+        version: 1 as const,
+        token: 'preparing-token',
+        team_name: internalTeamName,
+        canonical_session_id: sessionId,
+        native_session_ids: [sessionId],
+        tmux_session_name: null,
+        tmux_session_birth: null,
+        tmux_context: null,
+        team_pane_owner_id: `team:${internalTeamName}`,
+        hook_generation: 'hook-generation',
+        status: 'preparing' as const,
+        created_at: new Date().toISOString(),
+        resources: [],
+      };
+      assert.equal(await createTeamLifecycleGeneration(certificate, repo), true);
+      await assert.rejects(() => startTeam(teamName, 'must not provision', 'executor', 1, [], repo), /team_lifecycle_recovery_required:preparing-token/);
+      assert.equal(existsSync(join(repo, '.omx', 'state', 'team', internalTeamName, 'config.json')), false);
+
+      await rm(join(repo, '.omx', 'state', 'team', internalTeamName, 'lifecycle-generation.json'));
+      await writeFile(join(repo, '.omx', 'state', 'team', internalTeamName, 'lifecycle-generation.json'), '{invalid', 'utf-8');
+      await assert.rejects(() => startTeam(teamName, 'must not provision', 'executor', 1, [], repo), /team_lifecycle_recovery_required:invalid/);
+      assert.equal(existsSync(join(repo, '.omx', 'state', 'team', internalTeamName, 'config.json')), false);
+
+      setLifecycleCertificateReaderForTests(async () => { throw Object.assign(new Error('busy'), { code: 'EIO' }); });
+      await assert.rejects(() => startTeam(teamName, 'must not provision', 'executor', 1, [], repo), /team_lifecycle_recovery_required:read_error/);
+      assert.equal(existsSync(join(repo, '.omx', 'state', 'team', internalTeamName, 'config.json')), false);
+    } finally {
+      resetLifecycleCertificateReaderForTests();
+      if (typeof previousSessionId === 'string') process.env.OMX_SESSION_ID = previousSessionId;
+      else delete process.env.OMX_SESSION_ID;
+      if (typeof previousMode === 'string') process.env.OMX_TEAM_WORKER_LAUNCH_MODE = previousMode;
+      else delete process.env.OMX_TEAM_WORKER_LAUNCH_MODE;
+      await rm(repo, { recursive: true, force: true });
+    }
+  });
+
   it('retains interactive metadata when its lifecycle certificate is missing or malformed', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-lifecycle-retention-'));
     const teamName = 'team-lifecycle-retention';
@@ -741,6 +788,27 @@ describe('runtime', () => {
       setLifecycleCertificateReaderForTests(async () => { throw transientError; });
       await shutdownTeam(teamName, cwd, { force: true });
       assert.equal(existsSync(teamRoot), true);
+    } finally {
+      resetLifecycleCertificateReaderForTests();
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('does not remove worker instruction state on an incomplete interactive release', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-incomplete-release-instructions-'));
+    const teamName = 'team-incomplete-instr';
+    try {
+      await initTeamState(teamName, 'incomplete release test', 'executor', 1, cwd);
+      const instructionsPath = join(cwd, '.omx', 'state', 'team', teamName, 'worker-agents.md');
+      await writeFile(instructionsPath, '# Base worker instructions\n');
+
+      // Interactive shutdown without exact lifecycle authority is an incomplete
+      // release: the fail-closed gate must preserve recoverable state, so it
+      // never removes instruction state and reports the run as not complete.
+      const summary = await shutdownTeam(teamName, cwd, { force: true });
+      assert.equal(summary.complete, false);
+      assert.equal(existsSync(instructionsPath), true);
+      assert.equal(await readFile(instructionsPath, 'utf-8'), '# Base worker instructions\n');
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

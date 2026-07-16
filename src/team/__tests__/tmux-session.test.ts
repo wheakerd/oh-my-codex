@@ -231,6 +231,7 @@ if [ "${'$'}{1:-}" = "if-shell" ]; then
         receipt="${'$'}{rejected_branch##*display-message -p }"
         receipt="${'$'}{receipt%% *}"
       fi
+      [ -f "$state_dir/if-shell-omit-receipt" ] && exit 0
       printf '%s\n' "${'$'}receipt"
       exit 0
       ;;
@@ -536,6 +537,32 @@ esac
     }
   });
 
+  it('fails closed when missing publication receipt has no complete read-back pair', async () => {
+    const previousPane = process.env.TMUX_PANE;
+    try {
+      process.env.TMUX_PANE = '%1';
+      await withMockTmuxFixture('omx-missing-birth-receipt-', (logPath) => `#!/bin/sh
+printf '%s\\n' "$*" >> "${logPath}"
+case "$1" in
+  display-message) printf 'leader:0 %%1\\n' ;;
+  *) exit 0 ;;
+esac
+`, async ({ logPath }) => {
+        const stateDir = `${logPath}.tmux-state`;
+        await mkdir(stateDir, { recursive: true });
+        await writeFile(`${stateDir}/births-empty`, '1');
+        await writeFile(`${stateDir}/if-shell-concurrent-replacement`, '1');
+        await writeFile(`${stateDir}/if-shell-omit-receipt`, '1');
+
+        const candidate = establishExactTeamHudCandidate({ sessionId: 'canonical-session', expectedLeaderPaneId: '%1' });
+        assert.equal(candidate, null);
+      });
+    } finally {
+      if (typeof previousPane === 'string') process.env.TMUX_PANE = previousPane;
+      else delete process.env.TMUX_PANE;
+    }
+  });
+
   it('reads shutdown evidence without rewriting tmux tags', async () => {
     const previousPane = process.env.TMUX_PANE;
     try {
@@ -652,7 +679,7 @@ describe('HUD resize hook command builders', () => {
   it('appends a self-validating resize hook rather than replacing a numeric slot', () => {
     const args = buildRegisterResizeHookArgs('my-session:0', 'omx_resize_team_session_0_1', '%1', HUD_TMUX_TEAM_HEIGHT_LINES, 'generation-a', hookEvidence);
     assert.deepEqual(args.slice(0, 5), ['set-hook', '-a', '-t', 'my-session:0', 'client-resized']);
-    assert.match(args[5] ?? '', /if-shell -t %1 -F/);
+    assert.match(args[5] ?? '', /if-shell -t '%1' -F/);
     assert.match(args[5] ?? '', /session-birth/);
     assert.match(args[5] ?? '', /pane-birth/);
     assert.match(args[5] ?? '', /pane_start_command/);
@@ -718,7 +745,7 @@ if [ "$1" = if-shell ]; then set -- $6; while [ "$#" -gt 0 ]; do if [ "$1" = set
     assert.match(delayed[2] ?? '', /@omx_team_pane_owner_id/);
     assert.match(delayed[2] ?? '', /@omx_team_hook_active_generation_a/);
     assert.match(reconcile[1] ?? '', /pane_start_command/);
-    assert.match(reconcile[1] ?? '', /resize-pane -t %7/);
+    assert.match(reconcile[1] ?? '', /resize-pane -t .*%7/);
   });
 
   it('makes missing immutable resize evidence inert without scheduling an ID-only resize', () => {
@@ -4726,7 +4753,7 @@ esac
             assert.match(log, /@omx_team_pane_owner_id},team#:logical-owner/);
             assert.match(log, /@omx_team_pane_birth}/);
             assert.match(log, /@omx_team_pane_role},worker/);
-            assert.match(log, /kill-pane -t %2.*__omx_startup_rollback_applied_.*__omx_startup_rollback_rejected_/);
+            assert.match(log, /kill-pane -t .*%2.*__omx_startup_rollback_applied_.*__omx_startup_rollback_rejected_/);
             assert.doesNotMatch(log, /@omx_instance_id.*logical-owner-id/);
           }
         },
@@ -6867,7 +6894,7 @@ esac
         assert.equal(summary.kill.attempted, 1);
         assert.equal(summary.kill.succeeded, 1);
         const log = await readFile(logPath, 'utf-8');
-        assert.match(log, /if-shell -t %3 -F .*@omx_team_pane_birth.*@omx_team_pane_role.*,worker.*kill-pane -t %3/);
+        assert.match(log, /if-shell -t %3 -F .*@omx_team_pane_birth.*@omx_team_pane_role.*,worker.*kill-pane -t .*%3/);
 
         assert.doesNotMatch(log, /kill-pane -t %1/);
         assert.doesNotMatch(log, /kill-pane -t %2/);
@@ -6928,7 +6955,7 @@ exit 0
         assert.equal(summary.kill.succeeded, 0);
         assert.equal(summary.kill.failed, 1);
         const log = await readFile(logPath, 'utf-8');
-        assert.match(log, /if-shell -t %3 -F .*kill-pane -t %3.*display-message -p __omx_worker_teardown_applied_.*display-message -p __omx_worker_teardown_rejected_/);
+        assert.match(log, /if-shell -t %3 -F .*kill-pane -t .*%3.*display-message -p __omx_worker_teardown_applied_.*display-message -p __omx_worker_teardown_rejected_/);
         assert.doesNotMatch(log, /^kill-pane -t %3$/m);
       },
     );
@@ -6960,7 +6987,7 @@ esac
           kind: 'hud', id: '%2', created: true, pane_birth: 'hud-birth', command: 'env OMX_SESSION_ID=canonical OMX_TMUX_HUD_LEADER_PANE=%1 node omx hud --watch', role: 'hud', acquired_at: '2026-01-01T00:00:00.000Z',
         }), false);
         const log = await readFile(logPath, 'utf-8');
-        assert.match(log, /if-shell -t %2 -F .*kill-pane -t %2.*__omx_hud_teardown_applied_.*__omx_hud_teardown_rejected_/);
+        assert.match(log, /if-shell -t %2 -F .*kill-pane -t .*%2.*__omx_hud_teardown_applied_.*__omx_hud_teardown_rejected_/);
         assert.match(log, /@omx_pane_instance_id},hud-birth/);
         assert.doesNotMatch(log, /@omx_pane_instance_id},pane-birth/);
         assert.doesNotMatch(log, /^kill-pane -t %2$/m);

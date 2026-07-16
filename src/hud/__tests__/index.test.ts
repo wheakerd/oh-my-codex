@@ -659,6 +659,10 @@ if [[ "$1" == "list-panes" ]]; then
   printf '%s\n' "%3\tnode\t0\t28\t100\t2\t29\t100\t32\tsess-a\tsess-a\texec env OMX_SESSION_ID='sess-a' OMX_TMUX_HUD_LEADER_PANE='%1' /node /omx.js hud --watch\t/tmp"
   exit 0
 fi
+if [[ "$1" == "if-shell" ]]; then
+  printf '__omx_hud_pane_kill_applied__\n'
+  exit 0
+fi
 if [[ "$1" == "resize-pane" || "$1" == "set-hook" || "$1" == "kill-pane" ]]; then
   exit 0
 fi
@@ -722,6 +726,14 @@ printf '%s\n' "$*" >> ${JSON.stringify(logPath)}
 if [[ "$1" == "display-message" ]]; then
   fmt="\${@: -1}"
   case "$fmt" in
+    *pane_current_command*pane_start_command*)
+      printf "sess-a\tsess-a\tmanaged-session\t@3\tnode\texec env OMX_SESSION_ID='sess-a' OMX_TMUX_HUD_LEADER_PANE='%%1' /node /omx.js hud --watch\n"
+      exit 0
+      ;;
+    '#{@omx_pane_instance_id}')
+      printf 'sess-a\n'
+      exit 0
+      ;;
     *session_name*)
       printf 'managed-session\t$7\t@3\t%%1\n'
       exit 0

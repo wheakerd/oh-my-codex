@@ -119,6 +119,107 @@ async function createLaunchFixture(
   };
 }
 
+// Faithful detached-launch tmux stub: new-session returns a pane and records the
+// session name; display-message returns a stable session/window/pane context;
+// set/show-option persist and read exact session/pane births; if-shell executes
+// the applied/rejected branch (publishing births or killing the session) and
+// echoes the trailing applied receipt; kill-session logs its exact target.
+function fullBirthDetachedTmuxStub(
+  logPath: string,
+  attachMode: 'fail' | 'noop',
+): string {
+  const attachBranch = attachMode === 'fail'
+    ? `    printf 'error connecting to /tmp/tmux-1000/default (Operation not permitted)\\n' >&2\n    exit 1`
+    : `    exit 0`;
+  return `#!/bin/sh
+printf 'tmux:%s\\n' "$*" >> "${logPath}"
+nameMarker="${logPath}.session-name"
+instMarker="${logPath}.session-instance"
+paneMarker="${logPath}.pane-instance"
+case "$1" in
+  -V|list-sessions)
+    printf 'tmux 3.4\\n'
+    exit 0
+    ;;
+  has-session)
+    exit 0
+    ;;
+  new-session)
+    prev=''
+    for a in "$@"; do
+      if [ "$prev" = '-s' ]; then printf '%s\\n' "$a" > "$nameMarker"; fi
+      prev="$a"
+    done
+    printf '%%12\\n'
+    exit 0
+    ;;
+  split-window)
+    printf 'hud-pane\\n'
+    exit 0
+    ;;
+  display-message)
+    for a in "$@"; do
+      case "$a" in
+        '#{socket_path}') printf '/tmp/tmux-test.sock\\n'; exit 0 ;;
+        '#{session_attached}') printf '0\\n'; exit 0 ;;
+      esac
+    done
+    last=''
+    for a in "$@"; do last="$a"; done
+    sname=$(cat "$nameMarker" 2>/dev/null || printf 'detached-session')
+    case "$last" in
+      '#{session_name}') printf '%s\\n' "$sname"; exit 0 ;;
+      *) printf '%s\\tdetached-sid\\t@1\\t%%12\\n' "$sname"; exit 0 ;;
+    esac
+    ;;
+  show-options|show-option)
+    for a in "$@"; do
+      case "$a" in
+        @omx_instance_id) cat "$instMarker" 2>/dev/null || true; exit 0 ;;
+        @omx_pane_instance_id) cat "$paneMarker" 2>/dev/null || true; exit 0 ;;
+      esac
+    done
+    printf 'off\\n'
+    exit 0
+    ;;
+  set-option)
+    prev=''
+    for a in "$@"; do
+      if [ "$prev" = '@omx_instance_id' ]; then printf '%s\\n' "$a" > "$instMarker"; fi
+      if [ "$prev" = '@omx_pane_instance_id' ]; then printf '%s\\n' "$a" > "$paneMarker"; fi
+      prev="$a"
+    done
+    exit 0
+    ;;
+  if-shell)
+    true_cmd="$6"
+    binst=$(printf '%s' "$true_cmd" | sed -n "s/.* @omx_instance_id '\\([^']*\\)'.*/\\1/p")
+    bpane=$(printf '%s' "$true_cmd" | sed -n "s/.*@omx_pane_instance_id '\\([^']*\\)'.*/\\1/p")
+    if [ -n "$binst" ]; then printf '%s\\n' "$binst" > "$instMarker"; fi
+    if [ -n "$bpane" ]; then printf '%s\\n' "$bpane" > "$paneMarker"; fi
+    case "$true_cmd" in
+      kill-session*)
+        ktarget=$(printf '%s' "$true_cmd" | sed -n "s/^kill-session -t '\\([^']*\\)'.*/\\1/p")
+        printf 'tmux:kill-session -t %s\\n' "$ktarget" >> "${logPath}"
+        ;;
+    esac
+    printf '%s' "$true_cmd" | awk '{print $NF}'
+    exit 0
+    ;;
+  kill-session)
+    exit 0
+    ;;
+  attach-session)
+${attachBranch}
+    ;;
+  set-hook|run-shell|resize-pane|select-pane|kill-pane)
+    exit 0
+    ;;
+esac
+exit 0
+`;
+}
+
 describe('omx launch fallback when tmux is unavailable', () => {
   it('surfaces direct Codex startup stderr and preserves the child exit code', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-launch-child-error-'));
@@ -493,27 +594,32 @@ case "$1" in
     fi
     exit 0
     ;;
-  show-options)
-    if [ "$5" = '@omx_instance_id' ]; then
-      cat "${instanceMarker}"
-      exit 0
-    fi
+  show-options|show-option)
+    for a in "$@"; do
+      case "$a" in
+        @omx_instance_id) cat "${instanceMarker}" 2>/dev/null || true; exit 0 ;;
+        @omx_pane_instance_id) cat "\${paneMarker}" 2>/dev/null || true; exit 0 ;;
+      esac
+    done
     printf 'off\n'
     exit 0
     ;;
-  show-option)
-    if [ "$6" = '@omx_pane_instance_id' ]; then
-      cat "${instanceMarker}"
-      exit 0
-    fi
-    exit 1
-    ;;
   set-option)
-    if [ "$4" = '@omx_instance_id' ]; then
-      printf '%s\n' "$5" > "${instanceMarker}"
-    elif [ "$5" = '@omx_pane_instance_id' ]; then
-      printf '%s\n' "$6" > "\${paneMarker}"
-    fi
+    prev=''
+    for a in "$@"; do
+      if [ "$prev" = '@omx_instance_id' ]; then printf '%s\n' "$a" > "${instanceMarker}"; fi
+      if [ "$prev" = '@omx_pane_instance_id' ]; then printf '%s\n' "$a" > "\${paneMarker}"; fi
+      prev="$a"
+    done
+    exit 0
+    ;;
+  if-shell)
+    publish="$6"
+    binst=$(printf '%s' "$publish" | sed -n "s/.* @omx_instance_id '\\([^']*\\)'.*/\\1/p")
+    bpane=$(printf '%s' "$publish" | sed -n "s/.*@omx_pane_instance_id '\\([^']*\\)'.*/\\1/p")
+    if [ -n "$binst" ]; then printf '%s\n' "$binst" > "${instanceMarker}"; fi
+    if [ -n "$bpane" ]; then printf '%s\n' "$bpane" > "\${paneMarker}"; fi
+    printf '%s' "$publish" | awk '{print $NF}'
     exit 0
     ;;
   set-hook|attach-session|kill-session|run-shell|resize-pane)
@@ -1466,45 +1572,7 @@ exit 1
       await chmod(fakeCodexPath, 0o755);
       await writeFile(fakePsPath, '#!/bin/sh\nexit 0\n');
       await chmod(fakePsPath, 0o755);
-      await writeFile(
-        fakeTmuxPath,
-        `#!/bin/sh
-printf 'tmux:%s\n' "$*" >> "${tmuxLogPath}"
-case "$1" in
-  -V|list-sessions)
-    exit 0
-    ;;
-  new-session)
-    printf 'leader-pane\n'
-    exit 0
-    ;;
-  split-window)
-    printf 'hud-pane\n'
-    exit 0
-    ;;
-  display-message)
-    if [ "$2" = '-p' ] && [ "$3" = '#{socket_path}' ]; then
-      printf '/tmp/tmux-test.sock\n'
-    else
-      printf '0\n'
-    fi
-    exit 0
-    ;;
-  show-options)
-    printf 'off\n'
-    exit 0
-    ;;
-  attach-session)
-    printf 'error connecting to /tmp/tmux-1000/default (Operation not permitted)\n' >&2
-    exit 1
-    ;;
-  set-option|set-hook|kill-session|run-shell|resize-pane|select-pane)
-    exit 0
-    ;;
-esac
-exit 0
-`,
-      );
+      await writeFile(fakeTmuxPath, fullBirthDetachedTmuxStub(tmuxLogPath, 'fail'));
       await chmod(fakeTmuxPath, 0o755);
 
       const result = runOmx(
@@ -1528,6 +1596,11 @@ exit 0
       assert.match(result.stdout, /fake-codex:.*--dangerously-bypass-approvals-and-sandbox/);
       assert.match(tmuxLog, /tmux:attach-session -t /);
       assert.match(tmuxLog, /tmux:kill-session -t /);
+      const birthIdx = tmuxLog.indexOf('__omx_birth_established_');
+      const killIdx = tmuxLog.indexOf('tmux:kill-session -t ');
+      assert.ok(birthIdx >= 0, 'birth publication receipt must be present');
+      assert.ok(killIdx >= 0, 'destructive rollback kill-session must be present');
+      assert.ok(birthIdx < killIdx, 'applied birth receipt must precede destructive rollback');
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
@@ -1538,38 +1611,7 @@ exit 0
     try {
       const { env, tmuxLogPath } = await createLaunchFixture(
         wd,
-        (tmuxLogPath) => `#!/bin/sh
-printf 'tmux:%s\n' "$*" >> "${tmuxLogPath}"
-case "$1" in
-  -V|list-sessions)
-    exit 0
-    ;;
-  new-session)
-    printf 'leader-pane\n'
-    exit 0
-    ;;
-  split-window)
-    printf 'hud-pane\n'
-    exit 0
-    ;;
-  display-message)
-    if [ "$2" = '-p' ] && [ "$3" = '#{socket_path}' ]; then
-      printf '/tmp/tmux-test.sock\n'
-    else
-      printf '0\n'
-    fi
-    exit 0
-    ;;
-  show-options)
-    printf 'off\n'
-    exit 0
-    ;;
-  set-option|set-hook|attach-session|kill-session|run-shell|resize-pane|select-pane)
-    exit 0
-    ;;
-esac
-exit 0
-`,
+        (tmuxLogPath) => fullBirthDetachedTmuxStub(tmuxLogPath, 'noop'),
       );
 
       const result = runOmx(
