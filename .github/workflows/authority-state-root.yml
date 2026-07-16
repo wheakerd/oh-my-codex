@@ -179,8 +179,17 @@ jobs:
             dist/state/__tests__/operations.test.js \
             dist/cli/__tests__/state.test.js \
             dist/cli/__tests__/index.test.js \
-            dist/cli/__tests__/launch-fallback.test.js \
             2>&1 | tee authority-evidence/authority-recovery-concurrency-e2e.log
+          if [[ "${{ matrix.os }}" == "macos" ]]; then
+            node --test --test-concurrency=1 \
+              --test-name-pattern='omx launch fallback when tmux is unavailable|omx --worktree disposable state root' \
+              dist/cli/__tests__/launch-fallback.test.js \
+              2>&1 | tee -a authority-evidence/authority-recovery-concurrency-e2e.log
+          else
+            node --test --test-concurrency=1 \
+              dist/cli/__tests__/launch-fallback.test.js \
+              2>&1 | tee -a authority-evidence/authority-recovery-concurrency-e2e.log
+          fi
       - name: Run hotswap rollover lane
         shell: bash
         run: |
