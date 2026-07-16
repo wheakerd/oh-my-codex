@@ -1,4 +1,4 @@
-import { readFile, writeFile, mkdir, rename, readdir, lstat } from 'fs/promises';
+import { readFile, writeFile, mkdir, rename, readdir, lstat, rm } from 'fs/promises';
 
 import { join, dirname, resolve, sep } from 'path';
 import { existsSync } from 'fs';
@@ -95,6 +95,8 @@ export interface TeamConfig {
   workers: WorkerInfo[];
   created_at: string;
   tmux_session: string; // "omx-team-{name}"
+  tmux_session_id?: string;
+  tmux_session_created?: string;
   next_task_id: number;
   leader_cwd?: string;
   team_state_root?: string;
@@ -102,8 +104,10 @@ export interface TeamConfig {
   worktree_mode?: WorktreeMode;
   /** Leader's own tmux pane ID — must never be killed during worker cleanup. */
   leader_pane_id: string | null;
+  leader_pane_pid?: number | null;
   /** HUD pane spawned below the leader column — excluded from worker pane cleanup. */
   hud_pane_id: string | null;
+  hud_pane_pid?: number | null;
   /** Team-scoped tmux pane owner token used by shutdown safety checks. */
   tmux_pane_owner_id?: string;
   /** Registered HUD resize hook name used for window-size reconciliation. */
@@ -115,6 +119,7 @@ export interface TeamConfig {
   display_name?: string;
   requested_name?: string;
   identity_source?: string;
+  config_generation?: number;
 }
 
 export interface WorkerInfo {
@@ -313,6 +318,8 @@ export interface TeamManifestV2 {
   permissions_snapshot: PermissionsSnapshot;
   team_decomposition?: Record<string, unknown>;
   tmux_session: string;
+  tmux_session_id?: string;
+  tmux_session_created?: string;
   worker_count: number;
   workers: WorkerInfo[];
   next_task_id: number;
@@ -322,7 +329,9 @@ export interface TeamManifestV2 {
   workspace_mode?: 'single' | 'worktree';
   worktree_mode?: WorktreeMode;
   leader_pane_id: string | null;
+  leader_pane_pid?: number | null;
   hud_pane_id: string | null;
+  hud_pane_pid?: number | null;
   tmux_pane_owner_id?: string;
   resize_hook_name: string | null;
   resize_hook_target: string | null;
@@ -331,6 +340,7 @@ export interface TeamManifestV2 {
   display_name?: string;
   requested_name?: string;
   identity_source?: string;
+  config_generation?: number;
 }
 
 export interface TeamWorkspaceMetadata {
@@ -1454,6 +1464,119 @@ async function withTeamLock<T>(teamName: string, cwd: string, fn: () => Promise<
   return await withTeamLockImpl(teamName, cwd, LOCK_STALE_MS, { teamDir, taskClaimLockDir, mailboxLockDir }, fn);
 }
 
+export async function withTeamTaskBarrier<T>(
+  teamName: string,
+  cwd: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  return await withTeamLock(teamName, cwd, fn);
+}
+
+export type TeamMembershipTaskTransaction = {
+  baseGeneration: number;
+  tasks: Array<{ taskId: string; oldBytes: string | null; newBytes: string | null }>;
+  config: { oldBytes: string; newBytes: string };
+  manifest?: { oldBytes: string | null; newBytes: string | null };
+};
+
+type MembershipTransactionJournal = {
+  schemaVersion: 1;
+  phase: 'prepared' | 'committed';
+  files: Array<{ path: string; oldBytes: string | null; newBytes: string | null }>;
+};
+
+function membershipTransactionPath(teamName: string, cwd: string): string {
+  return join(teamDir(teamName, cwd), '.membership-task-transaction.json');
+}
+
+export async function removeDurableFile(filePath: string): Promise<void> {
+  const stateRoot = teamStateMutationRoot(filePath);
+  if (stateRoot) {
+    const authority = await resolveValidatedTeamAuthority(dirname(dirname(stateRoot)));
+    if (!authority || resolve(stateRoot) !== authority.canonical_state_root) {
+      throw new Error('team state mutation requires persisted session authority; ambient state-root aliases are diagnostic-only');
+    }
+    await withStateAuthorityTransaction(authority, async (pinnedAuthority) => {
+      await assertTeamStateMutationPath(pinnedAuthority.canonical_state_root, filePath);
+      await rm(filePath, { force: true });
+    });
+    return;
+  }
+  await rm(filePath, { force: true });
+}
+
+async function applyMembershipTransactionFiles(
+  files: readonly MembershipTransactionJournal['files'][number][],
+  useNewBytes: boolean,
+): Promise<void> {
+  for (const file of files) {
+    const bytes = useNewBytes ? file.newBytes : file.oldBytes;
+    if (bytes === null) await removeDurableFile(file.path);
+    else await writeAtomic(file.path, bytes);
+  }
+}
+
+export async function recoverTeamMembershipTaskTransaction(teamName: string, cwd: string): Promise<void> {
+  const journalPath = membershipTransactionPath(teamName, cwd);
+  let journal: MembershipTransactionJournal;
+  try {
+    journal = JSON.parse(await readFile(journalPath, 'utf8')) as MembershipTransactionJournal;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw error;
+  }
+  if (journal.schemaVersion !== 1 || !Array.isArray(journal.files)
+    || (journal.phase !== 'prepared' && journal.phase !== 'committed')) {
+    throw new Error(`Invalid membership transaction journal for ${teamName}`);
+  }
+  await applyMembershipTransactionFiles(journal.files, journal.phase === 'committed');
+  await removeDurableFile(journalPath);
+}
+
+export async function finalizeTeamMembershipTaskTransaction(teamName: string, cwd: string): Promise<void> {
+  await removeDurableFile(membershipTransactionPath(teamName, cwd));
+}
+
+export async function commitTeamMembershipTaskTransaction(
+  teamName: string,
+  cwd: string,
+  transaction: TeamMembershipTaskTransaction,
+): Promise<void> {
+  await withTeamTaskBarrier(teamName, cwd, async () => {
+    const configPath = teamConfigPath(teamName, cwd);
+    const current = JSON.parse(await readFile(configPath, 'utf8')) as TeamConfig;
+    const generation = current.config_generation ?? 0;
+    if (generation !== transaction.baseGeneration) {
+      throw new Error(`team_membership_stale_generation:${teamName}:${transaction.baseGeneration}:${generation}`);
+    }
+    const nextConfig = JSON.parse(transaction.config.newBytes) as TeamConfig;
+    nextConfig.config_generation = generation + 1;
+    const files: MembershipTransactionJournal['files'] = [
+      ...transaction.tasks.map((task) => ({
+        path: taskFilePath(teamName, task.taskId, cwd), oldBytes: task.oldBytes, newBytes: task.newBytes,
+      })),
+      { path: configPath, oldBytes: transaction.config.oldBytes, newBytes: JSON.stringify(nextConfig, null, 2) },
+    ];
+    if (transaction.manifest) {
+      const nextManifest = transaction.manifest.newBytes === null ? null : {
+        ...(JSON.parse(transaction.manifest.newBytes) as TeamManifestV2), config_generation: generation + 1,
+      };
+      files.push({
+        path: teamManifestV2Path(teamName, cwd),
+        oldBytes: transaction.manifest.oldBytes,
+        newBytes: nextManifest === null ? null : JSON.stringify(nextManifest, null, 2),
+      });
+    }
+    const journalPath = membershipTransactionPath(teamName, cwd);
+    const journal: MembershipTransactionJournal = { schemaVersion: 1, phase: 'prepared', files };
+    await writeAtomic(journalPath, JSON.stringify(journal, null, 2));
+    await applyMembershipTransactionFiles(files, true);
+    journal.phase = 'committed';
+    await writeAtomic(journalPath, JSON.stringify(journal, null, 2));
+    await removeDurableFile(journalPath);
+  });
+}
+
 async function withTaskClaimLock<T>(
   teamName: string,
   taskId: string,
@@ -1823,6 +1946,23 @@ export function resolveDispatchLockTimeoutMs(env: NodeJS.ProcessEnv = process.en
 
 async function withDispatchLock<T>(teamName: string, cwd: string, fn: () => Promise<T>): Promise<T> {
   return await withDispatchLockImpl(teamName, cwd, teamDir, dispatchLockDir, fn);
+}
+
+/** Remove worker-targeted dispatch requests under the authoritative dispatch lock. */
+export async function removeDispatchRequestsForWorkers(
+  teamName: string,
+  workerNames: readonly string[],
+  cwd: string,
+): Promise<void> {
+  const names = new Set(workerNames);
+  await withDispatchLock(teamName, cwd, async () => {
+    const requests = await readDispatchRequests(teamName, cwd);
+    await writeDispatchRequests(
+      teamName,
+      requests.filter((request) => !names.has(request.to_worker)),
+      cwd,
+    );
+  });
 }
 
 export async function enqueueDispatchRequest(

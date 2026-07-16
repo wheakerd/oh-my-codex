@@ -286,9 +286,7 @@ async function configurePaneIds(teamName: string, cwd: string, leaderPaneId: str
   assert.ok(config, 'missing team config');
   if (!config) throw new Error('missing team config');
   config.leader_pane_id = leaderPaneId;
-  config.leader_pane_pid = panePids[leaderPaneId];
   config.hud_pane_id = '%96';
-  config.hud_pane_pid = 196;
   config.tmux_pane_owner_id = 'delivery-smoke-owner';
   config.workers = config.workers.map((worker) => {
     const paneId = workerPaneIds[worker.name] ?? worker.pane_id;

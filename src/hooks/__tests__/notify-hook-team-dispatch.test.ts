@@ -754,7 +754,6 @@ exit 0
       assert.ok(cfg);
       if (!cfg) throw new Error('missing team config');
       cfg.leader_pane_id = '%99';
-      cfg.leader_pane_pid = 9999;
       bindCanonicalTeamPaneAuthority(cfg);
       await saveTeamConfig(cfg, cwd);
 
@@ -1101,7 +1100,6 @@ exit 0
       assert.ok(cfg);
       if (!cfg) throw new Error('missing team config');
       cfg.leader_pane_id = '%91';
-      cfg.leader_pane_pid = 9191;
       bindCanonicalTeamPaneAuthority(cfg);
       await saveTeamConfig(cfg, cwd);
 
@@ -1247,7 +1245,6 @@ exit 0
       assert.ok(cfg);
       if (!cfg) throw new Error('missing team config');
       cfg.leader_pane_id = '%77';
-      cfg.leader_pane_pid = 7777;
       bindCanonicalTeamPaneAuthority(cfg);
       await saveTeamConfig(cfg, cwd);
 

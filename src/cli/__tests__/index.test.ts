@@ -83,6 +83,7 @@ import {
   resolveNativeSessionName,
   releaseTmuxExtendedKeysLease,
   withTmuxExtendedKeys,
+  serializeDetachedSessionParentEnv,
 
   buildInsideTmuxHudHookEnv,
   registerInsideTmuxHudResizeHook,

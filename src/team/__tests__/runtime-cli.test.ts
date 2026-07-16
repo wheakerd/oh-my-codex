@@ -215,7 +215,6 @@ describe('runtime-cli helpers', () => {
       assert.ok(config);
       config.tmux_session = '';
       config.leader_pane_id = null;
-      config.leader_pane_pid = null;
       await saveTeamConfig(config, cwd);
 
       const teamRoot = join(cwd, '.omx', 'state', 'team', 'shutdown-fallback');

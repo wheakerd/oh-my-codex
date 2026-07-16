@@ -16,6 +16,8 @@ import {
   readWorkspaceAuthorityAnchor,
   resolveStateAuthorityForGuard,
   sameRootFilesystemIdentity,
+  withStateAuthorityTransaction,
+  type ResolvedStateAuthorityContext,
   type RootFilesystemIdentity,
   type WorkspaceIdentity,
 } from '../state/authority.js';
@@ -93,6 +95,39 @@ async function requireRetainedActiveAuthority(): Promise<void> {
   if (await hasRetainedActiveAuthority()) return;
   stopping = true;
   throw new Error('watcher authority changed or terminalized');
+}
+
+async function withRetainedActiveAuthority<T>(
+  callback: (context: ResolvedStateAuthorityContext) => Promise<T>,
+): Promise<T> {
+  const retained = authorityTuple;
+  if (!retained) {
+    stopping = true;
+    throw new Error('watcher authority changed or terminalized');
+  }
+  const context = await resolveStateAuthorityForGuard({
+    startup_cwd: cwd,
+    observed_cwd: cwd,
+    session_id: process.env.OMX_SESSION_ID || undefined,
+  });
+  try {
+    return await withStateAuthorityTransaction(context, async (active) => {
+      const binding = active.session_binding;
+      const activeRootIdentity = await captureRootFilesystemIdentity(active.canonical_state_root);
+      if (!binding
+        || active.workspace_identity !== retained.workspaceIdentity
+        || active.generation.generation_id !== retained.generationId
+        || binding.binding_id !== retained.bindingId
+        || active.canonical_state_root !== retained.stateRoot
+        || !sameRootFilesystemIdentity(activeRootIdentity, retained.rootIdentity)) {
+        throw new Error('watcher authority changed or terminalized');
+      }
+      return callback(active);
+    });
+  } catch (error) {
+    stopping = true;
+    throw error;
+  }
 }
 interface FileMeta {
   threadId: string;
@@ -372,13 +407,14 @@ function inferOperationalCall(parsed: Record<string, unknown> | null, meta: File
 }
 
 async function dispatchDerivedEvent(event: Record<string, unknown>): Promise<void> {
-  await requireRetainedActiveAuthority();
   try {
     const { dispatchHookEvent } = await import('../hooks/extensibility/dispatcher.js');
-    await dispatchHookEvent(event as unknown as Parameters<typeof dispatchHookEvent>[0], {
-      cwd,
-      allowTeamWorkerSideEffects: false,
-      stateRoot: stateDir,
+    await withRetainedActiveAuthority(async (active) => {
+      await dispatchHookEvent(event as unknown as Parameters<typeof dispatchHookEvent>[0], {
+        cwd,
+        allowTeamWorkerSideEffects: false,
+        stateRoot: active.canonical_state_root,
+      });
     });
     await derivedLog({
       type: 'derived_event_dispatch',
@@ -423,7 +459,6 @@ interface OperationalEventInput {
 }
 
 async function dispatchOperationalEvent(input: OperationalEventInput): Promise<void> {
-  await requireRetainedActiveAuthority();
   try {
     const { buildDerivedHookEvent } = await import('../hooks/extensibility/events.js');
     const { dispatchHookEvent } = await import('../hooks/extensibility/dispatcher.js');
@@ -449,10 +484,12 @@ async function dispatchOperationalEvent(input: OperationalEventInput): Promise<v
       parser_reason: input.parserReason,
       confidence: input.confidence,
     });
-    await dispatchHookEvent(event, {
-      cwd,
-      allowTeamWorkerSideEffects: false,
-      stateRoot: stateDir,
+    await withRetainedActiveAuthority(async (active) => {
+      await dispatchHookEvent(event, {
+        cwd,
+        allowTeamWorkerSideEffects: false,
+        stateRoot: active.canonical_state_root,
+      });
     });
     await derivedLog({
       type: 'operational_event_dispatch',

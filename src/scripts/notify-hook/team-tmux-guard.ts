@@ -13,6 +13,11 @@ import {
 export const PANE_READINESS_UNVERIFIED_REASON = 'pane_readiness_unverified';
 let nextTmuxBufferId = 0;
 
+export function normalizeExactPaneId(value: unknown): string {
+  const paneId = safeString(value).trim();
+  return /^%\d+$/.test(paneId) ? paneId : '';
+}
+
 function buildSafePasteArgv(target: string, prompt: string): {
   bufferName: string;
   setBufferArgv: string[];

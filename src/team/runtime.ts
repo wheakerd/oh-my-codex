@@ -369,16 +369,26 @@ export function applyCreatedInteractiveSessionToConfig(
   workerPaneIds: Array<string | undefined>,
 ): void {
   config.tmux_session = createdSession.name;
+  config.tmux_session_id = createdSession.tmuxSessionId;
+  config.tmux_session_created = createdSession.tmuxSessionCreated;
   config.leader_pane_id = createdSession.leaderPaneId;
+  config.leader_pane_pid = createdSession.leaderPanePid ?? null;
   config.hud_pane_id = createdSession.hudPaneId;
+  config.hud_pane_pid = createdSession.hudPanePid ?? null;
   config.tmux_pane_owner_id = createdSession.teamPaneOwnerId;
   config.resize_hook_name = createdSession.resizeHookName;
   config.resize_hook_target = createdSession.resizeHookTarget;
-  for (let i = 0; i < createdSession.workerPaneIds.length; i++) {
-    const paneId = createdSession.workerPaneIds[i];
+  const paneIdsByIndex = createdSession.workerPaneIdsByIndex ?? createdSession.workerPaneIds;
+  for (let i = 0; i < paneIdsByIndex.length; i++) {
+    const paneId = paneIdsByIndex[i];
+    if (!paneId) continue;
     workerPaneIds[i] = paneId;
     if (config.workers[i]) {
       config.workers[i].pane_id = paneId;
+      const panePid = createdSession.workerPanePidsByIndex?.[i];
+      if (typeof panePid === 'number' && Number.isSafeInteger(panePid) && panePid > 0) {
+        config.workers[i].pid = panePid;
+      }
     }
   }
 }
@@ -5794,6 +5804,9 @@ async function notifyWorkerOutcome(
       message,
       workerPaneId,
       worker.worker_cli,
+      worker.pid,
+      config.tmux_pane_owner_id,
+      config.hud_pane_id ?? undefined,
     );
     return {
       ok: true,

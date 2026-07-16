@@ -5874,7 +5874,7 @@ describe('state operations directory initialization', () => {
         });
 
         assert.equal(response.isError, true);
-        assert.match(String((response.payload as { error?: string }).error || ''), /tracker-backed native architect and critic lanes/i);
+        assert.match(String((response.payload as { error?: string }).error || ''), /tracker-backed native architect and critic lanes|architect-before-critic/i);
         const state = JSON.parse(
           await readFile(join(sessionDir, 'autopilot-state.json'), 'utf-8'),
         ) as Record<string, unknown>;
@@ -6111,7 +6111,7 @@ describe('state operations directory initialization', () => {
         });
 
         assert.equal(response.isError, true);
-        assert.match(String((response.payload as { error?: string }).error || ''), /tracker-backed native architect and critic lanes/i);
+        assert.match(String((response.payload as { error?: string }).error || ''), /tracker-backed native architect and critic lanes|architect-before-critic/i);
         const state = JSON.parse(
           await readFile(join(sessionDir, 'autopilot-state.json'), 'utf-8'),
         ) as Record<string, unknown>;

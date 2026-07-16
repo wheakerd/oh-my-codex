@@ -52,13 +52,19 @@ const OMX_TEAM_PANE_OWNER_OPTION = '@omx_team_pane_owner_id';
 
 export interface TeamSession {
   name: string; // tmux target in "session:window" form
+  tmuxSessionId?: string;
+  tmuxSessionCreated?: string;
   workerCount: number;
   cwd: string;
   workerPaneIds: string[];
+  workerPaneIdsByIndex?: Array<string | null>;
+  workerPanePidsByIndex?: Array<number | null>;
   /** Leader's own pane ID — must never be targeted by worker cleanup routines. */
   leaderPaneId: string;
+  leaderPanePid?: number;
   /** HUD pane spawned below the leader column, or null if creation failed. */
   hudPaneId: string | null;
+  hudPanePid?: number | null;
   /** Registered tmux resize hook name for the HUD pane, or null if unavailable. */
   resizeHookName: string | null;
   /** Registered tmux resize hook target in "<session>:<window>" form, or null. */
@@ -502,6 +508,25 @@ async function capturePaneAsync(target: string): Promise<string> {
   const result = await runTmuxAsync(sharedBuildCapturePaneArgv(target, 80));
   if (!result.ok) return '';
   return result.stdout;
+}
+
+export async function captureWorkerPane(
+  sessionName: string,
+  workerIndex: number,
+  workerPaneId: string,
+  expectedPanePid: number,
+  expectedTeamOwnerId: string,
+  hudPaneId?: string,
+): Promise<string> {
+  if (!/^%[0-9]+$/.test(workerPaneId)
+    || !Number.isSafeInteger(expectedPanePid)
+    || expectedPanePid <= 0
+    || !expectedTeamOwnerId.trim()
+    || workerPaneId === hudPaneId) return '';
+  if (!paneHasOmxTeamOwnerTag(workerPaneId, expectedTeamOwnerId)) return '';
+  const currentPid = getWorkerPanePid(sessionName, workerIndex, workerPaneId);
+  if (currentPid !== expectedPanePid) return '';
+  return await capturePaneAsync(workerPaneId);
 }
 
 async function captureVisiblePaneAsync(target: string): Promise<string> {
@@ -2249,13 +2274,23 @@ export function createTeamSession(
       enableMouseScrolling(sessionName);
     }
 
+    const workerPaneIdsByIndex = workerPaneIds.map((paneId) => paneId || null);
+    const workerPanePidsByIndex = workerPaneIdsByIndex.map((paneId, index) =>
+      paneId ? getWorkerPanePid(teamTarget, index + 1, paneId) : null,
+    );
+    const leaderPanePid = getWorkerPanePid(teamTarget, 0, leaderPaneId) ?? undefined;
+    const hudPanePid = hudPaneId ? getWorkerPanePid(teamTarget, 0, hudPaneId) : null;
     return {
       name: teamTarget,
       workerCount,
       cwd,
       workerPaneIds,
+      workerPaneIdsByIndex,
+      workerPanePidsByIndex,
       leaderPaneId,
+      leaderPanePid,
       hudPaneId,
+      hudPanePid,
       resizeHookName,
       resizeHookTarget,
       teamPaneOwnerId,
@@ -2851,8 +2886,21 @@ export async function sendToWorker(
   text: string,
   workerPaneId?: string,
   workerCli?: TeamWorkerCli,
+  expectedPanePid?: number,
+  expectedTeamOwnerId?: string,
+  hudPaneId?: string,
 ): Promise<void> {
   assertWorkerTriggerText(text);
+  if (workerPaneId?.startsWith('%') && expectedPanePid !== undefined) {
+    if (workerPaneId === hudPaneId
+      || !Number.isSafeInteger(expectedPanePid)
+      || (expectedPanePid ?? 0) <= 0
+      || !expectedTeamOwnerId?.trim()
+      || !paneHasOmxTeamOwnerTag(workerPaneId, expectedTeamOwnerId)
+      || getWorkerPanePid(sessionName, workerIndex, workerPaneId) !== expectedPanePid) {
+      throw new Error(`sendToWorker: pane authorization failed for ${workerPaneId}`);
+    }
+  }
 
   const target = paneTarget(sessionName, workerIndex, workerPaneId);
   const strategy = resolveSendStrategyFromEnv();
