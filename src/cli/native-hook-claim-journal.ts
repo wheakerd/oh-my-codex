@@ -93,7 +93,7 @@ export async function restoreNativeHookClaimNoClobber(
 	} finally {
 		await destinationHandle.close();
 	}
-	await fsyncDirectory(dirname(destinationPath));
+	await fsyncDirectoryAfterRename(dirname(destinationPath));
 	const [currentClaimStat, currentClaimBytes, destinationBytes, destinationStat] = await Promise.all([
 		lstat(claimPath),
 		readFile(claimPath),
@@ -110,7 +110,7 @@ export async function restoreNativeHookClaimNoClobber(
 		throw new Error(`Native hook claim changed during restore: ${claimPath}.`);
 	}
 	await rm(claimPath);
-	await fsyncDirectory(dirname(claimPath));
+	await fsyncDirectoryAfterRename(dirname(claimPath));
 }
 
 async function readRegularBytes(path: string): Promise<Buffer | null> {
@@ -152,7 +152,7 @@ export async function persistNativeHookClaimJournal(
 	if (directoryStat.isSymbolicLink() || !directoryStat.isDirectory()) {
 		throw new Error(`Native hook claim journal directory is unsafe: ${directory}`);
 	}
-	if (directoryCreated) await fsyncDirectory(dirname(directory));
+	if (directoryCreated) await fsyncDirectoryAfterRename(dirname(directory));
 	const path = journalPath(root);
 	const payload: ClaimJournalEntry = {
 		version: 1,
@@ -172,14 +172,14 @@ export async function persistNativeHookClaimJournal(
 		throw error;
 	}
 	await handle.close();
-	await fsyncDirectory(directory);
+	await fsyncDirectoryAfterRename(directory);
 }
 
 export async function clearNativeHookClaimJournal(root: string): Promise<void> {
 	const path = journalPath(root);
 	try {
 		await rm(path);
-		await fsyncDirectory(dirname(path));
+		await fsyncDirectoryAfterRename(dirname(path));
 	} catch (error) {
 		if (!isMissing(error)) throw error;
 	}
@@ -228,7 +228,7 @@ export async function recoverNativeHookClaimJournal(root: string): Promise<boole
 				throw new Error("Native hook claim journal cannot finalize a linked restore with changed bytes.");
 			}
 			await rm(parsed.claimPath);
-			await fsyncDirectory(dirname(parsed.claimPath));
+			await fsyncDirectoryAfterRename(dirname(parsed.claimPath));
 			await clearNativeHookClaimJournal(root);
 			return true;
 		}
@@ -264,7 +264,7 @@ export async function recoverNativeHookClaimJournal(root: string): Promise<boole
 	}
 	if (parsed.afterHash !== null && digest(canonical) === parsed.afterHash) {
 		await rm(parsed.claimPath);
-		await fsyncDirectory(dirname(parsed.claimPath));
+		await fsyncDirectoryAfterRename(dirname(parsed.claimPath));
 		await clearNativeHookClaimJournal(root);
 		return true;
 	}

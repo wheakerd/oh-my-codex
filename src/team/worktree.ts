@@ -479,12 +479,35 @@ export function ensureWorktree(
   } satisfies EnsureWorktreeResult;
 
   if (plan.branchName) {
-    upsertCurrentTaskBaseline(plan.repoRoot, {
-      branch_name: plan.branchName,
-      worktree_path: ensured.worktreePath,
-      base_ref: plan.baseRef,
-      status: 'active',
-    });
+    try {
+      upsertCurrentTaskBaseline(plan.repoRoot, {
+        branch_name: plan.branchName,
+        worktree_path: ensured.worktreePath,
+        base_ref: plan.baseRef,
+        status: 'active',
+      });
+    } catch (error) {
+      const cleanupErrors: string[] = [];
+      const removeResult = spawnSync('git', ['worktree', 'remove', '--force', ensured.worktreePath], {
+        cwd: plan.repoRoot,
+        encoding: 'utf-8',
+        windowsHide: true,
+      });
+      if (removeResult.status !== 0) cleanupErrors.push(`remove:${(removeResult.stderr || '').trim() || removeResult.status}`);
+      if (ensured.createdBranch && ensured.branchName) {
+        const branchResult = spawnSync('git', ['branch', '-D', ensured.branchName], {
+          cwd: plan.repoRoot,
+          encoding: 'utf-8',
+          windowsHide: true,
+        });
+        if (branchResult.status !== 0 && branchExists(plan.repoRoot, ensured.branchName)) {
+          cleanupErrors.push(`branch:${(branchResult.stderr || '').trim() || branchResult.status}`);
+        }
+      }
+      const detail = error instanceof Error ? error.message : String(error);
+      if (cleanupErrors.length > 0) throw new Error(`worktree_post_add_bookkeeping_failed:${detail}; rollback_failed:${cleanupErrors.join('|')}`);
+      throw new Error(`worktree_post_add_bookkeeping_failed:${detail}`);
+    }
   }
 
   return ensured;
