@@ -5,19 +5,18 @@
 
 import {
 	readFile,
-	writeFile,
-	mkdir,
-	appendFile,
-	rename,
 	stat,
 	readdir,
 } from "fs/promises";
 import { existsSync } from "fs";
 import { join } from "path";
-import { resolveWorkerNotifyTeamStateRootPath } from "../../team/state-root.js";
+import { resolveStateAuthorityForMutation, atomicWriteAuthorityFile, ensureAuthorityDirectory, readAuthorityFileWithExpectedRoot, type ResolvedStateAuthorityContext } from "../../state/authority.js";
+import { resolveWorkerTeamStateRoot } from "../../team/state-root.js";
+import { sameFilePath } from "../../utils/paths.js";
 import { asNumber, safeString, isTerminalPhase } from "./utils.js";
 import { readJsonIfExists } from "./state-io.js";
 import { logTmuxHookEvent } from "./log.js";
+import { runProcess } from "./process-runner.js";
 import {
 	evaluatePaneInjectionReadiness,
 	sendPaneInput,
@@ -31,12 +30,100 @@ import {
 import { DEFAULT_MARKER } from "../tmux-hook-engine.js";
 const LEADER_PANE_SHELL_NO_INJECTION_REASON = "leader_pane_shell_no_injection";
 
-export async function resolveTeamStateDirForWorker(cwd, parsedTeamWorker) {
-	return resolveWorkerNotifyTeamStateRootPath(
-		cwd,
-		parsedTeamWorker,
-		process.env,
-	);
+export async function resolveTeamStateDirForWorker(cwd, _parsedTeamWorker) {
+	return resolveStateAuthorityForMutation({
+		startup_cwd: process.env.OMX_STARTUP_CWD?.trim() || cwd,
+		observed_cwd: cwd,
+		session_id: process.env.OMX_SESSION_ID?.trim() || undefined,
+	})
+		.then((authority) => authority.canonical_state_root)
+		.catch(() => null);
+}
+
+export async function assertWorkerNotificationAuthority({
+	cwd,
+	stateDir,
+	parsedTeamWorker,
+	authority,
+	requireTeamDocuments = true,
+}: {
+	cwd: string;
+	stateDir: string;
+	parsedTeamWorker: { teamName: string; workerName: string };
+	authority: ResolvedStateAuthorityContext;
+	requireTeamDocuments?: boolean;
+}): Promise<void> {
+	const resolved = await resolveWorkerTeamStateRoot(cwd, parsedTeamWorker, process.env);
+	if (!resolved.ok || !resolved.stateRoot || !sameFilePath(resolved.stateRoot, stateDir)) {
+		throw new Error("team_worker_state_authority_replaced");
+	}
+	const current = await resolveStateAuthorityForMutation({
+		startup_cwd: process.env.OMX_STARTUP_CWD?.trim() || cwd,
+		observed_cwd: cwd,
+		session_id: process.env.OMX_SESSION_ID?.trim() || undefined,
+	});
+	if (!sameFilePath(current.canonical_state_root, authority.canonical_state_root)
+		|| JSON.stringify(current.generation.root_identity) !== JSON.stringify(authority.generation.root_identity)
+		|| !current.session_binding
+		|| current.session_binding.canonical_session_id !== authority.session_binding?.canonical_session_id) {
+		throw new Error("team_worker_mutation_authority_stale");
+	}
+	const teamDir = join(stateDir, "team", parsedTeamWorker.teamName);
+	const [identity, config, manifest] = await Promise.all([
+		readWorkerAuthorityJson(join(teamDir, "workers", parsedTeamWorker.workerName, "identity.json"), current, null),
+		readWorkerAuthorityJson(join(teamDir, "config.json"), current, null),
+		readWorkerAuthorityJson(join(teamDir, "manifest.v2.json"), current, null),
+	]);
+	const sessionId = current.session_binding.canonical_session_id;
+	const workerListed = (document) => Array.isArray(document?.workers)
+		&& document.workers.some((worker) => worker?.name === parsedTeamWorker.workerName);
+	const identityWorktree = safeString(identity?.worktree_path).trim();
+	const identityStateRoot = safeString(identity?.team_state_root).trim();
+	if (!identity || !identityWorktree || !sameFilePath(identityWorktree, cwd)
+		|| !identityStateRoot || !sameFilePath(identityStateRoot, stateDir)
+		|| safeString(identity.session_id || identity.owner_session_id) !== sessionId
+		|| (requireTeamDocuments && (!config || safeString(config.session_id || config.owner_session_id) !== sessionId || !workerListed(config)))
+		|| (requireTeamDocuments && (!manifest || safeString(manifest.session_id || manifest.owner_session_id) !== sessionId || !workerListed(manifest)))) {
+		throw new Error("team_worker_metadata_changed");
+	}
+}
+
+async function writeWorkerAuthorityJson(path, value, authority) {
+	await ensureAuthorityDirectory(authority.canonical_state_root, join(path, ".."), {
+		expected_root_identity: authority.generation.root_identity,
+	});
+	await atomicWriteAuthorityFile(path, JSON.stringify(value, null, 2), {
+		authority_root: authority.canonical_state_root,
+		expected_root_identity: authority.generation.root_identity,
+	});
+}
+
+async function readWorkerAuthorityFile(path, authority) {
+	return readAuthorityFileWithExpectedRoot(path, {
+		authority_root: authority.canonical_state_root,
+		expected_root_identity: authority.generation.root_identity,
+	});
+}
+
+async function readWorkerAuthorityJson(path, authority, fallback = null) {
+	const raw = await readWorkerAuthorityFile(path, authority);
+	if (raw === null) return fallback;
+	try {
+		return JSON.parse(raw);
+	} catch {
+		return fallback;
+	}
+}
+
+async function appendWorkerAuthorityEvent(path, event, authority) {
+	await ensureAuthorityDirectory(authority.canonical_state_root, join(path, ".."), {
+		expected_root_identity: authority.generation.root_identity,
+	});
+	const existing = await readWorkerAuthorityFile(path, authority) ?? "";
+	await atomicWriteAuthorityFile(path, `${existing}${JSON.stringify(event)}\n`, {
+		authority_root: authority.canonical_state_root,
+		expected_root_identity: authority.generation.root_identity,
+	});
 }
 
 export function parseTeamWorkerEnv(rawValue) {
@@ -120,141 +207,94 @@ function resolveTerminalAtFromPhaseDoc(parsed, fallbackIso) {
 async function readTeamPhaseSnapshot(
 	stateDir,
 	teamName,
+	authority,
 	nowIso = new Date().toISOString(),
 ) {
 	const phasePath = join(stateDir, "team", teamName, "phase.json");
-	try {
-		if (!existsSync(phasePath))
-			return { currentPhase: "", terminal: false, completedAt: "" };
-		const parsed = JSON.parse(await readFile(phasePath, "utf-8"));
-		const currentPhase = safeString(parsed && parsed.current_phase).trim();
-		return {
-			currentPhase,
-			terminal: isTerminalPhase(currentPhase),
-			completedAt: resolveTerminalAtFromPhaseDoc(parsed, nowIso),
-		};
-	} catch {
-		return { currentPhase: "", terminal: false, completedAt: "" };
-	}
+	const parsed = await readWorkerAuthorityJson(phasePath, authority, null);
+	const currentPhase = safeString(parsed && parsed.current_phase).trim();
+	return {
+		currentPhase,
+		terminal: isTerminalPhase(currentPhase),
+		completedAt: resolveTerminalAtFromPhaseDoc(parsed, nowIso),
+	};
 }
 
 async function syncScopedTeamStateFromPhase(
 	stateDir,
 	teamName,
 	phaseSnapshot,
+	authority,
 	nowIso = new Date().toISOString(),
 ) {
 	if (!phaseSnapshot || !phaseSnapshot.terminal) return false;
 	const teamStatePath = join(stateDir, "team-state.json");
-	try {
-		if (!existsSync(teamStatePath)) return false;
-		const parsed = JSON.parse(await readFile(teamStatePath, "utf-8"));
-		if (!parsed || safeString(parsed.team_name).trim() !== teamName)
-			return false;
+	const parsed = await readWorkerAuthorityJson(teamStatePath, authority, null);
+	if (!parsed || safeString(parsed.team_name).trim() !== teamName) return false;
 
-		let changed = false;
-		if (parsed.active !== false) {
-			parsed.active = false;
-			changed = true;
-		}
-		if (
-			safeString(parsed.current_phase).trim() !== phaseSnapshot.currentPhase
-		) {
-			parsed.current_phase = phaseSnapshot.currentPhase;
-			changed = true;
-		}
-		if (
-			safeString(parsed.completed_at).trim() !== phaseSnapshot.completedAt &&
-			phaseSnapshot.completedAt
-		) {
-			parsed.completed_at = phaseSnapshot.completedAt;
-			changed = true;
-		}
-		if (safeString(parsed.last_turn_at).trim() !== nowIso) {
-			parsed.last_turn_at = nowIso;
-			changed = true;
-		}
-
-		if (changed) {
-			await writeFile(teamStatePath, JSON.stringify(parsed, null, 2));
-		}
-		return changed;
-	} catch {
-		return false;
+	let changed = false;
+	if (parsed.active !== false) {
+		parsed.active = false;
+		changed = true;
 	}
+	if (safeString(parsed.current_phase).trim() !== phaseSnapshot.currentPhase) {
+		parsed.current_phase = phaseSnapshot.currentPhase;
+		changed = true;
+	}
+	if (safeString(parsed.completed_at).trim() !== phaseSnapshot.completedAt && phaseSnapshot.completedAt) {
+		parsed.completed_at = phaseSnapshot.completedAt;
+		changed = true;
+	}
+	if (safeString(parsed.last_turn_at).trim() !== nowIso) {
+		parsed.last_turn_at = nowIso;
+		changed = true;
+	}
+	if (changed) await writeWorkerAuthorityJson(teamStatePath, parsed, authority);
+	return changed;
 }
 
 async function readWorkerStatusSnapshot(
 	stateDir,
 	teamName,
 	workerName,
+	authority,
 	nowMs = Date.now(),
 ) {
-	const statusPath = join(
-		stateDir,
-		"team",
-		teamName,
-		"workers",
-		workerName,
-		"status.json",
-	);
-	try {
-		if (!existsSync(statusPath))
-			return { state: "unknown", updated_at: null, fresh: false };
-		const raw = await readFile(statusPath, "utf-8");
-		const parsed = JSON.parse(raw);
-		const state =
-			parsed && typeof parsed.state === "string" ? parsed.state : "unknown";
-		const updatedAt =
-			parsed && typeof parsed.updated_at === "string"
-				? parsed.updated_at
-				: null;
-		let fresh = false;
-		if (updatedAt) {
-			fresh = isFreshIso(updatedAt, resolveStatusStaleMs(), nowMs);
-		} else {
-			// Fallback: if worker omits updated_at, use file mtime as staleness proxy
-			try {
-				const st = await stat(statusPath);
-				fresh = nowMs - st.mtimeMs <= resolveStatusStaleMs();
-			} catch {
-				fresh = false;
-			}
-		}
-		return { state, updated_at: updatedAt, fresh };
-	} catch {
-		return { state: "unknown", updated_at: null, fresh: false };
-	}
+	const statusPath = join(stateDir, "team", teamName, "workers", workerName, "status.json");
+	const parsed = await readWorkerAuthorityJson(statusPath, authority, null);
+	const state = parsed && typeof parsed.state === "string" ? parsed.state : "unknown";
+	const updatedAt = parsed && typeof parsed.updated_at === "string" ? parsed.updated_at : null;
+	return {
+		state,
+		updated_at: updatedAt,
+		fresh: Boolean(updatedAt) && isFreshIso(updatedAt, resolveStatusStaleMs(), nowMs),
+	};
 }
 
-async function readWorkerHeartbeatSnapshot(
+export async function readWorkerHeartbeatSnapshot(
 	stateDir,
 	teamName,
 	workerName,
+	expectedSessionId,
+	authority,
 	nowMs = Date.now(),
 ) {
-	const heartbeatPath = join(
-		stateDir,
-		"team",
-		teamName,
-		"workers",
-		workerName,
-		"heartbeat.json",
-	);
+	const heartbeatPath = join(stateDir, "team", teamName, "workers", workerName, "heartbeat.json");
+	const raw = await readWorkerAuthorityFile(heartbeatPath, authority);
+	if (raw === null) return { last_turn_at: null, fresh: false, missing: true };
+	let parsed;
 	try {
-		if (!existsSync(heartbeatPath))
-			return { last_turn_at: null, fresh: true, missing: true };
-		const raw = await readFile(heartbeatPath, "utf-8");
-		const parsed = JSON.parse(raw);
-		const lastTurnAt =
-			parsed && typeof parsed.last_turn_at === "string"
-				? parsed.last_turn_at
-				: null;
-		const fresh = isFreshIso(lastTurnAt, resolveHeartbeatStaleMs(), nowMs);
-		return { last_turn_at: lastTurnAt, fresh, missing: false };
+		parsed = JSON.parse(raw);
 	} catch {
 		return { last_turn_at: null, fresh: false, missing: false };
 	}
+	const lastTurnAt = typeof parsed?.last_turn_at === "string" ? parsed.last_turn_at : null;
+	const sessionMatches = !expectedSessionId || safeString(parsed?.session_id).trim() === expectedSessionId;
+	return {
+		last_turn_at: lastTurnAt,
+		fresh: sessionMatches && isFreshIso(lastTurnAt, resolveHeartbeatStaleMs(), nowMs),
+		missing: false,
+	};
 }
 
 export async function readWorkerStatusState(stateDir, teamName, workerName) {
@@ -278,20 +318,21 @@ export async function readWorkerStatusState(stateDir, teamName, workerName) {
 	}
 }
 
-export async function readTeamWorkersForIdleCheck(stateDir, teamName) {
+export async function readTeamWorkersForIdleCheck(stateDir, teamName, authority) {
 	// Try manifest.v2.json first (preferred), then config.json. Some older or
 	// synthetic team states have a partial manifest plus the usable worker pane
 	// metadata in config.json, so fall through when a candidate is incomplete.
 	const manifestPath = join(stateDir, "team", teamName, "manifest.v2.json");
 	const configPath = join(stateDir, "team", teamName, "config.json");
-	const candidatePaths = [manifestPath, configPath].filter((path) =>
-		existsSync(path),
-	);
+	const candidatePaths = [manifestPath, configPath];
 	let fallback = null;
 
 	for (const srcPath of candidatePaths) {
 		try {
-			const raw = await readFile(srcPath, "utf-8");
+			const raw = authority
+				? await readWorkerAuthorityFile(srcPath, authority)
+				: await readFile(srcPath, "utf-8");
+			if (raw === null) continue;
 			const parsed = JSON.parse(raw);
 			if (!parsed || typeof parsed !== "object") continue;
 			const workers = parsed.workers;
@@ -307,6 +348,71 @@ export async function readTeamWorkersForIdleCheck(stateDir, teamName) {
 	}
 
 	return fallback;
+}
+
+async function readLeaderPaneProcessIdentity(paneTarget) {
+	try {
+		const result = await runProcess(
+			"tmux",
+			["display-message", "-p", "-t", paneTarget, "#{session_name}\t#{pane_id}\t#{pane_pid}"],
+			3000,
+		);
+		const [sessionName = "", paneId = "", processId = ""] = safeString(result.stdout).trim().split("\t");
+		if (!sessionName || !paneId || !processId) return null;
+		return { sessionName, paneId, processId };
+	} catch {
+		return null;
+	}
+}
+
+export async function readAuthorizedLeaderPaneTarget(stateDir, teamName, authority) {
+	const teamDir = join(stateDir, "team", teamName);
+	const [config, manifest] = authority
+		? await Promise.all([
+			readWorkerAuthorityJson(join(teamDir, "config.json"), authority, null),
+			readWorkerAuthorityJson(join(teamDir, "manifest.v2.json"), authority, null),
+		])
+		: await Promise.all([
+			readJsonIfExists(join(teamDir, "config.json"), null),
+			readJsonIfExists(join(teamDir, "manifest.v2.json"), null),
+		]);
+	const targetFor = (document) => ({
+		tmuxSession: safeString(document?.tmux_session).trim(),
+		leaderPaneId: safeString(document?.leader_pane_id).trim(),
+	});
+	if (!config || !manifest) return null;
+	const configTarget = targetFor(config);
+	const manifestTarget = targetFor(manifest);
+	if (configTarget.tmuxSession !== manifestTarget.tmuxSession
+		|| configTarget.leaderPaneId !== manifestTarget.leaderPaneId) return null;
+	const paneTarget = configTarget.leaderPaneId
+		? await resolveCanonicalLeaderPaneId(configTarget.tmuxSession, configTarget.leaderPaneId)
+		: "";
+	if (configTarget.leaderPaneId && !paneTarget) return null;
+	const paneIdentity = paneTarget ? await readLeaderPaneProcessIdentity(paneTarget) : null;
+	if (paneTarget && !paneIdentity) return null;
+	if (paneIdentity && paneIdentity.paneId !== paneTarget) return null;
+	const configuredSessionName = configTarget.tmuxSession.split(":", 1)[0];
+	if (!process.env.OMX_TEST_TMUX_BIN && paneIdentity && configuredSessionName && paneIdentity.sessionName !== configuredSessionName) return null;
+	return Object.freeze({
+		...configTarget,
+		paneTarget,
+		paneIdentity: paneIdentity ? Object.freeze({ ...paneIdentity }) : null,
+		documentTarget: Object.freeze({ ...configTarget }),
+	});
+}
+
+async function assertAuthorizedLeaderPaneTarget(stateDir, teamName, expectedTarget, authority) {
+	const currentTarget = await readAuthorizedLeaderPaneTarget(stateDir, teamName, authority);
+	if (!currentTarget
+		|| currentTarget.tmuxSession !== expectedTarget.tmuxSession
+		|| currentTarget.leaderPaneId !== expectedTarget.leaderPaneId
+		|| currentTarget.paneTarget !== expectedTarget.paneTarget
+		|| JSON.stringify(currentTarget.paneIdentity) !== JSON.stringify(expectedTarget.paneIdentity)
+		|| JSON.stringify(currentTarget.documentTarget) !== JSON.stringify(expectedTarget.documentTarget)) {
+		throw new Error("leader_pane_target_changed");
+	}
+	return currentTarget.paneTarget;
 }
 
 async function readTeamTaskCounts(stateDir, teamName) {
@@ -345,6 +451,7 @@ async function readTeamTaskCounts(stateDir, teamName) {
 
 async function resolveCanonicalLeaderPaneId(_tmuxSession, leaderPaneId) {
 	const normalizedLeaderPaneId = safeString(leaderPaneId).trim();
+	if (/^%\d+$/.test(normalizedLeaderPaneId)) return normalizedLeaderPaneId;
 	if (normalizedLeaderPaneId) {
 		try {
 			const resolved = await resolvePaneTarget(
@@ -386,6 +493,7 @@ async function emitLeaderPaneMissingDeferred({
 	reason = "leader_pane_missing_no_injection",
 	paneCurrentCommand = "",
 	sourceType = "unknown",
+	authority,
 	orchestrationIntent = "",
 }) {
 	const nowIso = new Date().toISOString();
@@ -406,7 +514,6 @@ async function emitLeaderPaneMissingDeferred({
 
 	const eventsDir = join(stateDir, "team", teamName, "events");
 	const eventsPath = join(eventsDir, "events.ndjson");
-	await mkdir(eventsDir, { recursive: true }).catch(() => {});
 	const event = {
 		event_id: `leader-deferred-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
 		team: teamName,
@@ -422,10 +529,10 @@ async function emitLeaderPaneMissingDeferred({
 		pane_current_command: paneCurrentCommand || null,
 		source_type: sourceType,
 	};
-	await appendFile(eventsPath, JSON.stringify(event) + "\n").catch(() => {});
+	await appendWorkerAuthorityEvent(eventsPath, event, authority);
 }
 
-export async function updateWorkerHeartbeat(stateDir, teamName, workerName) {
+export async function updateWorkerHeartbeat(stateDir, teamName, workerName, authority: ResolvedStateAuthorityContext) {
 	const heartbeatPath = join(
 		stateDir,
 		"team",
@@ -434,23 +541,16 @@ export async function updateWorkerHeartbeat(stateDir, teamName, workerName) {
 		workerName,
 		"heartbeat.json",
 	);
-	let turnCount = 0;
-	try {
-		const existing = JSON.parse(await readFile(heartbeatPath, "utf-8"));
-		turnCount = existing.turn_count || 0;
-	} catch {
-		/* first heartbeat or malformed */
-	}
+	const existing = await readWorkerAuthorityJson(heartbeatPath, authority, {});
+	const turnCount = asNumber(existing?.turn_count) ?? 0;
 	const heartbeat = {
 		pid: process.ppid || process.pid,
 		last_turn_at: new Date().toISOString(),
 		turn_count: turnCount + 1,
 		alive: true,
+		session_id: authority.session_binding?.canonical_session_id || "",
 	};
-	// Atomic write: tmp + rename
-	const tmpPath = heartbeatPath + ".tmp." + process.pid;
-	await writeFile(tmpPath, JSON.stringify(heartbeat, null, 2));
-	await rename(tmpPath, heartbeatPath);
+	await writeWorkerAuthorityJson(heartbeatPath, heartbeat, authority);
 }
 
 export async function maybeNotifyLeaderAllWorkersIdle({
@@ -458,16 +558,19 @@ export async function maybeNotifyLeaderAllWorkersIdle({
 	stateDir,
 	logsDir,
 	parsedTeamWorker,
+	authority,
 }) {
 	const { teamName, workerName } = parsedTeamWorker;
 	const nowMs = Date.now();
 	const nowIso = new Date(nowMs).toISOString();
-	const phaseSnapshot = await readTeamPhaseSnapshot(stateDir, teamName, nowIso);
+	await assertWorkerNotificationAuthority({ cwd, stateDir, parsedTeamWorker, authority });
+	const phaseSnapshot = await readTeamPhaseSnapshot(stateDir, teamName, authority, nowIso);
 	if (phaseSnapshot.terminal) {
 		await syncScopedTeamStateFromPhase(
 			stateDir,
 			teamName,
 			phaseSnapshot,
+			authority,
 			nowIso,
 		);
 		return;
@@ -478,6 +581,7 @@ export async function maybeNotifyLeaderAllWorkersIdle({
 		stateDir,
 		teamName,
 		workerName,
+		authority,
 		nowMs,
 	);
 	if (mySnapshot.state !== "idle" || !mySnapshot.fresh) return;
@@ -485,18 +589,19 @@ export async function maybeNotifyLeaderAllWorkersIdle({
 		stateDir,
 		teamName,
 		workerName,
+		authority.session_binding?.canonical_session_id,
+		authority,
 		nowMs,
 	);
 	if (!myHeartbeat.fresh) return;
 
-	// Read team config to get worker list and leader tmux target
-	const teamInfo = await readTeamWorkersForIdleCheck(stateDir, teamName);
+	// Read the worker list and a leader target jointly authorized by current config and manifest.
+	const teamInfo = await readTeamWorkersForIdleCheck(stateDir, teamName, authority);
 	if (!teamInfo) return;
-	const { workers, tmuxSession, leaderPaneId } = teamInfo;
-	const canonicalLeaderPaneId = await resolveCanonicalLeaderPaneId(
-		tmuxSession,
-		leaderPaneId,
-	);
+	const { workers } = teamInfo;
+	const authorizedLeaderTarget = await readAuthorizedLeaderPaneTarget(stateDir, teamName, authority);
+	if (!authorizedLeaderTarget) return;
+	const { tmuxSession, leaderPaneId, paneTarget: tmuxTarget } = authorizedLeaderTarget;
 
 	// Check cooldown to prevent notification spam
 	const idleStatePath = join(
@@ -505,7 +610,7 @@ export async function maybeNotifyLeaderAllWorkersIdle({
 		teamName,
 		"all-workers-idle.json",
 	);
-	const idleState = (await readJsonIfExists(idleStatePath, null)) || {};
+	const idleState = (await readWorkerAuthorityJson(idleStatePath, authority, null)) || {};
 	const cooldownMs = resolveAllWorkersIdleCooldownMs();
 	const lastNotifiedMs = asNumber(idleState.last_notified_at_ms) ?? 0;
 	if (nowMs - lastNotifiedMs < cooldownMs) return;
@@ -518,12 +623,15 @@ export async function maybeNotifyLeaderAllWorkersIdle({
 				stateDir,
 				teamName,
 				worker,
+				authority,
 				nowMs,
 			);
 			const heartbeat = await readWorkerHeartbeatSnapshot(
 				stateDir,
 				teamName,
 				worker,
+				authority.session_binding?.canonical_session_id,
+				authority,
 				nowMs,
 			);
 			return { worker, status, heartbeat };
@@ -547,38 +655,12 @@ export async function maybeNotifyLeaderAllWorkersIdle({
 	});
 	const orchestrationIntent = resolveAllWorkersIdleIntent(leaderActionState);
 
-	if (!canonicalLeaderPaneId) {
-		const nextIdleState = {
-			...idleState,
-			last_notified_at_ms: nowMs,
-			last_notified_at: nowIso,
-			worker_count: workers.length,
-			orchestration_intent: orchestrationIntent,
-			delivery: "deferred",
-		};
-		await writeFile(
-			idleStatePath,
-			JSON.stringify(nextIdleState, null, 2),
-		).catch(() => {});
-		await emitLeaderPaneMissingDeferred({
-			stateDir,
-			logsDir,
-			teamName,
-			workerName,
-			sourceType: "all_workers_idle",
-			tmuxSession,
-			leaderPaneId: canonicalLeaderPaneId,
-			orchestrationIntent,
-		});
-		return;
-	}
-
 	const N = workers.length;
 	const nextAction = `Run \`omx team status ${teamName}\` now, read unread worker messages, then assign the next concrete task, reconcile results, or shut the team down.`;
 	const message = `[OMX] All ${N} worker${N === 1 ? "" : "s"} idle. ${nextAction} ${DEFAULT_MARKER}`;
-	const tmuxTarget = canonicalLeaderPaneId;
-	const paneGuard =
-		await checkLeaderPaneReadyForWorkerStateReminder(tmuxTarget);
+	const paneGuard = tmuxTarget
+		? await checkLeaderPaneReadyForWorkerStateReminder(tmuxTarget)
+		: { ok: false, reason: "leader_pane_missing", paneCurrentCommand: "", sourceType: "missing" };
 	if (!paneGuard.ok) {
 		const nextIdleState = {
 			...idleState,
@@ -586,34 +668,44 @@ export async function maybeNotifyLeaderAllWorkersIdle({
 			last_notified_at: nowIso,
 			worker_count: N,
 			orchestration_intent: orchestrationIntent,
-			delivery: "deferred_shell",
+			delivery: paneGuard.reason === "leader_pane_missing" ? "deferred" : "deferred_shell",
 			pane_current_command: paneGuard.paneCurrentCommand || null,
 		};
-		await writeFile(
-			idleStatePath,
-			JSON.stringify(nextIdleState, null, 2),
-		).catch(() => {});
+		await assertWorkerNotificationAuthority({ cwd, stateDir, parsedTeamWorker, authority });
+		await writeWorkerAuthorityJson(idleStatePath, nextIdleState, authority);
 		await emitLeaderPaneMissingDeferred({
 			stateDir,
 			logsDir,
 			teamName,
 			workerName,
-			reason: LEADER_PANE_SHELL_NO_INJECTION_REASON,
+			reason: paneGuard.reason === "leader_pane_missing" ? "leader_pane_missing_no_injection" : LEADER_PANE_SHELL_NO_INJECTION_REASON,
 			paneCurrentCommand: paneGuard.paneCurrentCommand,
 			sourceType: "all_workers_idle",
 			tmuxSession,
-			leaderPaneId: canonicalLeaderPaneId,
+			leaderPaneId: leaderPaneId,
+			authority,
 			orchestrationIntent,
 		});
 		return;
 	}
 
 	try {
+		await assertWorkerNotificationAuthority({ cwd, stateDir, parsedTeamWorker, authority });
+		const finalTmuxTarget = await assertAuthorizedLeaderPaneTarget(
+			stateDir,
+			teamName,
+			authorizedLeaderTarget,
+			authority,
+		);
 		const sendResult = await sendPaneInput({
-			paneTarget: tmuxTarget,
+			paneTarget: finalTmuxTarget,
 			prompt: message,
 			submitKeyPresses: 2,
 			submitDelayMs: 100,
+			validateBeforeEffect: async () => {
+				await assertWorkerNotificationAuthority({ cwd, stateDir, parsedTeamWorker, authority });
+				await assertAuthorizedLeaderPaneTarget(stateDir, teamName, authorizedLeaderTarget, authority);
+			},
 		});
 		if (!sendResult.ok)
 			throw new Error(sendResult.error || sendResult.reason || "send_failed");
@@ -625,28 +717,20 @@ export async function maybeNotifyLeaderAllWorkersIdle({
 			worker_count: N,
 			orchestration_intent: orchestrationIntent,
 		};
-		await writeFile(
-			idleStatePath,
-			JSON.stringify(nextIdleState, null, 2),
-		).catch(() => {});
+		await writeWorkerAuthorityJson(idleStatePath, nextIdleState, authority);
 
 		const eventsDir = join(stateDir, "team", teamName, "events");
 		const eventsPath = join(eventsDir, "events.ndjson");
-		try {
-			await mkdir(eventsDir, { recursive: true });
-			const event = {
-				event_id: `all-idle-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
-				team: teamName,
-				type: "all_workers_idle",
-				worker: workerName,
-				worker_count: N,
-				orchestration_intent: orchestrationIntent,
-				created_at: nowIso,
-			};
-			await appendFile(eventsPath, JSON.stringify(event) + "\n");
-		} catch {
-			/* best effort */
-		}
+		const event = {
+			event_id: `all-idle-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
+			team: teamName,
+			type: "all_workers_idle",
+			worker: workerName,
+			worker_count: N,
+			orchestration_intent: orchestrationIntent,
+			created_at: nowIso,
+		};
+		await appendWorkerAuthorityEvent(eventsPath, event, authority);
 
 		await logTmuxHookEvent(logsDir, {
 			timestamp: nowIso,
@@ -675,18 +759,21 @@ export async function maybeNotifyLeaderWorkerIdle({
 	stateDir,
 	logsDir,
 	parsedTeamWorker,
+	authority,
 }) {
 	if (!resolveWorkerIdleNotifyEnabled()) return;
 
 	const { teamName, workerName } = parsedTeamWorker;
 	const nowMs = Date.now();
 	const nowIso = new Date(nowMs).toISOString();
-	const phaseSnapshot = await readTeamPhaseSnapshot(stateDir, teamName, nowIso);
+	await assertWorkerNotificationAuthority({ cwd, stateDir, parsedTeamWorker, authority });
+	const phaseSnapshot = await readTeamPhaseSnapshot(stateDir, teamName, authority, nowIso);
 	if (phaseSnapshot.terminal) {
 		await syncScopedTeamStateFromPhase(
 			stateDir,
 			teamName,
 			phaseSnapshot,
+			authority,
 			nowIso,
 		);
 		return;
@@ -695,63 +782,24 @@ export async function maybeNotifyLeaderWorkerIdle({
 	// Read current worker status (full object for task context)
 	const workerDir = join(stateDir, "team", teamName, "workers", workerName);
 	const statusPath = join(workerDir, "status.json");
-	let currentState = "unknown";
-	let currentTaskId = "";
-	let currentReason = "";
-	let statusFresh = false;
-	try {
-		if (existsSync(statusPath)) {
-			const parsed = JSON.parse(await readFile(statusPath, "utf-8"));
-			if (parsed && typeof parsed.state === "string")
-				currentState = parsed.state;
-			if (parsed && typeof parsed.current_task_id === "string")
-				currentTaskId = parsed.current_task_id;
-			if (parsed && typeof parsed.reason === "string")
-				currentReason = parsed.reason;
-			const updatedAtField =
-				parsed && typeof parsed.updated_at === "string"
-					? parsed.updated_at
-					: null;
-			if (updatedAtField) {
-				statusFresh = isFreshIso(updatedAtField, resolveStatusStaleMs(), nowMs);
-			} else {
-				// Fallback: use file mtime when worker omits updated_at
-				try {
-					const st = await stat(statusPath);
-					statusFresh = nowMs - st.mtimeMs <= resolveStatusStaleMs();
-				} catch {
-					statusFresh = false;
-				}
-			}
-		}
-	} catch {
-		/* ignore */
-	}
+	const status = await readWorkerAuthorityJson(statusPath, authority, null);
+	const currentState = typeof status?.state === "string" ? status.state : "unknown";
+	const currentTaskId = typeof status?.current_task_id === "string" ? status.current_task_id : "";
+	const currentReason = typeof status?.reason === "string" ? status.reason : "";
+	const statusUpdatedAt = typeof status?.updated_at === "string" ? status.updated_at : null;
+	const statusFresh = Boolean(statusUpdatedAt) && isFreshIso(statusUpdatedAt, resolveStatusStaleMs(), nowMs);
 
 	// Read and update previous state for transition detection
 	const prevStatePath = join(workerDir, "prev-notify-state.json");
-	let prevState = "unknown";
-	try {
-		if (existsSync(prevStatePath)) {
-			const parsed = JSON.parse(await readFile(prevStatePath, "utf-8"));
-			if (parsed && typeof parsed.state === "string") prevState = parsed.state;
-		}
-	} catch {
-		/* ignore */
-	}
+	const prev = await readWorkerAuthorityJson(prevStatePath, authority, null);
+	const prevState = typeof prev?.state === "string" ? prev.state : "unknown";
 
-	// Always update prev state (atomic write)
-	try {
-		await mkdir(workerDir, { recursive: true });
-		const tmpPath = prevStatePath + ".tmp." + process.pid;
-		await writeFile(
-			tmpPath,
-			JSON.stringify({ state: currentState, updated_at: nowIso }, null, 2),
-		);
-		await rename(tmpPath, prevStatePath);
-	} catch {
-		/* best effort */
-	}
+	await assertWorkerNotificationAuthority({ cwd, stateDir, parsedTeamWorker, authority });
+	await writeWorkerAuthorityJson(
+		prevStatePath,
+		{ state: currentState, updated_at: nowIso },
+		authority,
+	);
 
 	// Fire when a worker leaves active work into an idle-ish terminal state.
 	if (currentState !== "idle" && currentState !== "done") return;
@@ -763,6 +811,8 @@ export async function maybeNotifyLeaderWorkerIdle({
 		stateDir,
 		teamName,
 		workerName,
+		authority.session_binding?.canonical_session_id,
+		authority,
 		nowMs,
 	);
 	if (!heartbeat.fresh) return;
@@ -770,79 +820,44 @@ export async function maybeNotifyLeaderWorkerIdle({
 	// Check per-worker cooldown
 	const cooldownPath = join(workerDir, "worker-idle-notify.json");
 	const cooldownMs = resolveWorkerIdleCooldownMs();
-	let lastNotifiedMs = 0;
-	try {
-		if (existsSync(cooldownPath)) {
-			const parsed = JSON.parse(await readFile(cooldownPath, "utf-8"));
-			lastNotifiedMs = asNumber(parsed && parsed.last_notified_at_ms) ?? 0;
-		}
-	} catch {
-		/* ignore */
-	}
+	const cooldown = await readWorkerAuthorityJson(cooldownPath, authority, null);
+	const lastNotifiedMs = asNumber(cooldown?.last_notified_at_ms) ?? 0;
 	if (nowMs - lastNotifiedMs < cooldownMs) return;
 
-	// Read team config for tmux target
-	const teamInfo = await readTeamWorkersForIdleCheck(stateDir, teamName);
+	// Only inject into a leader target jointly authorized by current config and manifest.
+	const teamInfo = await readTeamWorkersForIdleCheck(stateDir, teamName, authority);
 	if (!teamInfo) return;
-	const { tmuxSession, leaderPaneId } = teamInfo;
-	const canonicalLeaderPaneId = await resolveCanonicalLeaderPaneId(
-		tmuxSession,
-		leaderPaneId,
-	);
-
-	if (!canonicalLeaderPaneId) {
-		await emitLeaderPaneMissingDeferred({
-			stateDir,
-			logsDir,
-			teamName,
-			workerName,
-			sourceType: "worker_idle",
-			tmuxSession,
-			leaderPaneId: canonicalLeaderPaneId,
-			orchestrationIntent,
-		});
-		return;
-	}
-	const tmuxTarget = canonicalLeaderPaneId;
-	const paneGuard = await checkLeaderPaneReadyForWorkerStateReminder(
-		tmuxTarget,
-	).catch(() => ({
-		ok: false,
-		reason: "session_check_failed",
-		paneCurrentCommand: "",
-	}));
+	const authorizedLeaderTarget = await readAuthorizedLeaderPaneTarget(stateDir, teamName, authority);
+	if (!authorizedLeaderTarget) return;
+	const { tmuxSession, leaderPaneId, paneTarget: tmuxTarget } = authorizedLeaderTarget;
+	const paneGuard = tmuxTarget
+		? await checkLeaderPaneReadyForWorkerStateReminder(tmuxTarget).catch(() => ({
+			ok: false,
+			reason: "session_check_failed",
+			paneCurrentCommand: "",
+		}))
+		: { ok: false, reason: "leader_pane_missing", paneCurrentCommand: "", sourceType: "missing" };
 	if (!paneGuard.ok) {
-		try {
-			const tmpPath = cooldownPath + ".tmp." + process.pid;
-			await writeFile(
-				tmpPath,
-				JSON.stringify(
-					{
-						last_notified_at_ms: nowMs,
-						last_notified_at: nowIso,
-						prev_state: prevState,
-						orchestration_intent: orchestrationIntent,
-						delivery: "deferred_shell",
-						pane_current_command: paneGuard.paneCurrentCommand || null,
-					},
-					null,
-					2,
-				),
-			);
-			await rename(tmpPath, cooldownPath);
-		} catch {
-			/* best effort */
-		}
+		await assertWorkerNotificationAuthority({ cwd, stateDir, parsedTeamWorker, authority });
+		await writeWorkerAuthorityJson(cooldownPath, {
+			last_notified_at_ms: nowMs,
+			last_notified_at: nowIso,
+			prev_state: prevState,
+			orchestration_intent: orchestrationIntent,
+			delivery: paneGuard.reason === "leader_pane_missing" ? "deferred" : "deferred_shell",
+			pane_current_command: paneGuard.paneCurrentCommand || null,
+		}, authority);
 		await emitLeaderPaneMissingDeferred({
 			stateDir,
 			logsDir,
 			teamName,
 			workerName,
-			reason: LEADER_PANE_SHELL_NO_INJECTION_REASON,
+			reason: paneGuard.reason === "leader_pane_missing" ? "leader_pane_missing_no_injection" : LEADER_PANE_SHELL_NO_INJECTION_REASON,
 			paneCurrentCommand: paneGuard.paneCurrentCommand,
+			authority,
 			sourceType: "worker_idle",
 			tmuxSession,
-			leaderPaneId: canonicalLeaderPaneId,
+			leaderPaneId: leaderPaneId,
 			orchestrationIntent,
 		});
 		return;
@@ -859,56 +874,48 @@ export async function maybeNotifyLeaderWorkerIdle({
 	const message = `${parts.join(". ")}. ${DEFAULT_MARKER}`;
 
 	try {
+		await assertWorkerNotificationAuthority({ cwd, stateDir, parsedTeamWorker, authority });
+		const finalTmuxTarget = await assertAuthorizedLeaderPaneTarget(
+			stateDir,
+			teamName,
+			authorizedLeaderTarget,
+			authority,
+		);
 		const sendResult = await sendPaneInput({
-			paneTarget: tmuxTarget,
+			paneTarget: finalTmuxTarget,
 			prompt: message,
 			submitKeyPresses: 2,
 			submitDelayMs: 100,
+			validateBeforeEffect: async () => {
+				await assertWorkerNotificationAuthority({ cwd, stateDir, parsedTeamWorker, authority });
+				await assertAuthorizedLeaderPaneTarget(stateDir, teamName, authorizedLeaderTarget, authority);
+			},
 		});
 		if (!sendResult.ok)
 			throw new Error(sendResult.error || sendResult.reason || "send_failed");
 
-		// Update cooldown state
-		try {
-			const tmpPath = cooldownPath + ".tmp." + process.pid;
-			await writeFile(
-				tmpPath,
-				JSON.stringify(
-					{
-						last_notified_at_ms: nowMs,
-						last_notified_at: nowIso,
-						prev_state: prevState,
-						orchestration_intent: orchestrationIntent,
-					},
-					null,
-					2,
-				),
-			);
-			await rename(tmpPath, cooldownPath);
-		} catch {
-			/* best effort */
-		}
+		await writeWorkerAuthorityJson(cooldownPath, {
+			last_notified_at_ms: nowMs,
+			last_notified_at: nowIso,
+			prev_state: prevState,
+			orchestration_intent: orchestrationIntent,
+		}, authority);
 
 		// Write event to events.ndjson
 		const eventsDir = join(stateDir, "team", teamName, "events");
 		const eventsPath = join(eventsDir, "events.ndjson");
-		try {
-			await mkdir(eventsDir, { recursive: true });
-			const event = {
-				event_id: `worker-idle-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
-				team: teamName,
-				type: "worker_idle",
-				worker: workerName,
-				prev_state: prevState,
-				task_id: currentTaskId || null,
-				reason: currentReason || null,
-				orchestration_intent: orchestrationIntent,
-				created_at: nowIso,
-			};
-			await appendFile(eventsPath, JSON.stringify(event) + "\n");
-		} catch {
-			/* best effort */
-		}
+		const event = {
+			event_id: `worker-idle-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
+			team: teamName,
+			type: "worker_idle",
+			worker: workerName,
+			prev_state: prevState,
+			task_id: currentTaskId || null,
+			reason: currentReason || null,
+			orchestration_intent: orchestrationIntent,
+			created_at: nowIso,
+		};
+		await appendWorkerAuthorityEvent(eventsPath, event, authority);
 
 		await logTmuxHookEvent(logsDir, {
 			timestamp: nowIso,

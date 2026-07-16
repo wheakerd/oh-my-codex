@@ -36,7 +36,16 @@ import {
   verifyManagedPaneTarget,
 } from './managed-tmux.js';
 import type { PromptMutationAuthorization, ResolvedPromptTurnContext } from '../../hooks/prompt-session-provenance.js';
-import type { RootFilesystemIdentity } from '../../state/authority.js';
+import {
+  atomicWriteAuthorityFile,
+  captureRootFilesystemIdentity,
+  ensureAuthorityDirectory,
+  readAuthorityFileWithExpectedRoot,
+  sameRootFilesystemIdentity,
+  type ResolvedStateAuthorityContext,
+  type RootFilesystemIdentity,
+} from '../../state/authority.js';
+
 
 export const SKILL_ACTIVE_STATE_FILE = 'skill-active-state.json';
 export const DEEP_INTERVIEW_BLOCKED_APPROVAL_INPUTS = ['yes', 'y', 'proceed', 'continue', 'ok', 'sure', 'go ahead', 'next i should'];
@@ -635,7 +644,42 @@ export async function resolveNudgePaneTarget(stateDir: any, cwd = '', payload: a
     : await resolveManagedSessionPane(cwd, payload);
 }
 
-export async function maybeAutoNudge({ cwd, stateDir, logsDir, payload, context = null, syncResult = null }: { cwd: string; stateDir: string; logsDir: string; payload: any; context?: ResolvedPromptTurnContext | null; syncResult?: any }) {
+async function readJsonWithAuthority(path, fallback, authority: ResolvedStateAuthorityContext | null) {
+  if (!authority) return readJsonIfExists(path, fallback);
+  const content = await readAuthorityFileWithExpectedRoot(path, {
+    authority_root: authority.canonical_state_root,
+    expected_root_identity: authority.generation.root_identity,
+  });
+  if (content === null) return fallback;
+  return JSON.parse(content);
+}
+
+async function writeJsonWithAuthority(path, value, authority: ResolvedStateAuthorityContext | null) {
+  if (!authority) {
+    await mkdir(dirname(path), { recursive: true });
+    await writeFile(path, JSON.stringify(value, null, 2));
+    return;
+  }
+  await ensureAuthorityDirectory(authority.canonical_state_root, dirname(path), {
+    expected_root_identity: authority.generation.root_identity,
+  });
+  await atomicWriteAuthorityFile(path, JSON.stringify(value, null, 2), {
+    authority_root: authority.canonical_state_root,
+    expected_root_identity: authority.generation.root_identity,
+  });
+}
+
+async function assertPinnedAuthority(authority: ResolvedStateAuthorityContext | null) {
+  if (!authority) return;
+  const current = await captureRootFilesystemIdentity(authority.canonical_state_root);
+  if (!sameRootFilesystemIdentity(current, authority.generation.root_identity)) {
+    throw new Error('auto-nudge authority root changed before tmux effect');
+  }
+}
+
+
+export async function maybeAutoNudge({ cwd, stateDir, logsDir, payload, context = null, syncResult = null, authority = null }: { cwd: string; stateDir: string; logsDir: string; payload: any; context?: ResolvedPromptTurnContext | null; syncResult?: any; authority?: ResolvedStateAuthorityContext | null }) {
+
   const config = await loadAutoNudgeConfig();
   const effectiveResponse = resolveEffectiveAutoNudgeResponse(config.response);
   if (!config.enabled) return;
@@ -670,7 +714,8 @@ export async function maybeAutoNudge({ cwd, stateDir, logsDir, payload, context 
 
   try {
     const nudgeStatePath = await getScopedStatePath(stateDir, 'auto-nudge-state.json', invocationSessionId);
-    let nudgeState = await readScopedJsonIfExists(stateDir, 'auto-nudge-state.json', invocationSessionId, null);
+    let nudgeState = await readJsonWithAuthority(nudgeStatePath, null, authority);
+
     if (!nudgeState || typeof nudgeState !== 'object') {
       nudgeState = { nudgeCount: 0, lastNudgeAt: '', lastSignature: '', lastSemanticSignature: '' };
     }
@@ -749,8 +794,8 @@ export async function maybeAutoNudge({ cwd, stateDir, logsDir, payload, context 
     if (!isFallbackWatcherSource && config.stallMs > 0) {
       nudgeState.pendingSignature = signature;
       nudgeState.pendingSince = new Date().toISOString();
-      await mkdir(dirname(nudgeStatePath), { recursive: true }).catch(() => {});
-      await writeFile(nudgeStatePath, JSON.stringify(nudgeState, null, 2)).catch(() => {});
+      await writeJsonWithAuthority(nudgeStatePath, nudgeState, authority).catch(() => {});
+
       await logTmuxHookEvent(logsDir, {
         timestamp: new Date().toISOString(),
         type: 'auto_nudge_skipped',
@@ -812,6 +857,8 @@ export async function maybeAutoNudge({ cwd, stateDir, logsDir, payload, context 
     }
 
     const nowIso = new Date().toISOString();
+    await assertPinnedAuthority(authority);
+
     try {
       const sendResult = await sendPaneInput({
         paneTarget: paneId,
@@ -831,8 +878,7 @@ export async function maybeAutoNudge({ cwd, stateDir, logsDir, payload, context 
       nudgeState.lastSemanticSignature = semanticSignature;
       nudgeState.pendingSignature = '';
       nudgeState.pendingSince = '';
-      await mkdir(dirname(nudgeStatePath), { recursive: true }).catch(() => {});
-      await writeFile(nudgeStatePath, JSON.stringify(nudgeState, null, 2)).catch(() => {});
+      await writeJsonWithAuthority(nudgeStatePath, nudgeState, authority).catch(() => {});
 
       await logTmuxHookEvent(logsDir, {
         timestamp: nowIso,

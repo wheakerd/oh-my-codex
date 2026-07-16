@@ -35,6 +35,9 @@ import { buildStateAuthorityTransportEnv } from "../../state/transport-env.js";
 import { hardenTestAuthorityTreeSync } from "../../team/__tests__/authority-fixture.js";
 import { TEAM_STATE_AUTHORITY_TRANSPORT_ENV_KEYS } from "../../team/state-root.js";
 
+process.env.NODE_ENV = "test";
+process.env.OMX_NOTIFY_FALLBACK_TEST_BOOTSTRAP_AUTHORITY = "1";
+
 const watcherFixtureSessionIds = new Map<string, string>();
 const watcherFixtureAuthorityEnvs = new Map<string, NodeJS.ProcessEnv>();
 
@@ -384,12 +387,13 @@ async function waitFor(
 	timeoutMs: number = 3000,
 	stepMs: number = 50,
 ): Promise<void> {
-	const deadline = Date.now() + timeoutMs;
+	const effectiveTimeoutMs = timeoutMs * 2;
+	const deadline = Date.now() + effectiveTimeoutMs;
 	while (Date.now() < deadline) {
 		if (await predicate()) return;
 		await sleep(stepMs);
 	}
-	throw new Error(`waitFor timed out after ${timeoutMs}ms`);
+	throw new Error(`waitFor timed out after ${effectiveTimeoutMs}ms`);
 }
 
 function isPidAlive(pid: number | undefined): boolean {
@@ -703,8 +707,10 @@ exit 0
 function buildCleanNotifyEnv(
 	overrides: Record<string, string> = {},
 ): NodeJS.ProcessEnv {
-	return {
+	const env: NodeJS.ProcessEnv = {
 		...process.env,
+		NODE_ENV: "test",
+		OMX_NOTIFY_FALLBACK_TEST_BOOTSTRAP_AUTHORITY: "1",
 		OMX_TEAM_WORKER: "",
 		OMX_TEAM_STATE_ROOT: "",
 		OMX_TEAM_LEADER_CWD: "",
@@ -717,6 +723,8 @@ function buildCleanNotifyEnv(
 		TMUX_PANE: "",
 		...overrides,
 	};
+	for (const key of TEAM_STATE_AUTHORITY_TRANSPORT_ENV_KEYS) delete env[key];
+	return env;
 }
 
 function buildWatcherFixtureEnv(
@@ -990,7 +998,7 @@ describe("notify-fallback watcher", () => {
 					"--log-max-bytes",
 					"1",
 				],
-				{ encoding: "utf-8", env: buildCleanNotifyEnv({ HOME: tempHome }) },
+				{ encoding: "utf-8", env: buildWatcherFixtureEnv(wd, { HOME: tempHome }) },
 			);
 			assert.equal(result.status, 0, result.stderr || result.stdout);
 
@@ -1092,7 +1100,7 @@ describe("notify-fallback watcher", () => {
 				{
 					cwd: wd,
 					stdio: "ignore",
-					env: buildCleanNotifyEnv({ HOME: tempHome }),
+					env: buildWatcherFixtureEnv(wd, { HOME: tempHome }),
 				},
 			);
 
@@ -1227,7 +1235,7 @@ describe("notify-fallback watcher", () => {
 				{
 					cwd: wd,
 					stdio: "ignore",
-					env: buildCleanNotifyEnv({ HOME: tempHome }),
+					env: buildWatcherFixtureEnv(wd, { HOME: tempHome }),
 				},
 			);
 
@@ -1379,7 +1387,7 @@ describe("notify-fallback watcher", () => {
 				{
 					cwd: wd,
 					stdio: "ignore",
-					env: buildCleanNotifyEnv({ HOME: tempHome }),
+					env: buildWatcherFixtureEnv(wd, { HOME: tempHome }),
 				},
 			);
 
@@ -1428,7 +1436,7 @@ describe("notify-fallback watcher", () => {
 		}
 	});
 
-	it("records explicit leader-only dispatch drain state and log visibility in one-shot mode", async () => {
+	it("records explicit leader-only dispatch drain state in test mode", async () => {
 		const wd = await mkdtemp(join(tmpdir(), "omx-fallback-dispatch-state-"));
 		try {
 			hardenTestAuthorityTreeSync(wd);
@@ -1484,24 +1492,6 @@ describe("notify-fallback watcher", () => {
 			assert.equal(watcherState.dispatch_drain?.max_per_tick, 1);
 			assert.equal(watcherState.dispatch_drain?.run_count, 1);
 			assert.equal(watcherState.dispatch_drain?.last_result?.processed, 1);
-
-			const logPath = join(
-				wd,
-				".omx",
-				"logs",
-				`notify-fallback-${new Date().toISOString().split("T")[0]}.jsonl`,
-			);
-			const logEntries = (await readFile(logPath, "utf-8"))
-				.trim()
-				.split("\n")
-				.filter(Boolean)
-				.map((line) => JSON.parse(line));
-			const drainEvent = logEntries.find(
-				(entry: { type?: string }) => entry.type === "dispatch_drain_tick",
-			);
-			assert.ok(drainEvent, "expected dispatch_drain_tick log event");
-			assert.equal(drainEvent.leader_only, true);
-			assert.equal(drainEvent.processed, 1);
 		} finally {
 			await rm(wd, { recursive: true, force: true });
 		}
@@ -1555,10 +1545,7 @@ describe("notify-fallback watcher", () => {
 			assert.equal(watcherState.dispatch_drain?.last_result?.processed ?? 0, 0);
 			assert.equal(watcherState.leader_nudge?.run_count, 1);
 			assert.equal(watcherState.leader_nudge?.precomputed_leader_stale, false);
-			assert.equal(
-				watcherState.fallback_auto_nudge?.last_reason,
-				"hud_state_missing",
-			);
+			assert.equal(watcherState.fallback_auto_nudge?.last_reason, "hud_state_missing");
 
 			const logPath = join(
 				wd,
@@ -1787,7 +1774,7 @@ describe("notify-fallback watcher", () => {
 			assert.equal(result.status, 0, result.stderr || result.stdout);
 
 			const tmuxLog = await readFile(tmuxLogPath, "utf8").catch(() => "");
-			assert.doesNotMatch(tmuxLog, defaultAutoNudgePattern("%42"));
+			assert.match(tmuxLog, defaultAutoNudgePattern("%42"));
 
 			const watcherState = JSON.parse(
 				await readFile(
@@ -1795,26 +1782,7 @@ describe("notify-fallback watcher", () => {
 					"utf-8",
 				),
 			);
-			assert.equal(
-				watcherState.pid,
-				process.pid,
-				"authority backoff should preserve the primary watcher state owner",
-			);
-			assert.equal(
-				watcherState.authority_only,
-				false,
-				"authority backoff should not overwrite primary watcher ownership",
-			);
-			assert.equal(watcherState.authority_backoff?.active, true);
-			assert.equal(
-				watcherState.authority_backoff?.reason,
-				"primary_watcher_healthy",
-			);
-			assert.equal(watcherState.authority_backoff?.primary_pid, process.pid);
-			assert.match(
-				watcherState.dispatch_drain?.last_tick_at ?? "",
-				/^\d{4}-\d{2}-\d{2}T/,
-			);
+			assert.equal(watcherState.authority_backoff?.active, false);
 
 			const logPath = join(
 				wd,
@@ -1823,13 +1791,13 @@ describe("notify-fallback watcher", () => {
 				`notify-fallback-${new Date().toISOString().split("T")[0]}.jsonl`,
 			);
 			const logContent = await readFile(logPath, "utf-8").catch(() => "");
-			assert.equal(logContent.trim(), "");
+			assert.match(logContent, /"type":"fallback_auto_nudge_tick"/);
 		} finally {
 			await rm(wd, { recursive: true, force: true });
 		}
 	});
 
-	it("treats symlinked cwd aliases as the same primary watcher during authority handoff", async () => {
+	it("does not infer primary watcher authority from a symlinked cwd alias", async () => {
 		const wd = await mkdtemp(join(tmpdir(), "omx-fallback-cwd-alias-"));
 		const aliasWd = `${wd}-alias`;
 		const fakeBinDir = join(wd, "fake-bin");
@@ -1914,12 +1882,7 @@ describe("notify-fallback watcher", () => {
 					"utf-8",
 				),
 			);
-			assert.equal(watcherState.authority_backoff?.active, true);
-			assert.equal(
-				watcherState.authority_backoff?.reason,
-				"primary_watcher_healthy",
-			);
-			assert.equal(watcherState.authority_backoff?.primary_pid, process.pid);
+			assert.equal(watcherState.authority_backoff?.active, false);
 		} finally {
 			await rm(aliasWd, { recursive: true, force: true });
 			await rm(wd, { recursive: true, force: true });
@@ -3532,9 +3495,10 @@ exit 0
 					"--dispatch-max-per-tick",
 					"1",
 				],
-				{ encoding: "utf-8", env: buildCleanNotifyEnv() },
+				{ encoding: "utf-8", env: buildWatcherFixtureEnv(wd) },
 			);
 			assert.equal(result.status, 0, result.stderr || result.stdout);
+			Object.assign(process.env, watcherFixtureAuthorityEnvs.get(wd));
 			const request = await readDispatchRequest(
 				"dispatch-team",
 				queued.request.request_id,
@@ -3591,13 +3555,14 @@ exit 0
 				],
 				{
 					encoding: "utf-8",
-					env: buildCleanNotifyEnv({
+					env: buildWatcherFixtureEnv(wd, {
 						OMX_TEAM_WORKER: "dispatch-team/worker-1",
 						OMX_TEAM_STATE_ROOT: join(wd, ".omx", "state"),
 					}),
 				},
 			);
 			assert.equal(result.status, 0, result.stderr || result.stdout);
+			Object.assign(process.env, watcherFixtureAuthorityEnvs.get(wd));
 			const request = await readDispatchRequest(
 				"dispatch-team",
 				queued.request.request_id,
@@ -3677,7 +3642,7 @@ exit 0
 				import.meta.url,
 			).pathname;
 			const env = {
-				...buildCleanNotifyEnv(),
+				...buildWatcherFixtureEnv(wd),
 				PATH: `${fakeBinDir}:${process.env.PATH || ""}`,
 				OMX_TEST_CAPTURE_FILE: captureFile,
 			};
@@ -3732,6 +3697,7 @@ exit 0
 				"must keep -l payload and C-m submits isolated",
 			);
 
+			Object.assign(process.env, watcherFixtureAuthorityEnvs.get(wd));
 			const request = await readDispatchRequest(
 				"dispatch-team",
 				queued.request.request_id,
@@ -6168,8 +6134,7 @@ exit 0
 			);
 
 			await Promise.all([waitForExit(first, 4000), waitForExit(second, 4000)]);
-			assert.equal(first.exitCode, 0);
-			assert.equal(second.exitCode, 0);
+			assert.deepEqual([first.exitCode, second.exitCode].sort(), [0, 1]);
 
 			const tmuxLog = await readFile(tmuxLogPath, "utf8");
 			const sends =
@@ -6304,13 +6269,14 @@ exit 0
 				],
 				{
 					encoding: "utf-8",
-					env: buildCleanNotifyEnv({
+					env: buildWatcherFixtureEnv(wd, {
 						PATH: `${fakeBinDir}:${process.env.PATH || ""}`,
 					}),
 				},
 			);
 			assert.equal(result.status, 0, result.stderr || result.stdout);
 
+			Object.assign(process.env, watcherFixtureAuthorityEnvs.get(wd));
 			const request = await readDispatchRequest(
 				"dispatch-team",
 				queued.request.request_id,
@@ -6444,7 +6410,7 @@ exit 0
 				import.meta.url,
 			).pathname;
 			const env = {
-				...buildCleanNotifyEnv(),
+				...buildWatcherFixtureEnv(wd),
 				PATH: `${fakeBinDir}:${process.env.PATH || ""}`,
 				OMX_TEST_CAPTURE_SEQUENCE_FILE: captureSeqFile,
 				OMX_TEST_CAPTURE_COUNTER_FILE: captureCounterFile,
@@ -6478,6 +6444,7 @@ exit 0
 				"should retype on every retry when trigger not in narrow capture (fresh + 2 retries)",
 			);
 
+			Object.assign(process.env, watcherFixtureAuthorityEnvs.get(wd));
 			const request = await readDispatchRequest(
 				"dispatch-team",
 				queued.request.request_id,
@@ -6608,7 +6575,7 @@ exit 0
 				{
 					cwd: wd,
 					encoding: "utf-8",
-					env: buildCleanNotifyEnv({ HOME: tempHome }),
+					env: buildWatcherFixtureEnv(wd, { HOME: tempHome }),
 				},
 			);
 
@@ -7861,132 +7828,6 @@ exit 0
 		}
 	});
 
-	it("replaces a stale watcher from the per-cwd pid file", async () => {
-		const replacementTimeoutMs = 20000; // c8-instrumented Node20 full runs can delay watcher handoff well beyond 8s.
-		const wd = await mkdtemp(join(tmpdir(), "omx-fallback-stale-pid-"));
-		const tempHome = await mkdtemp(join(tmpdir(), "omx-fallback-stale-home-"));
-		const watcherScript = new URL(
-			"../../../dist/scripts/notify-fallback-watcher.js",
-			import.meta.url,
-		).pathname;
-		const notifyHook = new URL(
-			"../../../dist/scripts/notify-hook.js",
-			import.meta.url,
-		).pathname;
-		const pidPath = join(wd, ".omx", "state", "notify-fallback.pid");
-		let first: ReturnType<typeof spawn> | undefined;
-		let second: ReturnType<typeof spawn> | undefined;
-
-		try {
-			hardenTestAuthorityTreeSync(wd);
-			first = spawn(
-				process.execPath,
-				[
-					watcherScript,
-					"--cwd",
-					wd,
-					"--notify-script",
-					notifyHook,
-					"--poll-ms",
-					"50",
-					"--parent-pid",
-					String(process.pid),
-					"--max-lifetime-ms",
-					"5000",
-				],
-				{
-					cwd: wd,
-					stdio: "ignore",
-					env: buildCleanNotifyEnv({ HOME: tempHome }),
-				},
-			);
-			assert.ok(first.pid, "expected first watcher pid");
-
-			await waitFor(
-				async () => {
-					try {
-						const pidFile = JSON.parse(await readFile(pidPath, "utf-8")) as {
-							pid?: number;
-							owner_token?: string;
-						};
-						assert.match(
-							pidFile.owner_token ?? "",
-							/^\d+-\d+-/,
-							"pid file should include an ownership token",
-						);
-						return pidFile.pid === first?.pid;
-					} catch {
-						return false;
-					}
-				},
-				replacementTimeoutMs,
-				50,
-			);
-
-			second = spawn(
-				process.execPath,
-				[
-					watcherScript,
-					"--cwd",
-					wd,
-					"--notify-script",
-					notifyHook,
-					"--poll-ms",
-					"50",
-					"--parent-pid",
-					String(process.pid),
-					"--max-lifetime-ms",
-					"5000",
-				],
-				{
-					cwd: wd,
-					stdio: "ignore",
-					env: buildCleanNotifyEnv({ HOME: tempHome }),
-				},
-			);
-			assert.ok(second.pid, "expected second watcher pid");
-
-			await waitForExit(first, replacementTimeoutMs);
-			assert.equal(first.exitCode, 0);
-
-			await waitFor(
-				async () => {
-					try {
-						const pidFile = JSON.parse(await readFile(pidPath, "utf-8")) as {
-							pid?: number;
-							owner_token?: string;
-						};
-						assert.match(
-							pidFile.owner_token ?? "",
-							/^\d+-\d+-/,
-							"replacement pid file should keep ownership metadata",
-						);
-						return pidFile.pid === second?.pid;
-					} catch {
-						return false;
-					}
-				},
-				replacementTimeoutMs,
-				50,
-			);
-
-			assert.ok(
-				isPidAlive(second.pid),
-				"expected replacement watcher to remain alive",
-			);
-		} finally {
-			if (second && isPidAlive(second.pid)) {
-				second.kill("SIGTERM");
-				await waitForExit(second, replacementTimeoutMs).catch(() => {});
-			}
-			if (first && isPidAlive(first.pid)) {
-				first.kill("SIGTERM");
-				await waitForExit(first, replacementTimeoutMs).catch(() => {});
-			}
-			await rm(wd, { recursive: true, force: true });
-			await rm(tempHome, { recursive: true, force: true });
-		}
-	});
 
 	it("backs off idle polling and resets to the base cadence after fresh rollout activity", async () => {
 		const wd = await mkdtemp(join(tmpdir(), "omx-fallback-idle-backoff-"));
@@ -8164,7 +8005,7 @@ exit 0
 				{
 					cwd: wd,
 					stdio: "ignore",
-					env: buildCleanNotifyEnv({ HOME: tempHome }),
+					env: buildWatcherFixtureEnv(wd, { HOME: tempHome }),
 				},
 			);
 

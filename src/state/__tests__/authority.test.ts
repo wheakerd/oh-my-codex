@@ -18,6 +18,9 @@ import {
   acquireWorkspaceAuthorityLock,
   appendStateAuthorityEvidence,
   atomicWriteAuthorityFile,
+  readAuthorityFileWithExpectedRoot,
+  ensureAuthorityDirectory,
+  removeAuthorityDirectory,
   captureRootFilesystemIdentity,
   canonicalizeExistingAuthorityPath,
   canonicalizeTrustedAuthorityDarwinDirectoryAliasComponentsSync,
@@ -2096,6 +2099,91 @@ describe('state authority foundation', () => {
         await rm(outside, { recursive: true, force: true });
         await rm(workspace, { recursive: true, force: true });
       }
+    }
+  });
+
+  it('fails closed on a swapped-and-restored authority root instead of reading forged dedupe data', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'omx-authority-read-replacement-'));
+    const root = join(workspace, 'root');
+    const predecessor = join(workspace, 'predecessor');
+    const dedupe = join(root, 'sessions', 'worker-session', 'notify-hook-state.json');
+    try {
+      await mkdir(dirname(dedupe), { recursive: true });
+      await writeFile(dedupe, JSON.stringify({ recent_turns: { trusted: 1 } }), 'utf-8');
+      const expectedRootIdentity = await captureRootFilesystemIdentity(root);
+      await rename(root, predecessor);
+      await mkdir(dirname(dedupe), { recursive: true });
+      await writeFile(dedupe, JSON.stringify({ recent_turns: { forged: 1 } }), 'utf-8');
+      await assert.rejects(
+        readAuthorityFileWithExpectedRoot(dedupe, {
+          authority_root: root,
+          expected_root_identity: expectedRootIdentity,
+        }),
+        (error: unknown) => error instanceof Error
+          && 'code' in error
+          && error.code === AUTHORITY_DIAGNOSTIC_CODES.rootFingerprintMismatch,
+      );
+      assert.equal(await readFile(dedupe, 'utf-8'), JSON.stringify({ recent_turns: { forged: 1 } }));
+      await rename(root, join(workspace, 'forged-root'));
+      await rename(predecessor, root);
+      assert.equal(
+        await readAuthorityFileWithExpectedRoot(dedupe, {
+          authority_root: root,
+          expected_root_identity: expectedRootIdentity,
+        }),
+        JSON.stringify({ recent_turns: { trusted: 1 } }),
+      );
+    } finally {
+      await rm(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it('pins authority directory creation to the expected root identity', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'omx-authority-directory-replacement-'));
+    const root = join(workspace, 'root');
+    const predecessor = join(workspace, 'predecessor');
+    try {
+      await mkdir(root);
+      const expectedRootIdentity = await captureRootFilesystemIdentity(root);
+      await rename(root, predecessor);
+      await mkdir(root);
+      await assert.rejects(
+        ensureAuthorityDirectory(root, join(root, 'team'), { expected_root_identity: expectedRootIdentity }),
+        (error: unknown) => error instanceof Error
+          && 'code' in error
+          && error.code === AUTHORITY_DIAGNOSTIC_CODES.rootFingerprintMismatch,
+      );
+      assert.equal(existsSync(join(root, 'team')), false);
+    } finally {
+      await rm(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it('denies recursive authority directory deletion without descriptor-relative custody', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'omx-authority-cleanup-platform-'));
+    const target = join(root, 'team');
+    const originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+    try {
+      await mkdir(target);
+      await rm(target, { recursive: true, force: true });
+      if (process.platform === 'linux' && stateAuthorityFilesystemPrimitiveForPlatform().descriptor_relative) {
+        await removeAuthorityDirectory(target, { authority_root: root });
+        await removeAuthorityDirectory(join(root, 'missing-parent', 'team'), { authority_root: root });
+      }
+      await mkdir(target);
+      for (const platform of ['darwin', 'win32'] as const) {
+        Object.defineProperty(process, 'platform', { value: platform, configurable: true });
+        await assert.rejects(
+          removeAuthorityDirectory(target, { authority_root: root }),
+          (error: unknown) => error instanceof Error
+            && 'code' in error
+            && error.code === AUTHORITY_DIAGNOSTIC_CODES.rootCapabilityWeak,
+        );
+        assert.equal(existsSync(target), true);
+      }
+    } finally {
+      if (originalPlatform) Object.defineProperty(process, 'platform', originalPlatform);
+      await rm(root, { recursive: true, force: true });
     }
   });
 

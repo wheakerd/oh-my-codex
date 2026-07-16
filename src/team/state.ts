@@ -1,4 +1,4 @@
-import { readFile, writeFile, mkdir, rm, rename, readdir, lstat } from 'fs/promises';
+import { readFile, writeFile, mkdir, rename, readdir, lstat } from 'fs/promises';
 
 import { join, dirname, resolve, sep } from 'path';
 import { existsSync } from 'fs';
@@ -67,8 +67,18 @@ import {
 } from './contracts.js';
 import type { TeamReminderIntent } from './reminder-intents.js';
 import type { WorktreeMode } from './worktree.js';
-import { resolveCanonicalTeamMutationStateRoot, resolveCanonicalTeamStateRoot } from './state-root.js';
-import { atomicWriteAuthorityFile } from '../state/authority.js';
+import {
+  resolveCanonicalTeamMutationStateRoot,
+  resolveCanonicalTeamStateRoot,
+  resolveValidatedTeamAuthority,
+} from './state-root.js';
+import {
+  atomicWriteAuthorityFile,
+  ensureAuthorityDirectory,
+  removeAuthorityDirectory,
+  withStateAuthorityTransaction,
+  type ResolvedStateAuthorityContext,
+} from '../state/authority.js';
 
 import { normalizeTeamTaskCoordinationPlanForStorage } from './coordination-protocol.js';
 
@@ -817,33 +827,40 @@ function isTeamManifestV2(value: unknown): value is TeamManifestV2 {
 export async function writeAtomic(
   filePath: string,
   data: string,
-  expectedRootIdentity?: string,
+  expectedRootIdentity?: string | ResolvedStateAuthorityContext,
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<void> {
   const parent = dirname(filePath);
   const stateRoot = teamStateMutationRoot(filePath);
   if (stateRoot) {
-    // The target path is not authority. Re-resolve from its workspace identity
-    // and require a complete persisted transport before touching Team state.
-    const authoritativeRoot = resolveCanonicalTeamMutationStateRoot(
-      dirname(dirname(stateRoot)),
-      env,
-    );
-    const validatedExpectedRoot = expectedRootIdentity
-      ? resolve(expectedRootIdentity)
-      : authoritativeRoot;
-    if (
-      resolve(stateRoot) !== authoritativeRoot
-      || validatedExpectedRoot !== authoritativeRoot
-    ) {
-      throw new Error(
-        `team_state_root_authority_conflict:${resolve(stateRoot)}:${authoritativeRoot}`,
-      );
+    const write = async (authority: ResolvedStateAuthorityContext): Promise<void> => {
+      const authoritativeRoot = authority.canonical_state_root;
+      const validatedExpectedRoot = typeof expectedRootIdentity === 'string'
+        ? resolve(expectedRootIdentity)
+        : authoritativeRoot;
+      if (
+        resolve(stateRoot) !== authoritativeRoot
+        || validatedExpectedRoot !== authoritativeRoot
+      ) {
+        throw new Error(
+          `team_state_root_authority_conflict:${resolve(stateRoot)}:${authoritativeRoot}`,
+        );
+      }
+      await assertTeamStateMutationPath(authoritativeRoot, filePath);
+      await ensureAuthorityDirectory(authoritativeRoot, parent);
+      await assertTeamStateMutationPath(authoritativeRoot, filePath);
+      await atomicWriteAuthorityFile(filePath, data, {
+        authority_root: authoritativeRoot,
+        expected_root_identity: authority.generation.root_identity,
+      });
+    };
+    if (typeof expectedRootIdentity === 'object') {
+      await write(expectedRootIdentity);
+    } else {
+      const authority = await resolveValidatedTeamAuthority(dirname(dirname(stateRoot)), env);
+      if (!authority) throw new Error('team state mutation requires persisted session authority; ambient state-root aliases are diagnostic-only');
+      await withStateAuthorityTransaction(authority, async (pinnedAuthority) => write(pinnedAuthority));
     }
-    await assertTeamStateMutationPath(authoritativeRoot, filePath);
-    await mkdir(parent, { recursive: true, mode: 0o700 });
-    await assertTeamStateMutationPath(authoritativeRoot, filePath);
-    await atomicWriteAuthorityFile(filePath, data, { authority_root: authoritativeRoot });
     return;
   }
 
@@ -871,7 +888,7 @@ export async function writeAtomic(
 // Initialize team state directory + config.json
 // Creates: .omx/state/team/{name}/, workers/{worker-1}..{worker-N}/, tasks/
 // Throws if workerCount > maxWorkers (default 20)
-export async function initTeamState(
+async function initTeamStatePinned(
   teamName: string,
   task: string,
   agentType: string,
@@ -881,7 +898,9 @@ export async function initTeamState(
   env: NodeJS.ProcessEnv = process.env,
   workspace: TeamWorkspaceMetadata = {},
   lifecycleProfile: 'default' = 'default',
+  authority?: ResolvedStateAuthorityContext,
 ): Promise<TeamConfig> {
+  if (!authority) throw new Error('team state mutation requires persisted session authority; ambient state-root aliases are diagnostic-only');
   validateTeamName(teamName);
 
   if (maxWorkers > ABSOLUTE_MAX_WORKERS) {
@@ -892,7 +911,7 @@ export async function initTeamState(
     throw new Error(`workerCount (${workerCount}) exceeds maxWorkers (${maxWorkers})`);
   }
 
-  const stateRoot = resolveCanonicalTeamMutationStateRoot(cwd, env);
+  const stateRoot = authority.canonical_state_root;
   const leaderSessionId = await resolveLeaderSessionId(cwd, env);
   const configuredDiagnosticRoot = workspace.team_state_root?.trim();
   if (
@@ -927,18 +946,18 @@ export async function initTeamState(
   }
 
 
-  await mkdir(workersRoot, { recursive: true, mode: 0o700 });
-  await mkdir(tasksRoot, { recursive: true, mode: 0o700 });
-  await mkdir(claimsRoot, { recursive: true, mode: 0o700 });
-  await mkdir(mailboxRoot, { recursive: true, mode: 0o700 });
-  await mkdir(dispatchRoot, { recursive: true, mode: 0o700 });
-  await mkdir(eventsRoot, { recursive: true, mode: 0o700 });
-  await mkdir(approvalsRoot, { recursive: true, mode: 0o700 });
+  await ensureAuthorityDirectory(stateRoot, workersRoot);
+  await ensureAuthorityDirectory(stateRoot, tasksRoot);
+  await ensureAuthorityDirectory(stateRoot, claimsRoot);
+  await ensureAuthorityDirectory(stateRoot, mailboxRoot);
+  await ensureAuthorityDirectory(stateRoot, dispatchRoot);
+  await ensureAuthorityDirectory(stateRoot, eventsRoot);
+  await ensureAuthorityDirectory(stateRoot, approvalsRoot);
   for (const path of initializationPaths) {
     await assertTeamStateMutationPath(stateRoot, path);
   }
 
-  await writeAtomic(join(dispatchRoot, 'requests.json'), JSON.stringify([], null, 2), stateRoot, env);
+  await writeAtomic(join(dispatchRoot, 'requests.json'), JSON.stringify([], null, 2), authority, env);
 
   const workers: WorkerInfo[] = [];
   for (let i = 1; i <= workerCount; i++) {
@@ -946,7 +965,7 @@ export async function initTeamState(
     const worker: WorkerInfo = { name, index: i, role: agentType, assigned_tasks: [] };
     workers.push(worker);
     await assertTeamStateMutationPath(stateRoot, join(workersRoot, name));
-    await mkdir(join(workersRoot, name), { recursive: true, mode: 0o700 });
+    await ensureAuthorityDirectory(stateRoot, join(workersRoot, name));
 
   }
   const leaderWorkerId = readEnvValue(env, ['OMX_TEAM_WORKER']) ?? 'leader-fixed';
@@ -982,7 +1001,7 @@ export async function initTeamState(
     identity_source: workspace.identity_source,
   };
 
-  await writeAtomic(join(root, 'config.json'), JSON.stringify(config, null, 2), stateRoot, env);
+  await writeAtomic(join(root, 'config.json'), JSON.stringify(config, null, 2), authority, env);
   await writeAtomic(
     join(root, 'phase.json'),
     JSON.stringify(
@@ -996,7 +1015,7 @@ export async function initTeamState(
       null,
       2,
     ),
-    stateRoot,
+    authority,
     env,
   );
   await writeTeamManifestV2(
@@ -1034,8 +1053,38 @@ export async function initTeamState(
     },
     cwd,
     env,
+    authority,
   );
   return config;
+}
+
+export async function initTeamState(
+  teamName: string,
+  task: string,
+  agentType: string,
+  workerCount: number,
+  cwd: string,
+  maxWorkers: number = DEFAULT_MAX_WORKERS,
+  env: NodeJS.ProcessEnv = process.env,
+  workspace: TeamWorkspaceMetadata = {},
+  lifecycleProfile: 'default' = 'default',
+): Promise<TeamConfig> {
+  const authority = await resolveValidatedTeamAuthority(cwd, env);
+  if (!authority) throw new Error('team state mutation requires persisted session authority; ambient state-root aliases are diagnostic-only');
+  return await withStateAuthorityTransaction(authority, async (pinnedAuthority) =>
+    initTeamStatePinned(
+      teamName,
+      task,
+      agentType,
+      workerCount,
+      cwd,
+      maxWorkers,
+      env,
+      workspace,
+      lifecycleProfile,
+      pinnedAuthority,
+    ),
+  );
 }
 
 async function writeConfig(cfg: TeamConfig, cwd: string): Promise<void> {
@@ -1167,6 +1216,7 @@ export async function writeTeamManifestV2(
   manifest: TeamManifestV2,
   cwd: string,
   env: NodeJS.ProcessEnv = process.env,
+  authority?: ResolvedStateAuthorityContext,
 ): Promise<void> {
   const normalizedPolicy = normalizeTeamPolicy(manifest.policy, {
     display_mode: manifest.policy?.display_mode === 'split_pane' ? 'split_pane' : 'auto',
@@ -1179,7 +1229,7 @@ export async function writeTeamManifestV2(
   const tmuxPaneOwnerId = typeof manifest.tmux_pane_owner_id === 'string' && manifest.tmux_pane_owner_id.trim() !== ''
     ? manifest.tmux_pane_owner_id.trim()
     : defaultTmuxPaneOwnerId(manifest.name);
-  const expectedRootIdentity = resolveCanonicalTeamMutationStateRoot(cwd, env);
+  const expectedRootIdentity = authority ?? resolveCanonicalTeamMutationStateRoot(cwd, env);
   const p = teamManifestV2Path(manifest.name, cwd, env);
   await writeAtomic(
     p,
@@ -2364,8 +2414,14 @@ export async function saveTeamConfig(config: TeamConfig, cwd: string): Promise<v
 // Delete team state directory.
 export async function cleanupTeamState(teamName: string, cwd: string): Promise<void> {
   assertSafeTeamName(teamName);
-  const root = resolveCanonicalTeamMutationStateRoot(cwd);
-  const path = teamDir(teamName, cwd);
-  await assertTeamStateMutationPath(root, path);
-  await rm(path, { recursive: true, force: true });
+  const authority = await resolveValidatedTeamAuthority(cwd);
+  if (!authority) throw new Error('team state mutation requires persisted session authority; ambient state-root aliases are diagnostic-only');
+  await withStateAuthorityTransaction(authority, async (pinnedAuthority) => {
+    const root = pinnedAuthority.canonical_state_root;
+    const path = join(root, 'team', teamName);
+    await removeAuthorityDirectory(path, {
+      authority_root: root,
+      expected_root_identity: pinnedAuthority.generation.root_identity,
+    });
+  });
 }

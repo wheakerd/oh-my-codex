@@ -40,6 +40,17 @@ import { readLatestTeamProgressEvidenceMs } from "../../team/progress-evidence.j
 import { validateSessionId } from "../../mcp/state-paths.js";
 import { TEAM_NAME_SAFE_PATTERN } from "../../team/contracts.js";
 import { isDeepInterviewStateActive } from "./auto-nudge.js";
+import {
+	atomicWriteAuthorityFile,
+	captureRootFilesystemIdentity,
+	ensureAuthorityDirectory,
+	readAuthorityFileWithExpectedRoot,
+
+	sameRootFilesystemIdentity,
+	type ResolvedStateAuthorityContext,
+} from "../../state/authority.js";
+
+
 const LEADER_PANE_MISSING_NO_INJECTION_REASON =
 	"leader_pane_missing_no_injection";
 const LEADER_PANE_SHELL_NO_INJECTION_REASON = "leader_pane_shell_no_injection";
@@ -87,8 +98,19 @@ export function setLeaderNudgeTestHooksForTests(hooks = {}) {
 async function atomicWriteJsonNoParentCreate(
 	path,
 	value,
-	{ beforeRename = null, afterRename = null } = {},
+	{ beforeRename = null, afterRename = null, authority = null } = {},
+
 ) {
+	if (authority) {
+		await ensureAuthorityDirectory(authority.canonical_state_root, dirname(path), {
+			expected_root_identity: authority.generation.root_identity,
+		});
+		await atomicWriteAuthorityFile(path, JSON.stringify(value, null, 2), {
+			authority_root: authority.canonical_state_root,
+			expected_root_identity: authority.generation.root_identity,
+		});
+		return;
+	}
 	const tempPath = `${path}.${process.pid}.${Date.now()}.${++atomicJsonWriteCounter}.tmp`;
 	try {
 		await writeFile(tempPath, JSON.stringify(value, null, 2));
@@ -99,6 +121,7 @@ async function atomicWriteJsonNoParentCreate(
 		await unlink(tempPath).catch(() => {});
 		throw error;
 	}
+
 }
 
 function cloneLeaderNudgeState(state) {
@@ -813,6 +836,27 @@ async function emitLeaderNudgeDeferredEvent(
 	}
 }
 
+async function assertPinnedLeaderNudgeAuthority(
+	authority: ResolvedStateAuthorityContext | null,
+): Promise<void> {
+	if (!authority) return;
+	const current = await captureRootFilesystemIdentity(authority.canonical_state_root);
+	if (!sameRootFilesystemIdentity(current, authority.generation.root_identity)) {
+		throw new Error("team leader nudge authority root changed before tmux effect");
+	}
+}
+
+async function readJsonWithLeaderNudgeAuthority(path, fallback, authority: ResolvedStateAuthorityContext | null) {
+	if (!authority) return await readJsonIfExists(path, fallback);
+	const content = await readAuthorityFileWithExpectedRoot(path, {
+		authority_root: authority.canonical_state_root,
+		expected_root_identity: authority.generation.root_identity,
+	});
+	return content === null ? fallback : JSON.parse(content);
+}
+
+
+
 export async function maybeNudgeTeamLeader({
 	cwd,
 	stateDir,
@@ -820,7 +864,17 @@ export async function maybeNudgeTeamLeader({
 	preComputedLeaderStale,
 	allowFreshMailboxNudges = true,
 	source = "notify_hook",
+	authority = null,
+}: {
+	cwd: string;
+	stateDir: string;
+	logsDir: string;
+	preComputedLeaderStale?: boolean | null;
+	allowFreshMailboxNudges?: boolean;
+	source?: string;
+	authority?: ResolvedStateAuthorityContext | null;
 }) {
+
 	const intervalMs = resolveLeaderNudgeIntervalMs();
 	const idleCooldownMs = resolveLeaderAllIdleNudgeCooldownMs();
 	const nowMs = Date.now();
@@ -831,7 +885,8 @@ export async function maybeNudgeTeamLeader({
 	const authoritativeStateDir = scopedStateDirs[0] || stateDir;
 	const nudgeStatePath = join(authoritativeStateDir, "team-leader-nudge.json");
 
-	let nudgeState = await readJsonIfExists(nudgeStatePath, null);
+	let nudgeState = await readJsonWithLeaderNudgeAuthority(nudgeStatePath, null, authority);
+
 	if (!nudgeState || typeof nudgeState !== "object") {
 		nudgeState = { last_nudged_by_team: {} };
 	}
@@ -1169,13 +1224,14 @@ export async function maybeNudgeTeamLeader({
 		};
 		const cleanupTeamPersistence = async () => {
 			await unlink(join(teamDir, "leader-attention.json")).catch(() => {});
-			const latestState = await readJsonIfExists(nudgeStatePath, nudgeState);
+			const latestState = await readJsonWithLeaderNudgeAuthority(nudgeStatePath, nudgeState, authority);
 			const cleanedState = cloneLeaderNudgeState(latestState);
 			removeTeamFromLeaderNudgeState(cleanedState, teamName);
 			nudgeState = cleanedState;
-			await atomicWriteJsonNoParentCreate(nudgeStatePath, cleanedState).catch(
+			await atomicWriteJsonNoParentCreate(nudgeStatePath, cleanedState, { authority }).catch(
 				() => {},
 			);
+
 		};
 
 		const persistLeaderNudgeBookkeeping = async ({
@@ -1209,7 +1265,8 @@ export async function maybeNudgeTeamLeader({
 				await atomicWriteJsonNoParentCreate(
 					leaderAttentionPath,
 					leaderAttention,
-					{
+					{ authority,
+
 						beforeRename: async (tempPath) => {
 							if (leaderNudgeTestHooks.beforeLeaderAttentionRename) {
 								await leaderNudgeTestHooks.beforeLeaderAttentionRename({
@@ -1285,6 +1342,7 @@ export async function maybeNudgeTeamLeader({
 
 			try {
 				await atomicWriteJsonNoParentCreate(nudgeStatePath, nextNudgeState, {
+					authority,
 					beforeRename: async (tempPath) => {
 						if (leaderNudgeTestHooks.beforeGlobalNudgeStateRename) {
 							await leaderNudgeTestHooks.beforeGlobalNudgeStateRename({
@@ -1533,6 +1591,7 @@ export async function maybeNudgeTeamLeader({
 		}
 
 		try {
+			await assertPinnedLeaderNudgeAuthority(authority);
 			const leaderHasActiveTask = paneHasActiveTask(paneGuard.paneCapture);
 			let deliveryMode = "sent";
 			if (leaderHasActiveTask) {

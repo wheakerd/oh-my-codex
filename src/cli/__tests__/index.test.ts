@@ -1,7 +1,7 @@
 import { after, afterEach, before, describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, readFileSync, utimesSync } from "node:fs";
-import { chmod, lstat, mkdir, mkdtemp, readFile, readdir as fsReaddir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir as fsReaddir, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { basename, delimiter, dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -1652,12 +1652,23 @@ describe("watcher script path resolution", () => {
 describe("buildNotifyFallbackWatcherEnv", () => {
   it("enables watcher authority and propagates CODEX_HOME override when requested", () => {
     const env = buildNotifyFallbackWatcherEnv(
-      { HOME: "/tmp/home", OMX_HUD_AUTHORITY: "0", TMUX: "sock,1,0", TMUX_PANE: "%2" },
-      { codexHomeOverride: "/tmp/codex-home", omxRootOverride: "/tmp/omx-root", enableAuthority: true },
+      {
+        HOME: "/tmp/home",
+        OMX_HUD_AUTHORITY: "0",
+        OMX_STATE_AUTHORITY_PATH: "/tmp/home/.omx/state/state-authority.json",
+        OMX_STATE_AUTHORITY_ID: "authority",
+        OMX_STATE_AUTHORITY_GENERATION_ID: "generation",
+        OMX_STATE_AUTHORITY_WORKSPACE_DIGEST: "workspace",
+        OMX_STATE_AUTHORITY_CAPABILITY: "bearer",
+        TMUX: "sock,1,0",
+        TMUX_PANE: "%2",
+      },
+      { codexHomeOverride: "/tmp/codex-home", enableAuthority: true },
     );
     assert.equal(env.OMX_HUD_AUTHORITY, "1");
     assert.equal(env.CODEX_HOME, "/tmp/codex-home");
-    assert.equal(env.OMX_ROOT, "/tmp/omx-root");
+    assert.equal(env.OMX_STATE_AUTHORITY_CAPABILITY, "bearer");
+    assert.equal(env.OMX_STATE_AUTHORITY_PATH, "/tmp/home/.omx/state/state-authority.json");
     assert.equal(env.HOME, "/tmp/home");
     assert.equal(env.TMUX, undefined);
     assert.equal(env.TMUX_PANE, undefined);
@@ -1676,11 +1687,11 @@ describe("buildNotifyFallbackWatcherEnv", () => {
 });
 
 describe("shouldEnableNotifyFallbackWatcher", () => {
-  it("keeps notify fallback enabled by default on non-Windows hosts", () => {
+  it("keeps notify fallback enabled by default on Linux", () => {
     assert.equal(shouldEnableNotifyFallbackWatcher({}, "linux"), true);
   });
 
-  it("disables notify fallback explicitly on non-Windows hosts", () => {
+  it("disables notify fallback explicitly on Linux", () => {
     assert.equal(
       shouldEnableNotifyFallbackWatcher({ OMX_NOTIFY_FALLBACK: "0" }, "linux"),
       false,
@@ -1691,16 +1702,63 @@ describe("shouldEnableNotifyFallbackWatcher", () => {
     assert.equal(shouldEnableNotifyFallbackWatcher({}, "win32"), false);
   });
 
-  it("allows explicit opt-in for notify fallback on win32", () => {
+  it("rejects explicit opt-in on platforms without process identity custody", () => {
     assert.equal(
       shouldEnableNotifyFallbackWatcher({ OMX_NOTIFY_FALLBACK: "1" }, "win32"),
-      true,
+      false,
+    );
+    assert.equal(
+      shouldEnableNotifyFallbackWatcher({ OMX_NOTIFY_FALLBACK: "1" }, "darwin"),
+      false,
     );
   });
 });
 
+async function watcherPidAuthority(cwd: string) {
+  const canonicalPath = await realpath(cwd);
+  const identity = await stat(canonicalPath);
+  return {
+    observed_cwd: cwd,
+    canonical_state_root: canonicalPath,
+    generation: {
+      authority_id: "test-authority",
+      generation_id: "test-generation",
+      root_identity: {
+        device: identity.dev,
+        inode: identity.ino,
+        canonical_path: canonicalPath,
+      },
+    },
+    workspace_identity: { digest: "test-workspace" },
+  };
+}
+
+function watcherPidRecord(
+  pid: number,
+  rootIdentity: Awaited<ReturnType<typeof watcherPidAuthority>>["generation"]["root_identity"],
+  startedAt = "2026-04-05T00:00:00.000Z",
+) {
+  return JSON.stringify({
+    schema_version: 1,
+    owner_token: "test-owner",
+    authority_id: "test-authority",
+    generation_id: "test-generation",
+    workspace_digest: "test-workspace",
+    root_identity: rootIdentity,
+    cwd: rootIdentity.canonical_path,
+    pid,
+    process_start_identity: {
+      schema_version: 1,
+      platform: "linux",
+      boot_id: "test-boot",
+      start_ticks: "1",
+    },
+    started_at: startedAt,
+  });
+}
+
 describe("reapStaleNotifyFallbackWatcher", () => {
-  it("stops an existing watcher even when a later startup gate would skip relaunch", async () => {
+  it("refuses an unauthenticated watcher PID record even when it names a watcher", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-stale-notify-fallback-"));
     try {
       const pidPath = join(cwd, "notify-fallback.pid");
@@ -1719,7 +1777,7 @@ describe("reapStaleNotifyFallbackWatcher", () => {
         },
       });
 
-      assert.deepEqual(killed, [{ pid: 4321, signal: "SIGTERM" }]);
+      assert.deepEqual(killed, []);
       assert.equal(shouldEnableNotifyFallbackWatcher({}, "win32"), false);
     } finally {
       await rm(cwd, { recursive: true, force: true });
@@ -1773,8 +1831,7 @@ describe("reapStaleNotifyFallbackWatcher", () => {
           warned.push({ message, meta });
         },
       });
-      assert.equal(warned.length, 1);
-      assert.equal(warned[0]?.message, "[omx] warning: failed to stop stale notify fallback watcher");
+      assert.equal(warned.length, 0);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -5304,7 +5361,7 @@ exit 0
     await rm(cwd, { recursive: true, force: true });
   });
 
-  it("reapStaleNotifyFallbackWatcher sends SIGTERM only after confirming watcher identity", async () => {
+  it("reapStaleNotifyFallbackWatcher refuses an unauthenticated watcher PID record", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-reap-pid-confirmed-"));
     const pidPath = join(cwd, "watcher.pid");
     await writeFile(pidPath, JSON.stringify({ pid: 12345, started_at: "2026-04-05T00:00:00.000Z" }));
@@ -5315,11 +5372,11 @@ exit 0
       tryKillPid: (pid) => { killed.push(pid); return true; },
     });
 
-    assert.deepEqual(killed, [12345], "should SIGTERM the verified watcher process");
+    assert.deepEqual(killed, [], "must not SIGTERM an unauthenticated PID record");
     await rm(cwd, { recursive: true, force: true });
   });
 
-  it("reapStaleNotifyFallbackWatcher skips recently started watcher records to avoid respawn loops", async () => {
+  it("refuses an unauthenticated recent watcher record", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-reap-pid-recent-"));
     const pidPath = join(cwd, "watcher.pid");
     await writeFile(pidPath, JSON.stringify({ pid: 24680, started_at: "2026-05-15T00:00:00.000Z" }));
@@ -5332,12 +5389,12 @@ exit 0
       tryKillPid: (pid) => { killed.push(pid); return true; },
     });
 
-    assert.equal(result, "recent_active");
+    assert.equal(result, "invalid");
     assert.equal(killed.length, 0, "should not kill a watcher still inside the startup grace window");
     await rm(cwd, { recursive: true, force: true });
   });
 
-  it("reuses legacy plain-text PID parsing without widening stale reap semantics across PID reuse", async () => {
+  it("refuses legacy plain-text PID records without probing or signaling the PID", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-reap-legacy-pid-"));
     try {
       const pidPath = join(cwd, "watcher.pid");
@@ -5355,17 +5412,13 @@ exit 0
         },
       });
 
-      assert.deepEqual(
-        observed,
-        [12345],
-        "legacy plain-text PID files should still identity-check reused PIDs before any kill",
-      );
+      assert.deepEqual(observed, []);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
   });
 
-  it("reaps watcher-record PIDs only after the record path confirms watcher identity across PID reuse", async () => {
+  it("refuses a watcher record without authoritative ownership fields", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-reap-record-pid-"));
     try {
       const pidPath = join(cwd, "watcher.pid");
@@ -5387,14 +5440,93 @@ exit 0
         },
       });
 
-      assert.deepEqual(observed, [
-        { step: "identity", pid: 54321 },
-        { step: "kill", pid: 54321 },
-      ]);
+      assert.deepEqual(observed, []);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
   });
+
+describe("authoritative fallback watcher PID ownership", () => {
+  it("does not signal without a provable live process identity", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-authoritative-reap-"));
+    try {
+      const authority = await watcherPidAuthority(cwd);
+      const pidPath = join(cwd, "notify-fallback.pid");
+      await writeFile(pidPath, watcherPidRecord(12345, authority.generation.root_identity), "utf-8");
+      const killed: number[] = [];
+
+      const result = await reapStaleNotifyFallbackWatcher(pidPath, authority, {
+        isWatcherProcess: () => true,
+        resolveCurrentAuthority: async () => authority,
+        tryKillPid: (pid) => { killed.push(pid); return true; },
+      });
+
+      assert.equal(result, "identity_mismatch");
+      assert.deepEqual(killed, []);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("does not signal a predecessor generation PID record in the successor root", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-predecessor-generation-reap-"));
+    try {
+      const authority = await watcherPidAuthority(cwd);
+      const pidPath = join(cwd, "notify-fallback.pid");
+      await writeFile(
+        pidPath,
+        JSON.stringify({
+          ...JSON.parse(watcherPidRecord(23456, authority.generation.root_identity)),
+          generation_id: "predecessor-generation",
+        }),
+        "utf-8",
+      );
+      const killed: number[] = [];
+
+      const result = await reapStaleNotifyFallbackWatcher(pidPath, authority, {
+        isWatcherProcess: () => true,
+        resolveCurrentAuthority: async () => authority,
+        tryKillPid: (pid) => { killed.push(pid); return true; },
+      });
+
+      assert.equal(result, "identity_mismatch");
+      assert.deepEqual(killed, []);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("does not signal a hostile PID after its authority root is replaced", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-replaced-root-reap-"));
+    const replacement = await mkdtemp(join(tmpdir(), "omx-replacement-root-"));
+    const retired = `${cwd}-retired`;
+    try {
+      const authority = await watcherPidAuthority(cwd);
+      const pidPath = join(cwd, "notify-fallback.pid");
+      await writeFile(
+        join(replacement, "notify-fallback.pid"),
+        watcherPidRecord(54321, authority.generation.root_identity),
+        "utf-8",
+      );
+      await rename(cwd, retired);
+      await rename(replacement, cwd);
+      const killed: number[] = [];
+
+      const result = await reapStaleNotifyFallbackWatcher(pidPath, authority, {
+        isWatcherProcess: () => true,
+        resolveCurrentAuthority: async () => authority,
+        tryKillPid: (pid) => { killed.push(pid); return true; },
+      });
+
+      assert.equal(result, "failed");
+      assert.deepEqual(killed, []);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+      await rm(replacement, { recursive: true, force: true });
+      await rm(retired, { recursive: true, force: true });
+    }
+  });
+});
 
   it("acquireTmuxExtendedKeysLease recovers from a stale lock left by a crashed process", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-tmux-stale-lock-"));

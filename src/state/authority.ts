@@ -21,6 +21,7 @@ import {
   readdir,
   link,
   rename,
+  rm,
   stat,
   unlink,
 } from 'node:fs/promises';
@@ -1114,14 +1115,21 @@ async function assertAuthorityLocator(
   }
 }
 
-export async function ensureAuthorityDirectory(root: string, directory: string): Promise<string> {
+export async function ensureAuthorityDirectory(
+  root: string,
+  directory: string,
+  options: Pick<AtomicAuthorityWriteOptions, 'expected_root_identity'> = {},
+): Promise<string> {
   const canonicalRoot = canonicalizeExistingAuthorityPath(root, 'authority root');
   const target = assertPathInput(directory, 'authority directory');
   if (!isAuthorityPathWithin(canonicalRoot, target)) {
     authorityError(AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot, `authority directory escapes root: ${target}`);
   }
   const relativeTarget = relative(canonicalRoot, target);
-  const rootIdentity = await captureRootFilesystemIdentity(canonicalRoot);
+  const rootIdentity = options.expected_root_identity ?? await captureRootFilesystemIdentity(canonicalRoot);
+  if (!sameRootFilesystemIdentity(rootIdentity, await captureRootFilesystemIdentity(canonicalRoot))) {
+    authorityError(AUTHORITY_DIAGNOSTIC_CODES.rootFingerprintMismatch, 'authority root does not match the expected root fingerprint');
+  }
   if (relativeTarget === '') {
     assertSecureStateRootCustody(rootIdentity, 'authority directory');
     return canonicalRoot;
@@ -1494,6 +1502,71 @@ async function closeAuthorityMutationResources(
   }
 }
 
+/**
+ * Remove a directory only while its authority root remains the expected pinned
+ * filesystem object. The target is first moved through the opened parent
+ * directory into a private quarantine name, so a later path replacement cannot
+ * cause recursive removal of successor content.
+ */
+export async function removeAuthorityDirectory(
+  directory: string,
+  options: Pick<AtomicAuthorityWriteOptions, 'authority_root' | 'expected_root_identity'>,
+): Promise<void> {
+  const target = assertPathInput(directory, 'authority directory');
+  const targetName = basename(target);
+  if (!/^[A-Za-z0-9._-]{1,128}$/.test(targetName) || targetName === '.' || targetName === '..') {
+    authorityError(AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot, `authority directory basename is unsafe: ${targetName}`);
+  }
+
+  if (!stateAuthorityFilesystemPrimitiveForPlatform().descriptor_relative) {
+    authorityError(
+      AUTHORITY_DIAGNOSTIC_CODES.rootCapabilityWeak,
+      'safe descriptor-relative recursive authority directory deletion is unavailable on this platform',
+    );
+  }
+
+  let scope: AuthorityMutationScope;
+  try {
+    scope = await openAuthorityMutationScope(target, options);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw error;
+  }
+  let targetDirectory: OpenedAuthorityDirectory | undefined;
+  try {
+    const sourcePath = join(scope.parent.descriptor_path, targetName);
+    let openedTarget: OpenedAuthorityDirectory;
+    try {
+      openedTarget = await openNoFollowAuthorityDirectory(sourcePath, 'authority directory');
+      targetDirectory = openedTarget;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+      throw error;
+    }
+    await assertAuthorityMutationScopeCurrent(scope);
+
+    const quarantineName = `.${targetName}.delete-${randomBytes(16).toString('hex')}`;
+    const quarantinePath = join(scope.parent.descriptor_path, quarantineName);
+    const beforeRename = await lstat(sourcePath);
+    if (beforeRename.isSymbolicLink() || !beforeRename.isDirectory()
+      || !sameStatIdentity(beforeRename, { dev: openedTarget.device, ino: openedTarget.inode })) {
+      authorityError(AUTHORITY_DIAGNOSTIC_CODES.rootFingerprintMismatch, 'authority directory changed before quarantine rename');
+    }
+    await rename(sourcePath, quarantinePath);
+    const quarantined = await lstat(quarantinePath);
+    if (quarantined.isSymbolicLink() || !quarantined.isDirectory()
+      || !sameStatIdentity(quarantined, { dev: openedTarget.device, ino: openedTarget.inode })) {
+      authorityError(AUTHORITY_DIAGNOSTIC_CODES.rootFingerprintMismatch, 'authority directory changed during quarantine rename');
+    }
+    await assertAuthorityMutationScopeCurrent(scope);
+    await rm(quarantinePath, { recursive: true, force: true });
+    await assertAuthorityMutationScopeCurrent(scope);
+  } finally {
+    await targetDirectory?.handle?.close().catch(() => undefined);
+    await closeAuthorityMutationScope(scope);
+  }
+}
+
 async function assertAuthorityMutationTarget(
   scope: AuthorityMutationScope,
   basenameTarget: string,
@@ -1682,9 +1755,15 @@ export async function atomicWriteAuthorityFile(
   }
 }
 
-async function readAuthorityFileNoFollow(
+/**
+ * Reads a regular file beneath an authority root while proving that the pinned
+ * root generation and every opened path component remain unchanged. Missing
+ * files return null; substituted roots, links, and non-regular files fail
+ * closed.
+ */
+export async function readAuthorityFileWithExpectedRoot(
   path: string,
-  options: AtomicAuthorityWriteOptions,
+  options: Pick<AtomicAuthorityWriteOptions, 'authority_root' | 'expected_root_identity'>,
 ): Promise<string | null> {
   const target = assertPathInput(path, 'authority file');
   const basenameTarget = basename(target);
@@ -1740,6 +1819,13 @@ async function readAuthorityFileNoFollow(
     await handle?.close().catch(() => undefined);
     await closeAuthorityMutationScope(scope).catch(() => undefined);
   }
+}
+
+async function readAuthorityFileNoFollow(
+  path: string,
+  options: AtomicAuthorityWriteOptions,
+): Promise<string | null> {
+  return await readAuthorityFileWithExpectedRoot(path, options);
 }
 
 async function appendAuthorityFileNoFollow(

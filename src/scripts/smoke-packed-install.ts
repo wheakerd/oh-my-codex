@@ -1487,8 +1487,27 @@ async function runPackedTransportRegressions(hookScript: string, smokeCwd: strin
   const globalNodeModules = resolveGlobalNodeModules(prefixDir);
   const packageRoot = join(globalNodeModules, 'oh-my-codex');
   const hookScript = join(packageRoot, 'dist', 'scripts', 'codex-native-hook.js');
+  const watcherScript = join(packageRoot, 'dist', 'scripts', 'notify-fallback-watcher.js');
   const smokeCwd = mkdtempSync(join(tmpdir(), 'omx-packed-hook-smoke-'));
   try {
+    const hostileWatcherRoot = join(smokeCwd, 'hostile-watcher-root');
+    const hostileWatcher = spawnSync(process.execPath, [realpathSync(watcherScript), '--once', '--authority-only'], {
+      cwd: smokeCwd,
+      env: {
+        ...process.env,
+        OMX_ROOT: hostileWatcherRoot,
+        OMX_STATE_ROOT: hostileWatcherRoot,
+        OMX_TEAM_STATE_ROOT: hostileWatcherRoot,
+      },
+      encoding: 'utf-8',
+      stdio: 'pipe',
+    });
+    if (hostileWatcher.status === 0) {
+      throw new Error('packed fallback watcher accepted unauthenticated ambient root authority');
+    }
+    if (existsSync(hostileWatcherRoot)) {
+      throw new Error('packed fallback watcher mutated an unauthenticated ambient root');
+    }
     for (const eventName of PACKED_INSTALL_NATIVE_HOOK_SMOKE_EVENTS) {
       const payload = buildNativeHookSmokePayload(eventName, smokeCwd);
       const result = run(process.execPath, [realpathSync(hookScript)], {

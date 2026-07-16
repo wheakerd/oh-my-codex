@@ -20,7 +20,6 @@ import {
 import { buildStateAuthorityTransportEnv } from "../../state/transport-env.js";
 import { hardenTestAuthorityTreeSync } from "../../team/__tests__/authority-fixture.js";
 import { resolveWorkerNotifyTeamStateRoot } from "../../team/state-root.js";
-import { readTeamWorkersForIdleCheck } from "../../scripts/notify-hook/team-worker.js";
 import { writeSessionStart } from "../session.js";
 
 const fixtureAuthorityEnv = new Map<string, NodeJS.ProcessEnv>();
@@ -142,6 +141,15 @@ if [[ "$cmd" == "display-message" ]]; then
     echo "notify-worker-idle"
   elif [[ "\${@: -1}" == "#S" ]]; then
     echo "session-test"
+  elif [[ "\${@: -1}" == "#{session_name}\t#{pane_id}\t#{pane_pid}" ]]; then
+    target=""
+    while (($#)); do
+      case "$1" in
+        -t) target="$2"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    printf 'session-test\t%s\t12345\n' "$target"
   fi
   exit 0
 fi
@@ -396,6 +404,10 @@ describe("notify-hook per-worker idle notification", {
 				);
 			}
 
+			const heartbeatPath = join(workersDir, "worker-1", "heartbeat.json");
+			assert.ok(existsSync(heartbeatPath), `authenticated worker heartbeat should exist: ${result.stderr || result.stdout}`);
+			const heartbeat = JSON.parse(await readFile(heartbeatPath, "utf-8"));
+			assert.equal(heartbeat.session_id, "notify-worker-idle");
 			const eventsPath = join(teamDir, "events", "events.ndjson");
 			assert.ok(
 				existsSync(eventsPath),
@@ -646,6 +658,10 @@ if [[ "$cmd" == "display-message" ]]; then
       *) format="$1"; shift ;;
     esac
   done
+  if [[ "$format" == "#{session_name}\t#{pane_id}\t#{pane_pid}" ]]; then
+    printf 'session-test\t%s\t12345\n' "$target"
+    exit 0
+  fi
   if [[ "$format" == "#{pane_current_command}" && "$target" == "%79" ]]; then
     echo "zsh"
   fi
@@ -792,6 +808,10 @@ if [[ "$cmd" == "display-message" ]]; then
   done
   if [[ "$format" == "#{pane_in_mode}" && "$target" == "%81" ]]; then
     echo "0"
+    exit 0
+  fi
+  if [[ "$format" == "#{session_name}\t#{pane_id}\t#{pane_pid}" ]]; then
+    printf 'session-test\t%s\t12345\n' "$target"
     exit 0
   fi
   if [[ "$format" == "#{pane_current_command}" && "$target" == "%81" ]]; then
@@ -1326,10 +1346,6 @@ exit 0
 			await writeFile(fakeTmuxPath, buildFakeTmux(tmuxLogPath));
 			await chmod(fakeTmuxPath, 0o755);
 			writeWorkerIdentityFixture(cwd, `${teamName}/worker-1`);
-			assert.equal(
-				(await readTeamWorkersForIdleCheck(stateDir, teamName))?.leaderPaneId,
-				"%62",
-			);
 
 			const result = runNotifyHookAsWorker(
 				cwd,

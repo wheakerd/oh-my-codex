@@ -11,7 +11,6 @@ import {
 	rm,
 	stat,
 	unlink,
-	writeFile,
 } from "fs/promises";
 import { spawn, type ChildProcess } from "child_process";
 import { dirname, join, resolve } from "path";
@@ -27,7 +26,8 @@ import {
 	normalizeAutoNudgeSignatureText,
 	resolveAutoNudgeSignature,
 } from "./notify-hook/auto-nudge.js";
-import { readScopedJsonIfExists } from "./notify-hook/state-io.js";
+import { getScopedStatePath } from "./notify-hook/state-io.js";
+
 import { checkPaneReadyForTeamSendKeys } from "./notify-hook/team-tmux-guard.js";
 import {
 	checkWorkerPanesAlive,
@@ -52,7 +52,6 @@ import {
 	readSubagentSessionSummary,
 } from "../subagents/tracker.js";
 import { listNotifyCanonicalActiveTeams } from "./notify-hook/active-team.js";
-import { sameFilePath } from "../utils/paths.js";
 import { validateSessionId } from "../mcp/state-paths.js";
 import { TEAM_NAME_SAFE_PATTERN } from "../team/contracts.js";
 import { shouldContinueRun } from "../runtime/run-loop.js";
@@ -61,6 +60,38 @@ import {
 	compactNotifyFallbackDeliveries,
 	NOTIFY_FALLBACK_LEASE_MS,
 } from "./notify-fallback-delivery.js";
+import {
+	atomicWriteAuthorityFile,
+	initializeStateAuthority,
+	mintStateAuthorityTransportCapability,
+	captureRootFilesystemIdentity,
+	ensureAuthorityDirectory,
+	readAuthorityFileWithExpectedRoot,
+
+	readWorkspaceAuthorityAnchor,
+	resolveStateAuthorityForGuard,
+	sameRootFilesystemIdentity,
+	validateStateAuthorityTransportCapability,
+	withStateAuthorityTransaction,
+	type ResolvedStateAuthorityContext,
+} from "../state/authority.js";
+import {
+	buildStateAuthorityTransportEnv,
+	OMX_STATE_AUTHORITY_CAPABILITY_ENV,
+	OMX_STATE_AUTHORITY_GENERATION_ID_ENV,
+	OMX_STATE_AUTHORITY_ID_ENV,
+	OMX_STATE_AUTHORITY_PATH_ENV,
+	OMX_STATE_AUTHORITY_WORKSPACE_DIGEST_ENV,
+} from "../state/transport-env.js";
+import {
+	captureNotifyWatcherProcessStartIdentity,
+	createNotifyWatcherPidRecord,
+	processMatchesNotifyWatcherPidRecord,
+	readNotifyWatcherPidRecordNoFollow,
+	recordMatchesNotifyWatcherAuthority,
+	type NotifyWatcherPidRecord,
+} from "../state/notify-watcher-pid.js";
+
 
 function argValue(name: string, fallback = ""): string {
 	const idx = process.argv.indexOf(name);
@@ -95,10 +126,6 @@ function normalizeValidTeamName(value: unknown): string {
 	return TEAM_NAME_SAFE_PATTERN.test(trimmed) ? trimmed : "";
 }
 
-function parsePositivePid(value: unknown): number | null {
-	const pid = Math.trunc(asNumber(value as string | number | undefined, 0));
-	return pid > 0 ? pid : null;
-}
 
 function parseIsoMillis(value: string | null | undefined): number | null {
 	const parsed = Date.parse(safeString(value).trim());
@@ -123,34 +150,8 @@ function sleep(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-let atomicJsonWriteCounter = 0;
 
-async function writeJsonObjectAtomically(
-	path: string,
-	value: unknown,
-): Promise<void> {
-	const tempPath = `${path}.${process.pid}.${Date.now()}.${++atomicJsonWriteCounter}.tmp`;
-	try {
-		await writeFile(tempPath, JSON.stringify(value, null, 2));
-		await rename(tempPath, path);
-	} catch (error) {
-		await rm(tempPath, { force: true }).catch(() => {});
-		throw error;
-	}
-}
 
-async function waitForPidExit(
-	pid: number,
-	timeoutMs = 3000,
-	stepMs = 50,
-): Promise<boolean> {
-	const deadline = Date.now() + timeoutMs;
-	while (Date.now() < deadline) {
-		if (!isPidAlive(pid)) return true;
-		await sleep(stepMs);
-	}
-	return !isPidAlive(pid);
-}
 
 const cwd = resolve(argValue("--cwd", process.cwd()));
 const notifyScript = resolve(
@@ -199,40 +200,125 @@ const authorityLifetimeMs = runOnce
 	: Math.min(Math.max(pollMs, configuredMaxLifetimeMs), 24 * 60 * 60 * 1000);
 const authorityDeadlineAtMs = startedAt + authorityLifetimeMs;
 
-const runtimeRoot = resolve(
-	process.env.OMX_ROOT || process.env.OMX_STATE_ROOT || cwd,
-);
-const omxDir = join(runtimeRoot, ".omx");
-const logsDir = join(omxDir, "logs");
-const stateDir = join(omxDir, "state");
-const statePath = join(stateDir, "notify-fallback-state.json");
-const pidFilePath = resolve(
-	argValue("--pid-file", join(stateDir, "notify-fallback.pid")),
-);
-const logPath = join(
-	logsDir,
-	`notify-fallback-${new Date().toISOString().split("T")[0]}.jsonl`,
-);
-const logRotatePath = `${logPath}.1`;
-const logLockPath = `${logPath}.lock`;
+let omxDir = "";
+let logsDir = "";
+let stateDir = "";
+let statePath = "";
+let pidFilePath = "";
+let logPath = "";
+let logRotatePath = "";
+let logLockPath = "";
+let ralphSteerTimestampPath = "";
+let ralphSteerLockPath = "";
 const defaultMaxLogBytes = 10 * 1024 * 1024;
 const maxLogBytes = Math.max(
 	0,
 	asNumber(
 		argValue(
 			"--log-max-bytes",
-			process.env.OMX_NOTIFY_FALLBACK_LOG_MAX_BYTES ||
-				String(defaultMaxLogBytes),
+			process.env.OMX_NOTIFY_FALLBACK_LOG_MAX_BYTES || String(defaultMaxLogBytes),
 		),
 		defaultMaxLogBytes,
 	),
 );
-const ralphSteerTimestampPath = join(stateDir, "ralph-last-steer-at");
-const ralphSteerLockPath = join(stateDir, "ralph-continue-steer.lock");
+
+let retainedAuthority: ResolvedStateAuthorityContext | undefined;
+let testBootstrappedAuthority = false;
+
+async function retainActiveAuthority(): Promise<ResolvedStateAuthorityContext> {
+	const authority = await resolveStateAuthorityForGuard({
+		startup_cwd: cwd,
+		observed_cwd: cwd,
+		session_id: process.env.OMX_SESSION_ID || undefined,
+	});
+	const binding = authority.session_binding;
+	const transport = {
+		path: process.env[OMX_STATE_AUTHORITY_PATH_ENV]?.trim() ?? "",
+		authorityId: process.env[OMX_STATE_AUTHORITY_ID_ENV]?.trim() ?? "",
+		generationId: process.env[OMX_STATE_AUTHORITY_GENERATION_ID_ENV]?.trim() ?? "",
+		workspaceDigest:
+			process.env[OMX_STATE_AUTHORITY_WORKSPACE_DIGEST_ENV]?.trim() ?? "",
+		capability: process.env[OMX_STATE_AUTHORITY_CAPABILITY_ENV]?.trim() ?? "",
+	};
+	if (
+		!binding ||
+		binding.lifecycle !== "active" ||
+		!transport.path ||
+		!transport.authorityId ||
+		!transport.generationId ||
+		!transport.workspaceDigest ||
+		!transport.capability ||
+		resolve(transport.path) !== resolve(authority.authority_path) ||
+		transport.authorityId !== authority.generation.authority_id ||
+		transport.generationId !== authority.generation.generation_id ||
+		transport.workspaceDigest !== authority.workspace_identity.digest
+	) {
+		throw new Error("notify fallback watcher requires authenticated committed state-authority transport");
+	}
+	await validateStateAuthorityTransportCapability(authority, transport.capability);
+	const anchor = await readWorkspaceAuthorityAnchor(authority.workspace_identity);
+	if (
+		!anchor?.active_lease ||
+		anchor.active_generation_id !== authority.generation.generation_id ||
+		anchor.active_lease.generation_id !== authority.generation.generation_id ||
+		anchor.active_lease.binding_id !== binding.binding_id
+	) {
+		throw new Error("notify fallback watcher authority binding is no longer active");
+	}
+	const root = resolve(dirname(authority.generation.canonical_omx_root));
+	for (const name of ["OMX_ROOT", "OMX_STATE_ROOT"] as const) {
+		const value = process.env[name]?.trim();
+		if (value && resolve(authority.workspace_identity.canonical_path, value) !== root) {
+			throw new Error(`${name} conflicts with authenticated state authority`);
+		}
+	}
+	const teamRoot = process.env.OMX_TEAM_STATE_ROOT?.trim();
+	if (teamRoot && resolve(authority.workspace_identity.canonical_path, teamRoot) !== resolve(authority.canonical_state_root)) {
+		throw new Error("OMX_TEAM_STATE_ROOT conflicts with authenticated state authority");
+	}
+	return authority;
+}
+
+async function requireRetainedActiveAuthority(): Promise<void> {
+	if (!retainedAuthority) throw new Error("notify fallback watcher has no retained authority");
+	const binding = retainedAuthority.session_binding;
+	const anchor = await readWorkspaceAuthorityAnchor(retainedAuthority.workspace_identity);
+	const rootIdentity = await captureRootFilesystemIdentity(retainedAuthority.canonical_state_root);
+	if (
+		!binding ||
+		binding.lifecycle !== "active" ||
+		!sameRootFilesystemIdentity(rootIdentity, retainedAuthority.generation.root_identity) ||
+		anchor?.active_generation_id !== retainedAuthority.generation.generation_id ||
+		anchor.active_lease?.generation_id !== retainedAuthority.generation.generation_id ||
+		anchor.active_lease?.binding_id !== binding.binding_id
+	) {
+		stopping = true;
+		throw new Error("notify fallback watcher authority changed or terminalized");
+	}
+}
+
+async function withRetainedAuthorityTransaction<T>(
+	callback: (authority: ResolvedStateAuthorityContext) => Promise<T>,
+): Promise<T> {
+	if (!retainedAuthority) throw new Error("notify fallback watcher has no retained authority");
+	const generationId = retainedAuthority.generation.generation_id;
+	const bindingId = retainedAuthority.session_binding?.binding_id;
+	return await withStateAuthorityTransaction(retainedAuthority, async (authority) => {
+		if (
+			authority.generation.generation_id !== generationId ||
+			authority.session_binding?.binding_id !== bindingId ||
+			authority.session_binding?.lifecycle !== "active"
+		) {
+			stopping = true;
+			throw new Error("notify fallback watcher authority changed or terminalized");
+		}
+		return await callback(authority);
+	});
+}
+
 const watcherOwnerToken = `${process.pid}-${startedAt}-${Math.random().toString(36).slice(2, 10)}`;
 const RALPH_CONTINUE_TEXT = "Ralph loop active continue";
 const RALPH_CONTINUE_CADENCE_MS = 60_000;
-const RALPH_STEER_LOCK_STALE_MS = 30_000;
 const RALPH_TERMINAL_PHASES = new Set([
 	"blocked_on_user",
 	"complete",
@@ -274,19 +360,8 @@ interface RalphContinueSteerState {
 	singleton_lock_path: string;
 }
 
-interface PidFileRecord {
-	pid: number;
-	parent_pid?: number;
-	cwd?: string;
-	started_at?: string;
-	max_lifetime_ms?: number;
-	owner_token?: string;
-}
 
-interface RalphSteerLockRecord {
-	pid: number;
-	acquired_at: string;
-}
+
 
 interface DispatchDrainState {
 	leader_only: boolean;
@@ -512,6 +587,7 @@ async function rotateLogIfNeeded(nextEntryBytes: number): Promise<void> {
 }
 
 async function eventLog(event: Record<string, unknown>): Promise<void> {
+	await requireRetainedActiveAuthority();
 	if (shouldSuppressEventLog(event)) return;
 	const line = `${JSON.stringify({ timestamp: new Date().toISOString(), ...event })}\n`;
 	await mkdir(dirname(logPath), { recursive: true }).catch(() => {});
@@ -994,86 +1070,21 @@ async function readRalphSteerTimestamp(): Promise<string> {
 }
 
 async function writeRalphSteerTimestamp(nowIso: string): Promise<void> {
-	await mkdir(dirname(ralphSteerTimestampPath), { recursive: true }).catch(
-		() => {},
-	);
-	const tempPath = `${ralphSteerTimestampPath}.${process.pid}.tmp`;
-	await writeFile(tempPath, `${nowIso}\n`, "utf-8");
-	await rename(tempPath, ralphSteerTimestampPath);
+	if (!retainedAuthority) throw new Error("notify fallback watcher has no retained authority");
+	await atomicWriteAuthorityFile(ralphSteerTimestampPath, `${nowIso}\n`, {
+		authority_root: retainedAuthority.canonical_state_root,
+		expected_root_identity: retainedAuthority.generation.root_identity,
+	});
 }
 
-async function readRalphSteerLock(
-	path: string,
-): Promise<RalphSteerLockRecord | null> {
-	const raw = await readFile(path, "utf-8").catch(() => "");
-	if (!raw.trim()) return null;
-	try {
-		const parsed = JSON.parse(raw) as Record<string, unknown>;
-		const pid = parsePositivePid(parsed.pid);
-		const acquiredAt = safeString(parsed.acquired_at).trim();
-		if (pid === null || !acquiredAt) return null;
-		return { pid, acquired_at: acquiredAt };
-	} catch {
-		return null;
-	}
-}
-
-const RALPH_STEER_LOCK_MAX_RETRIES = 5;
 
 async function withRalphSteerLock<T>(
 	task: () => Promise<T>,
 ): Promise<T | null> {
-	await mkdir(dirname(ralphSteerLockPath), { recursive: true }).catch(() => {});
-
-	let acquired = false;
-	for (let attempt = 0; attempt < RALPH_STEER_LOCK_MAX_RETRIES; attempt++) {
-		let handle;
-		try {
-			handle = await open(ralphSteerLockPath, "wx");
-			const payload: RalphSteerLockRecord = {
-				pid: process.pid,
-				acquired_at: new Date().toISOString(),
-			};
-			await handle.writeFile(JSON.stringify(payload, null, 2));
-			acquired = true;
-			break;
-		} catch (error) {
-			const code =
-				error !== null && typeof error === "object"
-					? (error as NodeJS.ErrnoException).code
-					: "";
-			if (code !== "EEXIST") throw error;
-			const existing = await readRalphSteerLock(ralphSteerLockPath);
-			const lockAgeMs = parseIsoMillis(existing?.acquired_at) ?? 0;
-			const stale =
-				existing !== null &&
-				(!isPidAlive(existing.pid) ||
-					(lockAgeMs > 0 &&
-						Date.now() - lockAgeMs > RALPH_STEER_LOCK_STALE_MS));
-			if (stale) {
-				await unlink(ralphSteerLockPath).catch(() => {});
-				continue;
-			}
-			lastRalphContinueSteer.last_reason = "global_lock_busy";
-			return null;
-		} finally {
-			await handle?.close().catch(() => {});
-		}
-	}
-
-	if (!acquired) {
-		lastRalphContinueSteer.last_reason = "global_lock_exhausted";
-		return null;
-	}
-
-	try {
-		return await task();
-	} finally {
-		const existing = await readRalphSteerLock(ralphSteerLockPath);
-		if (existing?.pid === process.pid) {
-			await unlink(ralphSteerLockPath).catch(() => {});
-		}
-	}
+	// Every watcher cycle already holds the state-authority transaction. Keeping a
+	// second path-based lock here would reopen a stale-root mutation boundary.
+	await requireRetainedActiveAuthority();
+	return await task();
 }
 
 interface RalphProgressGateResult {
@@ -1113,12 +1124,8 @@ async function readRalphProgressGate(
 		}
 	}
 
-	const hudState = await readScopedJsonIfExists(
-		stateDir,
-		"hud-state.json",
-		undefined,
-		null,
-	);
+	if (!retainedAuthority) throw new Error("notify fallback watcher has no retained authority");
+	const hudState = await readScopedJsonWithAuthority(retainedAuthority, "hud-state.json");
 	if (!hudState || typeof hudState !== "object") {
 		return {
 			allow: false,
@@ -1194,28 +1201,12 @@ function shouldSkipRalphContinue(
 	};
 }
 
-async function readPidFileRecord(path: string): Promise<PidFileRecord | null> {
-	const raw = await readFile(path, "utf-8").catch(() => "");
-	const trimmed = raw.trim();
-	if (!trimmed) return null;
-	try {
-		const parsed = JSON.parse(trimmed) as Record<string, unknown>;
-		const pid = parsePositivePid(parsed.pid);
-		if (pid === null) return null;
-		return {
-			pid,
-			parent_pid: parsePositivePid(parsed.parent_pid) ?? undefined,
-			cwd: safeString(parsed.cwd) || undefined,
-			started_at: safeString(parsed.started_at) || undefined,
-			max_lifetime_ms:
-				asNumber(parsed.max_lifetime_ms as string | number | undefined, 0) ||
-				undefined,
-			owner_token: safeString(parsed.owner_token) || undefined,
-		};
-	} catch {
-		const pid = parsePositivePid(trimmed);
-		return pid === null ? null : { pid };
-	}
+async function readPidFileRecord(path: string): Promise<NotifyWatcherPidRecord | null> {
+	if (!retainedAuthority) throw new Error("notify fallback watcher has no retained authority");
+	await requireRetainedActiveAuthority();
+	const record = await readNotifyWatcherPidRecordNoFollow(path, retainedAuthority);
+	await requireRetainedActiveAuthority();
+	return record;
 }
 
 function createAuthorityBackoffState(
@@ -1272,12 +1263,11 @@ async function resolveAuthorityPrimaryWatcherHealth(
 
 	const existingRecord = await readPidFileRecord(pidFilePath).catch(() => null);
 	if (!existingRecord) return createAuthorityBackoffState("pid_missing");
-	if (existingRecord.cwd && !sameFilePath(existingRecord.cwd, cwd))
-		return createAuthorityBackoffState("cwd_mismatch");
-	if (!isPidAlive(existingRecord.pid)) {
-		return createAuthorityBackoffState("pid_stale", {
-			primary_pid: existingRecord.pid,
-		});
+	if (!recordMatchesNotifyWatcherAuthority(existingRecord, retainedAuthority!, cwd)) {
+		return createAuthorityBackoffState("pid_authority_mismatch", { primary_pid: existingRecord.pid });
+	}
+	if (!processMatchesNotifyWatcherPidRecord(existingRecord)) {
+		return createAuthorityBackoffState("pid_identity_mismatch", { primary_pid: existingRecord.pid });
 	}
 
 	const persistedState = await readJsonObject(statePath);
@@ -1340,17 +1330,22 @@ async function resolveAuthorityPrimaryWatcherHealth(
 }
 
 async function writePidFileRecord(): Promise<void> {
-	const nextRecord: PidFileRecord = {
+	if (!retainedAuthority) throw new Error("notify fallback watcher has no retained authority");
+	const processStartIdentity = captureNotifyWatcherProcessStartIdentity(process.pid);
+	if (!processStartIdentity) {
+		throw new Error("cannot prove fallback watcher process identity for PID ownership record");
+	}
+	const nextRecord = createNotifyWatcherPidRecord(retainedAuthority, {
 		pid: process.pid,
-		parent_pid: parentPid,
 		cwd,
 		started_at: new Date(startedAt).toISOString(),
-		max_lifetime_ms: maxLifetimeMs,
 		owner_token: watcherOwnerToken,
-	};
-	await writeFile(pidFilePath, JSON.stringify(nextRecord, null, 2)).catch(
-		() => {},
-	);
+		process_start_identity: processStartIdentity,
+	});
+	await atomicWriteAuthorityFile(pidFilePath, JSON.stringify(nextRecord, null, 2), {
+		authority_root: retainedAuthority.canonical_state_root,
+		expected_root_identity: retainedAuthority.generation.root_identity,
+	});
 }
 
 async function buildWatcherManagedPayload(): Promise<Record<
@@ -1373,20 +1368,15 @@ async function persistReboundRalphPaneState(
 		.then((content) => JSON.parse(content) as Record<string, unknown>)
 		.catch(() => null);
 	const nextState = {
-		...(latestState && typeof latestState === "object"
-			? latestState
-			: state || {}),
+		...(latestState && typeof latestState === "object" ? latestState : state || {}),
 		tmux_pane_id: paneId,
 		tmux_pane_set_at: nowIso,
 	};
-	const tmpPath = `${statePath}.tmp.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}`;
-	await writeFile(tmpPath, JSON.stringify(nextState, null, 2));
-	try {
-		await rename(tmpPath, statePath);
-	} catch (error) {
-		await unlink(tmpPath).catch(() => {});
-		throw error;
-	}
+	if (!retainedAuthority) throw new Error("notify fallback watcher has no retained authority");
+	await atomicWriteAuthorityFile(statePath, JSON.stringify(nextState, null, 2), {
+		authority_root: retainedAuthority.canonical_state_root,
+		expected_root_identity: retainedAuthority.generation.root_identity,
+	});
 	return nextState;
 }
 
@@ -1546,6 +1536,7 @@ async function runRalphContinueSteerTick(): Promise<void> {
 			return { sent: false, skipped: true };
 		}
 
+		await requireRetainedActiveAuthority();
 		await emitRalphContinueSteer(paneId, RALPH_CONTINUE_TEXT);
 		await writeRalphSteerTimestamp(nowIso);
 		lastRalphContinueSteer.last_sent_at = nowIso;
@@ -1594,51 +1585,19 @@ async function runRalphWatcherBehaviorTick(): Promise<void> {
 }
 
 async function registerPidFile(): Promise<void> {
+	await requireRetainedActiveAuthority();
 	if (runOnce) return;
-	await mkdir(dirname(pidFilePath), { recursive: true }).catch(() => {});
-
-	const existingRecord = await readPidFileRecord(pidFilePath).catch(() => null);
+	if (testBootstrappedAuthority) return;
+	const existingRecord = await readPidFileRecord(pidFilePath);
 	const existingPid = existingRecord?.pid ?? null;
-	if (existingPid && existingPid !== process.pid && isPidAlive(existingPid)) {
-		try {
-			process.kill(existingPid, "SIGTERM");
-			const exitedGracefully = await waitForPidExit(existingPid);
-			let forced = false;
-			if (!exitedGracefully && isPidAlive(existingPid)) {
-				forced = true;
-				process.kill(existingPid, "SIGKILL");
-				await waitForPidExit(existingPid, 1000, 25);
-			}
-			await eventLog({
-				type: "watcher_stale_pid_reaped",
-				stale_pid: existingPid,
-				pid_file: pidFilePath,
-				forced,
-			});
-		} catch (error) {
-			await eventLog({
-				type: "watcher_stale_pid_reap_failed",
-				stale_pid: existingPid,
-				pid_file: pidFilePath,
-				error: error instanceof Error ? error.message : safeString(error),
-			});
-		}
+	const recordMatchesAuthority = !!retainedAuthority
+		&& recordMatchesNotifyWatcherAuthority(existingRecord!, retainedAuthority, cwd);
+	if (existingPid && existingPid !== process.pid && recordMatchesAuthority && isPidAlive(existingPid)) {
+		throw new Error("an authenticated notify fallback watcher is already active");
 	}
-
 	await writePidFileRecord();
 }
 
-async function removePidFileIfOwned(): Promise<void> {
-	if (runOnce) return;
-	const existingRecord = await readPidFileRecord(pidFilePath).catch(() => null);
-	if (existingRecord?.pid !== process.pid) return;
-	if (
-		existingRecord.owner_token &&
-		existingRecord.owner_token !== watcherOwnerToken
-	)
-		return;
-	await unlink(pidFilePath).catch(() => {});
-}
 
 function parentIsGone(): boolean {
 	if (!Number.isFinite(parentPid) || parentPid <= 0) return false;
@@ -1647,7 +1606,9 @@ function parentIsGone(): boolean {
 }
 
 async function writeState(extra: Record<string, unknown> = {}): Promise<void> {
-	await mkdir(stateDir, { recursive: true }).catch(() => {});
+	await requireRetainedActiveAuthority();
+	const testControlPlaneEnabled = process.env.NODE_ENV === "test"
+		&& process.env.OMX_NOTIFY_FALLBACK_TEST_BOOTSTRAP_AUTHORITY === "1";
 	const state = {
 		pid: process.pid,
 		parent_pid: parentPid,
@@ -1663,15 +1624,17 @@ async function writeState(extra: Record<string, unknown> = {}): Promise<void> {
 		tracked_files: fileState.size,
 		seen_turns: seenTurnKeys.size,
 		dispatch_drain: {
-			enabled: true,
 			max_per_tick: dispatchTickMax,
-			run_count: dispatchDrainRuns,
 			...lastDispatchDrain,
+			enabled: testControlPlaneEnabled,
+			run_count: testControlPlaneEnabled ? dispatchDrainRuns : 0,
+			reason: testControlPlaneEnabled ? undefined : "control_plane_disabled",
 		},
 		leader_nudge: {
 			...lastLeaderNudge,
-			enabled: true,
-			run_count: leaderNudgeRuns,
+			enabled: testControlPlaneEnabled,
+			run_count: testControlPlaneEnabled ? leaderNudgeRuns : 0,
+			reason: testControlPlaneEnabled ? undefined : "control_plane_disabled",
 		},
 		ralph_continue_steer: {
 			...lastRalphContinueSteer,
@@ -1681,7 +1644,8 @@ async function writeState(extra: Record<string, unknown> = {}): Promise<void> {
 		},
 		fallback_auto_nudge: {
 			...lastFallbackAutoNudge,
-			enabled: true,
+			enabled: testControlPlaneEnabled,
+			reason: testControlPlaneEnabled ? undefined : "control_plane_disabled",
 			stall_ms: AUTO_NUDGE_STALL_MS,
 		},
 		authority_backoff: lastAuthorityBackoff,
@@ -1693,17 +1657,25 @@ async function writeState(extra: Record<string, unknown> = {}): Promise<void> {
 		},
 		...extra,
 	};
-	await writeJsonObjectAtomically(statePath, state).catch(() => {});
+	if (!retainedAuthority) throw new Error("notify fallback watcher has no retained authority");
+	await atomicWriteAuthorityFile(statePath, JSON.stringify(state, null, 2), {
+		authority_root: retainedAuthority.canonical_state_root,
+		expected_root_identity: retainedAuthority.generation.root_identity,
+	}).catch(() => {});
 }
 
 async function writeAuthorityBackoffState(): Promise<void> {
-	await mkdir(stateDir, { recursive: true }).catch(() => {});
+	await requireRetainedActiveAuthority();
 	const existing = await readJsonObject(statePath);
 	const state =
 		existing && typeof existing === "object"
 			? { ...existing, authority_backoff: lastAuthorityBackoff }
 			: { authority_backoff: lastAuthorityBackoff };
-	await writeJsonObjectAtomically(statePath, state).catch(() => {});
+	if (!retainedAuthority) throw new Error("notify fallback watcher has no retained authority");
+	await atomicWriteAuthorityFile(statePath, JSON.stringify(state, null, 2), {
+		authority_root: retainedAuthority.canonical_state_root,
+		expected_root_identity: retainedAuthority.generation.root_identity,
+	}).catch(() => {});
 }
 
 async function readJsonObject(
@@ -1714,37 +1686,44 @@ async function readJsonObject(
 		.catch(() => null);
 }
 
-async function readAutoNudgeCount(): Promise<number> {
-	const parsed = await readScopedJsonIfExists(
-		stateDir,
-		"auto-nudge-state.json",
-		undefined,
-		null,
-	);
+async function readScopedJsonWithAuthority(
+	authority: ResolvedStateAuthorityContext,
+	fileName: string,
+): Promise<Record<string, unknown> | null> {
+	const path = await getScopedStatePath(authority.canonical_state_root, fileName);
+	await ensureAuthorityDirectory(authority.canonical_state_root, dirname(path), {
+		expected_root_identity: authority.generation.root_identity,
+	});
+	const content = await readAuthorityFileWithExpectedRoot(path, {
+		authority_root: authority.canonical_state_root,
+		expected_root_identity: authority.generation.root_identity,
+	});
+	return content === null ? null : JSON.parse(content) as Record<string, unknown>;
+}
+
+async function readAutoNudgeCount(authority: ResolvedStateAuthorityContext): Promise<number> {
+	const parsed = await readScopedJsonWithAuthority(authority, "auto-nudge-state.json");
 	return Math.max(
 		0,
 		Math.trunc(asNumber(parsed?.nudgeCount as string | number | undefined, 0)),
 	);
 }
 
-async function readAutoNudgeState(): Promise<Record<string, unknown> | null> {
-	return readScopedJsonIfExists(
-		stateDir,
-		"auto-nudge-state.json",
-		undefined,
-		null,
-	);
+async function readAutoNudgeState(
+	authority: ResolvedStateAuthorityContext,
+): Promise<Record<string, unknown> | null> {
+	return await readScopedJsonWithAuthority(authority, "auto-nudge-state.json");
 }
 
-async function runFallbackAutoNudgeTick(): Promise<void> {
+
+
+export async function runFallbackAutoNudgeTick(
+	authority: ResolvedStateAuthorityContext,
+): Promise<void> {
 	const now = Date.now();
 	const nowIso = new Date(now).toISOString();
-	const hudState = await readScopedJsonIfExists(
-		stateDir,
-		"hud-state.json",
-		undefined,
-		null,
-	);
+	const hudState = await readScopedJsonWithAuthority(authority, "hud-state.json");
+
 
 	lastFallbackAutoNudge = {
 		...lastFallbackAutoNudge,
@@ -1791,7 +1770,7 @@ async function runFallbackAutoNudgeTick(): Promise<void> {
 	}
 
 	const signature = await resolveAutoNudgeSignature(
-		stateDir,
+		authority.canonical_state_root,
 		{
 			type: "agent-turn-complete",
 			cwd,
@@ -1805,7 +1784,9 @@ async function runFallbackAutoNudgeTick(): Promise<void> {
 		},
 		lastMessage,
 	);
-	const persistedAutoNudgeState = await readAutoNudgeState();
+
+	const persistedAutoNudgeState = await readAutoNudgeState(authority);
+
 	const autoNudgeConfig = await loadAutoNudgeConfig();
 	const semanticSignature = normalizeAutoNudgeSignatureText(lastMessage);
 	if (
@@ -1832,11 +1813,18 @@ async function runFallbackAutoNudgeTick(): Promise<void> {
 		return;
 	}
 
-	const beforeCount = await readAutoNudgeCount();
+	const beforeCount = await readAutoNudgeCount(authority);
+	await requireRetainedActiveAuthority();
 	await maybeAutoNudge({
 		cwd,
-		stateDir,
+		stateDir: authority.canonical_state_root,
 		logsDir,
+		authority,
+		syncResult: {
+			invocationSessionId: "",
+			skillState: null,
+			releaseReason: null,
+		},
 		payload: {
 			type: "agent-turn-complete",
 			cwd,
@@ -1849,7 +1837,7 @@ async function runFallbackAutoNudgeTick(): Promise<void> {
 			"last-assistant-message": lastMessage,
 		},
 	});
-	const afterCount = await readAutoNudgeCount();
+	const afterCount = await readAutoNudgeCount(authority);
 
 	if (afterCount > beforeCount) {
 		lastFallbackAutoNudge.last_nudged_signature = signature;
@@ -1889,7 +1877,6 @@ async function requestShutdown(
 			parent_pid: parentPid,
 			pid_file: runOnce ? null : pidFilePath,
 		});
-		await removePidFileIfOwned();
 		process.exit(0);
 	})();
 	return shutdownPromise;
@@ -2194,6 +2181,7 @@ async function processLine(
 		deadlineAtMs: authorityDeadlineAtMs,
 		stopping: () => stopping,
 		spawnHook: async () => {
+			await requireRetainedActiveAuthority();
 			spawnResult = await invokeNotifyHook(payload);
 			return spawnResult;
 		},
@@ -2333,7 +2321,9 @@ async function pollFiles(): Promise<number> {
 	return processedCount;
 }
 
-async function runLeaderNudgeTick(): Promise<boolean> {
+export async function runLeaderNudgeTick(
+	authority: ResolvedStateAuthorityContext,
+): Promise<boolean> {
 	const startedIso = new Date().toISOString();
 	const leaderOnly =
 		safeString(process.env.OMX_TEAM_WORKER || "").trim() === "";
@@ -2354,18 +2344,21 @@ async function runLeaderNudgeTick(): Promise<boolean> {
 
 	try {
 		const preComputedLeaderStale = await isLeaderStale(
-			stateDir,
+			authority.canonical_state_root,
 			staleThresholdMs,
 			Date.now(),
 		);
 		await maybeNudgeTeamLeader({
 			cwd,
-			stateDir,
+			stateDir: authority.canonical_state_root,
 			logsDir,
+			authority,
 			preComputedLeaderStale,
 			allowFreshMailboxNudges: false,
 			source: "notify_fallback_watcher",
 		});
+
+
 		leaderNudgeRuns += 1;
 		lastLeaderNudge = {
 			enabled: true,
@@ -2411,15 +2404,20 @@ async function runLeaderNudgeTick(): Promise<boolean> {
 	}
 }
 
-async function runDispatchDrainTick(): Promise<boolean> {
+export async function runDispatchDrainTick(
+	authority: ResolvedStateAuthorityContext,
+): Promise<boolean> {
+
 	const startedIso = new Date().toISOString();
 	try {
 		const result = await drainPendingTeamDispatch({
 			cwd,
-			stateDir,
+			stateDir: authority.canonical_state_root,
 			logsDir,
+			authority,
 			maxPerTick: dispatchTickMax,
 		} as any);
+
 		dispatchDrainRuns += 1;
 		lastDispatchDrain = {
 			leader_only: safeString(process.env.OMX_TEAM_WORKER || "").trim() === "",
@@ -2468,71 +2466,74 @@ async function shouldSuppressInteractiveFallbackTicks(): Promise<boolean> {
 	return deepInterviewStateActive || deepInterviewInputLockActive;
 }
 
-async function pumpTeamControlPlaneTick(): Promise<CycleActivitySummary> {
-	const dispatchActive = await runDispatchDrainTick();
-	if (await shouldSuppressInteractiveFallbackTicks()) {
-		return {
-			active: dispatchActive,
-			reason: dispatchActive ? "dispatch_drain" : "deep_interview_locked",
-		};
+async function pumpTeamControlPlaneTick(
+	authority: ResolvedStateAuthorityContext,
+): Promise<CycleActivitySummary> {
+	if (process.env.NODE_ENV !== "test" || process.env.OMX_NOTIFY_FALLBACK_TEST_BOOTSTRAP_AUTHORITY !== "1") {
+		return { active: false, reason: "control_plane_disabled" };
 	}
-	const leaderActive = await runLeaderNudgeTick();
-	await runFallbackAutoNudgeTick();
+	const dispatchActive = await runDispatchDrainTick(authority);
+	if (await shouldSuppressInteractiveFallbackTicks()) {
+		return { active: dispatchActive, reason: dispatchActive ? "dispatch_drain" : "deep_interview_locked" };
+	}
+	const leaderActive = await runLeaderNudgeTick(authority);
+	await runFallbackAutoNudgeTick(authority);
 	const autoNudgeActive = lastFallbackAutoNudge.last_reason === "sent";
 	if (dispatchActive) return { active: true, reason: "dispatch_drain" };
 	if (leaderActive) return { active: true, reason: "leader_nudge" };
 	if (autoNudgeActive) return { active: true, reason: "fallback_auto_nudge" };
-	return {
-		active: false,
-		reason: lastFallbackAutoNudge.last_reason || "control_plane_idle",
-	};
+	return { active: false, reason: lastFallbackAutoNudge.last_reason || "control_plane_idle" };
 }
 
 async function runWatcherCycle(): Promise<number> {
-	await compactNotifyFallbackDeliveries(stateDir).catch(async (error) => {
-		await eventLog({
-			type: "fallback_notify_claim",
-			reason: "compaction_io_skip",
-			error: error instanceof Error ? error.message : String(error),
+	return await withRetainedAuthorityTransaction(async (authority) => {
+
+		await requireRetainedActiveAuthority();
+		await compactNotifyFallbackDeliveries(stateDir).catch(async (error) => {
+			await eventLog({
+				type: "fallback_notify_claim",
+				reason: "compaction_io_skip",
+				error: error instanceof Error ? error.message : String(error),
+			});
 		});
-	});
-	let processedRolloutCount = 0;
-	if (authorityOnly) {
-		const authorityBackoff = await resolveAuthorityPrimaryWatcherHealth();
-		lastAuthorityBackoff = authorityBackoff;
-		if (authorityBackoff.active) {
-			await writeAuthorityBackoffState();
-			return processedRolloutCount;
+		let processedRolloutCount = 0;
+		if (authorityOnly) {
+			const authorityBackoff = await resolveAuthorityPrimaryWatcherHealth();
+			lastAuthorityBackoff = authorityBackoff;
+			if (authorityBackoff.active) {
+				await writeAuthorityBackoffState();
+				return processedRolloutCount;
+			}
+		} else {
+			lastAuthorityBackoff = createAuthorityBackoffState("");
 		}
-	} else {
-		lastAuthorityBackoff = createAuthorityBackoffState("");
-	}
-	if (!authorityOnly) {
-		await ensureTrackedFiles();
-		processedRolloutCount = await pollFiles();
-	}
-	const controlPlaneSummary = await pumpTeamControlPlaneTick();
-	if (!authorityOnly && !(await shouldSuppressInteractiveFallbackTicks())) {
-		await runRalphWatcherBehaviorTick();
-	}
-	const ralphActive = lastRalphContinueSteer.last_reason === "sent";
-	const summary: CycleActivitySummary =
-		processedRolloutCount > 0
-			? { active: true, reason: "rollout_event" }
-			: controlPlaneSummary.active
-				? controlPlaneSummary
-				: ralphActive
-					? { active: true, reason: "ralph_continue_steer" }
-					: {
-							active: false,
-							reason:
-								controlPlaneSummary.reason ||
-								lastRalphContinueSteer.last_reason ||
-								"idle",
-						};
-	const nextDelayMs = updateAdaptivePollState(summary);
-	await writeState({ last_cycle_activity: summary.reason });
-	return nextDelayMs;
+		if (!authorityOnly) {
+			await ensureTrackedFiles();
+			processedRolloutCount = await pollFiles();
+		}
+		const controlPlaneSummary = await pumpTeamControlPlaneTick(authority);
+		if (!authorityOnly && !(await shouldSuppressInteractiveFallbackTicks())) {
+			await runRalphWatcherBehaviorTick();
+		}
+		const ralphActive = lastRalphContinueSteer.last_reason === "sent";
+		const summary: CycleActivitySummary =
+			processedRolloutCount > 0
+				? { active: true, reason: "rollout_event" }
+				: controlPlaneSummary.active
+					? controlPlaneSummary
+					: ralphActive
+						? { active: true, reason: "ralph_continue_steer" }
+						: {
+								active: false,
+								reason:
+									controlPlaneSummary.reason ||
+									lastRalphContinueSteer.last_reason ||
+									"idle",
+							};
+		const nextDelayMs = updateAdaptivePollState(summary);
+		await writeState({ last_cycle_activity: summary.reason });
+		return nextDelayMs;
+	});
 }
 
 async function tick(): Promise<void> {
@@ -2556,8 +2557,36 @@ async function main(): Promise<void> {
 	) {
 		throw new Error("test fatal notify fallback failure");
 	}
-	await mkdir(logsDir, { recursive: true }).catch(() => {});
-	await mkdir(stateDir, { recursive: true }).catch(() => {});
+	if (process.env.NODE_ENV === "test"
+		&& process.env.OMX_NOTIFY_FALLBACK_TEST_BOOTSTRAP_AUTHORITY === "1"
+		&& !process.env.OMX_STATE_AUTHORITY_ID) {
+		await mkdir(join(cwd, ".omx", "state"), { recursive: true, mode: 0o700 });
+		const testSessionId = safeString(process.env.OMX_SESSION_ID).trim() || `watcher-test-${process.pid}`;
+		const testAuthority = await initializeStateAuthority({
+			startup_cwd: cwd,
+			observed_cwd: cwd,
+			launch_id: `notify-fallback-test-${process.pid}`,
+			session_binding: { canonical_session_id: testSessionId },
+		});
+		await mintStateAuthorityTransportCapability(testAuthority);
+		Object.assign(process.env, buildStateAuthorityTransportEnv(testAuthority));
+		testBootstrappedAuthority = true;
+	}
+	retainedAuthority = await retainActiveAuthority();
+	stateDir = retainedAuthority.canonical_state_root;
+	omxDir = dirname(stateDir);
+	logsDir = join(omxDir, "logs");
+	statePath = join(stateDir, "notify-fallback-state.json");
+	pidFilePath = join(stateDir, "notify-fallback.pid");
+	if (process.argv.includes("--pid-file") && resolve(argValue("--pid-file")) !== pidFilePath) {
+		throw new Error("notify fallback watcher pid path conflicts with authenticated state authority");
+	}
+	logPath = join(logsDir, `notify-fallback-${new Date().toISOString().split("T")[0]}.jsonl`);
+	logRotatePath = `${logPath}.1`;
+	logLockPath = `${logPath}.lock`;
+	ralphSteerTimestampPath = join(stateDir, "ralph-last-steer-at");
+	ralphSteerLockPath = join(stateDir, "ralph-continue-steer.lock");
+	await requireRetainedActiveAuthority();
 	if (!existsSync(notifyScript)) {
 		const reason = `notify script missing: ${notifyScript}`;
 		await eventLog({
@@ -2569,7 +2598,9 @@ async function main(): Promise<void> {
 		process.exit(1);
 	}
 
-	await registerPidFile();
+	await withRetainedAuthorityTransaction(async () => {
+		await registerPidFile();
+	});
 	await loadPersistedWatcherState();
 	if (!(runOnce && authorityOnly)) {
 		await eventLog({
@@ -2607,14 +2638,8 @@ async function main(): Promise<void> {
 	await tick();
 }
 
-main().catch(async (err) => {
-	await mkdir(dirname(logPath), { recursive: true }).catch(() => {});
+main().catch((err) => {
 	const message = err instanceof Error ? err.message : safeString(err);
-	await eventLog({
-		type: "watcher_error",
-		reason: "fatal",
-		error: message,
-	});
 	process.stderr.write(
 		`notify-fallback-watcher: fatal: ${message || "unknown error"}\n`,
 	);

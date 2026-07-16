@@ -41,6 +41,8 @@ async function persistLeaderTeamMetadata({
     assigned_tasks: [],
     worktree_path: workerCwd,
     team_state_root: teamStateRoot,
+    session_id: sessionId,
+    owner_session_id: sessionId,
   };
   await mkdir(join(teamRoot, 'workers', workerName), { recursive: true, mode: 0o700 });
   await Promise.all([
@@ -227,10 +229,18 @@ describe('notify-hook cross-worktree heartbeat resolution', () => {
       });
       hardenTestAuthorityTreeSync(leaderCwd);
 
-      const result = runWorkerNotify(workerCwd, `${teamName}/${workerName}`, { ...fixture.env, OMX_TEAM_LEADER_CWD: leaderCwd });
-      assert.equal(result.status, 0, `notify-hook failed: ${result.stderr || result.stdout}`);
+      const firstResult = runWorkerNotify(workerCwd, `${teamName}/${workerName}`, { ...fixture.env, OMX_TEAM_LEADER_CWD: leaderCwd });
+      assert.equal(firstResult.status, 0, `notify-hook failed: ${firstResult.stderr || firstResult.stdout}`);
 
       const heartbeatPath = join(leaderWorkerDir, 'heartbeat.json');
+      assert.equal(existsSync(heartbeatPath), true, `heartbeat should still resolve to leader-owned team state: ${firstResult.stderr || firstResult.stdout}`);
+      const firstHeartbeat = JSON.parse(await readFile(heartbeatPath, 'utf8')) as { turn_count?: number };
+      assert.equal(firstHeartbeat.turn_count, 1, 'first authenticated worker turn must persist heartbeat increment');
+
+      const secondResult = runWorkerNotify(workerCwd, `${teamName}/${workerName}`, { ...fixture.env, OMX_TEAM_LEADER_CWD: leaderCwd });
+      assert.equal(secondResult.status, 0, `notify-hook failed: ${secondResult.stderr || secondResult.stdout}`);
+      const secondHeartbeat = JSON.parse(await readFile(heartbeatPath, 'utf8')) as { turn_count?: number };
+      assert.equal(secondHeartbeat.turn_count, 2, 'second authenticated worker turn must increment persisted heartbeat');
       assert.equal(existsSync(heartbeatPath), true, 'heartbeat should still resolve to leader-owned team state');
 
       const wrongHeartbeatPath = join(workerCwd, '.omx', 'state', 'team', teamName, 'workers', workerName, 'heartbeat.json');

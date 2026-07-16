@@ -213,6 +213,7 @@ import {
   validateCommittedStateAuthorityLaunchTransportJournal,
   validateCommittedStateAuthorityLaunchTransportPublication,
   validateStateAuthorityTransportCapability,
+  withStateAuthorityTransaction,
   type FirstPartyIssuer,
   type ResolvedStateAuthorityContext,
   type StateAuthorityLaunchTransportPublication,
@@ -295,6 +296,16 @@ import {
   type ParseNotifyTempContractResult,
 } from "../notifications/temp-contract.js";
 import { execInjectCommand } from "../exec/followup.js";
+import {
+  captureNotifyWatcherProcessStartIdentity,
+  createNotifyWatcherPidRecord,
+  processMatchesNotifyWatcherPidRecord,
+  readNotifyWatcherPidRecordNoFollow,
+  recordMatchesNotifyWatcherAuthority,
+  sameNotifyWatcherRootIdentity,
+  type NotifyWatcherPidAuthority,
+  type NotifyWatcherPidRecord,
+} from "../state/notify-watcher-pid.js";
 import { imagegenCommand } from "../imagegen/continuation.js";
 import { capabilitiesCommand } from "./capabilities.js";
 
@@ -6558,13 +6569,11 @@ export function buildNotifyFallbackWatcherEnv(
   env: NodeJS.ProcessEnv = process.env,
   options: {
     codexHomeOverride?: string;
-    omxRootOverride?: string;
     enableAuthority?: boolean;
     sessionId?: string;
   } = {},
 ): NodeJS.ProcessEnv {
   const nextEnv = { ...env };
-  removeProcessLocalStateAuthorityBearer(nextEnv);
   delete nextEnv.TMUX;
   delete nextEnv.TMUX_PANE;
 
@@ -6573,7 +6582,6 @@ export function buildNotifyFallbackWatcherEnv(
     ...(options.codexHomeOverride
       ? { CODEX_HOME: options.codexHomeOverride }
       : {}),
-    ...(options.omxRootOverride ? { OMX_ROOT: options.omxRootOverride } : {}),
     ...(options.sessionId ? { OMX_SESSION_ID: options.sessionId } : {}),
     OMX_HUD_AUTHORITY: options.enableAuthority ? "1" : "0",
   };
@@ -6584,9 +6592,7 @@ export function shouldEnableNotifyFallbackWatcher(
   platform: NodeJS.Platform = process.platform,
 ): boolean {
   const toggle = String(env.OMX_NOTIFY_FALLBACK ?? "").trim();
-  if (platform === "win32") {
-    return toggle === "1";
-  }
+  if (platform !== "linux") return false;
   return toggle !== "0";
 }
 
@@ -8398,9 +8404,6 @@ async function emitNativeHookEvent(
   });
 }
 
-function notifyFallbackPidPath(cwd: string): string {
-  return join(omxRoot(cwd), "state", "notify-fallback.pid");
-}
 
 function hookDerivedWatcherPidPath(cwd: string): string {
   return join(omxRoot(cwd), "state", "hook-derived-watcher.pid");
@@ -8501,31 +8504,11 @@ async function launchBackgroundHelper(
   return child.pid;
 }
 
-function parseWatcherPidFile(content: string): number | null {
-  const trimmed = content.trim();
-  if (!trimmed) return null;
-  try {
-    const parsed = JSON.parse(trimmed) as unknown;
-    if (typeof parsed === "number") {
-      return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
-    }
-    const pid =
-      typeof parsed === "object" && parsed !== null
-        ? (parsed as { pid?: unknown }).pid
-        : undefined;
-    return typeof pid === "number" && Number.isFinite(pid) && pid > 0
-      ? pid
-      : null;
-  } catch {
-    const pid = Number.parseInt(trimmed, 10);
-    return Number.isFinite(pid) && pid > 0 ? pid : null;
-  }
-}
 
-interface WatcherPidRecord {
-  pid: number;
-  startedAt: string | null;
-}
+type WatcherPidRecord = NotifyWatcherPidRecord;
+type WatcherPidAuthority = NotifyWatcherPidAuthority & { observed_cwd: string };
+
+
 
 export type NotifyFallbackReapResult =
   | "missing"
@@ -8553,121 +8536,77 @@ function isWatcherRecordWithinReapGrace(
   nowMs = Date.now(),
   graceMs = resolveNotifyFallbackReapGraceMs(),
 ): boolean {
-  if (graceMs <= 0 || !record.startedAt) return false;
-  const startedMs = Date.parse(record.startedAt);
+  if (graceMs <= 0) return false;
+  const startedMs = Date.parse(record.started_at);
   if (!Number.isFinite(startedMs)) return false;
   const ageMs = nowMs - startedMs;
   return ageMs >= 0 && ageMs < graceMs;
 }
 
-function parseWatcherPidRecord(content: string): WatcherPidRecord | null {
-  const trimmed = content.trim();
-  if (!trimmed) return null;
-  try {
-    const parsed = JSON.parse(trimmed) as unknown;
-    if (typeof parsed === "object" && parsed !== null) {
-      const { pid, started_at: startedAtRaw } = parsed as {
-        pid?: unknown;
-        started_at?: unknown;
-      };
-      if (typeof pid === "number" && Number.isFinite(pid) && pid > 0) {
-        return {
-          pid,
-          startedAt: typeof startedAtRaw === "string" ? startedAtRaw : null,
-        };
-      }
-    }
-  } catch {}
-
-  const pid = parseWatcherPidFile(trimmed);
-  return pid ? { pid, startedAt: null } : null;
-}
-
-function isLikelyOmxWatcherProcess(
-  pid: number,
-  execFileSyncFn: typeof execFileSync = execFileSync,
-  platform: NodeJS.Platform = process.platform,
-): boolean {
-  if (platform === "win32") {
-    // ps is unavailable on native Windows; fall back to unconditional reap
-    // to preserve the pre-identity-check behavior on opted-in Windows hosts.
-    return true;
-  }
-  try {
-    const cmd = execFileSyncFn("ps", ["-p", String(pid), "-o", "command="], {
-      encoding: "utf-8",
-      timeout: 2000,
-      windowsHide: true,
-    }) as string;
-    return (
-      cmd.includes("notify-fallback-watcher") ||
-      cmd.includes("hook-derived-watcher")
-    );
-  } catch {
-    return false;
-  }
-}
+type LegacyNotifyFallbackReapDependencies = {
+  exists?: (path: string) => boolean;
+  readFile?: (path: string, encoding: BufferEncoding) => Promise<string>;
+  tryKillPid?: (pid: number, signal?: NodeJS.Signals) => boolean;
+  hasErrnoCode?: (error: unknown, code: string) => boolean;
+  warn?: (message?: unknown, ...optionalParams: unknown[]) => void;
+  isWatcherProcess?: (pid: number) => boolean;
+  nowMs?: () => number;
+  reapGraceMs?: number;
+};
 
 export async function reapStaleNotifyFallbackWatcher(
   pidPath: string,
-  deps: {
-    exists?: (path: string) => boolean;
-    readFile?: (path: string, encoding: BufferEncoding) => Promise<string>;
-    tryKillPid?: (pid: number, signal?: NodeJS.Signals) => boolean;
-    hasErrnoCode?: (error: unknown, code: string) => boolean;
-    warn?: (message?: unknown, ...optionalParams: unknown[]) => void;
-    isWatcherProcess?: (pid: number) => boolean;
-    nowMs?: () => number;
-    reapGraceMs?: number;
+  authority: WatcherPidAuthority | LegacyNotifyFallbackReapDependencies,
+  deps: LegacyNotifyFallbackReapDependencies & {
+    resolveCurrentAuthority?: (observedCwd: string) => Promise<WatcherPidAuthority>;
   } = {},
 ): Promise<NotifyFallbackReapResult> {
-  const exists = deps.exists ?? existsSync;
-  if (!exists(pidPath)) return "missing";
-
-  const { readFile } = await import("fs/promises");
-  const readFileImpl = deps.readFile ?? readFile;
-  const tryKillPidImpl = deps.tryKillPid ?? tryKillPid;
+  if (!("generation" in authority) || !("workspace_identity" in authority)) {
+    return "invalid";
+  }
   const hasErrnoCodeImpl = deps.hasErrnoCode ?? hasErrnoCode;
   const warn = deps.warn ?? console.warn;
-  const isWatcherProcessImpl =
-    deps.isWatcherProcess ?? isLikelyOmxWatcherProcess;
-
   try {
-    const record = parseWatcherPidRecord(await readFileImpl(pidPath, "utf-8"));
-    if (!record) return "invalid";
-    if (!isWatcherProcessImpl(record.pid)) return "identity_mismatch";
-    if (
-      isWatcherRecordWithinReapGrace(
+    const record = await readNotifyWatcherPidRecordNoFollow(pidPath, authority);
+    if (!record) return "missing";
+    if (!recordMatchesNotifyWatcherAuthority(record, authority, authority.observed_cwd)
+      || !processMatchesNotifyWatcherPidRecord(record)) return "identity_mismatch";
+    if (isWatcherRecordWithinReapGrace(
       record,
       deps.nowMs?.() ?? Date.now(),
       deps.reapGraceMs ?? resolveNotifyFallbackReapGraceMs(),
-      )
-    ) {
-      return "recent_active";
+    )) return "recent_active";
+
+    // Re-resolve and re-read immediately before signaling: a replaced record,
+    // authority rollover, or PID reuse is never an eligible signal target.
+    const current = await (deps.resolveCurrentAuthority
+      ? deps.resolveCurrentAuthority(authority.observed_cwd)
+      : resolveStateAuthorityForGuard({ startup_cwd: authority.observed_cwd, observed_cwd: authority.observed_cwd }));
+    if (current.generation.generation_id !== authority.generation.generation_id
+      || current.generation.authority_id !== authority.generation.authority_id
+      || current.workspace_identity.digest !== authority.workspace_identity.digest
+      || !sameNotifyWatcherRootIdentity(current.generation.root_identity, authority.generation.root_identity)) {
+      return "identity_mismatch";
     }
-    tryKillPidImpl(record.pid, "SIGTERM");
-    return "reaped";
+    const finalRecord = await readNotifyWatcherPidRecordNoFollow(pidPath, current);
+    if (!finalRecord || finalRecord.owner_token !== record.owner_token
+      || finalRecord.pid !== record.pid
+      || !recordMatchesNotifyWatcherAuthority(finalRecord, current, current.observed_cwd)
+      || !processMatchesNotifyWatcherPidRecord(finalRecord)) return "identity_mismatch";
+    // Node does not expose pidfd/process-handle signaling. Preserve a live,
+    // identity-matched watcher rather than risk PID reuse before a numeric kill.
+    return "recent_active";
   } catch (error: unknown) {
     if (!hasErrnoCodeImpl(error, "ESRCH")) {
       warn("[omx] warning: failed to stop stale notify fallback watcher", {
-          path: pidPath,
-          error: error instanceof Error ? error.message : String(error),
+        path: pidPath,
+        error: error instanceof Error ? error.message : String(error),
       });
     }
     return "failed";
   }
 }
 
-function tryKillPid(pid: number, signal: NodeJS.Signals = "SIGTERM"): boolean {
-  try {
-    process.kill(pid, signal);
-    return true;
-  } catch (error: unknown) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (code === "ESRCH") return false;
-    throw error;
-  }
-}
 
 async function startNotifyFallbackWatcher(
   cwd: string,
@@ -8677,86 +8616,99 @@ async function startNotifyFallbackWatcher(
     sessionId?: string;
   } = {},
 ): Promise<void> {
-  const { mkdir, writeFile } = await import("fs/promises");
-  const pidPath = notifyFallbackPidPath(cwd);
-  const reapResult = await reapStaleNotifyFallbackWatcher(pidPath);
-  if (reapResult === "recent_active") return;
-
-  if (!shouldEnableNotifyFallbackWatcher(process.env, process.platform)) return;
+  const authority = await resolveInheritedStateAuthorityForLaunch(cwd).catch(
+    (error: unknown) => {
+      console.warn("[omx] warning: refusing unauthenticated notify fallback watcher launch", {
+        cwd,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return undefined;
+    },
+  );
+  if (!authority || !shouldEnableNotifyFallbackWatcher(process.env, process.platform)) {
+    return;
+  }
 
   const pkgRoot = getPackageRoot();
   const watcherScript = resolveNotifyFallbackWatcherScript(pkgRoot);
   const notifyScript = resolveNotifyHookScript(pkgRoot);
   if (!existsSync(watcherScript) || !existsSync(notifyScript)) return;
 
-  await mkdir(join(omxRoot(cwd), "state"), { recursive: true }).catch(
-    (error: unknown) => {
-      console.warn(
-        "[omx] warning: failed to create notify fallback watcher state directory",
-        {
+  try {
+    await withStateAuthorityTransaction(authority, async (pinnedAuthority) => {
+      const pidPath = join(
+        pinnedAuthority.canonical_state_root,
+        "notify-fallback.pid",
+      );
+      const reapResult = await reapStaleNotifyFallbackWatcher(pidPath, pinnedAuthority);
+      if (reapResult === "recent_active") return;
+
+      const watcherEnv = buildNotifyFallbackWatcherEnv(process.env, {
+        codexHomeOverride: options.codexHomeOverride,
+        enableAuthority: options.enableAuthority === true,
+        sessionId: options.sessionId,
+      });
+      publishStateAuthorityTransport(pinnedAuthority, watcherEnv);
+      const rootIdentity = await captureRootFilesystemIdentity(
+        pinnedAuthority.canonical_state_root,
+      );
+      if (
+        rootIdentity.device !== pinnedAuthority.generation.root_identity.device ||
+        rootIdentity.inode !== pinnedAuthority.generation.root_identity.inode ||
+        rootIdentity.canonical_path !== pinnedAuthority.generation.root_identity.canonical_path
+      ) {
+        throw new Error("notify fallback watcher authority root was replaced before spawn");
+      }
+      const watcherPid = await launchBackgroundHelper(
+        [
+          watcherScript,
+          "--cwd",
           cwd,
-          error: error instanceof Error ? error.message : String(error),
+          "--notify-script",
+          notifyScript,
+          "--pid-file",
+          pidPath,
+          "--parent-pid",
+          String(process.pid),
+          ...(process.env.OMX_NOTIFY_FALLBACK_MAX_LIFETIME_MS
+            ? [
+                "--max-lifetime-ms",
+                process.env.OMX_NOTIFY_FALLBACK_MAX_LIFETIME_MS,
+              ]
+            : []),
+        ],
+        { cwd, env: watcherEnv },
+      );
+      if (!watcherPid) return;
+
+      const processStartIdentity = captureNotifyWatcherProcessStartIdentity(watcherPid);
+      if (!processStartIdentity) {
+        // The watcher writes its own record once it can prove its identity.
+        // Never seed an unverifiable PID that a later launcher might signal.
+        return;
+      }
+      const record = createNotifyWatcherPidRecord(pinnedAuthority, {
+        pid: watcherPid,
+        cwd,
+        started_at: new Date().toISOString(),
+        owner_token: `launcher-${randomUUID()}`,
+        process_start_identity: processStartIdentity,
+      });
+      await atomicWriteAuthorityFile(
+        pidPath,
+        JSON.stringify(record, null, 2),
+        {
+          authority_root: pinnedAuthority.canonical_state_root,
+          expected_root_identity: pinnedAuthority.generation.root_identity,
         },
       );
-    },
-  );
-  const watcherEnv = buildNotifyFallbackWatcherEnv(process.env, {
-    codexHomeOverride: options.codexHomeOverride,
-    omxRootOverride: resolveOmxRootForLaunch(cwd, process.env),
-    enableAuthority: options.enableAuthority === true,
-    sessionId: options.sessionId,
-  });
-  let watcherPid: number | undefined;
-  try {
-    watcherPid = await launchBackgroundHelper(
-      [
-        watcherScript,
-        "--cwd",
-        cwd,
-        "--notify-script",
-        notifyScript,
-        "--pid-file",
-        pidPath,
-        "--parent-pid",
-        String(process.pid),
-        ...(process.env.OMX_NOTIFY_FALLBACK_MAX_LIFETIME_MS
-          ? [
-            "--max-lifetime-ms",
-            process.env.OMX_NOTIFY_FALLBACK_MAX_LIFETIME_MS,
-          ]
-          : []),
-      ],
-      {
-        cwd,
-        env: watcherEnv,
-      },
-    );
+    });
   } catch (error: unknown) {
     console.warn("[omx] warning: failed to launch notify fallback watcher", {
       cwd,
       error: error instanceof Error ? error.message : String(error),
     });
-    return;
   }
-
-  if (!watcherPid) return;
-
-  await writeFile(
-    pidPath,
-    JSON.stringify(
-      { pid: watcherPid, started_at: new Date().toISOString() },
-      null,
-      2,
-    ),
-  ).catch((error: unknown) => {
-    console.warn(
-      "[omx] warning: failed to write notify fallback watcher pid file",
-      {
-        path: pidPath,
-        error: error instanceof Error ? error.message : String(error),
-      },
-    );
-  });
 }
 
 async function startHookDerivedWatcher(cwd: string): Promise<void> {
@@ -8832,37 +8784,8 @@ async function startHookDerivedWatcher(cwd: string): Promise<void> {
   });
 }
 
-async function stopNotifyFallbackWatcher(cwd: string): Promise<void> {
-  const { readFile, unlink } = await import("fs/promises");
-  const pidPath = notifyFallbackPidPath(cwd);
-  if (!existsSync(pidPath)) return;
-
-  try {
-    const pid = parseWatcherPidFile(await readFile(pidPath, "utf-8"));
-    if (pid) {
-      tryKillPid(pid, "SIGTERM");
-    }
-  } catch (error: unknown) {
-    if (!hasErrnoCode(error, "ESRCH")) {
-      console.warn(
-        "[omx] warning: failed to stop notify fallback watcher process",
-        {
-          path: pidPath,
-          error: error instanceof Error ? error.message : String(error),
-        },
-      );
-    }
-  }
-
-  await unlink(pidPath).catch((error: unknown) => {
-    console.warn(
-      "[omx] warning: failed to remove notify fallback watcher pid file",
-      {
-        path: pidPath,
-        error: error instanceof Error ? error.message : String(error),
-      },
-    );
-  });
+async function stopNotifyFallbackWatcher(_cwd: string): Promise<void> {
+  // Fail closed: the watcher exits through its authenticated lifecycle guards.
 }
 
 async function stopHookDerivedWatcher(cwd: string): Promise<void> {

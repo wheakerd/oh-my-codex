@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { execFileSync } from "node:child_process";
-import { chmod, mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -17,6 +17,11 @@ import {
 import { buildStateAuthorityTransportEnv } from "../../../state/transport-env.js";
 import { hardenTestAuthorityTreeSync } from "../../../team/__tests__/authority-fixture.js";
 import { writeSessionStart } from "../../../hooks/session.js";
+import {
+	readAuthorizedLeaderPaneTarget,
+	readWorkerHeartbeatSnapshot,
+	updateWorkerHeartbeat,
+} from "../team-worker.js";
 
 async function initWorkerFixture(): Promise<{
 	cwd: string;
@@ -477,5 +482,42 @@ describe("handleTeamWorkerPostToolUseSuccess", { concurrency: false }, () => {
 		assert.equal(result.handled, false);
 		assert.equal(result.status, "skipped");
 		assert.equal(existsSync(join(cwd, ".omx", "state", "team")), false);
+	});
+});
+
+describe("team worker notification authority", { concurrency: false }, () => {
+	it("rejects conflicting config and manifest leader targets", async () => {
+		const fixture = await initWorkerFixture();
+		const authority = await resolveStateAuthorityForGuard({ startup_cwd: fixture.cwd, observed_cwd: fixture.cwd, session_id: "posttooluse-session" });
+		const teamDir = join(fixture.stateRoot, "team", "demo-team");
+		for (const fileName of ["config.json", "manifest.v2.json"]) {
+			const path = join(teamDir, fileName);
+			const document = JSON.parse(await readFile(path, "utf-8"));
+			document.tmux_session = "demo-session";
+			document.leader_pane_id = "%17";
+			await writeFile(path, JSON.stringify(document), "utf-8");
+		}
+
+		const configPath = join(teamDir, "config.json");
+		const config = JSON.parse(await readFile(configPath, "utf-8"));
+		config.leader_pane_id = "%18";
+		await writeFile(configPath, JSON.stringify(config), "utf-8");
+		assert.equal(await readAuthorizedLeaderPaneTarget(fixture.stateRoot, "demo-team", authority), null);
+	});
+
+	it("binds heartbeats to the current session and rejects a replacement root", async () => {
+		const fixture = await initWorkerFixture();
+		const authority = await resolveStateAuthorityForGuard({
+			startup_cwd: fixture.cwd,
+			observed_cwd: fixture.cwd,
+			session_id: "posttooluse-session",
+		});
+		await updateWorkerHeartbeat(fixture.stateRoot, "demo-team", "worker-1", authority);
+		assert.equal((await readWorkerHeartbeatSnapshot(fixture.stateRoot, "demo-team", "worker-1", "posttooluse-session", authority)).fresh, true);
+		assert.equal((await readWorkerHeartbeatSnapshot(fixture.stateRoot, "demo-team", "worker-1", "different-session", authority)).fresh, false);
+
+		await rename(fixture.stateRoot, `${fixture.stateRoot}-replaced`);
+		await mkdir(fixture.stateRoot, { recursive: true, mode: 0o700 });
+		await assert.rejects(updateWorkerHeartbeat(fixture.stateRoot, "demo-team", "worker-1", authority));
 	});
 });

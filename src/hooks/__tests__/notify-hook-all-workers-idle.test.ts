@@ -22,7 +22,7 @@ async function withTempWorkingDir(run: (cwd: string) => Promise<void>): Promise<
 }
 
 async function writeJson(path: string, value: unknown): Promise<void> {
-  const persisted = /(?:config|manifest\.v2)\.json$/.test(path) && value && typeof value === 'object'
+  const persisted = /(?:config|manifest\.v2|heartbeat)\.json$/.test(path) && value && typeof value === 'object'
     ? {
         session_id: 'notify-hook-all-workers-idle',
         owner_session_id: 'notify-hook-all-workers-idle',
@@ -31,9 +31,21 @@ async function writeJson(path: string, value: unknown): Promise<void> {
     : value;
   await mkdir(join(path, '..'), { recursive: true });
   await writeFile(path, JSON.stringify(persisted, null, 2));
+  if (path.endsWith('status.json') && persisted && typeof persisted === 'object') {
+    const status = persisted as { updated_at?: unknown };
+    await writeFile(join(path, '..', 'heartbeat.json'), JSON.stringify({
+      pid: process.pid,
+      last_turn_at: typeof status.updated_at === 'string' ? status.updated_at : new Date().toISOString(),
+      turn_count: 1,
+      alive: true,
+      session_id: 'notify-hook-all-workers-idle',
+    }, null, 2));
+  }
   if (path.endsWith('config.json') && persisted && typeof persisted === 'object') {
     const config = persisted as { workers?: unknown[]; tmux_session?: unknown; leader_pane_id?: unknown };
     await writeFile(join(path, '..', 'manifest.v2.json'), JSON.stringify({
+      session_id: 'notify-hook-all-workers-idle',
+      owner_session_id: 'notify-hook-all-workers-idle',
       leader: {
         session_id: 'notify-hook-all-workers-idle',
         worker_id: 'leader-fixed',
@@ -52,11 +64,17 @@ set -eu
 echo "$@" >> "${tmuxLogPath}"
 cmd="$1"
 shift || true
-if [[ "$cmd" == "show-option" && "\${@: -1}" == "@omx_team_pane_owner_id" ]]; then
-  printf '%s\n' 'team:test'
-  exit 0
-fi
 if [[ "$cmd" == "display-message" ]]; then
+  if [[ "\${@: -1}" == "#{session_name}\t#{pane_id}\t#{pane_pid}" ]]; then
+    target=""
+    while (($#)); do
+      case "$1" in
+        -t) target="$2"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    printf 'fixture-session\t%s\t12345\n' "$target"
+  fi
   exit 0
 fi
 if [[ "$cmd" == "set-buffer" ]]; then
@@ -88,9 +106,7 @@ if [[ "$cmd" == "send-keys" ]]; then
   exit 0
 fi
 if [[ "$cmd" == "list-panes" ]]; then
-  for pane in $(seq 1 200); do
-    printf '%%%s\t0\t%s\n' "$pane" "$((12000 + pane))"
-  done
+  echo "%1 12345"
   exit 0
 fi
 exit 0
@@ -103,18 +119,6 @@ function writeWorkerIdentityFixture(cwd: string, workerEnv: string): string {
   assert.ok(workerName, 'worker env fixture should include a worker name');
 
   const stateRoot = join(cwd, '.omx', 'state');
-  const configPath = join(stateRoot, 'team', teamName, 'config.json');
-  if (existsSync(configPath)) {
-    const config = JSON.parse(readFileSync(configPath, 'utf8')) as Record<string, unknown>;
-    if (typeof config.leader_pane_id === 'string' && config.leader_pane_id.trim() !== '') {
-      config.tmux_pane_owner_id = 'team:test';
-      if (!(typeof config.leader_pane_pid === 'number' && config.leader_pane_pid > 0)) {
-        const paneNumber = Number(config.leader_pane_id.slice(1));
-        if (Number.isInteger(paneNumber) && paneNumber > 0) config.leader_pane_pid = 12000 + paneNumber;
-      }
-      writeFileSync(configPath, JSON.stringify(config, null, 2));
-    }
-  }
   const workerDir = join(stateRoot, 'team', teamName, 'workers', workerName);
   const identityPath = join(workerDir, 'identity.json');
   if (!existsSync(identityPath)) {
@@ -126,6 +130,8 @@ function writeWorkerIdentityFixture(cwd: string, workerEnv: string): string {
       assigned_tasks: [],
       worktree_path: cwd,
       team_state_root: stateRoot,
+      session_id: 'notify-hook-all-workers-idle',
+      owner_session_id: 'notify-hook-all-workers-idle',
     }, null, 2));
   }
   const manifestPath = join(stateRoot, 'team', teamName, 'manifest.v2.json');
@@ -168,6 +174,7 @@ function runNotifyHookAsWorker(
     env: {
       ...process.env,
       PATH: `${fakeBinDir}:${process.env.PATH || ''}`,
+      OMX_TEST_TMUX_BIN: join(fakeBinDir, 'tmux'),
       OMX_TEAM_WORKER: workerEnv,
       OMX_TEAM_STATE_ROOT: stateRoot,
       OMX_TEAM_LEADER_CWD: '',
@@ -333,7 +340,6 @@ describe('notify-hook all-workers-idle notification', () => {
         name: teamName,
         tmux_session: 'devsess:81',
         leader_pane_id: '%181',
-        leader_pane_pid: 12181,
         workers: [
           { name: 'worker-1', index: 1, role: 'executor', assigned_tasks: [] },
           { name: 'worker-2', index: 2, role: 'executor', assigned_tasks: [] },
@@ -353,10 +359,6 @@ set -eu
 echo "$@" >> "${tmuxLogPath}"
 cmd="$1"
 shift || true
-if [[ "$cmd" == "show-option" && "\${@: -1}" == "@omx_team_pane_owner_id" ]]; then
-  printf '%s\n' 'team:test'
-  exit 0
-fi
 if [[ "$cmd" == "display-message" ]]; then
   target=""
   format=""
@@ -369,6 +371,10 @@ if [[ "$cmd" == "display-message" ]]; then
   done
   if [[ "$format" == "#{pane_current_command}" && "$target" == "%181" ]]; then
     echo "zsh"
+    exit 0
+  fi
+  if [[ "$format" == "#{session_name}\t#{pane_id}\t#{pane_pid}" && "$target" == "%181" ]]; then
+    printf 'shell-pane-all-idle\t%%181\t12345\n'
     exit 0
   fi
   exit 0
@@ -402,7 +408,7 @@ if [[ "$cmd" == "send-keys" ]]; then
   exit 0
 fi
 if [[ "$cmd" == "list-panes" ]]; then
-  printf '%%181\t0\t12181\n'
+  echo "%1 12345"
   exit 0
 fi
 exit 0
@@ -451,7 +457,6 @@ exit 0
         name: teamName,
         tmux_session: 'busy-all-idle:0',
         leader_pane_id: '%182',
-        leader_pane_pid: 12182,
         workers: [
           { name: 'worker-1', index: 1, role: 'executor', assigned_tasks: [] },
           { name: 'worker-2', index: 2, role: 'executor', assigned_tasks: [] },
@@ -471,10 +476,6 @@ set -eu
 echo "$@" >> "${tmuxLogPath}"
 cmd="$1"
 shift || true
-if [[ "$cmd" == "show-option" && "\${@: -1}" == "@omx_team_pane_owner_id" ]]; then
-  printf '%s\n' 'team:test'
-  exit 0
-fi
 if [[ "$cmd" == "display-message" ]]; then
   target=""
   format=""
@@ -491,6 +492,10 @@ if [[ "$cmd" == "display-message" ]]; then
   fi
   if [[ "$format" == "#{pane_current_command}" && "$target" == "%182" ]]; then
     echo "codex"
+    exit 0
+  fi
+  if [[ "$format" == "#{session_name}\t#{pane_id}\t#{pane_pid}" && "$target" == "%182" ]]; then
+    printf 'busy-leader-all-idle\t%%182\t12345\n'
     exit 0
   fi
   exit 0
@@ -528,7 +533,7 @@ if [[ "$cmd" == "send-keys" ]]; then
   exit 0
 fi
 if [[ "$cmd" == "list-panes" ]]; then
-  printf '%%182\t0\t12182\n'
+  echo "%1 12345"
   exit 0
 fi
 exit 0
@@ -573,7 +578,6 @@ exit 0
         name: teamName,
         tmux_session: 'devsess:8',
         leader_pane_id: '%99',
-        leader_pane_pid: 12099,
         workers: [
           { name: 'worker-1', index: 1, role: 'executor', assigned_tasks: [] },
           { name: 'worker-2', index: 2, role: 'executor', assigned_tasks: [] },
@@ -835,7 +839,6 @@ exit 0
         name: teamName,
         tmux_session: 'omx-team-event',
         leader_pane_id: '%77',
-        leader_pane_pid: 12077,
         workers: [
           { name: 'worker-1', index: 1, role: 'executor', assigned_tasks: [] },
           { name: 'worker-2', index: 2, role: 'executor', assigned_tasks: [] },
@@ -961,7 +964,6 @@ exit 0
         name: teamName,
         tmux_session: 'solo-session:0',
         leader_pane_id: '%13',
-        leader_pane_pid: 12013,
         workers: [
           { name: 'worker-1', index: 1, role: 'executor', assigned_tasks: [] },
         ],
@@ -988,7 +990,7 @@ exit 0
     });
   });
 
-  it('uses manifest.v2.json over config.json when both present', async () => {
+  it('denies conflicting config.json and manifest.v2.json leader targets', async () => {
     await withTempWorkingDir(async (cwd) => {
       const omxDir = join(cwd, '.omx');
       const stateDir = join(omxDir, 'state');
@@ -1003,49 +1005,30 @@ exit 0
       await mkdir(logsDir, { recursive: true });
       await mkdir(workersDir, { recursive: true });
       await mkdir(fakeBinDir, { recursive: true });
-
-      // Write BOTH config.json and manifest.v2.json
-      // They differ in tmux_session — manifest should win
       await writeJson(join(teamDir, 'config.json'), {
         name: teamName,
         tmux_session: 'wrong-session:0',
+        leader_pane_id: '%122',
         workers: [{ name: 'worker-1', index: 1, role: 'executor', assigned_tasks: [] }],
       });
       await writeJson(join(teamDir, 'manifest.v2.json'), {
         schema_version: 2,
         name: teamName,
-        task: 'test',
-        leader: { session_id: '', worker_id: 'leader-fixed', role: 'coordinator' },
-        policy: { display_mode: 'auto', worker_launch_mode: 'interactive', dispatch_mode: 'hook_preferred_with_fallback', dispatch_ack_timeout_ms: 2000 },
-        governance: { delegation_only: false, plan_approval_required: false, nested_teams_allowed: false, one_team_per_leader_session: true, cleanup_requires_all_workers_inactive: true },
-        lifecycle_profile: 'default',
-        permissions_snapshot: { approval_mode: 'unknown', sandbox_mode: 'unknown', network_access: true },
         tmux_session: 'correct-session:1',
         leader_pane_id: '%123',
-        leader_pane_pid: 12123,
-        tmux_pane_owner_id: 'team:test',
-        worker_count: 1,
         workers: [{ name: 'worker-1', index: 1, role: 'executor', assigned_tasks: [] }],
-        next_task_id: 1,
-        created_at: new Date().toISOString(),
       });
-
-      await mkdir(join(workersDir, 'worker-1'), { recursive: true });
       await writeJson(join(workersDir, 'worker-1', 'status.json'), {
         state: 'idle',
         updated_at: new Date().toISOString(),
       });
-
       await writeFile(fakeTmuxPath, buildFakeTmux(tmuxLogPath));
       await chmod(fakeTmuxPath, 0o755);
 
       const result = runNotifyHookAsWorker(cwd, fakeBinDir, `${teamName}/worker-1`);
       assert.equal(result.status, 0, `notify-hook failed: ${result.stderr || result.stdout}`);
-
-      assert.ok(existsSync(tmuxLogPath), 'tmux should have been called');
-      const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
-      assert.match(tmuxLog, /-t %123/, 'should use leader_pane_id from manifest.v2.json');
-      assert.doesNotMatch(tmuxLog, /wrong-session/, 'should not use tmux_session from config.json');
+      assert.equal(existsSync(tmuxLogPath), false, 'conflicting targets must not reach tmux');
+      assert.equal(existsSync(join(teamDir, 'all-workers-idle.json')), false, 'conflicting targets must not write delivery state');
     });
   });
 });

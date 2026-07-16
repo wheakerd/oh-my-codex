@@ -21,6 +21,7 @@
 import { writeFile, appendFile, mkdir, readFile } from 'fs/promises';
 import { existsSync } from 'fs';
 import { dirname, join, resolve } from 'path';
+import { fileURLToPath } from 'url';
 import {
   appendPromptSessionProvenanceRejection,
   isSessionStateUsable,
@@ -35,7 +36,9 @@ import {
   preflightSelectedTargetOwner,
   type ResolvedPromptTurnContext,
 } from '../hooks/prompt-session-provenance.js';
-import { resolveStateAuthorityForGuard } from '../state/authority.js';
+import { atomicWriteAuthorityFile, ensureAuthorityDirectory, readAuthorityFileWithExpectedRoot, resolveStateAuthorityForMutation, withStateAuthorityTransaction, type ResolvedStateAuthorityContext } from '../state/authority.js';
+import { readTeamModeConfig } from '../config/team-mode.js';
+import { resolveWorkerTeamStateRoot } from '../team/state-root.js';
 
 import { safeString, asNumber } from './notify-hook/utils.js';
 import {
@@ -78,7 +81,7 @@ import {
 } from './notify-hook/operational-events.js';
 import {
   parseTeamWorkerEnv,
-  resolveTeamStateDirForWorker,
+  assertWorkerNotificationAuthority,
   updateWorkerHeartbeat,
   maybeNotifyLeaderAllWorkersIdle,
   maybeNotifyLeaderWorkerIdle,
@@ -90,6 +93,13 @@ import {
   extractRawJsonStringField,
   utf8ByteLength,
 } from './hook-payload-guard.js';
+import {
+  classifyKeywordInput,
+  recordSkillActivation,
+  type KeywordInputClassification,
+  type RecordSkillActivationInput,
+  type SkillActiveState,
+} from '../hooks/keyword-detector.js';
 
 const RALPH_ACTIVE_PROGRESS_PHASES = new Set([
   'start',
@@ -106,6 +116,8 @@ const RALPH_ACTIVE_PROGRESS_PHASES = new Set([
 ]);
 
 const IDLE_NOTIFICATION_SUMMARY_MAX_LENGTH = 240;
+const NOTIFY_SKILL_ACTIVATION_ERROR_MAX_LENGTH = 512;
+const NOTIFY_SKILL_ACTIVATION_CONTEXT_MAX_LENGTH = 200;
 
 async function readJsonFileIfObject(path: string): Promise<Record<string, unknown> | null> {
   try {
@@ -280,13 +292,6 @@ function classifyIdleNotificationPhase(message: unknown): 'idle' | 'progress' | 
 }
 
 
-function isExplicitAutopilotActivationText(text: string): boolean {
-  return /(?:^|[^\w])\$autopilot\b/i.test(text)
-    || /^\s*\/autopilot\b/i.test(text)
-    || /^\s*(?:please\s+)?autopilot(?:\s+(?:this|mode|workflow|skill|loop|now))?\s*[.!]?\s*$/i.test(text)
-    || /\b(?:use|run|start|enable|launch|invoke|activate|resume|continue)\s+(?:the\s+)?autopilot(?:\s+(?:mode|workflow|skill|loop|now))?\s*[.!]?\s*$/i.test(text)
-    || /\bautopilot\s+(?:mode|workflow|skill|loop)\b/i.test(text);
-}
 
 function looksLikeAutopilotTerminalHandoff(text: string): boolean {
   return /\bAutopilot complete\b/i.test(text)
@@ -349,6 +354,106 @@ async function shouldSuppressAutopilotTerminalReplayActivation(
   if (!looksLikeAutopilotTerminalHandoff(lastAssistantMessage) && !isNotifyFallbackTaskCompletePayload(payload)) return false;
 
   return hasTerminalAutopilotStateForNotifyTurn(stateDir, sessionId, payload);
+}
+
+export interface NotifySkillActivationInput {
+  readonly stateDir: string;
+  readonly sourceCwd: string;
+  readonly text: string;
+  readonly sessionId?: string;
+  readonly threadId?: string;
+  readonly turnId?: string;
+  readonly payload: Record<string, unknown>;
+  readonly nowIso?: string;
+}
+
+export interface NotifySkillActivationDependencies {
+  readonly classifyKeywordInput?: (text: string) => KeywordInputClassification;
+  readonly recordSkillActivation?: (input: RecordSkillActivationInput) => Promise<SkillActiveState | null>;
+}
+
+function boundedNotifySkillActivationContext(value: unknown): string | null {
+  try {
+    const context = safeString(value).trim().slice(0, NOTIFY_SKILL_ACTIVATION_CONTEXT_MAX_LENGTH);
+    return context || null;
+  } catch {
+    return null;
+  }
+}
+
+function boundedNotifySkillActivationError(error: unknown): string {
+  try {
+    const message = error instanceof Error ? error.message : String(error);
+    return message.slice(0, NOTIFY_SKILL_ACTIVATION_ERROR_MAX_LENGTH);
+  } catch {
+    return 'unknown_error';
+  }
+}
+
+async function logNotifySkillActivationFailure(
+  logsDir: string,
+  input: NotifySkillActivationInput,
+  error: unknown,
+): Promise<void> {
+  await logNotifyHookEvent(logsDir, {
+    timestamp: new Date().toISOString(),
+    level: 'warn',
+    type: 'notify_skill_activation_failure',
+    error: boundedNotifySkillActivationError(error),
+    session_id: boundedNotifySkillActivationContext(input.sessionId),
+    thread_id: boundedNotifySkillActivationContext(input.threadId),
+    turn_id: boundedNotifySkillActivationContext(input.turnId),
+  }).catch(() => {});
+}
+
+/**
+ * Records prompt skill activation using one shared input classification for the
+ * terminal-replay check and the state writer.
+ */
+export async function recordNotifySkillActivation(
+  input: NotifySkillActivationInput,
+  dependencies: NotifySkillActivationDependencies = {},
+): Promise<SkillActiveState | null> {
+  const classification = (dependencies.classifyKeywordInput ?? classifyKeywordInput)(input.text);
+  const teamEnabled = readTeamModeConfig(input.sourceCwd).enabled;
+  const runtimeMatches = teamEnabled
+    ? classification.matches
+    : classification.matches.filter((match) => match.skill !== 'team');
+  const terminalAutopilotReplay = await shouldSuppressAutopilotTerminalReplayActivation(
+    input.stateDir,
+    input.payload,
+    runtimeMatches.some((match) => match.skill === 'autopilot'),
+    input.sessionId || '',
+  );
+  if (terminalAutopilotReplay && runtimeMatches[0]?.skill === 'autopilot') return null;
+
+  return (dependencies.recordSkillActivation ?? recordSkillActivation)({
+    stateDir: input.stateDir,
+    sourceCwd: input.sourceCwd,
+    text: input.text,
+    sessionId: input.sessionId,
+    threadId: input.threadId,
+    turnId: input.turnId,
+    nowIso: input.nowIso,
+    classification,
+    allowSecondaryAutopilot: !terminalAutopilotReplay,
+  });
+}
+
+/**
+ * Non-fatal notify-hook boundary for shared classification and state writes.
+ */
+export async function recordNotifySkillActivationNonFatal(
+  input: NotifySkillActivationInput,
+  logsDir: string,
+  dependencies: NotifySkillActivationDependencies = {},
+): Promise<SkillActiveState | null> {
+  try {
+    return await recordNotifySkillActivation(input, dependencies);
+  } catch (error) {
+    await logNotifySkillActivationFailure(logsDir, input, error);
+    return null;
+  }
 }
 
 function buildIdleNotificationFingerprint(payload: Record<string, unknown>): string {
@@ -446,6 +551,39 @@ async function resolveLeaderNotifyWriteDecision(
   };
 }
 
+async function resolveNotifyWorkerMutationAuthority(
+  cwd: string,
+  worker: { teamName: string; workerName: string },
+): Promise<{ authority: ResolvedStateAuthorityContext; stateRoot: string }> {
+  const resolution = await resolveWorkerTeamStateRoot(cwd, worker, process.env);
+  if (!resolution.ok || !resolution.stateRoot) {
+    throw new Error(resolution.reason || 'team_worker_state_authority_unresolved');
+  }
+  const authority = await resolveStateAuthorityForMutation({
+    startup_cwd: process.env.OMX_STARTUP_CWD?.trim() || cwd,
+    observed_cwd: cwd,
+    session_id: process.env.OMX_SESSION_ID?.trim() || undefined,
+  });
+  const identityPath = join(
+    resolution.stateRoot,
+    'team',
+    worker.teamName,
+    'workers',
+    worker.workerName,
+    'identity.json',
+  );
+  const identity = await readJsonFileIfObject(identityPath);
+  const worktreePath = safeString(identity?.worktree_path || '').trim();
+  const identityStateRoot = safeString(identity?.team_state_root || '').trim();
+  const identitySessionId = safeString(identity?.session_id || identity?.owner_session_id || '').trim();
+  if (!identity || !worktreePath || !sameFilePath(worktreePath, cwd)
+    || !identityStateRoot || !sameFilePath(identityStateRoot, resolution.stateRoot)
+    || !authority.session_binding
+    || !identitySessionId || identitySessionId !== authority.session_binding.canonical_session_id) {
+    throw new Error('team_worker_identity_not_authorized_by_state_authority');
+  }
+  return { authority, stateRoot: resolution.stateRoot };
+}
 async function main() {
   const rawPayload = process.argv[process.argv.length - 1];
   if (!rawPayload || rawPayload.startsWith('-')) {
@@ -479,12 +617,13 @@ async function main() {
   const parsedTeamWorker = parseTeamWorkerEnv(teamWorkerEnv);
   const isTeamWorker = !!parsedTeamWorker;
 
-  const resolvedWorkerStateDir = (isTeamWorker && parsedTeamWorker)
-    ? await resolveTeamStateDirForWorker(cwd, parsedTeamWorker)
+  const workerMutationResolution = (isTeamWorker && parsedTeamWorker)
+    ? await resolveNotifyWorkerMutationAuthority(cwd, parsedTeamWorker).catch(() => null)
     : null;
-  const workerStateRootResolved = !isTeamWorker || !!resolvedWorkerStateDir;
+  const workerMutationAuthority = workerMutationResolution?.authority || null;
+  const workerStateRootResolved = !isTeamWorker || !!workerMutationResolution;
   const leaderPointerContext = isTeamWorker ? null : resolveSessionPointerContext(cwd);
-  const stateDir = resolvedWorkerStateDir || leaderPointerContext?.baseStateDir || '';
+  const stateDir = workerMutationResolution?.stateRoot || leaderPointerContext?.baseStateDir || '';
   const logsDir = join(cwd, '.omx', 'logs');
   const omxDir = join(cwd, '.omx');
   const leaderWriteDecision = isTeamWorker
@@ -510,7 +649,6 @@ async function main() {
   // Ensure directories exist
   await mkdir(logsDir, { recursive: true }).catch(() => {});
   if (isTeamWorker && workerStateRootResolved) {
-    await mkdir(stateDir, { recursive: true }).catch(() => {});
     currentOmxSessionId = await readCurrentSessionId(stateDir).catch(() => '') || '';
   }
 
@@ -525,30 +663,67 @@ async function main() {
         const threadId = safeString(payload['thread-id'] || payload.thread_id || '');
         const eventType = safeString(payload.type || 'agent-turn-complete');
         const key = `${threadId || 'no-thread'}|${turnId}|${eventType}`;
-        const dedupeSessionId = getEffectiveSessionId();
-        const scope = leaderWriteDecision?.scope;
-        const dedupeStatePath = scope
-          ? await getScopedStatePathAtScope(stateDir, 'notify-hook-state.json', scope)
-          : await getScopedStatePath(stateDir, 'notify-hook-state.json', dedupeSessionId);
-        const dedupeState = normalizeNotifyState(
-          scope
-            ? await readScopedJsonAtScope(stateDir, 'notify-hook-state.json', scope, null)
-            : await readScopedJsonIfExists(stateDir, 'notify-hook-state.json', dedupeSessionId, null),
-        );
-        dedupeState.recent_turns = pruneRecentTurns(dedupeState.recent_turns, now);
-        if (dedupeState.recent_turns[key]) {
-          process.exit(0);
+        let duplicateWorkerTurn = false;
+        if (isTeamWorker && workerMutationAuthority) {
+          await withStateAuthorityTransaction(workerMutationAuthority, async (authority) => {
+            await assertWorkerNotificationAuthority({ cwd, stateDir, parsedTeamWorker: parsedTeamWorker!, authority });
+            const sessionId = authority.session_binding?.canonical_session_id;
+            if (!sessionId) throw new Error('worker_session_authority_missing');
+            const dedupeStatePath = join(
+              authority.canonical_state_root,
+              'sessions',
+              sessionId,
+              'notify-hook-state.json',
+            );
+            await ensureAuthorityDirectory(authority.canonical_state_root, dirname(dedupeStatePath), {
+              expected_root_identity: authority.generation.root_identity,
+            });
+            const raw = await readAuthorityFileWithExpectedRoot(dedupeStatePath, {
+              authority_root: authority.canonical_state_root,
+              expected_root_identity: authority.generation.root_identity,
+            });
+            const dedupeState = normalizeNotifyState(raw ? JSON.parse(raw) : null);
+            dedupeState.recent_turns = pruneRecentTurns(dedupeState.recent_turns, now);
+            if (dedupeState.recent_turns[key]) {
+              duplicateWorkerTurn = true;
+              return;
+            }
+            dedupeState.recent_turns[key] = now;
+            dedupeState.last_event_at = new Date().toISOString();
+            (dedupeState as any).session_id = sessionId;
+            await atomicWriteAuthorityFile(dedupeStatePath, JSON.stringify(dedupeState, null, 2), {
+              authority_root: authority.canonical_state_root,
+              expected_root_identity: authority.generation.root_identity,
+            });
+          });
+          if (duplicateWorkerTurn) return;
+        } else {
+          const dedupeSessionId = getEffectiveSessionId();
+          const scope = leaderWriteDecision?.scope;
+          const dedupeStatePath = scope
+            ? await getScopedStatePathAtScope(stateDir, 'notify-hook-state.json', scope)
+            : await getScopedStatePath(stateDir, 'notify-hook-state.json', dedupeSessionId);
+          const dedupeState = normalizeNotifyState(
+            scope
+              ? await readScopedJsonAtScope(stateDir, 'notify-hook-state.json', scope, null)
+              : await readScopedJsonIfExists(stateDir, 'notify-hook-state.json', dedupeSessionId, null),
+          );
+          dedupeState.recent_turns = pruneRecentTurns(dedupeState.recent_turns, now);
+          if (dedupeState.recent_turns[key]) {
+            process.exit(0);
+          }
+          dedupeState.recent_turns[key] = now;
+          dedupeState.last_event_at = new Date().toISOString();
+          if (scope) {
+            (dedupeState as any).session_id = scope.targetSessionId;
+            (dedupeState as any).owner_codex_session_id = scope.ownerCodexSessionId;
+          }
+          await mkdir(dirname(dedupeStatePath), { recursive: true }).catch(() => {});
+          await writeFile(dedupeStatePath, JSON.stringify(dedupeState, null, 2)).catch(() => {});
         }
-        dedupeState.recent_turns[key] = now;
-        dedupeState.last_event_at = new Date().toISOString();
-        if (scope) {
-          (dedupeState as any).session_id = scope.targetSessionId;
-          (dedupeState as any).owner_codex_session_id = scope.ownerCodexSessionId;
-        }
-        await mkdir(dirname(dedupeStatePath), { recursive: true }).catch(() => {});
-        await writeFile(dedupeStatePath, JSON.stringify(dedupeState, null, 2)).catch(() => {});
       }
     } catch {
+      if (isTeamWorker) return;
       // Non-critical
     }
   }
@@ -821,12 +996,15 @@ async function main() {
   // 4.5. Update team worker heartbeat (if applicable)
   if (isTeamWorker) {
     try {
-      if (parsedTeamWorker) {
-        const { teamName: twTeamName, workerName: twWorkerName } = parsedTeamWorker;
-        await updateWorkerHeartbeat(stateDir, twTeamName, twWorkerName);
+      if (parsedTeamWorker && workerMutationAuthority) {
+        await withStateAuthorityTransaction(workerMutationAuthority, async (authority) => {
+          await assertWorkerNotificationAuthority({ cwd, stateDir, parsedTeamWorker, authority });
+          await updateWorkerHeartbeat(stateDir, parsedTeamWorker.teamName, parsedTeamWorker.workerName, authority);
+        });
       }
     } catch {
-      // Non-critical: heartbeat write failure should never block the hook
+      if (isTeamWorker) return;
+      // A missing, stale, or replaced authority must prevent worker effects.
     }
   }
 
@@ -835,48 +1013,36 @@ async function main() {
 
   // 4.45. Skill activation tracking: update skill-active-state.json before any nudge logic.
   if (isTeamWorker || canWriteLeaderScopedState) {
-    try {
-      const { detectKeywords, recordSkillActivation } = await import('../hooks/keyword-detector.js');
-      if (latestUserInput) {
-        const activationSessionId = getEffectiveSessionId();
-        const keywordAuthority = await resolveStateAuthorityForGuard({
-          startup_cwd: cwd,
-          observed_cwd: cwd,
-          session_id: activationSessionId || undefined,
-        });
-        const isAutopilotActivation = detectKeywords(latestUserInput)
-          .some((match) => match.skill === 'autopilot')
-          || isExplicitAutopilotActivationText(latestUserInput);
-        const suppressTerminalReplay = await shouldSuppressAutopilotTerminalReplayActivation(
-          stateDir,
-          payload,
-          isAutopilotActivation,
-          activationSessionId,
-        );
-        if (!suppressTerminalReplay) {
-          await recordSkillActivation({
-            stateDir,
-            sourceCwd: cwd,
-            text: latestUserInput,
-            sessionId: activationSessionId,
-            threadId: payloadThreadId,
-            expectedRootIdentity: keywordAuthority.generation.root_identity,
-            turnId: safeString(payload['turn-id'] || payload.turn_id || ''),
-            ...(!isTeamWorker && leaderWriteDecision ? {
-              resolvedPromptTurnContext: leaderWriteDecision.context,
-              onProvenanceRejected: async (diagnostic: import('../hooks/prompt-session-provenance.js').PromptDiagnosticDescriptor) => {
-                await appendPromptSessionProvenanceRejection(leaderWriteDecision.pointerContext, diagnostic).catch(() => {});
-              },
-            } : {}),
-          });
-        }
-      }
-    } catch {
-      // Non-fatal: keyword detector module may not be built yet
+    if (latestUserInput) {
+      const activationAuthority = await resolveStateAuthorityForMutation({
+        startup_cwd: cwd,
+        observed_cwd: cwd,
+        session_id: getEffectiveSessionId() || undefined,
+      });
+      await recordNotifySkillActivationNonFatal({
+        stateDir,
+        sourceCwd: cwd,
+        text: latestUserInput,
+        sessionId: getEffectiveSessionId(),
+        threadId: payloadThreadId,
+        turnId: safeString(payload['turn-id'] || payload.turn_id || ''),
+        payload,
+      }, logsDir, {
+        recordSkillActivation: async (input) => recordSkillActivation({
+          ...input,
+          expectedRootIdentity: activationAuthority.generation.root_identity,
+          ...(!isTeamWorker && leaderWriteDecision ? {
+            resolvedPromptTurnContext: leaderWriteDecision.context,
+            onProvenanceRejected: async (diagnostic: import('../hooks/prompt-session-provenance.js').PromptDiagnosticDescriptor) => {
+              await appendPromptSessionProvenanceRejection(leaderWriteDecision.pointerContext, diagnostic).catch(() => {});
+            },
+          } : {}),
+        }),
+      });
     }
 
     try {
-      const lifecycleAuthority = await resolveStateAuthorityForGuard({
+      const lifecycleAuthority = await resolveStateAuthorityForMutation({
         startup_cwd: cwd,
         observed_cwd: cwd,
         session_id: getEffectiveSessionId() || undefined,
@@ -901,20 +1067,24 @@ async function main() {
   const deepInterviewInputLockActive = await isDeepInterviewInputLockActive(stateDir, effectiveSessionId);
 
   // 4.55. Notify leader when individual worker transitions to idle (worker session only)
-  if (isTeamWorker && parsedTeamWorker && !deepInterviewStateActive) {
+  if (isTeamWorker && parsedTeamWorker && !deepInterviewStateActive && workerMutationAuthority) {
     try {
-      await maybeNotifyLeaderWorkerIdle({ cwd, stateDir, logsDir, parsedTeamWorker });
+      await withStateAuthorityTransaction(workerMutationAuthority, async (authority) => {
+        await maybeNotifyLeaderWorkerIdle({ cwd, stateDir, logsDir, parsedTeamWorker, authority });
+      });
     } catch {
-      // Non-critical
+      return;
     }
   }
 
   // 4.6. Notify leader when all workers are idle (worker session only)
-  if (isTeamWorker && parsedTeamWorker && !deepInterviewStateActive) {
+  if (isTeamWorker && parsedTeamWorker && !deepInterviewStateActive && workerMutationAuthority) {
     try {
-      await maybeNotifyLeaderAllWorkersIdle({ cwd, stateDir, logsDir, parsedTeamWorker });
+      await withStateAuthorityTransaction(workerMutationAuthority, async (authority) => {
+        await maybeNotifyLeaderAllWorkersIdle({ cwd, stateDir, logsDir, parsedTeamWorker, authority });
+      });
     } catch {
-      // Non-critical
+      return;
     }
   }
 
@@ -1188,9 +1358,11 @@ async function logFatalNotifyHookError(err: unknown): Promise<void> {
   }) + '\n').catch(() => {});
 }
 
-main().catch((err) => {
-  // Notify hooks are auxiliary background work. Avoid printing stack traces into
-  // Codex TUI/PowerShell foreground panes; record diagnostics in .omx/logs.
-  process.exitCode = 0;
-  void logFatalNotifyHookError(err);
-});
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main().catch((err) => {
+    // Notify hooks are auxiliary background work. Avoid printing stack traces into
+    // Codex TUI/PowerShell foreground panes; record diagnostics in .omx/logs.
+    process.exitCode = 0;
+    void logFatalNotifyHookError(err);
+  });
+}

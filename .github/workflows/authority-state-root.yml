@@ -183,6 +183,21 @@ jobs:
             dist/team/__tests__/api-interop.test.js \
             dist/team/__tests__/tmux-session.test.js \
             2>&1 | tee authority-evidence/team-tmux-transport.log
+      - name: Run watcher, notify, and subagent authority lane
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --test --test-concurrency=1 \
+            dist/scripts/__tests__/notify-fallback-watcher.test.js \
+            dist/scripts/__tests__/hook-derived-watcher.test.js \
+            dist/hooks/__tests__/notify-hook-team-worker-fail-closed.test.js \
+            dist/hooks/__tests__/notify-hook-cross-worktree-heartbeat.test.js \
+            dist/hooks/__tests__/notify-hook-session-scope.test.js \
+            dist/hooks/__tests__/notify-hook-worker-idle.test.js \
+            dist/hooks/__tests__/notify-hook-all-workers-idle.test.js \
+            dist/subagents/__tests__/tracker.test.js \
+            dist/subagents/__tests__/adapted-role-binding.test.js \
+            2>&1 | tee authority-evidence/watcher-notify-subagent.log
       - name: Verify packed native installation
         shell: bash
         run: |
@@ -230,6 +245,7 @@ jobs:
             'authority-recovery-concurrency-e2e.log',
             'hotswap-rollover.log',
             'team-tmux-transport.log',
+            'watcher-notify-subagent.log',
             'native-agents.log',
             'packed-install.log',
             'doctor-platform.log',
@@ -320,6 +336,7 @@ jobs:
             'authority-recovery-concurrency-e2e.log',
             'hotswap-rollover.log',
             'team-tmux-transport.log',
+            'watcher-notify-subagent.log',
             'native-agents.log',
             'packed-install.log',
             'doctor-platform.log',
