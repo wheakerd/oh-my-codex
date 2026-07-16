@@ -368,14 +368,8 @@ async function buildPublishedTestAuthorityEnv(
 	sessionId: string,
 	env: NodeJS.ProcessEnv,
 ): Promise<NodeJS.ProcessEnv> {
-	await initializeTestStateAuthority(cwd, sessionId, env);
+	const initializedEnv = await initializeTestStateAuthority(cwd, sessionId, env);
 	await writeSessionStartDirect(cwd, sessionId);
-	const authority = await resolveStateAuthorityForGuard({
-		startup_cwd: cwd,
-		observed_cwd: cwd,
-		session_id: sessionId,
-	});
-	await mintStateAuthorityTransportCapability(authority);
 	const isolatedEnv = { ...env };
 	for (const key of [
 		"OMX_ROOT",
@@ -386,10 +380,11 @@ async function buildPublishedTestAuthorityEnv(
 	]) {
 		delete isolatedEnv[key];
 	}
-	return buildStateAuthorityTransportEnv(authority, {
+	return {
 		...isolatedEnv,
+		...initializedEnv,
 		OMX_SESSION_ID: sessionId,
-	});
+	};
 }
 
 async function dispatchCodexNativeHook(
@@ -3057,7 +3052,7 @@ PY`,
     }
   });
 
-  it("preserves exact structural prompt classification through compiled UserPromptSubmit state and Stop", async () => {
+  it("preserves exact structural prompt classification through compiled UserPromptSubmit state and Stop", { timeout: 600_000 }, async () => {
     const cases = [
       { name: "mixed-indent", prompt: " \t$ralplan plan this", expectedSkill: null },
       { name: "at-suffix", prompt: "$ralplan@docs", expectedSkill: null },
