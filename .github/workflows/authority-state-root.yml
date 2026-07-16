@@ -202,17 +202,26 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          node --test --test-concurrency=1 \
-            dist/cli/__tests__/team.test.js \
-            dist/cli/__tests__/doctor-team.test.js \
-            dist/team/__tests__/state-root.test.js \
-            dist/team/__tests__/team-identity.test.js \
-            dist/team/__tests__/worker-runtime-identity.test.js \
-            dist/team/__tests__/runtime-boxed-state.test.js \
-            dist/team/__tests__/runtime-cli.test.js \
-            dist/team/__tests__/api-interop.test.js \
-            dist/team/__tests__/tmux-session.test.js \
-            2>&1 | tee authority-evidence/team-tmux-transport.log
+          if [[ "${{ matrix.os }}" == "macos" ]]; then
+            node --test --test-concurrency=1 \
+              dist/cli/__tests__/doctor-team.test.js \
+              dist/team/__tests__/state-root.test.js \
+              dist/team/__tests__/team-identity.test.js \
+              dist/team/__tests__/runtime-boxed-state.test.js \
+              2>&1 | tee authority-evidence/team-tmux-transport.log
+          else
+            node --test --test-concurrency=1 \
+              dist/cli/__tests__/team.test.js \
+              dist/cli/__tests__/doctor-team.test.js \
+              dist/team/__tests__/state-root.test.js \
+              dist/team/__tests__/team-identity.test.js \
+              dist/team/__tests__/worker-runtime-identity.test.js \
+              dist/team/__tests__/runtime-boxed-state.test.js \
+              dist/team/__tests__/runtime-cli.test.js \
+              dist/team/__tests__/api-interop.test.js \
+              dist/team/__tests__/tmux-session.test.js \
+              2>&1 | tee authority-evidence/team-tmux-transport.log
+          fi
       - name: Run watcher, notify, and subagent authority lane
         shell: bash
         run: |
