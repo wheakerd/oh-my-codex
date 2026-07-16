@@ -4512,6 +4512,7 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
         configuredRestoredHudPaneId,
         configuredRestoredHudPanePid,
         restoredHudDebtRoot,
+        true,
       );
     } catch (error) {
       if (!(error instanceof Error) || !error.message.startsWith('restored_hud_cleanup_debt_unresolved:')) {

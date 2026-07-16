@@ -2064,6 +2064,8 @@ sleep 5
       else delete process.env.OMX_TEAM_LEADER_CWD;
       if (typeof prevLaunchMode === 'string') process.env.OMX_TEAM_WORKER_LAUNCH_MODE = prevLaunchMode;
       else delete process.env.OMX_TEAM_WORKER_LAUNCH_MODE;
+      if (typeof prevWorkerCli === 'string') process.env.OMX_TEAM_WORKER_CLI = prevWorkerCli;
+      else delete process.env.OMX_TEAM_WORKER_CLI;
       await rm(cwd, { recursive: true, force: true });
     }
   });
@@ -9954,6 +9956,91 @@ esac
           const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
           assert.doesNotMatch(tmuxLog, /kill-pane -t %44|kill-pane -t %45|kill-session|resize-pane|select-pane|send-keys|run-shell/);
           assert.doesNotMatch(tmuxLog, /show-option -p -t %45 @omx_team_pane_owner_id/);
+        },
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('shutdownTeam retires matching restored-HUD config when the pinned pane is no longer a HUD', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-shutdown-restored-hud-matching-nonhud-'));
+    const teamName = 'hud-matching-nonhud';
+    try {
+      await withMockTmuxFixture(
+        {
+          dirPrefix: 'omx-runtime-shutdown-restored-hud-matching-nonhud-bin-',
+          tmuxScript: (tmuxLogPath) => `#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "${tmuxLogPath}"
+case "$1" in
+  -V)
+    echo 'tmux 3.4'
+    ;;
+  list-panes)
+    case "$*" in
+      *"-a -F #{pane_id}"*)
+        printf '%%11\\t0\\t2000000011\\n%%44\\t0\\t2000000044\\n'
+        ;;
+      *"-t %11 -F #{pane_id}"*"#{pane_current_command}"*)
+        printf '%%11\\tzsh\\tzsh\\n%%44\\tnode\\tnot-a-hud\\n'
+        ;;
+      *) exit 1 ;;
+    esac
+    ;;
+  show-option)
+    case "$*" in
+      *"-p -t %11 @omx_team_pane_owner_id"*)
+        printf 'team:hud-matching-nonhud\\n'
+        ;;
+      *) exit 1 ;;
+    esac
+    ;;
+  *) exit 1 ;;
+esac
+`,
+        },
+        async ({ tmuxLogPath }) => {
+          await initTeamState(teamName, 'matching restored HUD non-authority test', 'executor', 1, cwd);
+          const config = await readTeamConfig(teamName, cwd);
+          assert.ok(config);
+          if (!config) return;
+          config.tmux_session = 'leader';
+          config.tmux_pane_owner_id = 'team:hud-matching-nonhud';
+          config.leader_pane_id = '%11';
+          config.leader_pane_pid = 2000000011;
+          config.hud_pane_id = '%44';
+          config.hud_pane_pid = 2000000044;
+          config.workers = [];
+          config.worker_count = 0;
+          await saveTeamConfig(config, cwd);
+          const debtPath = join(cwd, '.omx', 'state', 'team', teamName, '.restored-hud-cleanup-debt.json');
+          await writeFile(debtPath, `${JSON.stringify({
+            schema_version: 1,
+            operation: 'restored_hud_cleanup',
+            pane_id: '%44',
+            pane_pid: 2000000044,
+            leader_pane_id: '%11',
+            leader_pane_pid: 2000000011,
+            leader_pane_owner_id: 'team:hud-matching-nonhud',
+            hud_owner_leader_pane_id: '%11',
+          })}\n`);
+
+          for (let attempt = 0; attempt < 2; attempt++) {
+            await assert.rejects(
+              () => shutdownTeam(teamName, cwd, { force: true }),
+              /restored_hud_cleanup_debt_unresolved:%44/,
+            );
+            const persisted = await readTeamConfig(teamName, cwd);
+            assert.ok(persisted);
+            assert.equal(persisted?.hud_pane_id, null);
+            assert.equal(persisted?.hud_pane_pid, null);
+            assert.equal(existsSync(debtPath), true);
+          }
+
+          const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
+          assert.doesNotMatch(tmuxLog, /kill-pane|kill-session|resize-pane|select-pane|send-keys|run-shell/);
+          assert.doesNotMatch(tmuxLog, /show-option -p -t %44 @omx_team_pane_owner_id/);
         },
       );
     } finally {
