@@ -4718,6 +4718,7 @@ esac
             await writeFile(join(stateDir, 'mode'), mutation);
             await writeFile(join(stateDir, 'receipts'), '');
             let journaledWorker = false;
+            let journaledLeaderBirth = '';
             await writeFile(logPath, '');
             assert.throws(
               () => createTeamSession('Opaque Rollback', 1, cwd, [], [], {
@@ -4733,6 +4734,9 @@ esac
                   tmuxWindowIndex: '0',
                 },
                 journalResource: (resource) => {
+                  if (resource.kind === 'leader' && resource.id === '%1') {
+                    journaledLeaderBirth = resource.pane_birth ?? '';
+                  }
                   const isWorker = resource.kind === 'worker'
                     && resource.created === true
                     && resource.id === '%2'
@@ -4745,6 +4749,7 @@ esac
               /forced rollback after worker journal/,
             );
             assert.equal(journaledWorker, true);
+            assert.equal(journaledLeaderBirth, 'opaque-pane-birth');
             const log = await readFile(logPath, 'utf-8');
             await readFile(join(stateDir, 'receipts'), 'utf-8');
             assert.match(log, /if-shell -t %2 -F/);
@@ -5641,6 +5646,14 @@ case "\${1:-}" in
         printf "%%1\\n"
         ;;
     esac
+    exit 0
+    ;;
+  show-options)
+    echo "session-birth"
+    exit 0
+    ;;
+  show-option)
+    echo "pane-birth"
     exit 0
     ;;
   split-window)

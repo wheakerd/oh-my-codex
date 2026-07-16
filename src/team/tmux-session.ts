@@ -2176,11 +2176,25 @@ export function createTeamSession(
       && hudExactCandidate.leaderPaneId === leaderPaneId
       && hudEvidenceStillMatches,
     );
+    const observedLeaderBirth = readPaneInstanceTag(leaderPaneId)?.trim() ?? '';
+    if (!rollbackSessionBirth || !observedLeaderBirth) {
+      throw new Error('missing_exact_team_leader_birth');
+    }
     tagPaneTeamOwner(leaderPaneId, teamPaneOwnerId);
+    const lockedSessionBirth = runTmux(['show-options', '-qv', '-t', sessionName, OMX_INSTANCE_OPTION]);
+    const lockedLeaderBirth = readPaneInstanceTag(leaderPaneId)?.trim() ?? '';
+    if (
+      !lockedSessionBirth.ok
+      || lockedSessionBirth.stdout.trim() !== rollbackSessionBirth
+      || lockedLeaderBirth !== observedLeaderBirth
+    ) {
+      throw new Error('changed_exact_team_leader_birth');
+    }
     options.journalResource?.({
       kind: 'leader',
       id: leaderPaneId,
       created: false,
+      pane_birth: observedLeaderBirth,
       acquired_at: new Date().toISOString(),
     });
     const exactHudPaneIds = hasExactHudAuthority

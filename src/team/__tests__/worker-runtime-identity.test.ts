@@ -34,7 +34,7 @@ async function activateScaleUpLifecycle(teamName: string, cwd: string, config: N
     status: 'preparing', created_at: new Date().toISOString(), resources: [],
   }, cwd), true);
   assert.equal(await appendTeamLifecycleResource(teamName, token, {
-    kind: 'leader', id: config.leader_pane_id ?? '%11', created: true, pane_birth: 'session-birth-1', role: 'leader', acquired_at: new Date().toISOString(),
+    kind: 'leader', id: config.leader_pane_id ?? '%11', created: false, pane_birth: 'session-birth-1', role: 'leader', acquired_at: new Date().toISOString(),
   }, cwd), true);
   assert.equal(await finalizeTeamLifecycleGeneration(teamName, token, 'active', cwd, {
     tmux_session_name: config.tmux_session, tmux_session_birth: 'session-birth-1', tmux_context: `${config.tmux_session}:0`,
@@ -184,7 +184,6 @@ process.on('SIGTERM', () => process.exit(0));
       assert.match(worker1Joined, /--model gpt-5\.6-luna/);
       assert.match(worker2Joined, /model_reasoning_effort="low"/);
       assert.match(worker2Joined, /--model gpt-5\.6-luna/);
-
       await shutdownTeam(runtime.teamName, cwd, { force: true });
       runtime = null;
     } finally {

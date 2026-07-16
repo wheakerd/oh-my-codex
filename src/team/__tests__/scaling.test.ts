@@ -285,7 +285,7 @@ async function activateScaleUpLifecycle(teamName: string, cwd: string, config: N
   };
   assert.equal(await createTeamLifecycleGeneration(certificate, cwd), true);
   assert.equal(await appendTeamLifecycleResource(teamName, certificate.token, {
-    kind: 'leader', id: config.leader_pane_id ?? '%11', created: true, pane_birth: 'session-birth-1', role: 'leader', acquired_at: new Date().toISOString(),
+    kind: 'leader', id: config.leader_pane_id ?? '%11', created: false, pane_birth: 'session-birth-1', role: 'leader', acquired_at: new Date().toISOString(),
   }, cwd), true);
   assert.equal(await finalizeTeamLifecycleGeneration(teamName, certificate.token, 'active', cwd, {
     tmux_session_name: config.tmux_session,

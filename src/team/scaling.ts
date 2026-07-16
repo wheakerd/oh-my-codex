@@ -241,7 +241,6 @@ function hasExactScaleUpTmuxAuthority(
   const leaderResource = lifecycle.resources.find((resource) =>
     resource.kind === 'leader'
     && resource.id === leaderPaneId
-    && resource.created
     && Boolean(resource.pane_birth?.trim()),
   );
   if (
