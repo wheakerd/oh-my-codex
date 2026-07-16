@@ -12,6 +12,7 @@ import { OMX_FIRST_PARTY_MCP_PLUGIN_TARGETS } from '../../config/omx-first-party
 type PackageJson = {
   files?: string[];
   bin?: string | Record<string, string>;
+  exports?: Record<string, string>;
   scripts?: Record<string, string>;
 };
 
@@ -38,6 +39,10 @@ describe('package bin contract', () => {
     );
 
     assert.deepEqual(pkg.bin, { omx: 'dist/cli/omx.js' });
+    assert.deepEqual(pkg.exports, {
+      '.': './dist/index.js',
+      './package.json': './package.json',
+    });
     assert.equal(pkg.scripts?.['build:explore'], 'cargo build -p omx-explore-harness');
     assert.equal(pkg.scripts?.['build:explore:release'], 'node dist/scripts/build-explore-harness.js');
     assert.equal(pkg.scripts?.['build:full'], 'npm run build && npm run build:explore:release && npm run build:sparkshell && npm run build:api');
