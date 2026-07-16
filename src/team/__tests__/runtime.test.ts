@@ -48,6 +48,7 @@ import {
   waitForClaudeStartupEvidence,
   cleanupTeamWorkerLaunchOrphanedMcpProcesses,
   settleStartupAttemptResults,
+  shouldCleanupFailedTeamStartupState,
   TEAM_LOW_COMPLEXITY_DEFAULT_MODEL,
   detectAndCleanStaleTeam,
   type TeamRuntime,
@@ -67,6 +68,55 @@ const coverageRun = process.env.NODE_V8_COVERAGE ? true : false;
 const skipSlowLifecycleUnderCoverage = coverageRun
   ? 'covered by the team-state-runtime lane; skipped under c8 to keep the coverage gate bounded around slow process-lifecycle waits'
   : false;
+
+describe('failed Team startup state cleanup ownership', () => {
+  const createdWorktree = {
+    enabled: true as const,
+    repoRoot: '/repo',
+    worktreePath: '/repo/.omx/team/t/worktrees/worker-1',
+    detached: false,
+    branchName: 'omx/team/t/worker-1',
+    created: true,
+    reused: false,
+    createdBranch: true,
+  };
+
+  it('cleans initialized state after every newly created worktree rolls back', () => {
+    assert.equal(shouldCleanupFailedTeamStartupState({
+      rollbackErrorCount: 0,
+      preserveInteractiveRecovery: false,
+      provisionedWorktrees: [createdWorktree],
+      provisionedWorktreeRollbackComplete: true,
+    }), true);
+  });
+
+  it('preserves initialized state when worktree rollback is partial or failed', () => {
+    assert.equal(shouldCleanupFailedTeamStartupState({
+      rollbackErrorCount: 1,
+      preserveInteractiveRecovery: false,
+      provisionedWorktrees: [createdWorktree],
+      provisionedWorktreeRollbackComplete: false,
+    }), false);
+  });
+
+  it('preserves initialized state for pre-existing reused worktrees', () => {
+    assert.equal(shouldCleanupFailedTeamStartupState({
+      rollbackErrorCount: 0,
+      preserveInteractiveRecovery: false,
+      provisionedWorktrees: [{ ...createdWorktree, created: false, reused: true, createdBranch: false }],
+      provisionedWorktreeRollbackComplete: true,
+    }), false);
+  });
+
+  it('allows a same-name retry after a clean no-resource startup rollback', () => {
+    assert.equal(shouldCleanupFailedTeamStartupState({
+      rollbackErrorCount: 0,
+      preserveInteractiveRecovery: false,
+      provisionedWorktrees: [],
+      provisionedWorktreeRollbackComplete: true,
+    }), true);
+  });
+});
 
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');

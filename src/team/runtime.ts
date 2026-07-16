@@ -2542,6 +2542,21 @@ export function projectHudRuntimeRootEnv(
   return { rootSource };
 }
 
+/** @internal Exact ownership gate for deleting initialized Team state after startup failure. */
+export function shouldCleanupFailedTeamStartupState(params: {
+  rollbackErrorCount: number;
+  preserveInteractiveRecovery: boolean;
+  provisionedWorktrees: ReadonlyArray<EnsureWorktreeResult | { enabled: false }>;
+  provisionedWorktreeRollbackComplete: boolean;
+}): boolean {
+  return params.rollbackErrorCount === 0
+    && !params.preserveInteractiveRecovery
+    && params.provisionedWorktreeRollbackComplete
+    && params.provisionedWorktrees.every((result) =>
+      result.enabled === false || (result.created && !result.reused),
+    );
+}
+
 export async function startTeam(
   teamName: string,
   task: string,
@@ -3499,22 +3514,29 @@ export async function startTeam(
     }
     if (!preserveInteractiveRecovery) restoreTeamModelInstructionsFile(sanitized);
 
-    if (rollbackErrors.length === 0 && provisionedWorktrees.length === 0 && !preserveInteractiveRecovery) {
-      try {
-        await cleanupTeamState(sanitized, leaderCwd);
-      } catch (cleanupError) {
-        rollbackErrors.push(`cleanupTeamState: ${String(cleanupError)}`);
-      }
-    }
+    let provisionedWorktreeRollbackComplete = provisionedWorktrees.length === 0;
     if (provisionedWorktrees.length > 0) {
       if (preserveInteractiveRecovery) {
         rollbackErrors.push('preserving provisioned worktrees: startup rollback release receipts are unavailable');
       } else {
         try {
           await rollbackProvisionedWorktrees(provisionedWorktrees, { skipBranchDeletion: false });
+          provisionedWorktreeRollbackComplete = true;
         } catch (cleanupError) {
           rollbackErrors.push(`rollbackProvisionedWorktrees: ${String(cleanupError)}`);
         }
+      }
+    }
+    if (shouldCleanupFailedTeamStartupState({
+      rollbackErrorCount: rollbackErrors.length,
+      preserveInteractiveRecovery,
+      provisionedWorktrees,
+      provisionedWorktreeRollbackComplete,
+    })) {
+      try {
+        await cleanupTeamState(sanitized, leaderCwd);
+      } catch (cleanupError) {
+        rollbackErrors.push(`cleanupTeamState: ${String(cleanupError)}`);
       }
     }
 
