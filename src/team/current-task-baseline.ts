@@ -1,5 +1,5 @@
 import { existsSync } from 'fs';
-import { mkdirSync, readFileSync, writeFileSync } from 'fs';
+import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'fs';
 import { join, resolve } from 'path';
 import { omxStateDir } from '../utils/paths.js';
 
@@ -30,6 +30,19 @@ export interface UpsertCurrentTaskBaselineInput {
   pr_number?: number;
   pr_url?: string;
   status?: CurrentTaskStatus;
+}
+
+let currentTaskBaselineWriteFailureInjector: (() => void) | null = null;
+let currentTaskBaselineTemporaryFileSequence = 0;
+
+export function setCurrentTaskBaselineWriteFailureInjectorForTest(
+  injector: (() => void) | null,
+): () => void {
+  const previous = currentTaskBaselineWriteFailureInjector;
+  currentTaskBaselineWriteFailureInjector = injector;
+  return () => {
+    currentTaskBaselineWriteFailureInjector = previous;
+  };
 }
 
 function baselinePath(repoRoot: string): string {
@@ -63,8 +76,24 @@ export function readCurrentTaskBaseline(repoRoot: string): CurrentTaskBaselineFi
 
 function writeCurrentTaskBaseline(repoRoot: string, data: CurrentTaskBaselineFile): void {
   const stateDir = omxStateDir(repoRoot);
+  const path = baselinePath(repoRoot);
+  const temporaryPath = join(
+    stateDir,
+    `.current-task-baseline.${process.pid}.${currentTaskBaselineTemporaryFileSequence += 1}.tmp`,
+  );
   mkdirSync(stateDir, { recursive: true });
-  writeFileSync(baselinePath(repoRoot), JSON.stringify(data, null, 2) + '\n', 'utf-8');
+  try {
+    writeFileSync(temporaryPath, JSON.stringify(data, null, 2) + '\n', 'utf-8');
+    currentTaskBaselineWriteFailureInjector?.();
+    renameSync(temporaryPath, path);
+  } catch (error) {
+    try {
+      unlinkSync(temporaryPath);
+    } catch {
+      // The temporary file may have already been atomically published or removed.
+    }
+    throw error;
+  }
 }
 
 export function listActiveCurrentTasks(repoRoot: string): CurrentTaskBaselineEntry[] {

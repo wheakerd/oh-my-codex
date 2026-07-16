@@ -2580,6 +2580,65 @@ exit 0
       await rm(fakeBinDir, { recursive: true, force: true });
     }
   });
+  it('uses an active lifecycle certificate receipt for initial worker scale-down', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-scale-down-initial-receipt-'));
+    const fakeBinDir = await mkdtemp(join(tmpdir(), 'omx-scale-down-initial-receipt-bin-'));
+    const tmuxStubPath = join(fakeBinDir, 'tmux');
+    const previousPath = process.env.PATH;
+    try {
+      await writeFile(tmuxStubPath, `#!/bin/sh
+case "${'$'}{1:-}" in
+  list-panes) echo '%22' ;;
+  show-option) echo 'session-birth-1' ;;
+  if-shell) for arg in ${'$'}6; do receipt="${'$'}arg"; done; echo "${'$'}receipt" ;;
+esac
+`, 'utf-8');
+      await chmod(tmuxStubPath, 0o755);
+      process.env.PATH = `${fakeBinDir}:${previousPath ?? ''}`;
+      await initTeamState('initial-receipt', 'task', 'executor', 2, cwd);
+      const config = await readTeamConfig('initial-receipt', cwd);
+      assert.ok(config);
+      if (!config) return;
+      config.tmux_session = 'omx-team-initial-receipt';
+      config.tmux_pane_owner_id = 'team:initial-receipt';
+      config.workers[1]!.pane_id = '%22';
+      await saveTeamConfig(config, cwd);
+      const token = '11111111-1111-4111-8111-111111111111';
+      assert.equal(await createTeamLifecycleGeneration({
+        version: 1,
+        token,
+        team_name: 'initial-receipt',
+        canonical_session_id: 'leader-session',
+        native_session_ids: ['leader-session'],
+        tmux_session_name: null,
+        tmux_session_birth: null,
+        tmux_context: null,
+        team_pane_owner_id: config.tmux_pane_owner_id!,
+        hook_generation: 'hook-generation',
+        status: 'preparing',
+        created_at: new Date().toISOString(),
+        resources: [{
+          kind: 'worker', id: '%22', created: true, role: 'worker', pane_birth: 'pane-birth-22',
+          command: 'worker-command-22', acquired_at: new Date().toISOString(),
+        }],
+      }, cwd), true);
+      assert.equal(await finalizeTeamLifecycleGeneration('initial-receipt', token, 'active', cwd, {
+        tmux_session_name: config.tmux_session,
+        tmux_session_birth: 'session-birth-1',
+        tmux_context: config.tmux_session,
+      }), true);
+
+      const result = await scaleDown('initial-receipt', cwd, { workerNames: ['worker-2'], force: true }, {
+        OMX_TEAM_SCALING_ENABLED: '1',
+      });
+      assert.deepEqual(result, { ok: true, removedWorkers: ['worker-2'], newWorkerCount: 1 });
+    } finally {
+      if (typeof previousPath === 'string') process.env.PATH = previousPath;
+      else delete process.env.PATH;
+      await rm(cwd, { recursive: true, force: true });
+      await rm(fakeBinDir, { recursive: true, force: true });
+    }
+  });
   it('preserves pane, worktree, and config when an exact scale-down teardown receipt is rejected', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-scale-down-rejected-receipt-'));
     const fakeBinDir = await mkdtemp(join(tmpdir(), 'omx-scale-down-rejected-receipt-bin-'));

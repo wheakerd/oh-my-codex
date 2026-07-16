@@ -35,6 +35,9 @@ import {
   writeAtomic,
   setWriteAtomicRenameForTests,
   resetWriteAtomicRenameForTests,
+  setWriteAtomicDirectorySyncForTests,
+  resetWriteAtomicDirectorySyncForTests,
+
   writeWorkerInbox,
   enqueueDispatchRequest,
   listDispatchRequests,
@@ -61,6 +64,8 @@ beforeEach(() => {
 
 afterEach(() => {
   resetWriteAtomicRenameForTests();
+  resetWriteAtomicDirectorySyncForTests();
+
   if (typeof ORIGINAL_OMX_TEAM_STATE_ROOT === 'string') process.env.OMX_TEAM_STATE_ROOT = ORIGINAL_OMX_TEAM_STATE_ROOT;
   else delete process.env.OMX_TEAM_STATE_ROOT;
 });
@@ -2119,6 +2124,42 @@ exit 1
 
       await writeAtomic(p, 'same-content');
       assert.equal(readFileSync(p, 'utf8'), 'same-content');
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('writeAtomic tolerates only unsupported directory fsync errors after rename', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-state-'));
+    try {
+      const p = join(cwd, 'atomic-directory-sync.txt');
+      setWriteAtomicDirectorySyncForTests(async () => {
+        const error = new Error('directory sync unsupported') as NodeJS.ErrnoException;
+        error.code = 'EOPNOTSUPP';
+        throw error;
+      });
+
+      await writeAtomic(p, 'durable-file-data');
+      assert.equal(readFileSync(p, 'utf8'), 'durable-file-data');
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('writeAtomic preserves genuine directory fsync failures after rename', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-state-'));
+    try {
+      const p = join(cwd, 'atomic-directory-sync-failure.txt');
+      setWriteAtomicDirectorySyncForTests(async () => {
+        const error = new Error('directory sync I/O failure') as NodeJS.ErrnoException;
+        error.code = 'EIO';
+        throw error;
+      });
+
+      await assert.rejects(() => writeAtomic(p, 'renamed-before-sync-failure'), (error: unknown) => {
+        return (error as NodeJS.ErrnoException).code === 'EIO';
+      });
+      assert.equal(readFileSync(p, 'utf8'), 'renamed-before-sync-failure');
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

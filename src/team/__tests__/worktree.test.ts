@@ -32,6 +32,13 @@ function branchExists(repoRoot: string, branch: string): boolean {
   }
 }
 
+function branchRef(repoRoot: string, branch: string): string {
+  return execFileSync('git', ['rev-parse', '--verify', `refs/heads/${branch}`], {
+    cwd: repoRoot,
+    encoding: 'utf-8',
+  }).trim();
+}
+
 describe('worktree parser', () => {
   it('parses detached mode from --worktree', () => {
     const parsed = parseWorktreeMode(['--worktree', '--yolo']);
@@ -301,6 +308,38 @@ describe('worktree ensure + rollback', () => {
       await rollbackProvisionedWorktrees([ensured]);
       assert.equal(existsSync(ensured.worktreePath), false);
       assert.equal(branchExists(repo, 'feature/rollback'), false);
+    } finally {
+      await rm(repo, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves a branch advanced after provisioning instead of deleting it during rollback', async () => {
+    const repo = await initRepo();
+    try {
+      const plan = planWorktreeTarget({
+        cwd: repo,
+        scope: 'launch',
+        mode: { enabled: true, detached: false, name: 'feature/rollback-cas' },
+      });
+      assert.equal(plan.enabled, true);
+      if (!plan.enabled) return;
+
+      const ensured = ensureWorktree(plan);
+      assert.equal(ensured.enabled, true);
+      if (!ensured.enabled) return;
+      assert.ok(ensured.createdBranchRef);
+      await writeFile(join(ensured.worktreePath, 'ADVANCED.md'), 'advanced\n', 'utf-8');
+      execFileSync('git', ['add', 'ADVANCED.md'], { cwd: ensured.worktreePath, stdio: 'ignore' });
+      execFileSync('git', ['commit', '-m', 'advance branch'], { cwd: ensured.worktreePath, stdio: 'ignore' });
+      const advancedRef = branchRef(repo, 'feature/rollback-cas');
+      assert.notEqual(advancedRef, ensured.createdBranchRef);
+
+      await assert.rejects(
+        rollbackProvisionedWorktrees([ensured]),
+        /worktree_rollback_failed:delete_branch:feature\/rollback-cas:/,
+      );
+      assert.equal(existsSync(ensured.worktreePath), false);
+      assert.equal(branchRef(repo, 'feature/rollback-cas'), advancedRef);
     } finally {
       await rm(repo, { recursive: true, force: true });
     }

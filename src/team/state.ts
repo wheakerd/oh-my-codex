@@ -428,6 +428,35 @@ export function setWriteAtomicRenameForTests(fn: typeof rename): void {
 export function resetWriteAtomicRenameForTests(): void {
   renameForAtomicWrite = rename;
 }
+
+
+type DirectorySyncForAtomicWrite = (directory: string) => Promise<void>;
+
+async function syncDirectoryForAtomicWrite(directory: string): Promise<void> {
+  const handle = await openFile(directory, 'r');
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+let syncDirectoryAfterAtomicWrite: DirectorySyncForAtomicWrite = syncDirectoryForAtomicWrite;
+
+export function setWriteAtomicDirectorySyncForTests(fn: DirectorySyncForAtomicWrite): void {
+  syncDirectoryAfterAtomicWrite = fn;
+}
+
+export function resetWriteAtomicDirectorySyncForTests(): void {
+  syncDirectoryAfterAtomicWrite = syncDirectoryForAtomicWrite;
+}
+
+function isUnsupportedDirectorySyncError(error: unknown): boolean {
+  if (typeof error !== 'object' || error === null || !('code' in error)) return false;
+  const code = (error as { code?: unknown }).code;
+  return code === 'EPERM' || code === 'EINVAL' || code === 'ENOTSUP' || code === 'EOPNOTSUPP';
+}
+
 export type TaskReadiness =
   | { ready: true }
   | { ready: false; reason: 'blocked_dependency'; dependencies: string[] };
@@ -981,11 +1010,10 @@ export async function writeAtomic(filePath: string, data: string): Promise<void>
     throw error;
   }
 
-  const directory = await openFile(parent, 'r');
   try {
-    await directory.sync();
-  } finally {
-    await directory.close();
+    await syncDirectoryAfterAtomicWrite(parent);
+  } catch (error) {
+    if (!isUnsupportedDirectorySyncError(error)) throw error;
   }
 }
 

@@ -348,14 +348,13 @@ async function assertTeamStartupIsNonDestructive(
   ]);
 
   if (!existingConfig && !existingManifest) return;
-
   const currentPhase = existingPhase?.current_phase;
   if (currentPhase && isTerminalPhase(currentPhase)) return;
+
+  const lifecycleProbe = await probeTeamLifecycleGeneration(teamName, cwd);
   if (
-    existingConfig?.worker_launch_mode === 'interactive'
-    && existingConfig.hud_pane_id
-    && existingConfig.resize_hook_name
-    && existingConfig.resize_hook_target
+    lifecycleProbe.status === 'valid'
+    && isTerminalTeamLifecycleGenerationStatus(lifecycleProbe.certificate.status)
   ) return;
 
   const tmuxSession = existingConfig?.tmux_session ?? existingManifest?.tmux_session ?? `omx-team-${teamName}`;
@@ -2596,7 +2595,7 @@ export async function startTeam(
       })
     : rawIdentityScope;
   const sanitized = buildInternalTeamName(displayName, identityScope);
-  const retainedHudConfig = await readTeamConfig(sanitized, leaderCwd);
+
   const leaderSessionId = identityScope.sessionId || identityScope.paneId || identityScope.tmuxTarget || identityScope.runId;
 
   await assertTeamStartupIsNonDestructive(sanitized, leaderCwd, leaderSessionId);
@@ -2754,19 +2753,6 @@ export async function startTeam(
     );
     if (!config) {
       throw new Error('failed to initialize team config');
-    }
-    if (
-      retainedHudConfig?.worker_launch_mode === 'interactive'
-      && retainedHudConfig.hud_pane_id
-      && retainedHudConfig.resize_hook_name
-      && retainedHudConfig.resize_hook_target
-    ) {
-      config.tmux_session = retainedHudConfig.tmux_session;
-      config.leader_pane_id = retainedHudConfig.leader_pane_id;
-      config.hud_pane_id = retainedHudConfig.hud_pane_id;
-      config.tmux_pane_owner_id = retainedHudConfig.tmux_pane_owner_id;
-      config.resize_hook_name = retainedHudConfig.resize_hook_name;
-      config.resize_hook_target = retainedHudConfig.resize_hook_target;
     }
     config.leader_cwd = leaderCwd;
     config.team_state_root = teamStateRoot;
@@ -3146,13 +3132,6 @@ export async function startTeam(
         config.hook_generation = lifecycleCertificate?.hook_generation ?? null;
         if (!lifecycleCertificate) throw new Error('missing_team_lifecycle_certificate');
         const acquiredResources = [
-          ...createdSession.workerPaneIds.map((paneId) => ({
-            kind: 'worker' as const,
-            id: paneId,
-            created: true,
-            pane_birth: createdSession.workerPaneBirths?.[paneId],
-            acquired_at: new Date().toISOString(),
-          })),
           ...(createdSession.hudPaneId ? [{
             kind: 'hud' as const,
             id: createdSession.hudPaneId,

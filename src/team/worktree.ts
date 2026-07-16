@@ -47,6 +47,8 @@ export interface EnsureWorktreeResult {
   created: boolean;
   reused: boolean;
   createdBranch: boolean;
+  /** The exact object ID initially assigned to a newly created branch. */
+  createdBranchRef?: string;
   /** True when the worktree had uncommitted changes at launch time. */
   dirty?: boolean;
 }
@@ -476,8 +478,10 @@ export function ensureWorktree(
     created: true,
     reused: false,
     createdBranch: Boolean(plan.branchName && !branchAlreadyExisted),
+    ...(plan.branchName && !branchAlreadyExisted
+      ? { createdBranchRef: plan.baseRef }
+      : {}),
   } satisfies EnsureWorktreeResult;
-
   if (plan.branchName) {
     try {
       upsertCurrentTaskBaseline(plan.repoRoot, {
@@ -494,8 +498,10 @@ export function ensureWorktree(
         windowsHide: true,
       });
       if (removeResult.status !== 0) cleanupErrors.push(`remove:${(removeResult.stderr || '').trim() || removeResult.status}`);
-      if (ensured.createdBranch && ensured.branchName) {
-        const branchResult = spawnSync('git', ['branch', '-D', ensured.branchName], {
+      if (ensured.createdBranch && ensured.branchName && ensured.createdBranchRef) {
+        const branchResult = spawnSync('git', [
+          'update-ref', '-d', `refs/heads/${ensured.branchName}`, ensured.createdBranchRef,
+        ], {
           cwd: plan.repoRoot,
           encoding: 'utf-8',
           windowsHide: true,
@@ -542,14 +548,16 @@ export async function rollbackProvisionedWorktrees(
     }
 
     if (options.skipBranchDeletion) continue;
-    if (!result.createdBranch || !result.branchName) continue;
+    if (!result.createdBranch || !result.branchName || !result.createdBranchRef) continue;
 
     const entriesAfterRemove = listWorktrees(result.repoRoot);
     const stillCheckedOut = hasBranchInUse(entriesAfterRemove, result.branchName, result.worktreePath);
     if (stillCheckedOut) continue;
 
     try {
-      await execFilePromise('git', ['branch', '-D', result.branchName], {
+      await execFilePromise('git', [
+        'update-ref', '-d', `refs/heads/${result.branchName}`, result.createdBranchRef,
+      ], {
         cwd: result.repoRoot,
         encoding: 'utf-8',
       });

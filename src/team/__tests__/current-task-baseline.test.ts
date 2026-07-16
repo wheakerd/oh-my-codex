@@ -9,6 +9,7 @@ import {
   assertCurrentTaskBranchAvailable,
   findActiveCurrentTaskByBranch,
   upsertCurrentTaskBaseline,
+  setCurrentTaskBaselineWriteFailureInjectorForTest,
 } from '../current-task-baseline.js';
 import { ensureWorktree, planWorktreeTarget } from '../worktree.js';
 
@@ -90,6 +91,78 @@ describe('current-task-baseline', () => {
       assert.equal(entry.issue_number, 1407);
       assert.equal(entry.pr_number, 1416);
       assert.equal(entry.status, 'merged');
+    } finally {
+      await rm(repo, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves the previously published bytes when atomic baseline publication fails', async () => {
+    const repo = await initRepo();
+    try {
+      upsertCurrentTaskBaseline(repo, {
+        branch_name: 'feature/published',
+        worktree_path: repo,
+        status: 'active',
+      });
+      const baselinePath = join(repo, '.omx', 'state', 'current-task-baseline.json');
+      const before = readFileSync(baselinePath, 'utf-8');
+      const restore = setCurrentTaskBaselineWriteFailureInjectorForTest(() => {
+        throw new Error('injected_partial_write_failure');
+      });
+      try {
+        assert.throws(
+          () => upsertCurrentTaskBaseline(repo, {
+            branch_name: 'feature/not-published',
+            worktree_path: repo,
+            status: 'active',
+          }),
+          /injected_partial_write_failure/,
+        );
+      } finally {
+        restore();
+      }
+      assert.equal(readFileSync(baselinePath, 'utf-8'), before);
+    } finally {
+      await rm(repo, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves a concurrently advanced branch when post-add baseline publication fails', async () => {
+    const repo = await initRepo();
+    try {
+      const plan = planWorktreeTarget({
+        cwd: repo,
+        scope: 'launch',
+        mode: { enabled: true, detached: false, name: 'feature/concurrently-advanced' },
+      });
+      assert.equal(plan.enabled, true);
+      if (!plan.enabled) return;
+
+      let advancedRef = '';
+      const restore = setCurrentTaskBaselineWriteFailureInjectorForTest(() => {
+        advancedRef = execFileSync('git', ['commit-tree', 'HEAD^{tree}', '-p', 'HEAD', '-m', 'concurrent'], {
+          cwd: repo,
+          encoding: 'utf-8',
+        }).trim();
+        execFileSync('git', ['update-ref', 'refs/heads/feature/concurrently-advanced', advancedRef], {
+          cwd: repo,
+          stdio: 'ignore',
+        });
+        throw new Error('injected_baseline_failure');
+      });
+      try {
+        assert.throws(() => ensureWorktree(plan), /worktree_post_add_bookkeeping_failed:injected_baseline_failure; rollback_failed:branch:/);
+      } finally {
+        restore();
+      }
+      assert.notEqual(advancedRef, '');
+      assert.equal(
+        execFileSync('git', ['rev-parse', '--verify', 'refs/heads/feature/concurrently-advanced'], {
+          cwd: repo,
+          encoding: 'utf-8',
+        }).trim(),
+        advancedRef,
+      );
     } finally {
       await rm(repo, { recursive: true, force: true });
     }

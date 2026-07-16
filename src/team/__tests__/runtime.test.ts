@@ -2426,6 +2426,12 @@ process.on('SIGTERM', () => process.exit(0));`,
 
       const beforeConfig = await readTeamConfig('dup-team', cwd);
       assert.ok(beforeConfig);
+      if (!beforeConfig) throw new Error('missing existing config');
+      beforeConfig.worker_launch_mode = 'interactive';
+      beforeConfig.hud_pane_id = '%existing-hud';
+      beforeConfig.resize_hook_name = 'omx-existing-hud-resize';
+      beforeConfig.resize_hook_target = 'existing:0';
+      await saveTeamConfig(beforeConfig, cwd);
 
       process.env.OMX_TEAM_WORKER_LAUNCH_MODE = 'prompt';
       process.env.OMX_SESSION_ID = 'sess-second-team';

@@ -233,6 +233,36 @@ function readTmuxSessionBirth(sessionName: string): string | null {
     return null;
   }
 }
+
+function initialWorkerLifecycleReceipt(
+  teamName: string,
+  config: TeamConfig,
+  sessionName: string,
+  certificate: Awaited<ReturnType<typeof probeTeamLifecycleGeneration>>,
+  worker: WorkerInfo,
+): { receipt: TeamLifecycleResource; sessionBirth: string } | null {
+  if (certificate.status !== 'valid' || certificate.certificate.status !== 'active') return null;
+  const lifecycle = certificate.certificate;
+  const sessionBirth = readTmuxSessionBirth(sessionName);
+  if (
+    lifecycle.team_name !== teamName
+    || lifecycle.tmux_session_name !== sessionName.split(':', 1)[0]
+    || lifecycle.tmux_context !== sessionName
+    || lifecycle.tmux_session_birth !== sessionBirth
+    || lifecycle.team_pane_owner_id !== config.tmux_pane_owner_id
+    || !sessionBirth
+    || !worker.pane_id
+  ) return null;
+  const receipt = lifecycle.resources.find((resource) =>
+    resource.kind === 'worker'
+    && resource.role === 'worker'
+    && resource.id === worker.pane_id
+    && resource.created === true
+    && Boolean(resource.pane_birth?.trim())
+    && Boolean(resource.command?.trim()),
+  );
+  return receipt ? { receipt, sessionBirth } : null;
+}
 function hasExactScaleUpTmuxAuthority(
   teamName: string,
   config: TeamConfig,
@@ -1110,21 +1140,34 @@ export async function scaleDown(
     if (liveTargetWorkers.some((worker) => worker.pane_id === leaderPaneId || worker.pane_id === hudPaneId)) {
       return { ok: false, error: 'scale_down_target_is_leader_or_hud' };
     }
-    const receipts = await Promise.all(liveTargetWorkers.map(async (worker) => ({
-      worker,
-      receipt: await readScaledWorkerReceipt(sanitized, worker.name, teamStateRoot),
-    })));
-    const invalidReceipt = receipts.find(({ worker, receipt }) => (
-      !receipt
-      || receipt.id !== worker.pane_id
-      || receipt.session_name !== sessionName
-      || receipt.team_pane_owner_id !== config.tmux_pane_owner_id
-    ));
+    const lifecycleCertificate = await probeTeamLifecycleGeneration(sanitized, leaderCwd);
+    const receipts = await Promise.all(liveTargetWorkers.map(async (worker) => {
+      const scaledReceipt = await readScaledWorkerReceipt(sanitized, worker.name, teamStateRoot);
+      if (
+        scaledReceipt
+        && scaledReceipt.id === worker.pane_id
+        && scaledReceipt.session_name === sessionName
+        && scaledReceipt.team_pane_owner_id === config.tmux_pane_owner_id
+      ) {
+        return { worker, receipt: scaledReceipt as TeamLifecycleResource, sessionBirth: scaledReceipt.session_birth };
+      }
+      const lifecycleReceipt = initialWorkerLifecycleReceipt(
+        sanitized,
+        config,
+        sessionName,
+        lifecycleCertificate,
+        worker,
+      );
+      return lifecycleReceipt
+        ? { worker, ...lifecycleReceipt }
+        : { worker, receipt: null, sessionBirth: null };
+    }));
+    const invalidReceipt = receipts.find(({ receipt }) => !receipt);
     if (invalidReceipt) {
       return { ok: false, error: `scale_down_missing_exact_teardown_receipt:${invalidReceipt.worker.name}` };
     }
-    const sessionBirth = receipts[0]?.receipt?.session_birth;
-    if (receipts.length > 0 && (!sessionBirth || receipts.some(({ receipt }) => receipt?.session_birth !== sessionBirth))) {
+    const sessionBirth = receipts[0]?.sessionBirth;
+    if (receipts.length > 0 && (!sessionBirth || receipts.some((entry) => entry.sessionBirth !== sessionBirth))) {
       return { ok: false, error: 'scale_down_inconsistent_session_birth_receipts' };
     }
     const targetPaneIds = receipts.map(({ receipt }) => receipt!.id);

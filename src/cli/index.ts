@@ -3699,6 +3699,7 @@ async function persistTmuxBirthLineage(
   cwd: string,
   sessionId: string,
   evidence: ActualTmuxInstanceEvidence,
+  env: NodeJS.ProcessEnv = process.env,
 ): Promise<void> {
   const tmuxSessionName = evidence.sessionName.trim();
   const tmuxSessionInstanceId = evidence.sessionInstanceId.trim();
@@ -3706,6 +3707,7 @@ async function persistTmuxBirthLineage(
   if (!tmuxSessionName || !tmuxSessionInstanceId || !tmuxPaneInstanceId) return;
   const domain = await resolveHudControlPlaneDomain({
     cwd,
+    env,
     requestedSessionId: sessionId,
     claimant: {
       sessionId,
@@ -5444,7 +5446,7 @@ async function runCodex(
               tmuxSessionName: sessionName,
               ...(tmuxPaneId ? { tmuxPaneId } : {}),
             });
-            if (tmuxBinding) await persistTmuxBirthLineage(cwd, sessionId, tmuxBinding);
+            if (tmuxBinding) await persistTmuxBirthLineage(cwd, sessionId, tmuxBinding, hudRuntimeEnv);
           });
         void detachedSessionBindingWrite.catch((err) => {
           logCliOperationFailure(err);
