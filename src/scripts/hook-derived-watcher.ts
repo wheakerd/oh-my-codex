@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { existsSync } from 'fs';
-import { appendFile, mkdir, open, readFile, readdir, stat, writeFile } from 'fs/promises';
+import { appendFile, mkdir, open, readFile, readdir, stat } from 'fs/promises';
 import { dirname, join, resolve } from 'path';
 import { homedir } from 'os';
 import { StringDecoder } from 'string_decoder';
@@ -12,6 +12,7 @@ import {
   parseExecCommandArgs,
 } from './notify-hook/operational-events.js';
 import {
+  atomicWriteAuthorityJson,
   captureRootFilesystemIdentity,
   readWorkspaceAuthorityAnchor,
   resolveStateAuthorityForGuard,
@@ -662,7 +663,13 @@ async function writeState(): Promise<void> {
     dispatched_events: tracked,
     pending_calls: pendingCalls.size,
   };
-  await writeFile(watcherStatePath, JSON.stringify(state, null, 2)).catch(() => {});
+  const retained = authorityTuple;
+  if (!retained) throw new Error('watcher authority changed or terminalized');
+  await atomicWriteAuthorityJson(watcherStatePath, state, {
+    authority_root: retained.stateRoot,
+    expected_root_identity: retained.rootIdentity,
+  });
+  await requireRetainedActiveAuthority();
 }
 
 async function flushOnce(reason: string): Promise<void> {

@@ -18,7 +18,7 @@ const testDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(testDir, '..', '..', '..');
 const defaultTarget = join(repoRoot, 'dist', 'cli', 'omx.js');
 const fixturesRoot = join(repoRoot, 'src', 'compat', 'fixtures', 'doctor');
-const SAFE_DOCTOR_RECOVERY = 'Review warnings above. Follow the check-specific recovery guidance; for AGENTS.md preservation prefer "omx setup --merge-agents".';
+const SAFE_DOCTOR_RECOVERY = 'Review warnings above. Use "omx setup --force" only when a warning recommends full replacement; for AGENTS.md preservation prefer "omx setup --merge-agents".';
 const SAFE_DOCTOR_FAILURE = 'Review failed checks above. Follow the check-specific recovery guidance; inspect invalid or ambiguous hook documents manually because doctor will not modify them.';
 
 function readFixture(name: string): string {
@@ -110,7 +110,7 @@ describe('compat doctor contract', () => {
       assert.equal(result.stderr, '');
       assert.equal(normalizeInstallDoctorOutput(result.stdout, home, wd), readFixture('install-onboarding.stdout.txt'));
       assert.ok(result.stdout.includes(SAFE_DOCTOR_RECOVERY) || result.stdout.includes(SAFE_DOCTOR_FAILURE));
-      assert.doesNotMatch(result.stdout, /^Review (?:warnings|failed checks) above\.[^\n]*--force/m);
+      assert.doesNotMatch(result.stdout, /^Run "omx setup --force"/m);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }

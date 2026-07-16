@@ -298,6 +298,35 @@ describe('omx doctor --team', () => {
     }
   });
 
+  it('matches stale leaders to each team configured tmux session exactly', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-doctor-team-'));
+    try {
+      for (const [teamName, tmuxSession] of [
+        ['api', 'custom-api-session'],
+        ['api-v2', 'omx-team-api-v2'],
+      ] as const) {
+        const teamRoot = join(wd, '.omx', 'state', 'team', teamName);
+        await mkdir(join(teamRoot, 'workers', 'worker-1'), { recursive: true });
+        await writeFile(join(teamRoot, 'config.json'), JSON.stringify({
+          name: teamName,
+          tmux_session: tmuxSession,
+        }));
+      }
+      await writeFile(join(wd, '.omx', 'state', 'hud-state.json'), JSON.stringify({
+        last_turn_at: new Date(Date.now() - 300_000).toISOString(),
+        turn_count: 5,
+      }));
+      const fakeBin = await createFakeTmuxBin(wd, '#!/bin/sh\nif [ "$1" = "list-sessions" ]; then echo "omx-team-api-v2"; exit 0; fi\nexit 0\n');
+
+      const res = runOmx(wd, ['doctor', '--team'], { PATH: testPath(fakeBin) });
+      assert.equal(res.status, 1, res.stderr || res.stdout);
+      assert.match(res.stdout, /api-v2 has active tmux session/);
+      assert.doesNotMatch(res.stdout, /\bapi has active tmux session/);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
   it('does not emit stale_leader when HUD state is fresh', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-doctor-team-'));
     try {

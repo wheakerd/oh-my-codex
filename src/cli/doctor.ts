@@ -806,6 +806,7 @@ async function collectTeamDoctorIssues(
 	const tmuxSessions = listTeamTmuxSessions();
 	const tmuxUnavailable = tmuxSessions === null;
 	const knownTeamSessions = new Set<string>();
+	const teamTmuxSessions = new Map<string, string>();
 
 	for (const teamName of teamDirs) {
 		const teamDir = join(teamsRoot, teamName);
@@ -868,6 +869,7 @@ async function collectTeamDoctorIssues(
 		}
 
 		knownTeamSessions.add(tmuxSession);
+		teamTmuxSessions.set(teamName, tmuxSession);
 
 		if (workerLaunchMode === "prompt") {
 			for (const worker of promptWorkers) {
@@ -982,9 +984,7 @@ async function collectTeamDoctorIssues(
 			if (leaderIsStale && !tmuxUnavailable) {
 				// Check if any team tmux session has live worker panes
 				for (const teamName of teamDirs) {
-					const session = knownTeamSessions.has(`omx-team-${teamName}`)
-						? `omx-team-${teamName}`
-						: [...knownTeamSessions].find((s) => s.includes(teamName));
+					const session = teamTmuxSessions.get(teamName);
 					if (!session || !tmuxSessions.has(session)) continue;
 					issues.push({
 						code: "stale_leader",
