@@ -10842,7 +10842,14 @@ export async function dispatchCodexNativeHook(
     ultragoalSteeringAdditionalContext = steeringProposal && !isSubagentPromptSubmit
       ? await applyUserPromptUltragoalSteering(workspaceCwd, prompt).catch((error) => `OMX native UserPromptSubmit rejected bounded .omx/ultragoal steering for G002-cli-and-prompt-submit-bridge: ${error instanceof Error ? error.message : String(error)}`)
       : null;
-    const hasKeywordIntent = promptClassification?.matches.length !== 0;
+    const hasKeywordIntent = Boolean(
+      promptClassification
+      && (
+        promptClassification.matches.length !== 0
+        || promptClassification.hasExplicitLikeInvocation
+        || promptClassification.reservedInput !== null
+      )
+    );
     if (hasKeywordIntent && !authority) {
       return {
         hookEventName,

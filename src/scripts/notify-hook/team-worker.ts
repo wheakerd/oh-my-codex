@@ -30,6 +30,10 @@ import {
 import { DEFAULT_MARKER } from "../tmux-hook-engine.js";
 const LEADER_PANE_SHELL_NO_INJECTION_REASON = "leader_pane_shell_no_injection";
 
+function positivePanePid(value) {
+	return Number.isInteger(value) && Number(value) > 0 ? Number(value) : undefined;
+}
+
 export async function resolveTeamStateDirForWorker(cwd, _parsedTeamWorker) {
 	return resolveStateAuthorityForMutation({
 		startup_cwd: process.env.OMX_STARTUP_CWD?.trim() || cwd,
@@ -339,8 +343,11 @@ export async function readTeamWorkersForIdleCheck(stateDir, teamName, authority)
 			if (!Array.isArray(workers) || workers.length === 0) continue;
 			const tmuxSession = safeString(parsed.tmux_session || "").trim();
 			const leaderPaneId = safeString(parsed.leader_pane_id || "").trim();
-			const result = { workers, tmuxSession, leaderPaneId };
-			if (leaderPaneId) return result;
+			const hudPaneId = safeString(parsed.hud_pane_id || "").trim();
+			const leaderPanePid = positivePanePid(parsed.leader_pane_pid);
+			const tmuxPaneOwnerId = safeString(parsed.tmux_pane_owner_id || "").trim();
+			const result = { workers, tmuxSession, leaderPaneId, leaderPanePid, tmuxPaneOwnerId, hudPaneId };
+			if (leaderPaneId && leaderPanePid && tmuxPaneOwnerId) return result;
 			if (!fallback) fallback = result;
 		} catch {
 			// Try the next state source.

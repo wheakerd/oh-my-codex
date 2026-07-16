@@ -3900,6 +3900,17 @@ export async function recordSkillActivation(rawInput: RecordSkillActivationInput
   const sessionStatePath = input.sessionId
     ? join(input.stateDir, 'sessions', input.sessionId, SKILL_ACTIVE_STATE_FILE)
     : null;
+  const skillStateTargets = [
+    ...(suppressRootMutation ? [] : [rootStatePath]),
+    ...(sessionStatePath ? [sessionStatePath] : []),
+  ];
+  for (const targetPath of skillStateTargets) {
+    try {
+      if (!(await lstat(targetPath)).isFile()) return null;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return null;
+    }
+  }
   if (resolvedPromptTurnContext && input.sessionId) {
     const preflight = await preflightKeywordTargetState(
       input.stateDir,
@@ -3959,6 +3970,7 @@ export async function recordSkillActivation(rawInput: RecordSkillActivationInput
       await persistDeepInterviewModeState(input.stateDir, applyProvenanceOwner(state), nowIso, previous, input);
     } catch (error) {
       console.warn('[omx] warning: failed to persist keyword activation state', error);
+      return null;
     }
 
     return applyProvenanceOwner(state);
@@ -4265,6 +4277,7 @@ export async function recordSkillActivation(rawInput: RecordSkillActivationInput
       return nextState;
     } catch (error) {
       console.warn('[omx] warning: failed to persist keyword activation state', error);
+      return null;
     }
 
     return workflowState;
@@ -4324,9 +4337,8 @@ export async function recordSkillActivation(rawInput: RecordSkillActivationInput
     return ownedNextState;
   } catch (error) {
     console.warn('[omx] warning: failed to persist keyword activation state', error);
+    return null;
   }
-
-  return state;
 }
 
 /**
