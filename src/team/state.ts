@@ -621,9 +621,10 @@ function defaultPermissionsSnapshot(): PermissionsSnapshot {
   };
 }
 
-function readEnvValue(env: NodeJS.ProcessEnv, keys: string[]): string | null {
+function readEnvValue(env: NodeJS.ProcessEnv, keys: readonly string[]): string | null {
+  const values = new Map(Object.entries(env));
   for (const key of keys) {
-    const value = env[key];
+    const value = values.get(key);
     if (typeof value === 'string' && value.trim() !== '') return value.trim();
   }
   return null;

@@ -231,17 +231,20 @@ const STATE_AUTHORITY_TRANSPORT_ENV_KEYS = [
 ] as const;
 
 async function withoutStateAuthorityTransport<T>(operation: () => Promise<T>): Promise<T> {
+  const processEnvironment = new Map(Object.entries(process.env));
   const previous = new Map(
-    STATE_AUTHORITY_TRANSPORT_ENV_KEYS.map((key) => [key, process.env[key]]),
+    STATE_AUTHORITY_TRANSPORT_ENV_KEYS.map((key) => [key, processEnvironment.get(key)]),
   );
   try {
-    for (const key of STATE_AUTHORITY_TRANSPORT_ENV_KEYS) delete process.env[key];
+    for (const key of STATE_AUTHORITY_TRANSPORT_ENV_KEYS) {
+      Reflect.deleteProperty(process.env, key);
+    }
     return await operation();
   } finally {
     for (const key of STATE_AUTHORITY_TRANSPORT_ENV_KEYS) {
       const value = previous.get(key);
-      if (value === undefined) delete process.env[key];
-      else process.env[key] = value;
+      if (value === undefined) Reflect.deleteProperty(process.env, key);
+      else Object.assign(process.env, { [key]: value });
     }
   }
 }

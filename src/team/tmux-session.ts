@@ -1182,15 +1182,16 @@ function buildModelInstructionsOverride(cwd: string, env: NodeJS.ProcessEnv): st
 }
 
 function readTmuxWorkerAmbientEnv(
-	env: NodeJS.ProcessEnv = process.env,
+  env: NodeJS.ProcessEnv = process.env,
 ): Record<string, string> {
-	const inherited: Record<string, string> = {};
-	for (const key of TMUX_WORKER_AMBIENT_ENV_ALLOWLIST) {
-		const value = env[key];
-		if (typeof value !== "string" || value.trim() === "") continue;
-		inherited[key] = value;
-	}
-	return inherited;
+  const inherited: Record<string, string> = {};
+  const values = new Map(Object.entries(env));
+  for (const key of TMUX_WORKER_AMBIENT_ENV_ALLOWLIST) {
+    const value = values.get(key);
+    if (typeof value !== 'string' || value.trim() === '') continue;
+    inherited[key] = value;
+  }
+  return inherited;
 }
 
 function splitWorkerStartupEnvForTmux(

@@ -73,7 +73,7 @@ theme = "base16-ocean-light"
     }
   });
 
-  it('fails strict load validation when hooks.json contains top-level state', async () => {
+  it('reports the Codex 0.140 migration contract for top-level hooks state', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-doctor-hooks-json-state-'));
     try {
       const home = join(wd, 'home');
@@ -109,17 +109,16 @@ theme = "base16-ocean-light"
       if (shouldSkipForSpawnPermissions(res.error)) return;
 
       assert.equal(res.status, 0, res.stderr || res.stdout);
-      assert.match(
-        res.stdout,
-        /\[XX\] Native hooks: hooks\.json failed strict load validation \(invalid_document\): Codex does not accept unknown root field state; inspect the file manually because doctor will not modify it/,
+      assert.ok(
+        res.stdout.includes(
+          '[XX] Native hooks: top-level state in hooks.json is incompatible with Codex 0.140 (unknown field state, expected hooks); run "omx setup --force" to migrate trust state to config.toml and repair hooks.json',
+        ),
       );
-      assert.doesNotMatch(res.stdout, /Run "omx setup" to fix installation issues/);
-      assert.doesNotMatch(res.stdout, /Native hooks:.*--force/);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
   });
-  it('fails closed when hooks.json contains invalid UTF-8 bytes', async () => {
+  it('reports the canonical invalid hooks.json repair contract for invalid UTF-8', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-doctor-hooks-json-invalid-utf8-'));
     try {
       const home = join(wd, 'home');
@@ -132,16 +131,17 @@ theme = "base16-ocean-light"
       if (shouldSkipForSpawnPermissions(res.error)) return;
 
       assert.equal(res.status, 0, res.stderr || res.stdout);
-      assert.match(
-        res.stdout,
-        /\[XX\] Native hooks: hooks\.json at .* is not valid UTF-8; inspect the file manually because doctor will not modify it/,
+      assert.ok(
+        res.stdout.includes(
+          '[XX] Native hooks: invalid hooks.json; Codex may skip OMX hook coverage until "omx setup --force" repairs it',
+        ),
       );
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
   });
 
-  it('preserves a UTF-8 BOM so strict hooks validation rejects it', async () => {
+  it('preserves a UTF-8 BOM while reporting the canonical invalid hooks.json repair contract', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-doctor-hooks-json-bom-'));
     try {
       const home = join(wd, 'home');
@@ -159,7 +159,11 @@ theme = "base16-ocean-light"
       if (shouldSkipForSpawnPermissions(res.error)) return;
 
       assert.equal(res.status, 0, res.stderr || res.stdout);
-      assert.match(res.stdout, /hooks\.json failed strict load validation \(invalid_document\)/);
+      assert.ok(
+        res.stdout.includes(
+          '[XX] Native hooks: invalid hooks.json; Codex may skip OMX hook coverage until "omx setup --force" repairs it',
+        ),
+      );
       assert.deepEqual(await readFile(hooksPath), hooks);
     } finally {
       await rm(wd, { recursive: true, force: true });
