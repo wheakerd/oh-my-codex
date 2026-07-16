@@ -714,18 +714,21 @@ export async function teardownManagedHudPane(
       return { status: 'skipped_not_omx_owned_tmux', removedPaneIds: [] };
     }
 
-    const identity = {
-      tmuxSessionInstanceId: leader.sessionInstanceId?.trim() ?? '',
-      tmuxPaneInstanceId: leader.paneInstanceId?.trim() ?? '',
-    };
     const exactHudPaneIds = panes
       .filter((pane) => pane.paneId !== currentPaneId && isHudWatchPane(pane))
-      .filter((pane) => tmuxSnapshotBindsCandidate(pane, [...equivalentSessionIds]))
-      .filter((pane) => [...equivalentSessionIds].some((sessionId) => hudPaneMatchesExactCandidate(
-        pane,
-        { sessionId, leaderPaneId: currentPaneId },
-        identity,
-      )))
+      .filter((pane) => {
+        const hudPaneBirth = pane.paneInstanceId?.trim() ?? '';
+        if (hudPaneBirth === (leader.paneInstanceId?.trim() ?? '')) return false;
+        if (!hudPaneBirth) return false;
+        return [...equivalentSessionIds].some((sessionId) => hudPaneMatchesExactCandidate(
+          pane,
+          { sessionId, leaderPaneId: currentPaneId },
+          {
+            tmuxSessionInstanceId: leader.sessionInstanceId?.trim() ?? '',
+            tmuxPaneInstanceId: hudPaneBirth,
+          },
+        ));
+      })
       .map((pane) => pane.paneId);
     const hooksUnregistered = (deps.unregisterHudResizeHook ?? unregisterHudResizeHook)(currentPaneId);
     if (!hooksUnregistered) {

@@ -7,6 +7,9 @@ import { join, relative } from 'path';
 import { tmpdir } from 'os';
 import { existsSync, readFileSync } from 'fs';
 import {
+  appendTeamLifecycleResource,
+  createTeamLifecycleGeneration,
+  finalizeTeamLifecycleGeneration,
   initTeamState,
   createTask,
   readTask,
@@ -214,6 +217,7 @@ async function writeReadyContextPack(
 async function writeSuccessfulScaleUpTmuxStub(
   fakeBinDir: string,
   tmuxLogPath: string,
+  _teamName?: string,
 ): Promise<void> {
   const tmuxStubPath = join(fakeBinDir, 'tmux');
   await writeFile(
@@ -223,6 +227,7 @@ async function writeSuccessfulScaleUpTmuxStub(
       'set -eu',
       `printf '%s\n' "$*" >> "${tmuxLogPath}"`,
       `state_dir="${tmuxLogPath}.state"`,
+      `context_file="${tmuxStubPath}.context"`,
       'mkdir -p "$state_dir"',
       'case "${1:-}" in',
       '  -V)',
@@ -233,6 +238,9 @@ async function writeSuccessfulScaleUpTmuxStub(
       '    ;;',
       '  list-panes)',
       '    echo "42424"',
+      '    ;;',
+      '  display-message)',
+      '    cat "$context_file"',
       '    ;;',
       '  send-keys)',
       '    ;;',
@@ -246,7 +254,9 @@ async function writeSuccessfulScaleUpTmuxStub(
       '    if [ "${2:-}" = "-p" ]; then printf "%s" "${6:-}" > "$state_dir/${4:-}_${5:-}"; fi',
       '    ;;',
       '  show-option)',
-      '    if [ "${2:-}" = "-qv" ] && [ "${3:-}" = "-p" ]; then cat "$state_dir/${5:-}_${6:-}" 2>/dev/null || true; else echo "session-birth-1"; fi',
+      '    if [ "${2:-}" = "-qv" ] && [ "${3:-}" = "-p" ]; then',
+      '      if [ -f "$state_dir/${5:-}_${6:-}" ]; then cat "$state_dir/${5:-}_${6:-}"; else echo "session-birth-1"; fi',
+      '    else echo "session-birth-1"; fi',
       '    ;;',
       'esac',
       'exit 0',
@@ -255,6 +265,33 @@ async function writeSuccessfulScaleUpTmuxStub(
   );
   await chmod(tmuxStubPath, 0o755);
   await writeFile(tmuxLogPath, '');
+}
+
+async function activateScaleUpLifecycle(teamName: string, cwd: string, config: NonNullable<Awaited<ReturnType<typeof readTeamConfig>>>): Promise<void> {
+  const certificate = {
+    version: 1 as const,
+    token: `scale-up-${teamName}`,
+    team_name: teamName,
+    canonical_session_id: `session-${teamName}`,
+    native_session_ids: [],
+    tmux_session_name: null,
+    tmux_session_birth: null,
+    tmux_context: null,
+    team_pane_owner_id: `team:${teamName}`,
+    hook_generation: `hook-${teamName}`,
+    status: 'preparing' as const,
+    created_at: new Date().toISOString(),
+    resources: [],
+  };
+  assert.equal(await createTeamLifecycleGeneration(certificate, cwd), true);
+  assert.equal(await appendTeamLifecycleResource(teamName, certificate.token, {
+    kind: 'leader', id: config.leader_pane_id ?? '%11', created: true, pane_birth: 'session-birth-1', role: 'leader', acquired_at: new Date().toISOString(),
+  }, cwd), true);
+  assert.equal(await finalizeTeamLifecycleGeneration(teamName, certificate.token, 'active', cwd, {
+    tmux_session_name: config.tmux_session,
+    tmux_session_birth: 'session-birth-1',
+    tmux_context: `${config.tmux_session}:0`,
+  }), true);
 }
 
 async function configureScaleUpTeamForDirectDispatch(teamName: string, cwd: string): Promise<void> {
@@ -268,6 +305,7 @@ async function configureScaleUpTeamForDirectDispatch(teamName: string, cwd: stri
   config.workers[0]!.pane_id = '%21';
   config.tmux_pane_owner_id = `team:${teamName}`;
   await saveTeamConfig(config, cwd);
+  await activateScaleUpLifecycle(teamName, cwd, config);
 
   const manifestPath = join(cwd, '.omx', 'state', 'team', teamName, 'manifest.v2.json');
   if (!existsSync(manifestPath)) {
@@ -784,7 +822,7 @@ exit 0
           '    echo ""',
           '    ;;',
           '  show-option)',
-          '    if [ "${2:-}" = "-qv" ] && [ "${3:-}" = "-p" ]; then cat "$state_dir/${5:-}_${6:-}" 2>/dev/null || true; else echo "session-birth-1"; fi',
+          '    if [ "${2:-}" = "-qv" ] && [ "${3:-}" = "-p" ]; then if [ -f "$state_dir/${5:-}_${6:-}" ]; then cat "$state_dir/${5:-}_${6:-}"; else echo "session-birth-1"; fi; else echo "session-birth-1"; fi',
           '    ;;',
           '  set-option)',
           '    if [ "${2:-}" = "-p" ]; then printf "%s" "${6:-}" > "$state_dir/${4:-}_${5:-}"; fi',
@@ -819,6 +857,7 @@ exit 0
       config.workers[0]!.pane_id = '%21';
       config.tmux_pane_owner_id = 'team:scale-up-role';
       await saveTeamConfig(config, cwd);
+      await activateScaleUpLifecycle('scale-up-role', cwd, config);
 
       const manifestPath = join(cwd, '.omx', 'state', 'team', 'scale-up-role', 'manifest.v2.json');
       const manifest = JSON.parse(await readFile(manifestPath, 'utf-8')) as { policy?: Record<string, unknown> };
@@ -1026,6 +1065,7 @@ printf '%s\\n' "$@" > '${capturePath}'
           '  show-option)',
           '    case "$*" in',
           '      *"@omx_instance_id"*) echo "session-birth-1" ;;',
+          '      *) echo "session-birth-1" ;;',
           '    esac',
           '    ;;',
           '  list-panes)',
@@ -1082,7 +1122,7 @@ printf '%s\\n' "$@" > '${capturePath}'
     const previousPath = process.env.PATH;
 
     try {
-      await writeSuccessfulScaleUpTmuxStub(fakeBinDir, tmuxLogPath);
+      await writeSuccessfulScaleUpTmuxStub(fakeBinDir, tmuxLogPath, teamName);
       process.env.PATH = `${fakeBinDir}:${previousPath ?? ''}`;
 
       await initTeamState(teamName, 'ultragoal scale-up test', 'executor', 1, cwd);
@@ -1141,7 +1181,7 @@ printf '%s\\n' "$@" > '${capturePath}'
     const previousPath = process.env.PATH;
 
     try {
-      await writeSuccessfulScaleUpTmuxStub(fakeBinDir, tmuxLogPath);
+      await writeSuccessfulScaleUpTmuxStub(fakeBinDir, tmuxLogPath, teamName);
       process.env.PATH = `${fakeBinDir}:${previousPath ?? ''}`;
 
       await initTeamState(teamName, 'generic scale-up test', 'executor', 1, cwd);
@@ -1184,7 +1224,7 @@ printf '%s\\n' "$@" > '${capturePath}'
     const previousPath = process.env.PATH;
 
     try {
-      await writeSuccessfulScaleUpTmuxStub(fakeBinDir, tmuxLogPath);
+      await writeSuccessfulScaleUpTmuxStub(fakeBinDir, tmuxLogPath, teamName);
       process.env.PATH = `${fakeBinDir}:${previousPath ?? ''}`;
 
       await initTeamState(teamName, 'plan-only scale-up test', 'executor', 1, cwd);
@@ -1231,7 +1271,7 @@ printf '%s\\n' "$@" > '${capturePath}'
     const approvedTask = 'Execute approved issue 1410 plan';
 
     try {
-      await writeSuccessfulScaleUpTmuxStub(fakeBinDir, tmuxLogPath);
+      await writeSuccessfulScaleUpTmuxStub(fakeBinDir, tmuxLogPath, teamName);
       process.env.PATH = `${fakeBinDir}:${previousPath ?? ''}`;
 
       await initTeamState(teamName, 'approved scale-up test', 'executor', 1, cwd);
@@ -1307,7 +1347,7 @@ printf '%s\\n' "$@" > '${capturePath}'
         const previousPath = process.env.PATH;
 
         try {
-          await writeSuccessfulScaleUpTmuxStub(fakeBinDir, tmuxLogPath);
+          await writeSuccessfulScaleUpTmuxStub(fakeBinDir, tmuxLogPath, teamName);
           process.env.PATH = `${fakeBinDir}:${previousPath ?? ''}`;
 
           await initTeamState(teamName, `approved ${state} scale-up model`, 'executor', 1, cwd);
@@ -1433,7 +1473,7 @@ printf '%s\\n' "$@" > '${capturePath}'
       const previousPath = process.env.PATH;
 
       try {
-        await writeSuccessfulScaleUpTmuxStub(fakeBinDir, tmuxLogPath);
+        await writeSuccessfulScaleUpTmuxStub(fakeBinDir, tmuxLogPath, teamName);
         process.env.PATH = `${fakeBinDir}:${previousPath ?? ''}`;
 
         await initTeamState(teamName, `approved ${state} scale-up test`, 'executor', 1, cwd);
@@ -1521,7 +1561,7 @@ printf '%s\\n' "$@" > '${capturePath}'
           '    echo ""',
           '    ;;',
           '  show-option)',
-          '    if [ "${2:-}" = "-qv" ] && [ "${3:-}" = "-p" ]; then cat "$state_dir/${5:-}_${6:-}" 2>/dev/null || true; else echo "session-birth-1"; fi',
+          '    if [ "${2:-}" = "-qv" ] && [ "${3:-}" = "-p" ]; then if [ -f "$state_dir/${5:-}_${6:-}" ]; then cat "$state_dir/${5:-}_${6:-}"; else echo "session-birth-1"; fi; else echo "session-birth-1"; fi',
           '    ;;',
           '  set-option)',
           '    if [ "${2:-}" = "-p" ]; then printf "%s" "${6:-}" > "$state_dir/${4:-}_${5:-}"; fi',
@@ -1570,6 +1610,7 @@ printf '%s\\n' "$@" > '${capturePath}'
       config.workers[0]!.pane_id = '%21';
       config.tmux_pane_owner_id = 'team:scale-up-project-reasoning';
       await saveTeamConfig(config, cwd);
+      await activateScaleUpLifecycle('scale-up-project-reasoning', cwd, config);
 
       const manifestPath = join(cwd, '.omx', 'state', 'team', 'scale-up-project-reasoning', 'manifest.v2.json');
       const manifest = JSON.parse(await readFile(manifestPath, 'utf-8')) as { policy?: Record<string, unknown> };
@@ -1649,7 +1690,7 @@ mkdir -p "$state_dir"
     echo ""
     ;;
   show-option)
-    if [ "\${2:-}" = "-qv" ] && [ "\${3:-}" = "-p" ]; then cat "$state_dir/\${5:-}_\${6:-}" 2>/dev/null || true; else echo "session-birth-1"; fi
+    if [ "\${2:-}" = "-qv" ] && [ "\${3:-}" = "-p" ]; then if [ -f "$state_dir/\${5:-}_\${6:-}" ]; then cat "$state_dir/\${5:-}_\${6:-}"; else echo "session-birth-1"; fi; else echo "session-birth-1"; fi
     ;;
   set-option)
     if [ "\${2:-}" = "-p" ]; then printf "%s" "\${6:-}" > "$state_dir/\${4:-}_\${5:-}"; fi
@@ -1682,6 +1723,7 @@ exit 0
       config.workers[0]!.pane_id = '%21';
       config.tmux_pane_owner_id = 'team:rollback-worktree';
       await saveTeamConfig(config, cwd);
+      await activateScaleUpLifecycle('rollback-worktree', cwd, config);
 
       const manifestPath = join(cwd, '.omx', 'state', 'team', 'rollback-worktree', 'manifest.v2.json');
       const manifest = JSON.parse(await readFile(manifestPath, 'utf-8')) as { policy?: Record<string, unknown> };
@@ -1742,7 +1784,7 @@ mkdir -p "$state_dir"
     echo ""
     ;;
   show-option)
-    if [ "\${2:-}" = "-qv" ] && [ "\${3:-}" = "-p" ]; then cat "$state_dir/\${5:-}_\${6:-}" 2>/dev/null || true; else echo "session-birth-1"; fi
+    if [ "\${2:-}" = "-qv" ] && [ "\${3:-}" = "-p" ]; then if [ -f "$state_dir/\${5:-}_\${6:-}" ]; then cat "$state_dir/\${5:-}_\${6:-}"; else echo "session-birth-1"; fi; else echo "session-birth-1"; fi
     ;;
   set-option)
     if [ "\${2:-}" = "-p" ]; then printf "%s" "\${6:-}" > "$state_dir/\${4:-}_\${5:-}"; fi
@@ -1772,6 +1814,7 @@ exit 0
       config.workers[0]!.pane_id = '%21';
       config.tmux_pane_owner_id = 'team:canonical-root';
       await saveTeamConfig(config, cwd);
+      await activateScaleUpLifecycle('canonical-root', cwd, config);
 
       const manifestPath = join(cwd, '.omx', 'state', 'team', 'canonical-root', 'manifest.v2.json');
       const manifest = JSON.parse(await readFile(manifestPath, 'utf-8')) as { policy?: Record<string, unknown> };
@@ -1840,7 +1883,7 @@ case "\${1:-}" in
     echo ""
     ;;
   show-option)
-    if [ "\${2:-}" = "-qv" ] && [ "\${3:-}" = "-p" ]; then cat "$state_dir/\${5:-}_\${6:-}" 2>/dev/null || true; else echo "session-birth-1"; fi
+    if [ "\${2:-}" = "-qv" ] && [ "\${3:-}" = "-p" ]; then if [ -f "$state_dir/\${5:-}_\${6:-}" ]; then cat "$state_dir/\${5:-}_\${6:-}"; else echo "session-birth-1"; fi; else echo "session-birth-1"; fi
     ;;
   set-option)
     if [ "\${2:-}" = "-p" ]; then printf "%s" "\${6:-}" > "$state_dir/\${4:-}_\${5:-}"; fi
@@ -1873,6 +1916,7 @@ exit 0
       config.workers[0]!.pane_id = '%21';
       config.tmux_pane_owner_id = 'team:frontier-role';
       await saveTeamConfig(config, cwd);
+      await activateScaleUpLifecycle('frontier-role', cwd, config);
 
       const manifestPath = join(cwd, '.omx', 'state', 'team', 'frontier-role', 'manifest.v2.json');
       const manifest = JSON.parse(await readFile(manifestPath, 'utf-8')) as { policy?: Record<string, unknown> };
@@ -1932,7 +1976,7 @@ case "\${1:-}" in
     echo ""
     ;;
   show-option)
-    if [ "\${2:-}" = "-qv" ] && [ "\${3:-}" = "-p" ]; then cat "$state_dir/\${5:-}_\${6:-}" 2>/dev/null || true; else echo "session-birth-1"; fi
+    if [ "\${2:-}" = "-qv" ] && [ "\${3:-}" = "-p" ]; then if [ -f "$state_dir/\${5:-}_\${6:-}" ]; then cat "$state_dir/\${5:-}_\${6:-}"; else echo "session-birth-1"; fi; else echo "session-birth-1"; fi
     ;;
   set-option)
     if [ "\${2:-}" = "-p" ]; then printf "%s" "\${6:-}" > "$state_dir/\${4:-}_\${5:-}"; fi
@@ -1962,6 +2006,7 @@ exit 0
       config.workers[0]!.pane_id = '%21';
       config.tmux_pane_owner_id = 'team:mini-tuned-root';
       await saveTeamConfig(config, cwd);
+      await activateScaleUpLifecycle('mini-tuned-root', cwd, config);
 
       const manifestPath = join(cwd, '.omx', 'state', 'team', 'mini-tuned-root', 'manifest.v2.json');
       const manifest = JSON.parse(await readFile(manifestPath, 'utf-8')) as { policy?: Record<string, unknown> };
@@ -2027,7 +2072,7 @@ case "\${1:-}" in
     echo ""
     ;;
   show-option)
-    if [ "\${2:-}" = "-qv" ] && [ "\${3:-}" = "-p" ]; then cat "$state_dir/\${5:-}_\${6:-}" 2>/dev/null || true; else echo "session-birth-1"; fi
+    if [ "\${2:-}" = "-qv" ] && [ "\${3:-}" = "-p" ]; then if [ -f "$state_dir/\${5:-}_\${6:-}" ]; then cat "$state_dir/\${5:-}_\${6:-}"; else echo "session-birth-1"; fi; else echo "session-birth-1"; fi
     ;;
   set-option)
     if [ "\${2:-}" = "-p" ]; then printf "%s" "\${6:-}" > "$state_dir/\${4:-}_\${5:-}"; fi
@@ -2050,6 +2095,7 @@ exit 0
       config.workers[0]!.pane_id = '%21';
       config.tmux_pane_owner_id = 'team:scale-up-layout';
       await saveTeamConfig(config, cwd);
+      await activateScaleUpLifecycle('scale-up-layout', cwd, config);
 
       const manifestPath = join(cwd, '.omx', 'state', 'team', 'scale-up-layout', 'manifest.v2.json');
       const manifest = JSON.parse(await readFile(manifestPath, 'utf-8')) as { policy?: Record<string, unknown> };
@@ -2111,7 +2157,7 @@ exit 0
           '    echo ""',
           '    ;;',
           '  show-option)',
-          '    if [ "${2:-}" = "-qv" ] && [ "${3:-}" = "-p" ]; then cat "$state_dir/${5:-}_${6:-}" 2>/dev/null || true; else echo "session-birth-1"; fi',
+          '    if [ "${2:-}" = "-qv" ] && [ "${3:-}" = "-p" ]; then if [ -f "$state_dir/${5:-}_${6:-}" ]; then cat "$state_dir/${5:-}_${6:-}"; else echo "session-birth-1"; fi; else echo "session-birth-1"; fi',
           '    ;;',
           '  set-option)',
           '    if [ "${2:-}" = "-p" ]; then printf "%s" "${6:-}" > "$state_dir/${4:-}_${5:-}"; fi',
@@ -2152,6 +2198,7 @@ exit 0
       config.workers[0]!.pane_id = '%21';
       config.tmux_pane_owner_id = `team:${teamName}`;
       await saveTeamConfig(config, repo);
+      await activateScaleUpLifecycle(teamName, repo, config);
 
       const manifestPath = join(repo, '.omx', 'state', 'team', teamName, 'manifest.v2.json');
       const manifest = JSON.parse(await readFile(manifestPath, 'utf-8')) as { policy?: Record<string, unknown> };
@@ -2221,7 +2268,7 @@ exit 0
           '    echo ""',
           '    ;;',
           '  show-option)',
-          '    if [ "${2:-}" = "-qv" ] && [ "${3:-}" = "-p" ]; then cat "$state_dir/${5:-}_${6:-}" 2>/dev/null || true; else echo "session-birth-1"; fi',
+          '    if [ "${2:-}" = "-qv" ] && [ "${3:-}" = "-p" ]; then if [ -f "$state_dir/${5:-}_${6:-}" ]; then cat "$state_dir/${5:-}_${6:-}"; else echo "session-birth-1"; fi; else echo "session-birth-1"; fi',
           '    ;;',
           '  set-option)',
           '    if [ "${2:-}" = "-p" ]; then printf "%s" "${6:-}" > "$state_dir/${4:-}_${5:-}"; fi',
@@ -2263,6 +2310,7 @@ exit 0
       config.workers[0]!.pane_id = '%21';
       config.tmux_pane_owner_id = `team:${teamName}`;
       await saveTeamConfig(config, repo);
+      await activateScaleUpLifecycle(teamName, repo, config);
 
       const manifestPath = join(repo, '.omx', 'state', 'team', teamName, 'manifest.v2.json');
       const manifest = JSON.parse(await readFile(manifestPath, 'utf-8')) as { policy?: Record<string, unknown> };

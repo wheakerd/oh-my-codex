@@ -52,7 +52,7 @@ import {
   type WorkerInfo,
   type WorkerStatus,
 } from './team-ops.js';
-import type { TeamLifecycleResource } from './state.js';
+import { probeTeamLifecycleGeneration, type TeamLifecycleResource } from './state.js';
 import {
   queueInboxInstruction,
   waitForDispatchReceipt,
@@ -227,6 +227,42 @@ function readTmuxSessionBirth(sessionName: string): string | null {
     return null;
   }
 }
+function hasExactScaleUpTmuxAuthority(
+  teamName: string,
+  config: TeamConfig,
+  sessionBirth: string,
+  certificate: Awaited<ReturnType<typeof probeTeamLifecycleGeneration>>,
+): boolean {
+  if (certificate.status !== 'valid' || certificate.certificate.status !== 'active') return false;
+  const lifecycle = certificate.certificate;
+  const sessionName = config.tmux_session;
+  const leaderPaneId = config.leader_pane_id?.trim() ?? '';
+  const teamPaneOwnerId = config.tmux_pane_owner_id?.trim() ?? '';
+  const leaderResource = lifecycle.resources.find((resource) =>
+    resource.kind === 'leader'
+    && resource.id === leaderPaneId
+    && resource.created
+    && Boolean(resource.pane_birth?.trim()),
+  );
+  if (
+    lifecycle.team_name !== teamName
+    || lifecycle.tmux_session_name !== sessionName
+    || lifecycle.tmux_session_birth !== sessionBirth
+    || lifecycle.team_pane_owner_id !== teamPaneOwnerId
+    || !lifecycle.tmux_context
+    || !leaderPaneId
+    || !leaderResource?.pane_birth
+  ) return false;
+  try {
+    const leaderBirth = execFileSync('tmux', [
+      'show-option', '-qv', '-p', '-t', leaderPaneId, '@omx_pane_instance_id',
+    ], { encoding: 'utf-8', stdio: 'pipe', windowsHide: true }).trim();
+    return leaderBirth === leaderResource.pane_birth;
+  } catch {
+    return false;
+  }
+}
+
 
 function tagScaledWorkerPane(
   paneId: string,
@@ -505,7 +541,12 @@ export async function scaleUp(
     // failure fails closed without probing or mutating tmux.
     const sessionBirth = readTmuxSessionBirth(sessionName);
     const teamPaneOwnerId = config.tmux_pane_owner_id?.trim();
-    if (!sessionBirth || !teamPaneOwnerId) {
+    const lifecycleCertificate = await probeTeamLifecycleGeneration(sanitized, leaderCwd);
+    if (
+      !sessionBirth
+      || !teamPaneOwnerId
+      || !hasExactScaleUpTmuxAuthority(sanitized, config, sessionBirth, lifecycleCertificate)
+    ) {
       return { ok: false, error: 'scale_up_missing_immutable_tmux_authority' };
     }
     const persistedUltragoalContext = await readPersistedTeamUltragoalContext(

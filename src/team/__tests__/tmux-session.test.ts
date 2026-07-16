@@ -5047,7 +5047,13 @@ esac
     const cwd = await mkdtemp(join(tmpdir(), 'omx-team-duplicate-hud-'));
     const previousTmux = process.env.TMUX;
     const previousPane = process.env.TMUX_PANE;
+    const previousPath = process.env.PATH;
     try {
+      const fakeBin = join(cwd, 'bin');
+      await mkdir(fakeBin, { recursive: true });
+      await writeFile(join(fakeBin, 'codex'), '#!/bin/sh\nexit 0\n');
+      await chmod(join(fakeBin, 'codex'), 0o755);
+      process.env.PATH = `${fakeBin}:${previousPath ?? ''}`;
       await withMockTmuxFixture(
         'omx-team-duplicate-hud-',
         (logPath) => `#!/bin/sh
@@ -5100,6 +5106,8 @@ esac
       else delete process.env.TMUX;
       if (typeof previousPane === 'string') process.env.TMUX_PANE = previousPane;
       else delete process.env.TMUX_PANE;
+      if (typeof previousPath === 'string') process.env.PATH = previousPath;
+      else delete process.env.PATH;
       await rm(cwd, { recursive: true, force: true });
     }
   });

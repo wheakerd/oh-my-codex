@@ -2444,7 +2444,7 @@ describe('teardownManagedHudPane', () => {
       }),
       listCurrentWindowPanes: () => [
         { paneId: '%1', currentCommand: 'codex', startCommand: 'codex', paneInstanceId: 'session-a', sessionInstanceId: 'session-a' },
-        { paneId: '%2', currentCommand: 'node', startCommand: "exec env OMX_SESSION_ID='session-a' OMX_TMUX_HUD_OWNER='1' OMX_TMUX_HUD_LEADER_PANE='%1' node omx.js hud --watch", paneInstanceId: 'session-a', sessionInstanceId: 'session-a' },
+        { paneId: '%2', currentCommand: 'node', startCommand: "exec env OMX_SESSION_ID='session-a' OMX_TMUX_HUD_OWNER='1' OMX_TMUX_HUD_LEADER_PANE='%1' node omx.js hud --watch", paneInstanceId: 'hud-birth-a', sessionInstanceId: 'session-a' },
         { paneId: '%3', currentCommand: 'node', startCommand: "exec env OMX_SESSION_ID='session-b' OMX_TMUX_HUD_OWNER='1' OMX_TMUX_HUD_LEADER_PANE='%1' node omx.js hud --watch", paneInstanceId: 'session-b', sessionInstanceId: 'session-b' },
       ],
       killManagedHudPane: (candidate) => { events.push(`kill:${candidate.paneId}`); killed.push(candidate.paneId); return true; },
