@@ -170,20 +170,20 @@ interface ScaledWorkerReceipt extends TeamLifecycleResource {
   readonly team_pane_owner_id: string;
 }
 
-function scaledWorkerReceiptPath(teamName: string, workerName: string, cwd: string): string {
-  return join(cwd, '.omx', 'state', 'team', teamName, 'scaling-receipts', `${workerName}.json`);
+function scaledWorkerReceiptPath(teamName: string, workerName: string, teamStateRoot: string): string {
+  return join(teamStateRoot, 'team', teamName, 'scaling-receipts', `${workerName}.json`);
 }
 
 async function writeScaledWorkerReceipt(
   teamName: string,
   workerName: string,
-  cwd: string,
+  teamStateRoot: string,
   receipt: ScaledWorkerReceipt,
 ): Promise<boolean> {
-  const path = scaledWorkerReceiptPath(teamName, workerName, cwd);
+  const path = scaledWorkerReceiptPath(teamName, workerName, teamStateRoot);
   const temporaryPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
   try {
-    await mkdir(join(cwd, '.omx', 'state', 'team', teamName, 'scaling-receipts'), { recursive: true });
+    await mkdir(join(teamStateRoot, 'team', teamName, 'scaling-receipts'), { recursive: true });
     await writeFile(temporaryPath, `${JSON.stringify(receipt, null, 2)}\n`, { encoding: 'utf-8', flag: 'wx' });
     await rename(temporaryPath, path);
     return true;
@@ -196,10 +196,10 @@ async function writeScaledWorkerReceipt(
 async function readScaledWorkerReceipt(
   teamName: string,
   workerName: string,
-  cwd: string,
+  teamStateRoot: string,
 ): Promise<ScaledWorkerReceipt | null> {
   try {
-    const value: unknown = JSON.parse(await readFile(scaledWorkerReceiptPath(teamName, workerName, cwd), 'utf-8'));
+    const value: unknown = JSON.parse(await readFile(scaledWorkerReceiptPath(teamName, workerName, teamStateRoot), 'utf-8'));
     if (!value || typeof value !== 'object') return null;
     const receipt = value as Partial<ScaledWorkerReceipt>;
     return receipt.kind === 'worker'
@@ -215,6 +215,12 @@ async function readScaledWorkerReceipt(
   } catch {
     return null;
   }
+}
+
+function resolveTeamStateRootForConfig(config: TeamConfig, leaderCwd: string, env: NodeJS.ProcessEnv): string {
+  return config.team_state_root
+    ? resolve(config.leader_cwd ?? leaderCwd, config.team_state_root)
+    : resolveCanonicalTeamStateRoot(leaderCwd, env);
 }
 
 function readTmuxSessionBirth(sessionName: string): string | null {
@@ -492,7 +498,7 @@ export async function scaleUp(
       };
     }
 
-    const teamStateRoot = config.team_state_root ?? resolveCanonicalTeamStateRoot(leaderCwd);
+    const teamStateRoot = resolveTeamStateRootForConfig(config, leaderCwd, env);
     const codexHomeOverride = resolveCodexHomeForLaunch(leaderCwd, env);
     const launchEnv = codexHomeOverride
       ? { ...env, CODEX_HOME: codexHomeOverride }
@@ -566,6 +572,12 @@ export async function scaleUp(
       await saveTeamConfig(config, leaderCwd);
     }
 
+    let activeWorkerRollbackContext: {
+      workerName?: string;
+      worktreePath?: string;
+      receipt?: ScaledWorkerReceipt;
+    } = {};
+
     const addedWorkers: WorkerInfo[] = [];
     const createdTaskIds: string[] = [];
     const provisionedWorktrees: EnsureWorktreeResult[] = [];
@@ -576,7 +588,7 @@ export async function scaleUp(
     ): Promise<ScaleError> => {
       const receipts = new Map<string, ScaledWorkerReceipt>();
       for (const worker of addedWorkers) {
-        const receipt = await readScaledWorkerReceipt(sanitized, worker.name, leaderCwd);
+        const receipt = await readScaledWorkerReceipt(sanitized, worker.name, teamStateRoot);
         if (receipt && worker.pane_id === receipt.id) receipts.set(receipt.id, receipt);
       }
       if (context.receipt) receipts.set(context.receipt.id, context.receipt);
@@ -601,18 +613,16 @@ export async function scaleUp(
       if (context.workerName && context.worktreePath && !addedWorkers.some((worker) => worker.name === context.workerName)) {
         await removeWorkerWorktreeRootAgentsFile(sanitized, context.workerName, teamStateRoot, context.worktreePath).catch(() => {});
       }
-      if (provisionedWorktrees.length > 0) {
-        if (provisionedWorktrees.some((result) => !result.created || result.reused)) {
-          return { ok: false, error: `${error}:scale_up_rollback_preserved_reused_worktree` };
-        }
+      const createdWorktrees = provisionedWorktrees.filter((result) => result.created && !result.reused);
+      if (createdWorktrees.length > 0) {
         try {
-          await rollbackProvisionedWorktrees(provisionedWorktrees, { skipBranchDeletion: false });
+          await rollbackProvisionedWorktrees(createdWorktrees, { skipBranchDeletion: false });
         } catch (cleanupError) {
           return { ok: false, error: `${error}:scale_up_rollback_worktree_cleanup_failed:${String(cleanupError)}` };
         }
       }
       for (const taskId of createdTaskIds) {
-        await rm(join(leaderCwd, '.omx', 'state', 'team', sanitized, 'tasks', `task-${taskId}.json`), { force: true }).catch(() => {});
+        await rm(join(teamStateRoot, 'team', sanitized, 'tasks', `task-${taskId}.json`), { force: true }).catch(() => {});
       }
       config.worker_count = config.workers.length;
       config.next_worker_index = initialNextIndex;
@@ -620,6 +630,7 @@ export async function scaleUp(
       return { ok: false, error };
     };
 
+    try {
     // Persist incoming tasks only after launch policy is frozen; the resulting
     // task listing is used for inbox and task materialization, never launch policy.
     for (const task of tasks) {
@@ -665,6 +676,10 @@ export async function scaleUp(
       if (workerWorkspaceResult.enabled) provisionedWorktrees.push(workerWorkspaceResult);
       const workerWorkspace = workerWorkspaceResult.enabled ? workerWorkspaceResult : null;
       const workerCwd = workerWorkspace ? workerWorkspace.worktreePath : leaderCwd;
+      activeWorkerRollbackContext = {
+        workerName,
+        worktreePath: workerWorkspace?.worktreePath,
+      };
 
       // Build startup command and create tmux pane
       const rawRolePromptContent = await loadRolePrompt(runtimeRole, join(leaderCwd, '.codex', 'prompts'))
@@ -760,13 +775,14 @@ export async function scaleUp(
         acquired_at: new Date().toISOString(), session_birth: sessionBirth, session_name: sessionName,
         team_pane_owner_id: teamPaneOwnerId,
       };
-      if (!await writeScaledWorkerReceipt(sanitized, workerName, leaderCwd, workerReceipt)) {
+      if (!await writeScaledWorkerReceipt(sanitized, workerName, teamStateRoot, workerReceipt)) {
         return await rollbackScaleUp(`Failed to durably journal tmux authority for ${workerName}`, {
           workerName,
           worktreePath: workerWorkspace?.worktreePath,
           receipt: workerReceipt,
         });
       }
+      activeWorkerRollbackContext.receipt = workerReceipt;
 
       // Intentionally avoid forcing `select-layout tiled` here.
       // Tiled relayout reflows leader/HUD panes and breaks team window layout.
@@ -947,6 +963,7 @@ export async function scaleUp(
       config.worker_count = config.workers.length;
       config.next_worker_index = nextIndex;
       await saveTeamConfig(config, leaderCwd);
+      activeWorkerRollbackContext = {};
     }
 
     await appendTeamEvent(sanitized, {
@@ -961,6 +978,9 @@ export async function scaleUp(
       newWorkerCount: config.worker_count,
       nextWorkerIndex: nextIndex,
     };
+    } catch (error) {
+      return await rollbackScaleUp(error instanceof Error ? error.message : String(error), activeWorkerRollbackContext);
+    }
   });
 }
 
@@ -1001,6 +1021,8 @@ export async function scaleDown(
     if (!config) {
       return { ok: false, error: `Team ${sanitized} not found` };
     }
+
+    const teamStateRoot = resolveTeamStateRootForConfig(config, leaderCwd, env);
 
     // Determine which workers to remove
     let targetWorkers: WorkerInfo[];
@@ -1090,7 +1112,7 @@ export async function scaleDown(
     }
     const receipts = await Promise.all(liveTargetWorkers.map(async (worker) => ({
       worker,
-      receipt: await readScaledWorkerReceipt(sanitized, worker.name, leaderCwd),
+      receipt: await readScaledWorkerReceipt(sanitized, worker.name, teamStateRoot),
     })));
     const invalidReceipt = receipts.find(({ worker, receipt }) => (
       !receipt

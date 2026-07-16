@@ -762,6 +762,30 @@ describe('HUD control-plane domains', () => {
       await rm(cwd, { recursive: true, force: true });
     }
   });
+
+  it('admits metadata aliases only when the requested id canonicalizes to the metadata session', async () => {
+    const cwd = await mkRealTemp('omx-hud-domain-alias-admission-');
+    try {
+      const stateDir = getBaseStateDir(cwd);
+      await mkdir(stateDir, { recursive: true });
+      await writeFile(join(stateDir, 'session.json'), JSON.stringify({
+        session_id: 'omx-canonical',
+        native_session_id: 'codex-native',
+        owner_omx_session_id: 'omx-owner',
+        owner_codex_session_id: 'codex-owner',
+        cwd,
+      }));
+
+      const alias = await resolveHudControlPlaneDomain({ cwd, requestedSessionId: 'codex-owner' });
+      const foreign = await resolveHudControlPlaneDomain({ cwd, requestedSessionId: 'stale-foreign' });
+
+      assert.deepEqual(alias.session?.equivalentIds, ['omx-canonical', 'codex-native', 'omx-owner', 'codex-owner']);
+      assert.deepEqual(foreign.session?.equivalentIds, ['stale-foreign']);
+      assert.equal(foreign.session?.canonicalId, 'stale-foreign');
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
   it('deletes only immutable nonce-bound lineage records during concurrent replacement', async () => {
     const cwd = await mkRealTemp('omx-hud-lineage-receipt-');
     try {

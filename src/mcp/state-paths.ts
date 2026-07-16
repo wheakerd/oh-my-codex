@@ -465,7 +465,9 @@ function readSessionIdFromEnvironment(env: NodeJS.ProcessEnv = process.env): str
 function resolveCanonicalSessionId(candidate: string | undefined, metadata: ResolvedSessionMetadata | undefined): string | undefined {
   if (!candidate) return undefined;
   if (!metadata) return candidate;
-  return metadata.nativeSessionAliases.includes(candidate) || metadata.ownerOmxSessionId === candidate
+  return metadata.nativeSessionAliases.includes(candidate)
+    || metadata.ownerOmxSessionId === candidate
+    || metadata.ownerCodexSessionId === candidate
     ? metadata.sessionId
     : candidate;
 }
@@ -710,8 +712,21 @@ export async function resolveHudControlPlaneDomain(
       : metadata?.sessionId
         ? 'session-json'
         : undefined;
+  const admitsMetadataAliases = Boolean(
+    requestedId
+    && metadata
+    && canonicalSessionId === metadata.sessionId,
+  );
   const equivalentIds = canonicalSessionId
-    ? [...new Set([canonicalSessionId, ...(metadata?.nativeSessionAliases ?? []), metadata?.nativeSessionId, metadata?.ownerOmxSessionId, metadata?.ownerCodexSessionId].filter((id): id is string => typeof id === 'string' && normalizeSessionId(id) !== undefined))]
+    ? [...new Set([
+      canonicalSessionId,
+      ...(admitsMetadataAliases ? [
+        ...metadata!.nativeSessionAliases,
+        metadata!.nativeSessionId,
+        metadata!.ownerOmxSessionId,
+        metadata!.ownerCodexSessionId,
+      ] : []),
+    ].filter((id): id is string => typeof id === 'string' && normalizeSessionId(id) !== undefined))]
     : [];
   const lineage = await readHudTmuxBirthLineage(baseStateDir, canonicalSessionId);
   const claimant = {

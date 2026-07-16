@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import {
 	clearNativeHookClaimJournal,
+	isUnsupportedDirectorySyncError,
 	persistNativeHookClaimJournal,
 	recoverNativeHookClaimJournal,
 } from "../native-hook-claim-journal.js";
@@ -15,6 +16,18 @@ async function markJournalOwnerDead(root: string): Promise<void> {
 	journal.ownerPid = 2_147_483_647;
 	await writeFile(path, `${JSON.stringify(journal, null, 2)}\n`, "utf-8");
 }
+
+test("directory sync tolerance accepts only documented unsupported errors", () => {
+	for (const code of ["EPERM", "EINVAL", "ENOTSUP", "EOPNOTSUPP"]) {
+		assert.equal(isUnsupportedDirectorySyncError({ code }), true, code);
+	}
+});
+
+test("directory sync tolerance rejects genuine failures", () => {
+	for (const error of [{ code: "EACCES" }, { code: "EIO" }, { code: "ENOENT" }, new Error("EPERM"), null]) {
+		assert.equal(isUnsupportedDirectorySyncError(error), false);
+	}
+});
 
 test("claim journal restores an exact original after rename-away interruption", async () => {
 	const root = await mkdtemp(join(tmpdir(), "omx-claim-recovery-"));

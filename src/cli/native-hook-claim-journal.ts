@@ -47,8 +47,22 @@ async function fsyncDirectory(path: string): Promise<void> {
 	}
 }
 
+export function isUnsupportedDirectorySyncError(error: unknown): boolean {
+	if (typeof error !== "object" || error === null || !("code" in error)) return false;
+	const code = (error as { code?: unknown }).code;
+	return code === "EPERM" || code === "EINVAL" || code === "ENOTSUP" || code === "EOPNOTSUPP";
+}
+
+async function fsyncDirectoryAfterRename(path: string): Promise<void> {
+	try {
+		await fsyncDirectory(path);
+	} catch (error) {
+		if (!isUnsupportedDirectorySyncError(error)) throw error;
+	}
+}
+
 export async function syncNativeHookClaimParent(path: string): Promise<void> {
-	await fsyncDirectory(dirname(path));
+	await fsyncDirectoryAfterRename(dirname(path));
 }
 
 export async function restoreNativeHookClaimNoClobber(

@@ -1158,6 +1158,11 @@ printf '%s\\n' "$@" > '${capturePath}'
         join(inboxStateRoot, 'team', teamName, 'workers', 'worker-2', 'inbox.md'),
         'utf-8',
       );
+      assert.equal(
+        existsSync(join(inboxStateRoot, 'team', teamName, 'scaling-receipts', 'worker-2.json')),
+        true,
+        'successful scale-up journals its receipt under the configured team state root',
+      );
       const tmuxCommands = await readScaleUpTmuxLogCommands(tmuxLogPath);
       assert.match(inbox, /Implement ultragoal follow-up/);
       assert.match(inbox, /### Leader-owned Ultragoal context/);
