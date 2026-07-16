@@ -667,6 +667,35 @@ describe('state authority foundation', () => {
   });
 
 
+  it('rejects forgeable issuer metadata without a valid source authority bearer', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'omx-authority-forged-rollover-'));
+    const runRoot = await mkdtemp(join(tmpdir(), 'omx-authority-forged-rollover-run-'));
+    try {
+      const initial = await initializeStateAuthority({
+        startup_cwd: workspace,
+        launch_id: 'forged-rollover-source',
+        session_binding: { canonical_session_id: 'forged-rollover-session' },
+      });
+      await assert.rejects(
+        rolloverStateAuthorityToAlternateRoot({
+          context: initial,
+          transport_capability: 'forged',
+          proposed_state_root: join(runRoot, '.omx', 'state'),
+          creation_root: runRoot,
+          launch_id: 'forged-rollover-target',
+          consumer_kind: 'madmax',
+          issuer: { kind: 'first-party-launcher', package_version: 'forged', package_digest: 'f'.repeat(64) },
+        }),
+        (error: unknown) => error instanceof Error
+          && 'code' in error
+          && (error.code === AUTHORITY_DIAGNOSTIC_CODES.transportCapabilityInvalid
+            || error.code === AUTHORITY_DIAGNOSTIC_CODES.transportCapabilityExpired),
+      );
+    } finally {
+      await rm(workspace, { recursive: true, force: true });
+      await rm(runRoot, { recursive: true, force: true });
+    }
+  });
   it('rolls a committed launch into one fenced alternate authority generation', async () => {
     const workspace = await mkdtemp(join(tmpdir(), 'omx-authority-alternate-rollover-'));
     const runRoot = await mkdtemp(join(tmpdir(), 'omx-authority-alternate-run-'));
@@ -677,18 +706,14 @@ describe('state authority foundation', () => {
         session_binding: { canonical_session_id: 'alternate-session' },
       });
       const alternateStateRoot = join(runRoot, '.omx', 'state');
-      const rolled = await rolloverStateAuthorityToAlternateRoot({
-        context: initial,
-        proposed_state_root: alternateStateRoot,
-        creation_root: runRoot,
-        launch_id: 'alternate-rollover-launch',
-        consumer_kind: 'madmax',
-        issuer: {
-          kind: 'first-party-launcher',
-          package_version: 'test',
-          package_digest: 'a'.repeat(64),
-        },
-      });
+      const rolled = await rolloverStateAuthorityToAlternateRoot({ context: initial, transport_capability: (await mintStateAuthorityTransportCapability(initial)).capability, proposed_state_root: alternateStateRoot, creation_root: runRoot,
+      launch_id: 'alternate-rollover-launch',
+      consumer_kind: 'madmax',
+      issuer: {
+        kind: 'first-party-launcher',
+        package_version: 'test',
+        package_digest: 'a'.repeat(64),
+      }, });
       assert.equal(
         rolled.canonical_state_root,
         canonicalizeExistingAuthorityPath(alternateStateRoot),
@@ -726,18 +751,14 @@ describe('state authority foundation', () => {
       if (!snapshotAnchor?.active_binding_locator) throw new Error('initial authority binding locator is missing');
       const snapshotBinding = await readFile(snapshotAnchor.active_binding_locator, 'utf8');
 
-      await rolloverStateAuthorityToAlternateRoot({
-        context: initial,
-        proposed_state_root: join(runRoot, '.omx', 'state'),
-        creation_root: runRoot,
-        launch_id: 'resurrection-successor-launch',
-        consumer_kind: 'madmax',
-        issuer: {
-          kind: 'first-party-launcher',
-          package_version: 'test',
-          package_digest: 'a'.repeat(64),
-        },
-      });
+      await rolloverStateAuthorityToAlternateRoot({ context: initial, transport_capability: (await mintStateAuthorityTransportCapability(initial)).capability, proposed_state_root: join(runRoot, '.omx', 'state'), creation_root: runRoot,
+      launch_id: 'resurrection-successor-launch',
+      consumer_kind: 'madmax',
+      issuer: {
+        kind: 'first-party-launcher',
+        package_version: 'test',
+        package_digest: 'a'.repeat(64),
+      }, });
 
       await writeFile(
         stateAuthorityPaths(workspaceIdentity).anchor_path,
@@ -772,14 +793,10 @@ describe('state authority foundation', () => {
         session_binding: { canonical_session_id: 'alternate-lexical-session' },
       });
       await assert.rejects(
-        rolloverStateAuthorityToAlternateRoot({
-          context: initial,
-          proposed_state_root: outsideStateRoot,
-          creation_root: creationRoot,
-          launch_id: 'alternate-lexical-rollover',
-          consumer_kind: 'madmax',
-          issuer,
-        }),
+        rolloverStateAuthorityToAlternateRoot({ context: initial, transport_capability: (await mintStateAuthorityTransportCapability(initial)).capability, proposed_state_root: outsideStateRoot, creation_root: creationRoot,
+        launch_id: 'alternate-lexical-rollover',
+        consumer_kind: 'madmax',
+        issuer, }),
         (error: unknown) => error instanceof Error
           && 'code' in error
           && error.code === AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot
@@ -2170,30 +2187,26 @@ describe('state authority foundation', () => {
     }
   });
 
-  it('denies recursive authority directory deletion without descriptor-relative custody', async () => {
+  it('removes authority directories with descriptor or revalidated-path custody on every supported platform', async () => {
     const root = await mkdtemp(join(tmpdir(), 'omx-authority-cleanup-platform-'));
     const target = join(root, 'team');
-    const originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+    const previousNodeEnv = process.env.NODE_ENV;
+    const previousPlatform = process.env.OMX_TEST_STATE_AUTHORITY_PLATFORM;
     try {
-      await mkdir(target);
-      await rm(target, { recursive: true, force: true });
-      if (process.platform === 'linux' && stateAuthorityFilesystemPrimitiveForPlatform().descriptor_relative) {
+      process.env.NODE_ENV = 'test';
+      for (const platform of ['linux', 'darwin', 'win32'] as const) {
+        process.env.OMX_TEST_STATE_AUTHORITY_PLATFORM = platform;
+        await mkdir(target);
+        await writeFile(join(target, 'state.json'), `${platform}\n`);
         await removeAuthorityDirectory(target, { authority_root: root });
+        assert.equal(existsSync(target), false);
         await removeAuthorityDirectory(join(root, 'missing-parent', 'team'), { authority_root: root });
       }
-      await mkdir(target);
-      for (const platform of ['darwin', 'win32'] as const) {
-        Object.defineProperty(process, 'platform', { value: platform, configurable: true });
-        await assert.rejects(
-          removeAuthorityDirectory(target, { authority_root: root }),
-          (error: unknown) => error instanceof Error
-            && 'code' in error
-            && error.code === AUTHORITY_DIAGNOSTIC_CODES.rootCapabilityWeak,
-        );
-        assert.equal(existsSync(target), true);
-      }
     } finally {
-      if (originalPlatform) Object.defineProperty(process, 'platform', originalPlatform);
+      if (previousNodeEnv === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = previousNodeEnv;
+      if (previousPlatform === undefined) delete process.env.OMX_TEST_STATE_AUTHORITY_PLATFORM;
+      else process.env.OMX_TEST_STATE_AUTHORITY_PLATFORM = previousPlatform;
       await rm(root, { recursive: true, force: true });
     }
   });
@@ -2285,15 +2298,11 @@ describe('state authority foundation', () => {
         });
         const alternateStateRoot = join(runRoot, '.omx', 'state');
         await assert.rejects(
-          rolloverStateAuthorityToAlternateRoot({
-            context: initial,
-            proposed_state_root: alternateStateRoot,
-            creation_root: runRoot,
-            launch_id: `rollover-${point}`,
-            consumer_kind: 'madmax',
-            issuer,
-            fault_injection: point,
-          }),
+          rolloverStateAuthorityToAlternateRoot({ context: initial, transport_capability: (await mintStateAuthorityTransportCapability(initial)).capability, proposed_state_root: alternateStateRoot, creation_root: runRoot,
+          launch_id: `rollover-${point}`,
+          consumer_kind: 'madmax',
+          issuer,
+          fault_injection: point, }),
           /injected alternate-root rollover crash/,
         );
         if (point === 'after_prepared_journal') {
@@ -2342,6 +2351,7 @@ describe('state authority foundation', () => {
         launch_id: 'rollover-preparation-source',
         session_binding: { canonical_session_id: 'rollover-preparation-session' },
       });
+      const sourceCapability = await mintStateAuthorityTransportCapability(initial);
       let signalFirstPreparationLocked!: () => void;
       const firstPreparationLocked = new Promise<void>((resolve) => {
         signalFirstPreparationLocked = resolve;
@@ -2361,6 +2371,7 @@ describe('state authority foundation', () => {
 
       const first = rolloverStateAuthorityToAlternateRoot({
         context: initial,
+        transport_capability: sourceCapability.capability,
         proposed_state_root: join(firstRoot, '.omx', 'state'),
         creation_root: firstRoot,
         launch_id: 'rollover-preparation-first',
@@ -2376,6 +2387,7 @@ describe('state authority foundation', () => {
 
       const second = rolloverStateAuthorityToAlternateRoot({
         context: initial,
+        transport_capability: sourceCapability.capability,
         proposed_state_root: join(secondRoot, '.omx', 'state'),
         creation_root: secondRoot,
         launch_id: 'rollover-preparation-second',
@@ -2417,15 +2429,11 @@ describe('state authority foundation', () => {
       });
       const alternateStateRoot = join(runRoot, '.omx', 'state');
       await assert.rejects(
-        rolloverStateAuthorityToAlternateRoot({
-          context: initial,
-          proposed_state_root: alternateStateRoot,
-          creation_root: runRoot,
-          launch_id: 'replacement-rollover',
-          consumer_kind: 'madmax',
-          issuer,
-          fault_injection: 'after_prepared_intent',
-        }),
+        rolloverStateAuthorityToAlternateRoot({ context: initial, transport_capability: (await mintStateAuthorityTransportCapability(initial)).capability, proposed_state_root: alternateStateRoot, creation_root: runRoot,
+        launch_id: 'replacement-rollover',
+        consumer_kind: 'madmax',
+        issuer,
+        fault_injection: 'after_prepared_intent', }),
         /injected alternate-root rollover crash/,
       );
       await rm(alternateStateRoot, { recursive: true, force: true });

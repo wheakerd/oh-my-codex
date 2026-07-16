@@ -75,14 +75,10 @@ async function createAlternateAuthority(
   await mintStateAuthorityTransportCapability(initial);
   const initialTransport = authorityTransport(initial);
   await mkdir(dirname(dirname(alternateStateRoot)), { recursive: true, mode: 0o700 });
-  const active = await rolloverStateAuthorityToAlternateRoot({
-    context: initial,
-    proposed_state_root: alternateStateRoot,
-    creation_root: dirname(dirname(alternateStateRoot)),
-    launch_id: `${launchId}-alternate`,
-    consumer_kind: 'boxed',
-    issuer: TEST_AUTHORITY_ISSUER,
-  });
+  const active = await rolloverStateAuthorityToAlternateRoot({ context: initial, transport_capability: (await mintStateAuthorityTransportCapability(initial)).capability, proposed_state_root: alternateStateRoot, creation_root: dirname(dirname(alternateStateRoot)),
+  launch_id: `${launchId}-alternate`,
+  consumer_kind: 'boxed',
+  issuer: TEST_AUTHORITY_ISSUER, });
   await mintStateAuthorityTransportCapability(active);
   return { active, initialTransport, activeTransport: authorityTransport(active) };
 }
@@ -470,6 +466,16 @@ describe('omx doctor --team', () => {
         /\[XX\] resume_blocker: alternate-authority references missing tmux session omx-team-alternate-authority/,
       );
       assert.doesNotMatch(res.stdout, /cwd-decoy references missing tmux session/);
+
+      const standardDoctor = runOmx(nestedCwd, ['doctor'], {
+        ...authorityTransport(active),
+        OMX_ROOT: relative(workspace, dirname(active.generation.canonical_omx_root)),
+        OMX_STATE_ROOT: relative(workspace, dirname(active.generation.canonical_omx_root)),
+        OMX_TEAM_STATE_ROOT: relative(workspace, active.canonical_state_root),
+        PATH: testPath(fakeBin),
+      });
+      assert.ok(standardDoctor.stdout.includes(`State dir: ${active.canonical_state_root}`));
+      assert.ok(!standardDoctor.stdout.includes(`State dir: ${join(nestedCwd, '.omx', 'state')}`));
     } finally {
       await rm(root, { recursive: true, force: true });
     }

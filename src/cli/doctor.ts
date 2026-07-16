@@ -472,9 +472,13 @@ export async function doctor(options: DoctorOptions = {}): Promise<void> {
 		),
 	);
 
-	// Check 8: State directory
-	checks.push(checkDirectory("State dir", paths.stateDir));
-	const authorityCheck = await checkStateAuthority(cwd);
+	// Check 8: State directory and committed authority
+	const resolvedAuthority = await resolveAuthorityForDoctor(cwd);
+	const diagnosticStateDir = resolvedAuthority.validated && resolvedAuthority.stateDir
+		? resolvedAuthority.stateDir
+		: paths.stateDir;
+	checks.push(checkDirectory("State dir", diagnosticStateDir));
+	const authorityCheck = await checkStateAuthority(cwd, resolvedAuthority);
 	if (authorityCheck) checks.push(authorityCheck);
 	checks.push(await checkRepoArtifactOwnership(cwd));
 
@@ -697,8 +701,11 @@ async function resolveAuthorityForDoctor(
 	}
 }
 
-async function checkStateAuthority(cwd: string): Promise<Check | null> {
-	const authority = await resolveAuthorityForDoctor(cwd);
+async function checkStateAuthority(
+	cwd: string,
+	authorityOverride?: Awaited<ReturnType<typeof resolveAuthorityForDoctor>>,
+): Promise<Check | null> {
+	const authority = authorityOverride ?? await resolveAuthorityForDoctor(cwd);
 	if (!authority.validated && authority.issues.length === 0) return null;
 	if (authority.issues.length > 0) {
 		return {

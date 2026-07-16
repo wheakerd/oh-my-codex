@@ -642,6 +642,6 @@ export async function queuePaneInput({
   }
 }
 
-export async function checkPaneReadyForTeamSendKeys(paneTarget: any, exactPaneId: any): Promise<any> {
+export async function checkPaneReadyForTeamSendKeys(paneTarget: any, exactPaneId?: any): Promise<any> {
   return evaluatePaneInjectionReadiness(paneTarget, { exactPaneId });
 }

@@ -3792,8 +3792,10 @@ async function activateMadmaxIsolationIfNeeded(
   if (!shouldAutoIsolateMadmaxLaunch(command, launchArgs, env, cwd))
     return authority;
   const runDir = allocateMadmaxIsolatedRoot(env);
+  const sourceCapability = await mintStateAuthorityTransportCapability(authority);
   const rolledAuthority = await rolloverStateAuthorityToAlternateRoot({
     context: authority,
+    transport_capability: sourceCapability.capability,
     proposed_state_root: join(runDir, ".omx", "state"),
     creation_root: runDir,
     launch_id: `madmax-${authority.generation.generation_id}`,

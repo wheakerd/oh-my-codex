@@ -579,18 +579,14 @@ exit 0
         await new Promise<void>((resolve) => setTimeout(resolve, 10));
       }
       assert.equal(existsSync(firstSpawnPath), true, "first hotswap launch did not start before rollover");
-      await rolloverStateAuthorityToAlternateRoot({
-        context: authority,
-        proposed_state_root: join(wd, "alternate-state"),
-        creation_root: wd,
-        launch_id: "hotswap-generation-rollover-alternate",
-        consumer_kind: "team",
-        issuer: {
-          kind: "first-party-launcher",
-          package_version: "test",
-          package_digest: "a".repeat(64),
-        },
-      });
+      await rolloverStateAuthorityToAlternateRoot({ context: authority, transport_capability: (await mintStateAuthorityTransportCapability(authority)).capability, proposed_state_root: join(wd, "alternate-state"), creation_root: wd,
+      launch_id: "hotswap-generation-rollover-alternate",
+      consumer_kind: "team",
+      issuer: {
+        kind: "first-party-launcher",
+        package_version: "test",
+        package_digest: "a".repeat(64),
+      }, });
       assert.equal(existsSync(firstChildFinishedPath), false, "authority rollover waited for the spawned child to exit");
 
       assert.equal(await hotswap, 1);

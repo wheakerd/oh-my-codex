@@ -93,14 +93,10 @@ describe('hook-derived-watcher', () => {
         observed_cwd: cwd,
         session_id: 'hook-derived-boxed-session',
       });
-      const active = await rolloverStateAuthorityToAlternateRoot({
-        context: initial,
-        proposed_state_root: join(boxedRoot, '.omx', 'state'),
-        creation_root: boxedRoot,
-        launch_id: 'hook-derived-boxed-alternate',
-        consumer_kind: 'boxed',
-        issuer: TEST_AUTHORITY_ISSUER,
-      });
+      const active = await rolloverStateAuthorityToAlternateRoot({ context: initial, transport_capability: (await mintStateAuthorityTransportCapability(initial)).capability, proposed_state_root: join(boxedRoot, '.omx', 'state'), creation_root: boxedRoot,
+      launch_id: 'hook-derived-boxed-alternate',
+      consumer_kind: 'boxed',
+      issuer: TEST_AUTHORITY_ISSUER, });
       await mintStateAuthorityTransportCapability(active);
       const authorityEnv = buildStateAuthorityTransportEnv(active, {
         OMX_SESSION_ID: 'hook-derived-boxed-session',
@@ -363,14 +359,10 @@ export async function onHookEvent(event) {
       await waitFor(async () => existsSync(watcherStatePath));
 
       const initial = await resolveStateAuthorityForGuard({ startup_cwd: cwd, observed_cwd: cwd, session_id: sessionId });
-      await rolloverStateAuthorityToAlternateRoot({
-        context: initial,
-        proposed_state_root: alternateRoot,
-        creation_root: join(base, 'alternate'),
-        launch_id: 'hook-derived-rollover-alternate',
-        consumer_kind: 'boxed',
-        issuer: TEST_AUTHORITY_ISSUER,
-      });
+      await rolloverStateAuthorityToAlternateRoot({ context: initial, transport_capability: (await mintStateAuthorityTransportCapability(initial)).capability, proposed_state_root: alternateRoot, creation_root: join(base, 'alternate'),
+      launch_id: 'hook-derived-rollover-alternate',
+      consumer_kind: 'boxed',
+      issuer: TEST_AUTHORITY_ISSUER, });
       await appendFile(rolloutPath, `${JSON.stringify({
         timestamp: new Date().toISOString(),
         type: 'event_msg',

@@ -1526,7 +1526,7 @@ async function runRalphContinueSteerTick(): Promise<void> {
 			return { sent: false, skipped: true };
 		}
 
-		const paneGuard = await checkPaneReadyForTeamSendKeys(paneId);
+		const paneGuard = await checkPaneReadyForTeamSendKeys(paneId, paneId);
 		lastRalphContinueSteer.pane_id = paneId;
 		lastRalphContinueSteer.pane_current_command =
 			paneGuard.paneCurrentCommand || "";

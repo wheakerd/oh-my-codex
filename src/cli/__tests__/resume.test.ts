@@ -125,14 +125,10 @@ async function writeCommittedMadmaxPublication(
     launch_id: 'resume-madmax-source',
     session_binding: { canonical_session_id: 'resume-madmax' },
   });
-  const authority = await rolloverStateAuthorityToAlternateRoot({
-    context: initial,
-    proposed_state_root: join(runDir, '.omx', 'state'),
-    creation_root: runDir,
-    launch_id: 'resume-madmax-run',
-    consumer_kind: 'madmax',
-    issuer: TEST_AUTHORITY_ISSUER,
-  });
+  const authority = await rolloverStateAuthorityToAlternateRoot({ context: initial, transport_capability: (await mintStateAuthorityTransportCapability(initial)).capability, proposed_state_root: join(runDir, '.omx', 'state'), creation_root: runDir,
+  launch_id: 'resume-madmax-run',
+  consumer_kind: 'madmax',
+  issuer: TEST_AUTHORITY_ISSUER, });
   const bindingKey = `madmax-root-${createHash('sha256').update(runDir).digest('hex').slice(0, 32)}`;
   const effects = {
     effect: 'madmax-metadata-registry',

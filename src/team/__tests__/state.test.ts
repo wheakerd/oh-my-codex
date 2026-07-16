@@ -2231,6 +2231,29 @@ exit 1
     }
   });
 
+  it('cleanupTeamState removes committed team state through macOS and Windows custody primitives', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-state-portable-cleanup-'));
+    const previousNodeEnv = process.env.NODE_ENV;
+    const previousPlatform = process.env.OMX_TEST_STATE_AUTHORITY_PLATFORM;
+    try {
+      process.env.NODE_ENV = 'test';
+      for (const platform of ['darwin', 'win32'] as const) {
+        const teamName = `portable-cleanup-${platform}`;
+        await initTeamState(teamName, 'portable cleanup', 'executor', 1, cwd);
+        const root = join(cwd, '.omx', 'state', 'team', teamName);
+        process.env.OMX_TEST_STATE_AUTHORITY_PLATFORM = platform;
+        await cleanupTeamState(teamName, cwd);
+        assert.equal(existsSync(root), false);
+      }
+    } finally {
+      if (previousNodeEnv === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = previousNodeEnv;
+      if (previousPlatform === undefined) delete process.env.OMX_TEST_STATE_AUTHORITY_PLATFORM;
+      else process.env.OMX_TEST_STATE_AUTHORITY_PLATFORM = previousPlatform;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
 
   it('cleanupTeamState rejects unsafe team names before path construction', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-team-state-unsafe-'));

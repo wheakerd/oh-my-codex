@@ -128,14 +128,10 @@ async function createAlternateAuthority(
   const initialTransport = authorityTransport(initial);
   await mkdir(dirname(dirname(alternateStateRoot)), { recursive: true, mode: 0o700 });
   await chmod(dirname(dirname(alternateStateRoot)), 0o700);
-  const active = await rolloverStateAuthorityToAlternateRoot({
-    context: initial,
-    proposed_state_root: alternateStateRoot,
-    creation_root: dirname(dirname(alternateStateRoot)),
-    launch_id: `${launchId}-alternate`,
-    consumer_kind: 'boxed',
-    issuer: TEST_AUTHORITY_ISSUER,
-  });
+  const active = await rolloverStateAuthorityToAlternateRoot({ context: initial, transport_capability: (await mintStateAuthorityTransportCapability(initial)).capability, proposed_state_root: alternateStateRoot, creation_root: dirname(dirname(alternateStateRoot)),
+  launch_id: `${launchId}-alternate`,
+  consumer_kind: 'boxed',
+  issuer: TEST_AUTHORITY_ISSUER, });
   await mintStateAuthorityTransportCapability(active);
   return { active, initialTransport, activeTransport: authorityTransport(active) };
 }

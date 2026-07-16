@@ -6697,18 +6697,14 @@ describe("launch state authority transport", () => {
     try {
       await mkdir(nested, { recursive: true });
       const initialAuthority = await establishLaunchAuthority(workspace, "alternate-parent");
-      const alternateAuthority = await rolloverStateAuthorityToAlternateRoot({
-        context: initialAuthority,
-        proposed_state_root: join(alternateRoot, ".omx", "state"),
-        creation_root: alternateRoot,
-        launch_id: "alternate-nested-transport",
-        consumer_kind: "madmax",
-        issuer: {
-          kind: "first-party-launcher",
-          package_version: "test",
-          package_digest: "a".repeat(64),
-        },
-      });
+      const alternateAuthority = await rolloverStateAuthorityToAlternateRoot({ context: initialAuthority, transport_capability: (await mintStateAuthorityTransportCapability(initialAuthority)).capability, proposed_state_root: join(alternateRoot, ".omx", "state"), creation_root: alternateRoot,
+      launch_id: "alternate-nested-transport",
+      consumer_kind: "madmax",
+      issuer: {
+        kind: "first-party-launcher",
+        package_version: "test",
+        package_digest: "a".repeat(64),
+      }, });
       await mintStateAuthorityTransportCapability(alternateAuthority);
       Object.assign(process.env, buildStateAuthorityTransportEnv(alternateAuthority, process.env));
       process.chdir(nested);

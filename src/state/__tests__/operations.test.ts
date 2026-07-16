@@ -23,6 +23,7 @@ import {
   StateAuthorityError,
   canonicalizeAuthorityPathForCreation,
   initializeStateAuthority,
+  mintStateAuthorityTransportCapability,
   resolveStateAuthorityForGuard,
   rolloverStateAuthorityToAlternateRoot,
 } from '../authority.js';
@@ -1439,18 +1440,14 @@ describe('state operations directory initialization', () => {
         startup_cwd: wd,
         observed_cwd: wd,
       });
-      const successor = await rolloverStateAuthorityToAlternateRoot({
-        context: predecessor,
-        proposed_state_root: join(runRoot, '.omx', 'state'),
-        creation_root: runRoot,
-        launch_id: 'state-operation-successor-rollover',
-        consumer_kind: 'madmax',
-        issuer: {
-          kind: 'first-party-launcher',
-          package_version: 'test',
-          package_digest: 'a'.repeat(64),
-        },
-      });
+      const successor = await rolloverStateAuthorityToAlternateRoot({ context: predecessor, transport_capability: (await mintStateAuthorityTransportCapability(predecessor)).capability, proposed_state_root: join(runRoot, '.omx', 'state'), creation_root: runRoot,
+      launch_id: 'state-operation-successor-rollover',
+      consumer_kind: 'madmax',
+      issuer: {
+        kind: 'first-party-launcher',
+        package_version: 'test',
+        package_digest: 'a'.repeat(64),
+      }, });
       assert.notEqual(successor.generation.generation_id, predecessor.generation.generation_id);
 
       const successorEvidencePath = join(

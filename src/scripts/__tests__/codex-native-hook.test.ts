@@ -35195,18 +35195,14 @@ describe("native hook inherited state authority", () => {
 				session_binding: { canonical_session_id: "omx-native-hook-stale" },
 			});
 			const staleTransport = await mintStateAuthorityTransportCapability(first);
-			const active = await rolloverStateAuthorityToAlternateRoot({
-				context: first,
-				proposed_state_root: join(workspace, "alternate-state"),
-				creation_root: workspace,
+			const active = await rolloverStateAuthorityToAlternateRoot({ context: first, transport_capability: (await mintStateAuthorityTransportCapability(first)).capability, proposed_state_root: join(workspace, "alternate-state"), creation_root: workspace,
 				launch_id: "native-hook-stale-generation-rollover",
 				consumer_kind: "team",
 				issuer: {
 					kind: "first-party-launcher",
 					package_version: "test",
 					package_digest: "a".repeat(64),
-				},
-			});
+				}, });
 			Object.assign(process.env, {
 				OMX_STATE_AUTHORITY_PATH: first.authority_path,
 				OMX_STATE_AUTHORITY_ID: first.generation.authority_id,

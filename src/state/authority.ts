@@ -1518,12 +1518,11 @@ export async function removeAuthorityDirectory(
     authorityError(AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot, `authority directory basename is unsafe: ${targetName}`);
   }
 
-  if (!stateAuthorityFilesystemPrimitiveForPlatform().descriptor_relative) {
-    authorityError(
-      AUTHORITY_DIAGNOSTIC_CODES.rootCapabilityWeak,
-      'safe descriptor-relative recursive authority directory deletion is unavailable on this platform',
-    );
-  }
+  const testPlatform = process.env.NODE_ENV === 'test'
+    && /^(linux|darwin|win32)$/.test(process.env.OMX_TEST_STATE_AUTHORITY_PLATFORM ?? '')
+    ? process.env.OMX_TEST_STATE_AUTHORITY_PLATFORM as NodeJS.Platform
+    : process.platform;
+  const descriptorRelative = stateAuthorityFilesystemPrimitiveForPlatform(testPlatform).descriptor_relative;
 
   let scope: AuthorityMutationScope;
   try {
@@ -1534,6 +1533,32 @@ export async function removeAuthorityDirectory(
   }
   let targetDirectory: OpenedAuthorityDirectory | undefined;
   try {
+    if (!descriptorRelative) {
+      const sourcePath = join(scope.parent.descriptor_path, targetName);
+      let beforeRename: Awaited<ReturnType<typeof lstat>>;
+      try {
+        beforeRename = await lstat(sourcePath);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+        throw error;
+      }
+      if (beforeRename.isSymbolicLink() || !beforeRename.isDirectory()) {
+        authorityError(AUTHORITY_DIAGNOSTIC_CODES.rootFingerprintMismatch, 'authority directory changed before quarantine rename');
+      }
+      await assertAuthorityMutationScopeCurrent(scope);
+      const quarantineName = `.${targetName}.delete-${randomBytes(16).toString('hex')}`;
+      const quarantinePath = join(scope.parent.descriptor_path, quarantineName);
+      await rename(sourcePath, quarantinePath);
+      const quarantined = await lstat(quarantinePath);
+      if (quarantined.isSymbolicLink() || !quarantined.isDirectory()
+        || !sameStatIdentity(quarantined, beforeRename)) {
+        authorityError(AUTHORITY_DIAGNOSTIC_CODES.rootFingerprintMismatch, 'authority directory changed during quarantine rename');
+      }
+      await assertAuthorityMutationScopeCurrent(scope);
+      await rm(quarantinePath, { recursive: true, force: true });
+      await assertAuthorityMutationScopeCurrent(scope);
+      return;
+    }
     const sourcePath = join(scope.parent.descriptor_path, targetName);
     let openedTarget: OpenedAuthorityDirectory;
     try {
@@ -7173,6 +7198,7 @@ export interface RolloverStateAuthorityToAlternateRootInput {
   launch_id: string;
   consumer_kind: AlternateRootConsumerKind;
   issuer: FirstPartyIssuer;
+  transport_capability: string;
   now?: Date;
   /** Test-only crash seam. It is never persisted or transported. */
   fault_injection?: RolloverStateAuthorityFaultInjectionPoint;
@@ -7218,6 +7244,7 @@ async function assertCurrentLeaseAuthorizesAlternateRollover(
 export async function rolloverStateAuthorityToAlternateRoot(
   input: RolloverStateAuthorityToAlternateRootInput,
 ): Promise<ResolvedStateAuthorityContext> {
+  await validateStateAuthorityTransportCapability(input.context, input.transport_capability);
   assertIssuer(input.issuer);
   safeIdentifier(input.launch_id, 'launch ID');
   const now = input.now ?? new Date();
