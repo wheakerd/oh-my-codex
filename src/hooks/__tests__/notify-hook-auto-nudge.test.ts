@@ -141,9 +141,17 @@ async function writeWorkerIdentityFixture(stateRoot: string, cwd: string, teamNa
     assigned_tasks: [],
     worktree_path: cwd,
     team_state_root: stateRoot,
+    session_id: 'sess-managed',
+    owner_session_id: 'sess-managed',
   };
   await mkdir(workerDir, { recursive: true });
   await writeJson(join(workerDir, 'identity.json'), identity);
+  await writeJson(join(teamDir, 'config.json'), {
+    name: teamName,
+    session_id: 'sess-managed',
+    owner_session_id: 'sess-managed',
+    workers: [identity],
+  });
   await writeJson(join(teamDir, 'manifest.v2.json'), {
     schema_version: 2,
     name: teamName,
