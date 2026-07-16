@@ -236,6 +236,8 @@ function hasExactScaleUpTmuxAuthority(
   if (certificate.status !== 'valid' || certificate.certificate.status !== 'active') return false;
   const lifecycle = certificate.certificate;
   const sessionName = config.tmux_session;
+  const configuredSessionName = sessionName.split(':', 1)[0]?.trim() ?? '';
+  const configuredContext = sessionName.includes(':') ? sessionName : lifecycle.tmux_context;
   const leaderPaneId = config.leader_pane_id?.trim() ?? '';
   const teamPaneOwnerId = config.tmux_pane_owner_id?.trim() ?? '';
   const leaderResource = lifecycle.resources.find((resource) =>
@@ -245,10 +247,11 @@ function hasExactScaleUpTmuxAuthority(
   );
   if (
     lifecycle.team_name !== teamName
-    || lifecycle.tmux_session_name !== sessionName
+    || lifecycle.tmux_session_name !== configuredSessionName
     || lifecycle.tmux_session_birth !== sessionBirth
+    || lifecycle.tmux_context !== configuredContext
+    || !configuredContext?.startsWith(`${configuredSessionName}:`)
     || lifecycle.team_pane_owner_id !== teamPaneOwnerId
-    || !lifecycle.tmux_context
     || !leaderPaneId
     || !leaderResource?.pane_birth
   ) return false;
@@ -565,6 +568,7 @@ export async function scaleUp(
 
     const addedWorkers: WorkerInfo[] = [];
     const createdTaskIds: string[] = [];
+    const provisionedWorktrees: EnsureWorktreeResult[] = [];
 
     const rollbackScaleUp = async (
       error: string,
@@ -596,6 +600,16 @@ export async function scaleUp(
       }
       if (context.workerName && context.worktreePath && !addedWorkers.some((worker) => worker.name === context.workerName)) {
         await removeWorkerWorktreeRootAgentsFile(sanitized, context.workerName, teamStateRoot, context.worktreePath).catch(() => {});
+      }
+      if (provisionedWorktrees.length > 0) {
+        if (provisionedWorktrees.some((result) => !result.created || result.reused)) {
+          return { ok: false, error: `${error}:scale_up_rollback_preserved_reused_worktree` };
+        }
+        try {
+          await rollbackProvisionedWorktrees(provisionedWorktrees, { skipBranchDeletion: false });
+        } catch (cleanupError) {
+          return { ok: false, error: `${error}:scale_up_rollback_worktree_cleanup_failed:${String(cleanupError)}` };
+        }
       }
       for (const taskId of createdTaskIds) {
         await rm(join(leaderCwd, '.omx', 'state', 'team', sanitized, 'tasks', `task-${taskId}.json`), { force: true }).catch(() => {});
@@ -648,6 +662,7 @@ export async function scaleUp(
             workerName,
           }))
         : { enabled: false } as const;
+      if (workerWorkspaceResult.enabled) provisionedWorktrees.push(workerWorkspaceResult);
       const workerWorkspace = workerWorkspaceResult.enabled ? workerWorkspaceResult : null;
       const workerCwd = workerWorkspace ? workerWorkspace.worktreePath : leaderCwd;
 

@@ -37,7 +37,7 @@ async function activateScaleUpLifecycle(teamName: string, cwd: string, config: N
     kind: 'leader', id: config.leader_pane_id ?? '%11', created: false, pane_birth: 'session-birth-1', role: 'leader', acquired_at: new Date().toISOString(),
   }, cwd), true);
   assert.equal(await finalizeTeamLifecycleGeneration(teamName, token, 'active', cwd, {
-    tmux_session_name: config.tmux_session, tmux_session_birth: 'session-birth-1', tmux_context: `${config.tmux_session}:0`,
+    tmux_session_name: config.tmux_session.split(':', 1)[0] ?? config.tmux_session, tmux_session_birth: 'session-birth-1', tmux_context: config.tmux_session.includes(':') ? config.tmux_session : `${config.tmux_session}:0`,
   }), true);
 }
 

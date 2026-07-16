@@ -288,9 +288,9 @@ async function activateScaleUpLifecycle(teamName: string, cwd: string, config: N
     kind: 'leader', id: config.leader_pane_id ?? '%11', created: false, pane_birth: 'session-birth-1', role: 'leader', acquired_at: new Date().toISOString(),
   }, cwd), true);
   assert.equal(await finalizeTeamLifecycleGeneration(teamName, certificate.token, 'active', cwd, {
-    tmux_session_name: config.tmux_session,
+    tmux_session_name: config.tmux_session.split(':', 1)[0] ?? config.tmux_session,
     tmux_session_birth: 'session-birth-1',
-    tmux_context: `${config.tmux_session}:0`,
+    tmux_context: config.tmux_session.includes(':') ? config.tmux_session : `${config.tmux_session}:0`,
   }), true);
 }
 
@@ -300,7 +300,7 @@ async function configureScaleUpTeamForDirectDispatch(teamName: string, cwd: stri
   if (!config) {
     throw new Error(`missing team config for ${teamName}`);
   }
-  config.tmux_session = `omx-team-${teamName}`;
+  config.tmux_session = `omx-team-${teamName}:0`;
   config.leader_pane_id = '%11';
   config.workers[0]!.pane_id = '%21';
   config.tmux_pane_owner_id = `team:${teamName}`;
@@ -1745,10 +1745,18 @@ exit 0
       if (result.ok) return;
       assert.match(result.error, /scale_up_dispatch_failed:worker-2/);
 
-      const workerRootAgents = join(cwd, '.omx', 'team', 'rollback-worktree', 'worktrees', 'worker-2', 'AGENTS.md');
-      assert.equal(await readFile(workerRootAgents, 'utf-8'), '# Root project instructions\n');
-      const backupPath = join(cwd, '.git', 'worktrees', 'worker-2', 'omx', 'root-agents-backup.json');
-      assert.equal(existsSync(backupPath), false);
+      const workerWorktree = join(cwd, '.omx', 'team', 'rollback-worktree', 'worktrees', 'worker-2');
+      assert.equal(existsSync(workerWorktree), false);
+      const retry = await scaleUp(
+        'rollback-worktree',
+        1,
+        'executor',
+        [{ subject: 'retry docs', description: 'retry docs', owner: 'worker-2', role: 'writer' }],
+        cwd,
+        { OMX_TEAM_SCALING_ENABLED: '1', OMX_TEAM_SKIP_READY_WAIT: '1' },
+      );
+      assert.equal(retry.ok, false);
+      if (!retry.ok) assert.match(retry.error, /scale_up_dispatch_failed:worker-2/);
     } finally {
       if (typeof previousPath === 'string') process.env.PATH = previousPath;
       else delete process.env.PATH;
