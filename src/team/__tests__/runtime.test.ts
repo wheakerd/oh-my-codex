@@ -479,6 +479,19 @@ ${scriptBody}
   );
 }
 
+async function writeSuccessfulEmptyTmuxQuery(binDir: string): Promise<void> {
+  await writeFile(
+    join(binDir, 'tmux'),
+    `#!/bin/sh
+if [ "\${1:-}" = "list-sessions" ]; then
+  exit 0
+fi
+exit 1
+`,
+    { mode: 0o755 },
+  );
+}
+
 async function withPromptModeCodexEnv<T>(
   binDir: string,
   extraEnv: Record<string, string | undefined>,
@@ -1996,6 +2009,7 @@ sleep 5
 `,
       { mode: 0o755 },
     );
+    await writeSuccessfulEmptyTmuxQuery(binDir);
 
     await initTeamState('parent-team', 'parent', 'executor', 1, cwd);
     const parentManifestPath = join(cwd, '.omx', 'state', 'team', 'parent-team', 'manifest.v2.json');
@@ -2099,6 +2113,7 @@ sleep 5
       `setTimeout(() => {}, 5000);
 process.on('SIGTERM', () => process.exit(0));`,
     );
+    await writeSuccessfulEmptyTmuxQuery(binDir);
 
     let runtime: TeamRuntime | null = null;
     try {
@@ -2162,9 +2177,14 @@ process.on('SIGTERM', () => process.exit(0));`,
 
   it('startTeam rejects duplicate active same-name team state without mutating existing files', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-duplicate-team-'));
+    const binDir = join(cwd, 'bin');
+    const prevPath = process.env.PATH;
+    await mkdir(binDir, { recursive: true });
+    await writeSuccessfulEmptyTmuxQuery(binDir);
     const prevSessionId = process.env.OMX_SESSION_ID;
     const prevLaunchMode = process.env.OMX_TEAM_WORKER_LAUNCH_MODE;
     try {
+      process.env.PATH = `${binDir}:${prevPath ?? ''}`;
       process.env.OMX_SESSION_ID = 'sess-existing-team';
       await initTeamState(
         'dup-team',
@@ -2207,6 +2227,8 @@ process.on('SIGTERM', () => process.exit(0));`,
       assert.equal(existingTask?.subject, 'existing subject');
       assert.equal(existingTask?.description, 'existing description');
     } finally {
+      if (typeof prevPath === 'string') process.env.PATH = prevPath;
+      else delete process.env.PATH;
       if (typeof prevSessionId === 'string') process.env.OMX_SESSION_ID = prevSessionId;
       else delete process.env.OMX_SESSION_ID;
       if (typeof prevLaunchMode === 'string') process.env.OMX_TEAM_WORKER_LAUNCH_MODE = prevLaunchMode;
