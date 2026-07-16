@@ -1249,31 +1249,38 @@ describe('state authority foundation', () => {
     const setCustody = (directory: string, rawGenericRights?: number) => {
       const script = [
         '$ErrorActionPreference = "Stop"',
-        '$acl = Get-Acl -LiteralPath $args[0]',
+        '$acl = Get-Acl -LiteralPath $env:OMX_TEST_CUSTODY_PATH',
         '$current = [Security.Principal.WindowsIdentity]::GetCurrent().User',
         '$acl.SetOwner($current)',
         '$acl.SetAccessRuleProtection($true, $false)',
         '$inheritance = [Security.AccessControl.InheritanceFlags]"ContainerInherit, ObjectInherit"',
         '$allow = [Security.AccessControl.AccessControlType]::Allow',
         '$acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($current, "FullControl", $inheritance, "None", $allow)))',
-        'if ($args.Count -gt 1) {',
+        'if ($env:OMX_TEST_CUSTODY_RIGHTS) {',
         '  $untrusted = New-Object Security.Principal.SecurityIdentifier("S-1-5-32-545")',
-        '  $rawRights = [Security.AccessControl.FileSystemRights]([int]$args[1])',
+        '  $rawRights = [Security.AccessControl.FileSystemRights]([int]$env:OMX_TEST_CUSTODY_RIGHTS)',
         '  $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($untrusted, $rawRights, $inheritance, "None", $allow)))',
         '}',
-        'Set-Acl -LiteralPath $args[0] -AclObject $acl',
-        'if ($args.Count -gt 1) {',
-        '  $installed = Get-Acl -LiteralPath $args[0]',
+        'Set-Acl -LiteralPath $env:OMX_TEST_CUSTODY_PATH -AclObject $acl',
+        'if ($env:OMX_TEST_CUSTODY_RIGHTS) {',
+        '  $installed = Get-Acl -LiteralPath $env:OMX_TEST_CUSTODY_PATH',
         '  $untrustedSid = "S-1-5-32-545"',
-        '  $rawMask = [int64]$args[1]',
+        '  $rawMask = [int64]$env:OMX_TEST_CUSTODY_RIGHTS',
         '  $hasRawAce = @($installed.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]) | Where-Object { $_.IdentityReference.Value -eq $untrustedSid -and ([int64]$_.FileSystemRights -band $rawMask) -ne 0 }).Count -gt 0',
         '  if (-not $hasRawAce) { throw "raw generic mutation ACE was not preserved" }',
         '}',
       ].join('; ');
       execFileSync('powershell.exe', [
-        '-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script, directory,
-        ...(rawGenericRights === undefined ? [] : [String(rawGenericRights)]),
-      ], { encoding: 'utf8', windowsHide: true });
+        '-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script,
+      ], {
+        encoding: 'utf8',
+        windowsHide: true,
+        env: {
+          ...process.env,
+          OMX_TEST_CUSTODY_PATH: directory,
+          ...(rawGenericRights === undefined ? {} : { OMX_TEST_CUSTODY_RIGHTS: String(rawGenericRights) }),
+        },
+      });
     };
     try {
       setCustody(secureWorkspace);

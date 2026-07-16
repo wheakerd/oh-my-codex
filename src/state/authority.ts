@@ -2052,7 +2052,7 @@ interface WindowsAuthorityCustody {
 function readWindowsAuthorityCustody(directory: string): WindowsAuthorityCustody {
   const script = [
     '$ErrorActionPreference = "Stop"',
-    '$acl = Get-Acl -LiteralPath $args[0]',
+    '$acl = Get-Acl -LiteralPath $env:OMX_AUTHORITY_CUSTODY_PATH',
     '$sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value',
     '$rules = @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]) | ForEach-Object {',
     '  [ordered]@{ sid = $_.IdentityReference.Value; type = $_.AccessControlType.ToString(); rights = [int64]$_.FileSystemRights }',
@@ -2061,8 +2061,13 @@ function readWindowsAuthorityCustody(directory: string): WindowsAuthorityCustody
   ].join('; ');
   try {
     const raw = execFileSync('powershell.exe', [
-      '-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script, directory,
-    ], { encoding: 'utf8', windowsHide: true, maxBuffer: 64 * 1024 }).trim();
+      '-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script,
+    ], {
+      encoding: 'utf8',
+      windowsHide: true,
+      maxBuffer: 64 * 1024,
+      env: { ...process.env, OMX_AUTHORITY_CUSTODY_PATH: directory },
+    }).trim();
     const custody = JSON.parse(raw) as Partial<WindowsAuthorityCustody>;
     if (typeof custody.owner !== 'string' || typeof custody.current !== 'string'
       || !Array.isArray(custody.rules)
