@@ -47,6 +47,7 @@ import {
   readUsableSessionState,
   reconcileNativeSessionStart,
   resolveSessionPointerContext,
+  type SessionStartOptions,
   type SessionState,
 } from "../hooks/session.js";
 import {
@@ -187,6 +188,8 @@ type CodexHookPayload = Record<string, unknown>;
 interface NativeHookDispatchOptions {
   cwd?: string;
   sessionOwnerPid?: number;
+  /** @internal Scoped deterministic SessionStart durability seam for native-hook tests. */
+  sessionStartOptions?: Pick<SessionStartOptions, 'platform' | 'regularFileSync'>;
   reconcileHudForPromptSubmitFn?: typeof reconcileHudForPromptSubmit;
 }
 
@@ -10288,6 +10291,7 @@ export async function dispatchCodexNativeHook(
         const sessionState = await reconcileNativeSessionStart(cwd, nativeSessionId, {
           context: pointerContext,
           pid: options.sessionOwnerPid ?? resolveSessionOwnerPid(payload),
+          ...options.sessionStartOptions,
           ...(ownerOmxSessionId
             ? { ownerOmxSessionId, ownerAliasVerified: true }
             : {}),
@@ -10621,6 +10625,7 @@ export async function dispatchCodexNativeHook(
         const sessionState = await reconcileNativeSessionStart(cwd, nativeSessionId, {
           context: pointerContext,
           pid: options.sessionOwnerPid ?? resolveSessionOwnerPid(payload),
+          ...options.sessionStartOptions,
           ...(ownerOmxSessionId ? { ownerOmxSessionId, ownerAliasVerified: true } : {}),
         });
         const bootstrapSessionId = safeString(sessionState.session_id).trim();
