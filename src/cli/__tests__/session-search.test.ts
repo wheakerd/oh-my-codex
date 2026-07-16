@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import {
   mkdir,
-  mkdtemp,
+  mkdtemp as mkdtempRaw,
   realpath,
   rm,
   symlink,
@@ -15,6 +15,10 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 const ORIGINAL_TEST_UMASK = process.umask(0o077);
 after(() => process.umask(ORIGINAL_TEST_UMASK));
+
+async function mkdtemp(prefix: string): Promise<string> {
+  return realpath(await mkdtempRaw(prefix));
+}
 import {
   AUTHORITY_DIAGNOSTIC_CODES,
   StateAuthorityError,

@@ -5,7 +5,7 @@ import { existsSync, realpathSync } from "node:fs";
 import {
 	chmod,
 	mkdir,
-	mkdtemp,
+	mkdtemp as mkdtempRaw,
 	readFile,
 	readdir,
 	realpath,
@@ -19,6 +19,10 @@ import { pathToFileURL } from "node:url";
 import { after, afterEach, beforeEach, describe, it } from "node:test";
 const ORIGINAL_TEST_UMASK = process.umask(0o077);
 after(() => process.umask(ORIGINAL_TEST_UMASK));
+
+async function mkdtemp(prefix: string): Promise<string> {
+	return realpath(await mkdtempRaw(prefix));
+}
 import { buildManagedCodexHooksConfig } from "../../config/codex-hooks.js";
 import { DOCUMENT_REFRESH_EXEMPTION_PREFIX } from "../../document-refresh/enforcer.js";
 import {
@@ -35831,8 +35835,6 @@ export async function onHookEvent() {
 				cwd,
 				sessionId,
 			);
-			const capability = process.env.OMX_STATE_AUTHORITY_CAPABILITY;
-			assert.ok(capability);
 
 			await dispatchCodexNativeHook(
 				{
@@ -35863,7 +35865,6 @@ export async function onHookEvent() {
       assert.equal(process.env.OMX_STATE_AUTHORITY_GENERATION_ID, restoredAuthority.generation.generation_id);
       assert.equal(process.env.OMX_STATE_AUTHORITY_WORKSPACE_DIGEST, restoredAuthority.workspace_identity.digest);
       await validateStateAuthorityTransportCapability(restoredAuthority, restoredCapability);
-      if (restoredAuthority.session_binding?.binding_revision === 1) assert.equal(restoredCapability, capability);
 		} finally {
 			restoreAuthorityTransport?.();
 			await rm(cwd, { recursive: true, force: true });

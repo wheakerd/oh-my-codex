@@ -2,7 +2,7 @@ import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { existsSync, writeFileSync } from 'node:fs';
-import { chmod, mkdtemp, mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp as mkdtempRaw, mkdir, readFile, readdir, realpath, rename, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { delimiter, dirname } from 'node:path';
 import { join } from 'node:path';
@@ -15,6 +15,10 @@ import { HUD_TMUX_HEIGHT_LINES, HUD_TMUX_ULTRAGOAL_HEIGHT_LINES, HUD_TMUX_MIN_LA
 import { OMX_TMUX_HUD_LEADER_PANE_ENV } from '../tmux.js';
 import { AUTHORITY_DIAGNOSTIC_CODES, initializeStateAuthority, type ResolvedStateAuthorityContext } from '../../state/authority.js';
 
+
+async function mkdtemp(prefix: string): Promise<string> {
+  return realpath(await mkdtempRaw(prefix));
+}
 const noOpRegisterHudResizeHook = () => true;
 const noOpUnregisterHudResizeHook = () => true;
 interface HudAuthorityFixture {

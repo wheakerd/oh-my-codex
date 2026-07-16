@@ -2,9 +2,13 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { chmod, mkdtemp, mkdir, realpath, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp as mkdtempRaw, mkdir, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, relative } from 'node:path';
+
+async function mkdtemp(prefix: string): Promise<string> {
+  return realpath(await mkdtempRaw(prefix));
+}
 import { renderHud } from '../render.js';
 import { recordSkillActivation } from '../../hooks/keyword-detector.js';
 import { createSubagentTrackingState, recordSubagentTurn, writeSubagentTrackingState } from '../../subagents/tracker.js';

@@ -225,7 +225,7 @@ export async function withMailboxLock<T>(
   const lockDir = deps.mailboxLockDir(teamName, workerName, cwd);
   const ownerPath = join(lockDir, 'owner');
   const ownerToken = lockOwnerToken();
-  const deadline = Date.now() + 5000;
+  const deadline = Date.now() + Math.max(5000, lockStaleMs);
   await mkdir(dirname(lockDir), { recursive: true });
   while (true) {
     try {

@@ -1,10 +1,14 @@
 import { afterEach, beforeEach, describe, it } from 'node:test';
 
 import assert from 'node:assert/strict';
-import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, writeFile } from 'fs/promises';
+import { chmod, mkdir, mkdtemp as mkdtempRaw, readFile, readdir, realpath, rename, rm, writeFile } from 'fs/promises';
 import { existsSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
+
+async function mkdtemp(prefix: string): Promise<string> {
+  return realpath(await mkdtempRaw(prefix));
+}
 import {
   AUTHORITY_DIAGNOSTIC_CODES,
   initializeStateAuthority,
