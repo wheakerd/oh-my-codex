@@ -100,6 +100,14 @@ jobs:
         with:
           node-version: 20
           cache: npm
+      - name: Canonicalize macOS temporary root
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          canonical_tmp="$(python3 -c 'import os; print(os.path.realpath(os.environ["TMPDIR"]))')"
+          test -d "$canonical_tmp"
+          printf 'TMPDIR=%s\n' "$canonical_tmp" >> "$GITHUB_ENV"
       - name: Prepare SHA-named evidence
         shell: bash
         env:
