@@ -173,10 +173,15 @@ function authorityScrubbedNativeHookSmokeEnv(overrides: NodeJS.ProcessEnv): Node
 	return { ...env, ...overrides };
 }
 
-function nativeHookSmokeDenialDetail(stdout: unknown): string | null {
+function nativeHookSmokeDenialDetail(
+	stdout: unknown,
+	options: { allowEmptyOutput?: boolean } = {},
+): string | null {
 	const raw = typeof stdout === "string" ? stdout : Buffer.isBuffer(stdout) ? stdout.toString("utf-8") : "";
 	const trimmed = raw.trim();
-	if (!trimmed) return "native hook emitted no JSON output";
+	if (!trimmed) {
+		return options.allowEmptyOutput ? null : "native hook emitted no JSON output";
+	}
 
 	let output: unknown;
 	try {
@@ -517,7 +522,9 @@ export async function doctor(options: DoctorOptions = {}): Promise<void> {
 	);
 
 	if (failCount > 0) {
-		console.log('\nRun "omx setup" to fix installation issues.');
+		console.log(
+			'\nReview failed checks above. Follow the check-specific recovery guidance; inspect invalid or ambiguous hook documents manually because doctor will not modify them.',
+		);
 	} else if (warnCount > 0) {
 		console.log(
 			'\nReview warnings above. Use "omx setup --force" only when a warning recommends full replacement; for AGENTS.md preservation prefer "omx setup --merge-agents".',
@@ -2057,7 +2064,9 @@ async function checkPluginScopedNativeHooks(
 				message: `plugin-scoped native hook smoke failed from ${expectedHookLauncherPath} (${detail})`,
 			};
 		}
-		const denialDetail = nativeHookSmokeDenialDetail(result.stdout);
+		const denialDetail = nativeHookSmokeDenialDetail(result.stdout, {
+			allowEmptyOutput: true,
+		});
 		if (denialDetail) {
 			return {
 				name: "Native hooks",

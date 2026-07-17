@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs';
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, rm, writeFile, readFile } from 'node:fs/promises';
@@ -87,6 +88,30 @@ describe('hooksCommand', () => {
 
     const disabledLogs = await captureHooksCommand(['status'], { OMX_HOOK_PLUGINS: '0' });
     assert.match(disabledLogs.join('\n'), /Plugins enabled: no \(disabled with OMX_HOOK_PLUGINS=0\)/);
+  });
+
+  it('runs the documented hooks quickstart from a pristine workspace', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'hooks-command-pristine-'));
+    const originalCwd = process.cwd();
+    const previous = new Map(AUTHORITY_TRANSPORT_ENV_KEYS.map((key) => [key, process.env[key]]));
+    try {
+      process.chdir(cwd);
+      for (const key of AUTHORITY_TRANSPORT_ENV_KEYS) delete process.env[key];
+      await hooksCommand(['init']);
+      await hooksCommand(['status']);
+      await hooksCommand(['validate']);
+      assert.equal(existsSync(join(cwd, '.omx', 'bootstrap', 'state-authority-anchor.json')), false);
+      await hooksCommand(['test']);
+      assert.equal(existsSync(join(cwd, '.omx', 'bootstrap', 'state-authority-anchor.json')), true);
+    } finally {
+      process.chdir(originalCwd);
+      for (const key of AUTHORITY_TRANSPORT_ENV_KEYS) {
+        const value = previous.get(key);
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      await rm(cwd, { recursive: true, force: true });
+    }
   });
 
   it('does not pass authority capability or root transport to hooks test plugins', async () => {

@@ -469,6 +469,21 @@ async function writeBridgeDispatchCompat(stateDir, teamName, requests) {
 }
 
 
+function resolveDispatchPaneAuthority(request, config, paneTarget) {
+  const leaderTargeted = request.to_worker === 'leader-fixed';
+  const worker = !leaderTargeted && Array.isArray(config?.workers)
+    ? config.workers.find((candidate) => safeString(candidate?.pane_id).trim() === paneTarget || Number(candidate?.index) === request.worker_index)
+    : null;
+  const configuredPid = leaderTargeted ? config?.leader_pane_pid : worker?.pid;
+  const expectedPanePid = Number(configuredPid);
+  return {
+    exactPaneId: paneTarget,
+    expectedPanePid: Number.isSafeInteger(expectedPanePid) && expectedPanePid > 0 ? expectedPanePid : undefined,
+    expectedPaneOwnerId: safeString(config?.tmux_pane_owner_id).trim() || undefined,
+    expectedHudPaneId: safeString(config?.hud_pane_id).trim() || undefined,
+  };
+}
+
 function defaultInjectTarget(request, config) {
   if (request.to_worker === 'leader-fixed') {
     const leaderPaneId = resolveLeaderPaneId(config);
@@ -794,12 +809,15 @@ async function injectDispatchRequest(request, config, cwd, stateDir, authority: 
     return { ok: false, reason: `target_resolution_failed:${resolution.reason}` };
   }
   const isLeaderMailboxDispatch = request.to_worker === 'leader-fixed';
+  const paneAuthority = resolveDispatchPaneAuthority(request, config, resolution.paneTarget);
+
   const paneGuard = await evaluatePaneInjectionReadiness(resolution.paneTarget, {
     skipIfScrolling: true,
     requireRunningAgent: leaderTargeted,
     requireReady: false,
     requireIdle: false,
     requireObservableState: leaderTargeted,
+    ...paneAuthority,
   });
   if (!paneGuard.ok) {
     return {
@@ -831,13 +849,6 @@ async function injectDispatchRequest(request, config, cwd, stateDir, authority: 
   // Retype whenever trigger text is NOT in the narrow input area, regardless of attempt count.
   // Pre-0.7.4 bug: 80-line capture matched trigger in scrollback output, falsely skipping retype.
   const shouldTypePrompt = attemptCountAtStart === 0 || !preCaptureHasTrigger;
-  if (shouldTypePrompt) {
-    if (attemptCountAtStart >= 1) {
-      // Clear stale text in input buffer before retyping (mirrors sync path tmux-session.ts:1270)
-      await runProcess('tmux', ['send-keys', '-t', resolution.paneTarget, 'C-u'], 1000).catch(() => {});
-      await new Promise((r) => setTimeout(r, 50));
-    }
-  }
 
   await assertPinnedDispatchAuthority(authority);
   const sendResult = await sendPaneInput({
@@ -847,6 +858,7 @@ async function injectDispatchRequest(request, config, cwd, stateDir, authority: 
     submitKeyPresses,
     typePrompt: shouldTypePrompt,
     queueFirstSubmit: leaderTargeted,
+    ...paneAuthority,
   });
   if (!sendResult.ok) {
     return {
@@ -885,6 +897,7 @@ async function injectDispatchRequest(request, config, cwd, stateDir, authority: 
           prompt: request.trigger_message,
           submitKeyPresses,
           typePrompt: false,
+          ...paneAuthority,
         }).catch(() => {});
         continue;
       }
@@ -932,6 +945,7 @@ async function injectDispatchRequest(request, config, cwd, stateDir, authority: 
       submitKeyPresses,
       typePrompt: false,
       queueFirstSubmit: leaderTargeted,
+      ...paneAuthority,
     }).catch(() => {});
   }
 

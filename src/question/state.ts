@@ -84,7 +84,7 @@ export async function createQuestionRecord(
   input: QuestionInput,
   sessionId?: string,
   now = new Date(),
-  options: { emitEvent?: boolean; timeoutMs?: number; runId?: string } = {},
+  options: { emitEvent?: boolean; timeoutMs?: number; runId?: string; stateDir?: string } = {},
 ): Promise<{ recordPath: string; record: QuestionRecord }> {
   const normalizedInput = normalizeQuestionInput(input);
   const questionId = buildQuestionId(now);
@@ -108,7 +108,9 @@ export async function createQuestionRecord(
     questions: normalizedInput.questions,
     ...(normalizedInput.source ? { source: normalizedInput.source } : {}),
   };
-  const recordPath = getQuestionRecordPath(cwd, questionId, sessionId);
+  const recordPath = options.stateDir
+    ? getQuestionRecordPathForStateDir(options.stateDir, questionId, sessionId)
+    : getQuestionRecordPath(cwd, questionId, sessionId);
   await writeQuestionRecord(recordPath, record);
   if (options.emitEvent) {
     await appendQuestionEvent(cwd, 'question-created', record, {
@@ -433,9 +435,11 @@ function validateSubmittedAnswersAgainstSchema(record: QuestionRecord, answers: 
 
 export async function listQuestionRecords(
   cwd: string,
-  options: { sessionId?: string; status?: QuestionStatus | 'open'; limit?: number } = {},
+  options: { sessionId?: string; status?: QuestionStatus | 'open'; limit?: number; stateDir?: string } = {},
 ): Promise<Array<{ recordPath: string; record: QuestionRecord }>> {
-  const dirs = [getQuestionStateDir(cwd, options.sessionId)];
+  const dirs = [options.stateDir
+    ? getQuestionStateDirForStateDir(options.stateDir, options.sessionId)
+    : getQuestionStateDir(cwd, options.sessionId)];
   const records = (await Promise.all(dirs.map((dir) => listQuestionRecordsInDir(dir)))).flat();
   const filtered = records.filter(({ record }) => {
     if (!options.status) return true;
@@ -452,14 +456,16 @@ export async function submitQuestionAnswerById(
   cwd: string,
   questionId: string,
   answerPayload: unknown,
-  options: { sessionId?: string; runId?: string; injectAnswersToPane?: InjectQuestionAnswersToPane; closeQuestionRenderer?: CloseQuestionRenderer } = {},
+  options: { sessionId?: string; runId?: string; stateDir?: string; injectAnswersToPane?: InjectQuestionAnswersToPane; closeQuestionRenderer?: CloseQuestionRenderer } = {},
 ): Promise<{ recordPath: string; record: QuestionRecord }> {
   const normalizedQuestionId = questionId.trim();
   if (!isValidQuestionId(normalizedQuestionId)) {
     throw new QuestionSubmitError('question_unknown', `Unknown question id: ${questionId}`);
   }
 
-  const recordPath = getQuestionRecordPath(cwd, normalizedQuestionId, options.sessionId);
+  const recordPath = options.stateDir
+    ? getQuestionRecordPathForStateDir(options.stateDir, normalizedQuestionId, options.sessionId)
+    : getQuestionRecordPath(cwd, normalizedQuestionId, options.sessionId);
   const result = await withQuestionSubmitLock(recordPath, async () => {
     const current = await readQuestionRecord(recordPath);
     if (!current) throw new QuestionSubmitError('question_unknown', `Unknown question id: ${normalizedQuestionId}`);

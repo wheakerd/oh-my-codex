@@ -3,7 +3,7 @@
  * All execution modes (autopilot, autoresearch, deep-interview, ralph, ultrawork, team, ultraqa, ralplan) share this base.
  */
 
-import { chmod, readFile, writeFile, mkdir, readdir } from 'fs/promises';
+import { chmod, readFile, mkdir, readdir } from 'fs/promises';
 import { existsSync } from 'fs';
 import { basename, dirname, join } from 'node:path';
 import { withModeRuntimeContext } from '../state/mode-state-context.js';
@@ -13,9 +13,6 @@ import {
   TRACKED_WORKFLOW_MODES,
   type TrackedWorkflowMode,
 } from '../state/workflow-transition.js';
-import { reconcileWorkflowTransition } from '../state/workflow-transition-reconcile.js';
-import { resolveStateAuthorityForGuard } from '../state/authority.js';
-import { syncCanonicalSkillStateForMode } from '../state/skill-active.js';
 import { validateAndNormalizeRalphState } from '../ralph/contract.js';
 import { applyRunOutcomeContract } from '../runtime/run-outcome.js';
 import { validateAutopilotCompletionTransition } from '../autopilot/completion-gate.js';
@@ -25,9 +22,11 @@ import { deriveAutopilotChildPhase, type AutopilotChildPhase } from '../autopilo
 import { syncRunStateFromModeState } from '../runtime/run-state.js';
 import {
   getStatePath,
+  resolveCommittedAuthorityRuntimeStateScope,
   resolveWritableStateScope,
 } from '../mcp/state-paths.js';
-import { completeRalplanSession, validateRalplanTerminalConsensus } from '../state/operations.js';
+import { executeStateOperation, validateRalplanTerminalConsensus } from '../state/operations.js';
+import { atomicWriteAuthorityFile } from '../state/authority.js';
 
 
 export interface ModeState {
@@ -164,25 +163,7 @@ export async function startMode(
   maxIterations: number = 50,
   projectRoot?: string
 ): Promise<ModeState> {
-  const scope = await resolveWritableStateScope(projectRoot);
-  const modeStatePath = join(scope.stateDir, basename(getStatePath(mode)));
-  const baseStateDir = dirname(dirname(scope.stateDir));
-  let transitionMessage: string | undefined;
-  if (isTrackedWorkflowMode(mode)) {
-    const authority = await resolveStateAuthorityForGuard({
-      startup_cwd: projectRoot ?? process.cwd(),
-      observed_cwd: projectRoot ?? process.cwd(),
-      session_id: scope.sessionId,
-    });
-    const transition = await reconcileWorkflowTransition(projectRoot ?? process.cwd(), mode, {
-      action: 'start',
-      sessionId: scope.sessionId,
-      source: 'startMode',
-      baseStateDir,
-      expectedRootIdentity: authority.generation.root_identity,
-    });
-    transitionMessage = transition.transitionMessage;
-  }
+  const scope = await resolveCommittedAuthorityRuntimeStateScope(projectRoot);
   await mkdir(scope.stateDir, { recursive: true, mode: 0o700 });
   await chmod(scope.stateDir, 0o700);
   await chmod(dirname(scope.stateDir), 0o700);
@@ -198,32 +179,24 @@ export async function startMode(
     current_phase: 'starting',
     task_description: taskDescription,
     started_at: new Date().toISOString(),
-    ...(transitionMessage ? { transition_message: transitionMessage } : {}),
     ...(mode === 'ralph' && scope.sessionId ? { owner_omx_session_id: scope.sessionId } : {}),
   };
 
   const withContext = withModeRuntimeContext({}, stateBase) as ModeState;
   const state = normalizeModeStateOrThrow(mode, withContext);
-  await writeFile(modeStatePath, JSON.stringify(state, null, 2));
-  await syncRunStateFromModeState(state, projectRoot, scope.sessionId);
-  if (isTrackedWorkflowMode(mode)) {
-    const authority = await resolveStateAuthorityForGuard({
-      startup_cwd: projectRoot ?? process.cwd(),
-      observed_cwd: projectRoot ?? process.cwd(),
-      session_id: scope.sessionId,
-    });
-    await syncCanonicalSkillStateForMode({
-      cwd: projectRoot ?? process.cwd(),
-      baseStateDir,
-      mode,
-      active: true,
-      currentPhase: typeof state.current_phase === 'string' ? state.current_phase : undefined,
-      sessionId: scope.sessionId,
-      source: 'startMode',
-      expectedRootIdentity: authority.generation.root_identity,
-    });
-  }
-  return state;
+  const result = await executeStateOperation('state_write', {
+    workingDirectory: projectRoot ?? process.cwd(),
+    ...(scope.sessionId ? { session_id: scope.sessionId } : {}),
+    mode,
+    state,
+  });
+  if (result.isError) throw new Error((result.payload as { error?: unknown }).error as string || `Failed to start mode ${mode}`);
+  const transition = (result.payload as { transition?: unknown }).transition;
+  const committedState = typeof transition === 'string'
+    ? { ...state, transition_message: transition }
+    : state;
+  await syncRunStateFromModeState(committedState, projectRoot, scope.sessionId);
+  return committedState;
 }
 
 /**
@@ -299,16 +272,9 @@ export async function updateModeState(
   explicitSessionId?: string,
   options: UpdateModeStateOptions = {},
 ): Promise<ModeState> {
-  const scope = await resolveWritableStateScope(projectRoot, explicitSessionId);
-  const baseStateDir = dirname(dirname(scope.stateDir));
+  const scope = await resolveCommittedAuthorityRuntimeStateScope(projectRoot, explicitSessionId);
+  const baseStateDir = scope.baseStateDir;
   const modeStatePath = join(scope.stateDir, basename(getStatePath(mode)));
-  const mutationAuthority = isTrackedWorkflowMode(mode)
-    ? await resolveStateAuthorityForGuard({
-        startup_cwd: projectRoot ?? process.cwd(),
-        observed_cwd: projectRoot ?? process.cwd(),
-        session_id: scope.source === 'explicit' ? undefined : scope.sessionId,
-      })
-    : null;
   const current = await readModeStateFromPaths([modeStatePath]);
   if (!current) throw new Error(`Mode ${mode} not found`);
   await mkdir(scope.stateDir, { recursive: true, mode: 0o700 });
@@ -392,30 +358,22 @@ export async function updateModeState(
     }
   }
   const updated = withModeRuntimeContext(current, normalizedBase) as ModeState;
-  await writeFile(modeStatePath, JSON.stringify(updated, null, 2));
-  await syncRunStateFromModeState(updated, projectRoot, scope.sessionId);
-  if (isTrackedWorkflowMode(mode)) {
-    const cwd = projectRoot ?? process.cwd();
-    const ralplanCompletionHandled = mode === 'ralplan' && await completeRalplanSession({
-      cwd,
-      baseStateDir,
-      state: updated as Record<string, unknown>,
-      explicitSessionId: scope.sessionId,
+  if (options.trustedPipelineProgress === true) {
+    await atomicWriteAuthorityFile(modeStatePath, JSON.stringify(updated, null, 2), {
+      authority_root: baseStateDir,
+      expected_root_identity: scope.authority.generation.root_identity,
     });
-    if (!ralplanCompletionHandled) {
-      if (!mutationAuthority) throw new Error('Tracked mode mutation authority was not resolved');
-      await syncCanonicalSkillStateForMode({
-        cwd,
-        baseStateDir,
-        mode,
-        active: updated.active === true,
-        currentPhase: typeof updated.current_phase === 'string' ? updated.current_phase : undefined,
-        sessionId: scope.sessionId,
-        source: 'updateModeState',
-        expectedRootIdentity: mutationAuthority.generation.root_identity,
-      });
-    }
+    await syncRunStateFromModeState(updated, projectRoot, scope.sessionId);
+    return updated;
   }
+  const result = await executeStateOperation('state_write', {
+    workingDirectory: projectRoot ?? process.cwd(),
+    ...(scope.sessionId ? { session_id: scope.sessionId } : {}),
+    mode,
+    state: updated,
+  });
+  if (result.isError) throw new Error((result.payload as { error?: unknown }).error as string || `Failed to update mode ${mode}`);
+  await syncRunStateFromModeState(updated, projectRoot, scope.sessionId);
   return updated;
 }
 

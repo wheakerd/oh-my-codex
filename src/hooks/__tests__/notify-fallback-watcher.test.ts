@@ -13,7 +13,7 @@ import {
 	writeFile as writeFileRaw,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
@@ -163,6 +163,23 @@ async function initTeamState(
 	const result = await initTeamStateWithAuthority(...args);
 	hardenTestAuthorityTreeSync(cwd);
 	return result;
+}
+
+async function bindDispatchWorkerPane(cwd: string): Promise<void> {
+	for (const name of ["config.json", "manifest.v2.json"]) {
+		const path = join(cwd, ".omx", "state", "team", "dispatch-team", name);
+		try {
+			const record = JSON.parse(await readFile(path, "utf-8"));
+			if (Array.isArray(record.workers) && record.workers[0]) {
+				record.workers[0].pid = process.pid;
+				record.workers[0].pane_id = "%42";
+			}
+			await writeFile(path, JSON.stringify(record, null, 2));
+		} catch {
+			// The alternate metadata format may be absent.
+		}
+	}
+	hardenTestAuthorityTreeSync(cwd);
 }
 
 async function enqueueDispatchRequest(
@@ -475,7 +492,7 @@ if [[ "$cmd" == "display-message" ]]; then
     exit 0
   fi
   if [[ "$fmt" == "#{pane_id}" ]]; then
-    echo "\${target:-%42}"
+    echo "%42"
     exit 0
   fi
   if [[ "$fmt" == "#{pane_current_path}" ]]; then
@@ -509,6 +526,10 @@ if [[ "$cmd" == "paste-buffer" ]]; then
     esac
   done
   if [[ -f "${tmuxLogPath}.buffer" ]]; then
+    if [[ -n "${options.failSendKeysMatch || ""}" ]] && grep -Fq "${options.failSendKeysMatch || ""}" "${tmuxLogPath}.buffer"; then
+      echo "send failed" >&2
+      exit 1
+    fi
     echo "send-keys -t \${target} -l $(cat "${tmuxLogPath}.buffer")" >> "${tmuxLogPath}"
   fi
   exit 0
@@ -529,7 +550,25 @@ if [[ "$cmd" == "send-keys" ]]; then
   fi
   exit 0
 fi
+if [[ "$cmd" == "show-option" ]]; then
+  if [[ "$*" == *"@omx_instance_id"* || "$*" == *"@omx_pane_instance_id"* ]]; then
+    printf "%s\n" "\${OMX_INSTANCE_ID:-}"
+  fi
+  exit 0
+fi
+if [[ "$cmd" == "list-sessions" ]]; then
+  printf "%s\t%s\n" "\${OMX_TEST_TMUX_SESSION_NAME:-session-test}" "\${OMX_INSTANCE_ID:-}"
+  exit 0
+fi
 if [[ "$cmd" == "list-panes" ]]; then
+  if [[ " $* " == *" -a "* ]]; then
+    printf '%b\n' "\${OMX_TEST_TMUX_LIST_PANES_OUTPUT:-%42\\t0\\t${process.pid}}"
+    exit 0
+  fi
+  if [[ "$*" == *"#{pane_pid}"* ]]; then
+    printf "%%42 %s\n" "${process.pid}"
+    exit 0
+  fi
   target=""
   while [[ "$#" -gt 0 ]]; do
     case "$1" in
@@ -541,10 +580,10 @@ if [[ "$cmd" == "list-panes" ]]; then
     shift || true
   done
   if [[ -n "$target" ]]; then
-    printf "%%42\tcodex\tcodex\n"
+    printf "%%42\t1\tcodex\tcodex\n"
     exit 0
   fi
-  echo "%42 1"
+  printf '%b\n' "\${OMX_TEST_TMUX_LIST_PANES_OUTPUT:-%42 1}"
   exit 0
 fi
 exit 0
@@ -595,6 +634,7 @@ function buildManagedRalphTmux(
 			return `${paneId}\t${active}\t${currentCommand}\t${startCommand}`;
 		})
 		.join("\n");
+	const exactPaneOutput = panes.map((pane) => `${pane.paneId}\t0\t${process.pid}`).join("\n");
 	const paneCommandBranches = panes
 		.map((pane) => {
 			const currentCommand = (pane.currentCommand || "codex").replace(
@@ -655,6 +695,10 @@ ${paneCommandBranches}
   exit 0
 fi
 if [[ "$cmd" == "list-panes" ]]; then
+  if [[ " $* " == *" -a "* ]]; then
+    printf '%s\n' "${exactPaneOutput}"
+    exit 0
+  fi
   target=""
   while [[ "$#" -gt 0 ]]; do
     case "$1" in
@@ -1447,7 +1491,7 @@ describe("notify-fallback watcher", () => {
 		}
 	});
 
-	it("records explicit leader-only dispatch drain state in test mode", async () => {
+	it("records explicit leader-only dispatch drain state in production mode", async () => {
 		const wd = await mkdtemp(join(tmpdir(), "omx-fallback-dispatch-state-"));
 		try {
 			hardenTestAuthorityTreeSync(wd);
@@ -1485,7 +1529,7 @@ describe("notify-fallback watcher", () => {
 					"--dispatch-max-per-tick",
 					"1",
 				],
-				{ encoding: "utf-8", env: buildCleanNotifyEnv() },
+				{ encoding: "utf-8", env: buildWatcherFixtureEnv(wd, { NODE_ENV: "production" }) },
 			);
 			assert.equal(result.status, 0, result.stderr || result.stdout);
 
@@ -1777,6 +1821,8 @@ describe("notify-fallback watcher", () => {
 						PATH: `${fakeBinDir}:${process.env.PATH || ""}`,
 						CODEX_HOME: codexHome,
 						OMX_SESSION_ID: "sess-managed-fallback",
+						OMX_INSTANCE_ID: "sess-managed-fallback",
+						OMX_TEST_TMUX_SESSION_NAME: `omx-${basename(wd)}-detached-sess-managed-fallback`.toLowerCase(),
 						TMUX: "1",
 						TMUX_PANE: "%42",
 						OMX_NOTIFY_FALLBACK_AUTO_NUDGE_STALL_MS: "5000",
@@ -2904,8 +2950,8 @@ exit 0
 						PATH: `${fakeBinDir}:${process.env.PATH || ""}`,
 						CODEX_HOME: codexHome,
 						OMX_SESSION_ID: "sess-managed-fallback",
-						OMX_TEST_TMUX_SESSION_NAME:
-							"omx-fallback-auto-nudge-stalled-managed",
+						OMX_INSTANCE_ID: "sess-managed-fallback",
+						OMX_TEST_TMUX_SESSION_NAME: `omx-${basename(wd)}-detached-sess-managed-fallback`.toLowerCase(),
 						TMUX: "1",
 						TMUX_PANE: "%42",
 						OMX_NOTIFY_FALLBACK_AUTO_NUDGE_STALL_MS: "5000",
@@ -3029,6 +3075,8 @@ exit 0
 						PATH: `${fakeBinDir}:${process.env.PATH || ""}`,
 						CODEX_HOME: codexHome,
 						OMX_SESSION_ID: "sess-managed-fallback",
+						OMX_INSTANCE_ID: "sess-managed-fallback",
+						OMX_TEST_TMUX_SESSION_NAME: `omx-${basename(wd)}-detached-sess-managed-fallback`.toLowerCase(),
 						TMUX: "1",
 						TMUX_PANE: "%42",
 						OMX_NOTIFY_FALLBACK_AUTO_NUDGE_STALL_MS: "5000",
@@ -3617,7 +3665,7 @@ exit 0
 		}
 	});
 
-	it("watcher retry does not retype when pre-capture still contains trigger", async () => {
+	it("does not type retry prompts when worker pane authority is unproven", async () => {
 		const wd = await mkdtemp(join(tmpdir(), "omx-fallback-dispatch-cm-"));
 		const fakeBinDir = join(wd, "fake-bin");
 		const tmuxLogPath = join(wd, "tmux.log");
@@ -3633,6 +3681,7 @@ exit 0
 			await writeFile(captureFile, "... ping ...");
 
 			await initTeamState("dispatch-team", "task", "executor", 1, wd);
+			await bindDispatchWorkerPane(wd);
 			const queued = await enqueueDispatchRequest(
 				"dispatch-team",
 				{
@@ -3655,6 +3704,7 @@ exit 0
 			).pathname;
 			const env = {
 				...buildWatcherFixtureEnv(wd),
+				OMX_TEST_TMUX_SESSION_NAME: "omx-team-dispatch-team",
 				PATH: `${fakeBinDir}:${process.env.PATH || ""}`,
 				OMX_TEST_CAPTURE_FILE: captureFile,
 			};
@@ -3696,14 +3746,14 @@ exit 0
 			assert.equal(second.status, 0, second.stderr || second.stdout);
 
 			const tmuxLog = await readFile(tmuxLogPath, "utf8");
-			const typeMatches = tmuxLog.match(/send-keys -t %42 -l ping/g) || [];
+			const typeMatches = tmuxLog.match(/set-buffer .* -- ping/g) || [];
 			assert.equal(
 				typeMatches.length,
-				1,
-				"fresh attempt should type once; retries with draft should be submit-only",
+				0,
+				`unproven worker panes must not receive typed retry prompts\n${tmuxLog}`,
 			);
 			const cmMatches = tmuxLog.match(/send-keys -t %42 C-m/g) || [];
-			assert.ok(cmMatches.length > 0, "submit should use C-m");
+			assert.equal(cmMatches.length, 0, "unproven worker panes must not receive submit keys");
 			assert.ok(
 				!/send-keys[^\n]*-l[^\n]*C-m/.test(tmuxLog),
 				"must keep -l payload and C-m submits isolated",
@@ -3715,9 +3765,9 @@ exit 0
 				queued.request.request_id,
 				wd,
 			);
-			assert.equal(request?.status, "pending");
-			assert.equal(request?.attempt_count, 2);
-			assert.equal(request?.last_reason, "tmux_send_keys_unconfirmed");
+			assert.equal(request?.status, "failed");
+			assert.equal(request?.attempt_count, 1);
+			assert.equal(request?.last_reason, "exact_pane_unavailable");
 		} finally {
 			if (typeof previousRuntimeBridge === "string")
 				process.env.OMX_RUNTIME_BRIDGE = previousRuntimeBridge;
@@ -3784,7 +3834,7 @@ exit 0
 				"../../../dist/scripts/notify-hook.js",
 				import.meta.url,
 			).pathname;
-			const env = {
+			const env: NodeJS.ProcessEnv = {
 				...buildWatcherFixtureEnv(wd),
 				PATH: `${fakeBinDir}:${process.env.PATH || ""}`,
 			};
@@ -3878,6 +3928,38 @@ exit 0
 				sends.length,
 				2,
 				"Ralph steer should fire again once the 60s cadence elapses",
+			);
+
+			const malformedIso = new Date(Date.now() - 61_000).toISOString();
+			watcherState.ralph_continue_steer.last_sent_at = malformedIso;
+			watcherState.ralph_continue_steer.shared_last_sent_at = malformedIso;
+			await writeFile(statePath, JSON.stringify(watcherState, null, 2));
+			await writeFile(sharedTimestampPath, `${malformedIso}\n`);
+			env.OMX_TEST_TMUX_LIST_PANES_OUTPUT = "%42 1";
+			const malformed = spawnSync(
+				process.execPath,
+				[
+					watcherScript,
+					"--once",
+					"--cwd",
+					wd,
+					"--notify-script",
+					notifyHook,
+					"--poll-ms",
+					"50",
+				],
+				{ encoding: "utf-8", env },
+			);
+			assert.equal(malformed.status, 0, malformed.stderr || malformed.stdout);
+			const malformedLog = await readFile(tmuxLogPath, "utf8");
+			const malformedSends =
+				malformedLog.match(
+					/send-keys -t %42 -l Ralph loop active continue \[OMX_TMUX_INJECT\]/g,
+				) || [];
+			assert.equal(
+				malformedSends.length,
+				2,
+				"malformed exact-pane proof must fail closed before Ralph injection",
 			);
 		} finally {
 			await rm(wd, { recursive: true, force: true });
@@ -6212,6 +6294,7 @@ exit 0
 			await chmod(join(fakeBinDir, "tmux"), 0o755);
 
 			await initTeamState("dispatch-team", "task", "executor", 1, wd);
+			await bindDispatchWorkerPane(wd);
 			const queued = await enqueueDispatchRequest(
 				"dispatch-team",
 				{
@@ -6283,6 +6366,8 @@ exit 0
 					encoding: "utf-8",
 					env: buildWatcherFixtureEnv(wd, {
 						PATH: `${fakeBinDir}:${process.env.PATH || ""}`,
+						OMX_INSTANCE_ID: "notify-fallback-control",
+						OMX_TEST_TMUX_SESSION_NAME: `omx-${basename(wd)}-detached-notify-fallback-control`.toLowerCase(),
 					}),
 				},
 			);
@@ -6315,7 +6400,7 @@ exit 0
 				/send failed/i,
 			);
 			const tmuxLog = await readFile(tmuxLogPath, "utf8");
-			assert.match(tmuxLog, /send-keys -t .* -l dispatch ping/);
+			assert.match(tmuxLog, /set-buffer .* -- Ralph loop active continue/);
 
 			const logPath = join(
 				wd,
@@ -6349,7 +6434,7 @@ exit 0
 		}
 	});
 
-	it("retypes on every retry when trigger is not in narrow input area", async () => {
+	it("does not retype retries when worker pane authority is unproven", async () => {
 		const wd = await mkdtemp(
 			join(tmpdir(), "omx-fallback-dispatch-cm-fallback-"),
 		);
@@ -6401,6 +6486,7 @@ exit 0
 			);
 
 			await initTeamState("dispatch-team", "task", "executor", 1, wd);
+			await bindDispatchWorkerPane(wd);
 			const queued = await enqueueDispatchRequest(
 				"dispatch-team",
 				{
@@ -6423,6 +6509,7 @@ exit 0
 			).pathname;
 			const env = {
 				...buildWatcherFixtureEnv(wd),
+				OMX_TEST_TMUX_SESSION_NAME: "omx-team-dispatch-team",
 				PATH: `${fakeBinDir}:${process.env.PATH || ""}`,
 				OMX_TEST_CAPTURE_SEQUENCE_FILE: captureSeqFile,
 				OMX_TEST_CAPTURE_COUNTER_FILE: captureCounterFile,
@@ -6449,11 +6536,11 @@ exit 0
 			}
 
 			const tmuxLog = await readFile(tmuxLogPath, "utf8");
-			const typeMatches = tmuxLog.match(/send-keys -t %42 -l ping/g) || [];
+			const typeMatches = tmuxLog.match(/set-buffer .* -- ping/g) || [];
 			assert.equal(
 				typeMatches.length,
-				3,
-				"should retype on every retry when trigger not in narrow capture (fresh + 2 retries)",
+				0,
+				`unproven worker panes must remain untouched across retries\n${tmuxLog}`,
 			);
 
 			Object.assign(process.env, watcherFixtureAuthorityEnvs.get(wd));
@@ -6463,7 +6550,7 @@ exit 0
 				wd,
 			);
 			assert.equal(request?.status, "failed");
-			assert.equal(request?.last_reason, "unconfirmed_after_max_retries");
+			assert.equal(request?.last_reason, "exact_pane_unavailable");
 		} finally {
 			if (typeof previousRuntimeBridge === "string")
 				process.env.OMX_RUNTIME_BRIDGE = previousRuntimeBridge;

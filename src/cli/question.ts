@@ -26,6 +26,10 @@ import { normalizeQuestionInput } from '../question/types.js';
 import { runQuestionUi } from '../question/ui.js';
 
 const DEFAULT_QUESTION_WAIT_TIMEOUT_MS = 30 * 60 * 1000;
+export interface QuestionCommandOptions {
+  stateDir?: string;
+}
+
 
 function parseQuestionWaitTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
   const raw = String(env.OMX_QUESTION_WAIT_TIMEOUT_MS ?? '').trim();
@@ -237,7 +241,7 @@ async function finalizeDirectDeepInterviewObligation(
   );
 }
 
-export async function questionCommand(args: string[]): Promise<void> {
+export async function questionCommand(args: string[], options: QuestionCommandOptions = {}): Promise<void> {
   const parsed = parseQuestionArgs(args);
   if (parsed.help || args.length === 0) {
     console.log(QUESTION_HELP);
@@ -263,7 +267,7 @@ export async function questionCommand(args: string[]): Promise<void> {
         process.cwd(),
         parsed.answerQuestionId,
         answerPayload,
-        { sessionId: parsed.sessionId },
+        { sessionId: parsed.sessionId, ...(options.stateDir ? { stateDir: options.stateDir } : {}) },
       );
       printJson({
         ok: true,
@@ -353,6 +357,7 @@ export async function questionCommand(args: string[]): Promise<void> {
   const { record, recordPath } = await createQuestionRecord(cwd, input, policy.sessionId, new Date(), {
     emitEvent: true,
     timeoutMs: waitTimeoutMs,
+    ...(options.stateDir ? { stateDir: options.stateDir } : {}),
   });
 
   let finalRecord;

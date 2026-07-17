@@ -24,7 +24,6 @@ import { runProcess } from "./process-runner.js";
 import { logTmuxHookEvent } from "./log.js";
 import {
 	evaluatePaneInjectionReadiness,
-	queuePaneInput,
 	sendPaneInput,
 } from "./team-tmux-guard.js";
 import { resolvePaneTarget } from "./tmux-injection.js";
@@ -989,6 +988,9 @@ export async function maybeNudgeTeamLeader({
 		let tmuxSession = "";
 		let leaderPaneId = "";
 		let ownerSessionId = "";
+		let leaderPanePid: number | undefined;
+		let tmuxPaneOwnerId = "";
+		let hudPaneId = "";
 		let workers = [];
 		try {
 			const manifestPath = join(teamDir, "manifest.v2.json");
@@ -1007,6 +1009,13 @@ export async function maybeNudgeTeamLeader({
 						? raw.leader.session_id
 						: "",
 				).trim();
+				const parsedLeaderPanePid = Number(raw?.leader_pane_pid);
+				leaderPanePid =
+					Number.isSafeInteger(parsedLeaderPanePid) && parsedLeaderPanePid > 0
+						? parsedLeaderPanePid
+						: undefined;
+				tmuxPaneOwnerId = safeString(raw?.tmux_pane_owner_id).trim();
+				hudPaneId = safeString(raw?.hud_pane_id).trim();
 				if (Array.isArray(raw && raw.workers)) workers = raw.workers;
 			}
 		} catch {
@@ -1456,6 +1465,13 @@ export async function maybeNudgeTeamLeader({
 			}).catch(() => {});
 			continue;
 		}
+		const paneAuthority = {
+			exactPaneId: canonicalLeaderPaneId,
+			expectedPanePid: leaderPanePid,
+			expectedPaneOwnerId: tmuxPaneOwnerId || undefined,
+			expectedHudPaneId: hudPaneId || undefined,
+		};
+
 
 		const paneGuard = await evaluatePaneInjectionReadiness(tmuxTarget, {
 			skipIfScrolling: true,
@@ -1464,6 +1480,7 @@ export async function maybeNudgeTeamLeader({
 			requireRunningAgent: true,
 			requireReady: false,
 			requireIdle: false,
+			...paneAuthority,
 		});
 		if (!paneGuard.ok) {
 			const deferredReason =
@@ -1595,9 +1612,12 @@ export async function maybeNudgeTeamLeader({
 			const leaderHasActiveTask = paneHasActiveTask(paneGuard.paneCapture);
 			let deliveryMode = "sent";
 			if (leaderHasActiveTask) {
-				const sendResult = await queuePaneInput({
+				const sendResult = await sendPaneInput({
 					paneTarget: tmuxTarget,
 					prompt: markedText,
+					submitKeyPresses: 1,
+					queueFirstSubmit: true,
+					...paneAuthority,
 				});
 				if (!sendResult.ok) {
 					throw new Error(sendResult.error || sendResult.reason);
@@ -1609,6 +1629,7 @@ export async function maybeNudgeTeamLeader({
 					prompt: markedText,
 					submitKeyPresses: 2,
 					submitDelayMs: 100,
+					...paneAuthority,
 				});
 				if (!sendResult.ok) {
 					throw new Error(sendResult.error || sendResult.reason);

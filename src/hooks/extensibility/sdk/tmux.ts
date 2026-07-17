@@ -265,7 +265,7 @@ async function sendTmuxKeys(
     hook_event: context.event.event,
     target: targetResolution.target,
     submitted: options.submit !== false,
-  }).catch(() => {});
+  }, context.stateRoot).catch(() => {});
 
   return {
     ok: true,

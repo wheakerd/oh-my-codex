@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
@@ -145,6 +145,30 @@ describe('ensureCanonicalRalphArtifacts', () => {
       assert.equal(Array.isArray(progress.visual_feedback[0].qualitative_feedback.next_actions), true);
       assert.equal(progress.visual_feedback[0].qualitative_feedback.next_actions.length > 0, true);
       assert.equal(progress.visual_feedback[0].next_actions.length <= VISUAL_NEXT_ACTIONS_LIMIT, true);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects visual feedback writes after the authoritative state root is replaced', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-ralph-visual-replaced-'));
+    try {
+      const stateRoot = join(cwd, '.omx', 'state');
+      await mkdir(stateRoot, { recursive: true, mode: 0o700 });
+      const expectedRootIdentity = await captureRootFilesystemIdentity(stateRoot);
+      await rename(stateRoot, join(cwd, '.omx', 'state-old'));
+      await mkdir(stateRoot, { recursive: true, mode: 0o700 });
+
+      await assert.rejects(
+        recordRalphVisualFeedback(cwd, {
+          score: 50,
+          verdict: 'revise',
+          category_match: false,
+          differences: ['replacement'],
+          suggestions: [],
+        }, 'sessVisual', stateRoot, expectedRootIdentity),
+        /replaced|fingerprint|authority/i,
+      );
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

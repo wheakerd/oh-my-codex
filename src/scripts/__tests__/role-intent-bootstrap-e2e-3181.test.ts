@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { describe, it } from 'node:test';
@@ -10,6 +10,11 @@ import { ralplanCommand } from '../../cli/ralplan.js';
 import { readSubagentTrackingState, recordSubagentTurnForSession } from '../../subagents/tracker.js';
 import { parseRoleIntentCorrelationToken } from '../../leader/contract.js';
 import { dispatchCodexNativeHook } from '../codex-native-hook.js';
+import {
+  initializeStateAuthority,
+  mintStateAuthorityTransportCapability,
+} from '../../state/authority.js';
+import { buildStateAuthorityTransportEnv } from '../../state/transport-env.js';
 
 async function invokeRoleIntent(cwd: string, args: string[]) {
   const stdout: string[] = [];
@@ -49,6 +54,21 @@ function runCompiled(cwd: string, environment: NodeJS.ProcessEnv, script: string
   });
 }
 
+
+async function installAuthenticatedAuthority(cwd: string, sessionId: string): Promise<NodeJS.ProcessEnv> {
+  await mkdir(join(cwd, '.omx', 'state'), { recursive: true, mode: 0o700 });
+  await chmod(join(cwd, '.omx'), 0o700);
+  await chmod(join(cwd, '.omx', 'state'), 0o700);
+  const authority = await initializeStateAuthority({
+    startup_cwd: cwd,
+    observed_cwd: cwd,
+    launch_id: `${sessionId}-launch`,
+    session_binding: { canonical_session_id: sessionId },
+  });
+  await mintStateAuthorityTransportCapability(authority);
+  return buildStateAuthorityTransportEnv(authority, { OMX_SESSION_ID: sessionId });
+}
+
 describe('#3181 end-to-end fresh App turn bootstrap', () => {
   it('SessionStart reconcile alone neither attests nor authorizes a role intent (fail-closed; positive provenance required)', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-3181-e2e-'));
@@ -58,6 +78,7 @@ describe('#3181 end-to-end fresh App turn bootstrap', () => {
       delete process.env.CODEX_SESSION_ID;
       delete process.env.SESSION_ID;
       const nativeSessionId = 'codex-native-fresh-app';
+      Object.assign(process.env, await installAuthenticatedAuthority(cwd, nativeSessionId));
 
       // 1. Fresh App/outside-tmux turn start: no session.json, no tracker yet.
       await dispatchCodexNativeHook(
@@ -97,6 +118,7 @@ describe('#3181 end-to-end fresh App turn bootstrap', () => {
       delete process.env.CODEX_SESSION_ID;
       delete process.env.SESSION_ID;
       const nativeSessionId = 'codex-native-exec-leader';
+      Object.assign(process.env, await installAuthenticatedAuthority(cwd, nativeSessionId));
 
       // Fresh exec turn where the first event reaching OMX is a leader PreToolUse (no
       // prior SessionStart pointer). The leader turn carries thread_id == session_id.
@@ -136,8 +158,11 @@ describe('#3181 end-to-end fresh App turn bootstrap', () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-3181-e2e-compiled-'));
     const home = await mkdtemp(join(tmpdir(), 'omx-3181-home-'));
     const codexHome = await mkdtemp(join(tmpdir(), 'omx-3181-codex-home-'));
-    const environment = buildHermeticChildEnvironment(home, codexHome);
     const nativeSessionId = 'codex-native-compiled-leader';
+    const environment = {
+      ...buildHermeticChildEnvironment(home, codexHome),
+      ...await installAuthenticatedAuthority(cwd, nativeSessionId),
+    };
     try {
       assert.equal(existsSync(join(cwd, '.omx', 'state', 'session.json')), false, 'compiled fixture must start without a canonical pointer');
       assert.equal(existsSync(join(cwd, '.omx', 'state', 'subagent-tracking.json')), false, 'compiled fixture must start without a tracker');
@@ -150,8 +175,19 @@ describe('#3181 end-to-end fresh App turn bootstrap', () => {
         'ralplan', 'role-intent', 'write', '--role', 'architect', '--parent-thread', nativeSessionId, '--json',
       ]);
       assert.notEqual(unattestedCli.status, 0, 'SessionStart-only state must not authorize the actual CLI');
-      assert.deepEqual(JSON.parse(String(unattestedCli.stdout)), { ok: false, reason: 'parent_not_active_leader' });
+      assert.deepEqual(JSON.parse(String(unattestedCli.stdout)), { ok: false, reason: 'native_anchor_unavailable' });
 
+      const compiledPointerPath = join(cwd, '.omx', 'state', 'session.json');
+      const compiledPointer = JSON.parse(String(await readFile(compiledPointerPath))) as Record<string, unknown>;
+      compiledPointer.native_session_id = nativeSessionId;
+      await writeFile(compiledPointerPath, `${JSON.stringify(compiledPointer)}\n`);
+      const compiledSessionPointerPath = join(cwd, '.omx', 'state', 'sessions', nativeSessionId, 'session.json');
+      if (existsSync(compiledSessionPointerPath)) {
+        const compiledSessionPointer = JSON.parse(String(await readFile(compiledSessionPointerPath))) as Record<string, unknown>;
+        compiledSessionPointer.native_session_id = nativeSessionId;
+        await writeFile(compiledSessionPointerPath, `${JSON.stringify(compiledSessionPointer)}\n`);
+      }
+      Object.assign(environment, await installAuthenticatedAuthority(cwd, nativeSessionId));
       const preToolUse = runCompiled(cwd, environment, 'scripts/codex-native-hook.js', [], {
         hook_event_name: 'PreToolUse',
         cwd,
@@ -166,6 +202,7 @@ describe('#3181 end-to-end fresh App turn bootstrap', () => {
       assert.equal(attested?.leader_thread_id, nativeSessionId);
       assert.equal(attested?.leader_attest_source, 'native-pretooluse');
 
+      Object.assign(environment, await installAuthenticatedAuthority(cwd, nativeSessionId));
       const cli = runCompiled(cwd, environment, 'cli/omx.js', [
         'ralplan', 'role-intent', 'write', '--role', 'architect', '--parent-thread', nativeSessionId, '--json',
       ]);
@@ -196,9 +233,12 @@ describe('#3181 end-to-end fresh App turn bootstrap', () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-3181-e2e-foreign-'));
     const home = await mkdtemp(join(tmpdir(), 'omx-3181-home-foreign-'));
     const codexHome = await mkdtemp(join(tmpdir(), 'omx-3181-codex-home-foreign-'));
-    const environment = buildHermeticChildEnvironment(home, codexHome);
     const canonicalNativeSessionId = 'codex-native-canonical-a';
     const foreignNativeSessionId = 'codex-native-foreign-b';
+    const environment = {
+      ...buildHermeticChildEnvironment(home, codexHome),
+      ...await installAuthenticatedAuthority(cwd, canonicalNativeSessionId),
+    };
     try {
       assert.equal(runCompiled(cwd, environment, 'scripts/codex-native-hook.js', [], {
         hook_event_name: 'SessionStart', cwd, session_id: canonicalNativeSessionId,
@@ -207,6 +247,7 @@ describe('#3181 end-to-end fresh App turn bootstrap', () => {
       const pointerBefore = await readFile(pointerPath);
       const trackerBefore = await readSubagentTrackingState(cwd);
 
+      Object.assign(environment, await installAuthenticatedAuthority(cwd, canonicalNativeSessionId));
       const preToolUse = runCompiled(cwd, environment, 'scripts/codex-native-hook.js', [], {
         hook_event_name: 'PreToolUse',
         cwd,
@@ -223,6 +264,7 @@ describe('#3181 end-to-end fresh App turn bootstrap', () => {
       assert.deepEqual(state.pending_role_intents, []);
       assert.deepEqual(state, trackerBefore, 'foreign PreToolUse must not add an A or B attestation or role intent');
 
+      Object.assign(environment, await installAuthenticatedAuthority(cwd, canonicalNativeSessionId));
       const cli = runCompiled(cwd, environment, 'cli/omx.js', [
         'ralplan', 'role-intent', 'write', '--role', 'architect', '--parent-thread', foreignNativeSessionId, '--json',
       ]);
@@ -404,6 +446,7 @@ describe('#3181 end-to-end fresh App turn bootstrap', () => {
       for (const [index, nativeBinding] of [undefined, '', { malformed: true }].entries()) {
         const cwd = join(root, String(index));
         const nativeSessionId = `codex-native-invalid-binding-${index}`;
+        Object.assign(process.env, await installAuthenticatedAuthority(cwd, nativeSessionId));
         await dispatchCodexNativeHook({ hook_event_name: 'SessionStart', cwd, session_id: nativeSessionId }, { cwd, sessionOwnerPid: process.pid });
         const pointerPath = join(cwd, '.omx', 'state', 'session.json');
         const pointer = JSON.parse(String(await readFile(pointerPath))) as Record<string, unknown>;

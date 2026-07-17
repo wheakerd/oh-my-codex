@@ -9,6 +9,7 @@ import {
   AUTHORITY_DIAGNOSTIC_CODES,
   StateAuthorityError,
   atomicWriteAuthorityFile,
+  ensureAuthorityDirectory,
   captureRootFilesystemIdentity,
   sameRootFilesystemIdentity,
   type RootFilesystemIdentity,
@@ -352,8 +353,15 @@ export async function recordRalphVisualFeedback(
   feedback: RalphVisualFeedback,
   sessionId?: string,
   baseStateDir?: string,
+  expectedRootIdentity?: RootFilesystemIdentity,
 ): Promise<void> {
   const canonicalProgressPath = resolveRalphProgressPath(cwd, sessionId, baseStateDir);
+  if (baseStateDir && !expectedRootIdentity) {
+    throw new StateAuthorityError(
+      AUTHORITY_DIAGNOSTIC_CODES.rootFingerprintMismatch,
+      'authoritative visual feedback requires the committed root identity',
+    );
+  }
   const ledger = await readCanonicalProgressLedger(canonicalProgressPath);
   const threshold = Number.isFinite(feedback.threshold) ? Number(feedback.threshold) : DEFAULT_VISUAL_THRESHOLD;
   const nextActions = [
@@ -383,8 +391,19 @@ export async function recordRalphVisualFeedback(
   visualFeedback.push(entry);
   ledger.visual_feedback = visualFeedback.slice(-30);
   ledger.updated_at = new Date().toISOString();
-  await mkdir(join(canonicalProgressPath, '..'), { recursive: true });
-  await writeFile(canonicalProgressPath, `${stableJsonPretty(ledger)}\n`);
+  const content = `${stableJsonPretty(ledger)}\n`;
+  if (baseStateDir && expectedRootIdentity) {
+    await ensureAuthorityDirectory(baseStateDir, join(canonicalProgressPath, '..'), {
+      expected_root_identity: expectedRootIdentity,
+    });
+    await atomicWriteAuthorityFile(canonicalProgressPath, content, {
+      authority_root: baseStateDir,
+      expected_root_identity: expectedRootIdentity,
+    });
+  } else {
+    await mkdir(join(canonicalProgressPath, '..'), { recursive: true });
+    await writeFile(canonicalProgressPath, content);
+  }
 }
 
 export async function ensureCanonicalRalphArtifacts(

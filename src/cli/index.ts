@@ -807,12 +807,14 @@ function removeProcessLocalStateAuthorityBearer(
 }
 
 async function resolveStandaloneCommittedAuthority(
-  surface: "HUD" | "state write/clear" | "status" | "cancel",
+  surface: "HUD" | "state write/clear" | "status" | "cancel" | "question",
   cwd: string = process.cwd(),
 ) {
   try {
     const scope = await resolveCommittedAuthorityRuntimeStateScope(cwd);
     assertStateAuthorityTransportAliasesMatch(scope.authority, process.env);
+    const capability = await mintStateAuthorityTransportCapability(scope.authority);
+    await validateStateAuthorityTransportCapability(scope.authority, capability.capability);
     return scope;
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
@@ -2845,31 +2847,26 @@ export function prependOmxRuntimeCommandShimToEnv(
   const shimDir = ensureOmxRuntimeCommandShim(cwd, omxBin, nodePath, platform);
   const pathDelimiter =
     platform === "win32" ? win32.delimiter : posix.delimiter;
-  const result: NodeJS.ProcessEnv = { ...env };
+  const result: NodeJS.ProcessEnv =
+    platform === "win32"
+      ? Object.fromEntries(
+          Object.entries(env).filter(
+            ([key]) => key.toLowerCase() !== "path",
+          ),
+        )
+      : { ...env };
 
   if (platform === "win32") {
-    // Windows env var names are case-insensitive; the inherited key is usually
-    // `Path`, not `PATH`. Find every case variant, preserve the existing value,
-    // prepend the shim directory, and collapse to a single key so the child does
-    // not see an empty `PATH` shadowing the real `Path` (which drops System32,
-    // WindowsPowerShell, etc.).
-    const pathVariants = Object.keys(result).filter(
-      (key) => key.toLowerCase() === "path",
-    );
-    let pathKey = "Path";
-    let currentPath = "";
-    for (const variant of pathVariants) {
-      const value = result[variant];
-      if (typeof value === "string" && value.length > 0) {
-        pathKey = variant;
-        currentPath = value;
-        break;
-      }
-    }
-    for (const variant of pathVariants) {
-      delete result[variant];
-    }
-    result[pathKey] = currentPath
+    // Windows env var names are case-insensitive; collapse every inherited
+    // PATH variant into the explicit `Path` spelling for the child process.
+    const inheritedPath = Object.entries(env).find(
+      ([key, value]) =>
+        key.toLowerCase() === "path" &&
+        typeof value === "string" &&
+        value.length > 0,
+    )?.[1];
+    const currentPath = typeof inheritedPath === "string" ? inheritedPath : "";
+    result.Path = currentPath
       ? `${shimDir}${pathDelimiter}${currentPath}`
       : shimDir;
   } else {
@@ -3987,9 +3984,11 @@ export async function main(args: string[]): Promise<void> {
       case "ask":
         await askCommand(args.slice(1));
         break;
-      case "question":
-        await questionCommand(args.slice(1));
+      case "question": {
+        const scope = await resolveStandaloneCommittedAuthority("question");
+        await questionCommand(args.slice(1), { stateDir: scope.baseStateDir });
         break;
+      }
       case "adapt":
         await adaptCommand(args.slice(1));
         break;
@@ -5789,10 +5788,11 @@ export function serializeDetachedSessionParentEnv(
   env: NodeJS.ProcessEnv,
 ): string {
   const lines: string[] = [];
-  for (const key of Object.keys(env).sort()) {
+  for (const [key, value] of Object.entries(env).sort(([left], [right]) =>
+    left.localeCompare(right),
+  )) {
     if (!SHELL_ENV_NAME_PATTERN.test(key)) continue;
     if (DETACHED_SESSION_PANE_ENV_KEYS.has(key)) continue;
-    const value = env[key];
     if (typeof value !== "string") continue;
     if (value.includes("\0")) continue;
     lines.push(`export ${key}=${quoteShellArg(value)}`);
@@ -5801,16 +5801,15 @@ export function serializeDetachedSessionParentEnv(
 }
 
 function detachedTmuxEnvironmentNames(env: NodeJS.ProcessEnv): string[] {
-  return Object.keys(env)
+  return Object.entries(env)
     .filter(
-      (key) =>
+      ([key, value]) =>
         SHELL_ENV_NAME_PATTERN.test(key) &&
-        !DETACHED_TMUX_MANAGED_ENV_NAMES.has(key),
+        !DETACHED_TMUX_MANAGED_ENV_NAMES.has(key) &&
+        typeof value === "string" &&
+        !value.includes("\0"),
     )
-    .filter((key) => {
-      const value = env[key];
-      return typeof value === "string" && !value.includes("\0");
-    })
+    .map(([key]) => key)
     .sort();
 }
 
@@ -6177,6 +6176,7 @@ function configureDetachedTmuxSessionEnvironment(
         manifest.sourceCount,
       )
     : [];
+  const environmentValues = new Map(Object.entries(env));
   const commands = manifest
     ? [
         [
@@ -6188,7 +6188,7 @@ function configureDetachedTmuxSessionEnvironment(
           quoteTmuxConfigArg(manifest.value),
         ].join(" "),
         ...environmentImports.map(({ sourceName, targetName }) => {
-          const value = env[targetName] ?? "";
+          const value = environmentValues.get(targetName) ?? "";
           if (typeof value !== "string") {
             throw new Error(`invalid detached tmux environment value for ${targetName}`);
           }
@@ -8153,8 +8153,8 @@ export function buildDetachedWindowsBootstrapScript(
     "const { execFileSync } = require('child_process');",
     `const tmuxCommand = ${tmuxCommandLiteral};`,
     `setTimeout(() => {`,
-    `try { execFileSync(tmuxCommand, ['send-keys', '-t', ${targetLiteral}, '-l', '--', ${commandLiteral}], { stdio: 'ignore' }); } catch {}`,
-    `try { execFileSync(tmuxCommand, ['send-keys', '-t', ${targetLiteral}, 'C-m'], { stdio: 'ignore' }); } catch {}`,
+    `try { execFileSync(tmuxCommand, ['send-keys', '-t', ${targetLiteral}, '-l', '--', ${commandLiteral}], { stdio: 'ignore', windowsHide: true }); } catch {}`,
+    `try { execFileSync(tmuxCommand, ['send-keys', '-t', ${targetLiteral}, 'C-m'], { stdio: 'ignore', windowsHide: true }); } catch {}`,
     `}, ${delay});`,
   ].join("");
 }
@@ -8570,7 +8570,6 @@ type LegacyNotifyFallbackReapDependencies = {
   exists?: (path: string) => boolean;
   readFile?: (path: string, encoding: BufferEncoding) => Promise<string>;
   tryKillPid?: (pid: number, signal?: NodeJS.Signals) => boolean;
-  hasErrnoCode?: (error: unknown, code: string) => boolean;
   warn?: (message?: unknown, ...optionalParams: unknown[]) => void;
   isWatcherProcess?: (pid: number) => boolean;
   nowMs?: () => number;
@@ -8587,7 +8586,6 @@ export async function reapStaleNotifyFallbackWatcher(
   if (!("generation" in authority) || !("workspace_identity" in authority)) {
     return "invalid";
   }
-  const hasErrnoCodeImpl = deps.hasErrnoCode ?? hasErrnoCode;
   const warn = deps.warn ?? console.warn;
   try {
     const record = await readNotifyWatcherPidRecordNoFollow(pidPath, authority);
@@ -8620,7 +8618,7 @@ export async function reapStaleNotifyFallbackWatcher(
     // identity-matched watcher rather than risk PID reuse before a numeric kill.
     return "recent_active";
   } catch (error: unknown) {
-    if (!hasErrnoCodeImpl(error, "ESRCH")) {
+    if (!hasErrnoCode(error, "ESRCH")) {
       warn("[omx] warning: failed to stop stale notify fallback watcher", {
         path: pidPath,
         error: error instanceof Error ? error.message : String(error),

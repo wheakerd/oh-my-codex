@@ -21,7 +21,7 @@ import {
   type WorkflowTransitionDecision,
 } from './workflow-transition.js';
 import {
-  listActiveSkills,
+  listTransitionActiveSkills,
   readVisibleSkillActiveStateForStateDir,
   syncCanonicalSkillStateForMode,
 } from './skill-active.js';
@@ -329,8 +329,7 @@ async function visibleTrackedModes(
   sessionId?: string,
 ): Promise<TrackedWorkflowMode[]> {
   const canonical = await readVisibleSkillActiveStateForStateDir(stateRoot, sessionId);
-  const canonicalModes = listActiveSkills(canonical ?? {})
-    .filter((entry) => sessionId || safeString(entry.session_id).trim().length === 0)
+  const canonicalModes = listTransitionActiveSkills(canonical ?? {}, sessionId)
     .map((entry) => entry.skill)
     .filter(isTrackedWorkflowMode);
 

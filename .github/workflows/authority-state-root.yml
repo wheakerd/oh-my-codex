@@ -233,7 +233,13 @@ jobs:
               dist/cli/__tests__/doctor-team.test.js \
               dist/team/__tests__/state-root.test.js \
               dist/team/__tests__/team-identity.test.js \
+              dist/team/__tests__/worker-runtime-identity.test.js \
               dist/team/__tests__/runtime-boxed-state.test.js \
+              dist/team/__tests__/runtime-cli.test.js \
+              dist/team/__tests__/api-interop.test.js \
+              dist/team/__tests__/state.test.js \
+              dist/cli/__tests__/team.test.js \
+              dist/team/__tests__/tmux-session.test.js \
               2>&1 | tee authority-evidence/team-tmux-transport.log
           else
             node --test --test-concurrency=1 \
@@ -245,6 +251,7 @@ jobs:
               dist/team/__tests__/runtime-boxed-state.test.js \
               dist/team/__tests__/runtime-cli.test.js \
               dist/team/__tests__/api-interop.test.js \
+              dist/team/__tests__/state.test.js \
               dist/team/__tests__/tmux-session.test.js \
               2>&1 | tee authority-evidence/team-tmux-transport.log
           fi
@@ -254,6 +261,8 @@ jobs:
           set -euo pipefail
           node --test --test-concurrency=1 \
             dist/scripts/__tests__/notify-fallback-watcher.test.js \
+            dist/hooks/__tests__/notify-hook-team-dispatch.test.js \
+            dist/hooks/__tests__/notify-hook-team-tmux-guard.test.js \
             dist/scripts/__tests__/hook-derived-watcher.test.js \
             dist/hooks/__tests__/notify-hook-team-worker-fail-closed.test.js \
             dist/hooks/__tests__/notify-hook-cross-worktree-heartbeat.test.js \
@@ -407,6 +416,7 @@ jobs:
             'doctor-platform.log',
             'capability-report.txt',
           ];
+          const requiredLogFiles = requiredFiles.filter((file) => file.endsWith('.log'));
           const sha256 = (path) => createHash('sha256').update(readFileSync(path)).digest('hex');
           const evidenceRoot = 'authority-evidence-download';
           const expectedSha = process.env.EXPECTED_SHA;
@@ -502,6 +512,12 @@ jobs:
               const path = join(evidenceDir, file);
               if (manifest.required_files[file] !== sha256(path)) {
                 throw new Error(`manifested evidence hash mismatch: ${target.matrixOs}/${file}`);
+              }
+            }
+            for (const file of requiredLogFiles) {
+              const log = readFileSync(join(evidenceDir, file), 'utf8');
+              if (/^status=not-run(?:\r?\n|$)/.test(log)) {
+                throw new Error(`successful matrix lane retained not-run evidence: ${target.matrixOs}/${file}`);
               }
             }
             if (readFileSync(join(evidenceDir, 'tested-sha.txt'), 'utf8').trim() !== expectedSha) {

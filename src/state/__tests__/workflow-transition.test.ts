@@ -275,6 +275,15 @@ describe('workflow transition rules', () => {
       try {
         const stateDir = join(wd, '.omx', 'state');
         await mkdir(stateDir, { recursive: true });
+        await chmod(wd, 0o700);
+        await chmod(join(wd, '.omx'), 0o700);
+        await chmod(stateDir, 0o700);
+        const authority = await initializeStateAuthority({
+          startup_cwd: wd,
+          observed_cwd: wd,
+          launch_id: 'workflow-foreign-team-terminal',
+          session_binding: { canonical_session_id: 'foreign-team-session' },
+        });
         const teamState = { active: false, mode: 'team', current_phase: 'cancelled', run_outcome: 'continue' };
         const skillState = {
           version: 1,
@@ -293,6 +302,7 @@ describe('workflow transition rules', () => {
         const transition = await reconcileWorkflowTransition(wd, 'deep-interview', {
           action: 'write',
           source: 'test',
+          expectedRootIdentity: authority.generation.root_identity,
         });
 
         assert.equal(transition.decision.allowed, true);
@@ -307,18 +317,30 @@ describe('workflow transition rules', () => {
     });
   });
 
-  it('still rejects planning rollback when root Team detail is genuinely active', async () => {
+  it('allows the approved Team to deep-interview overlap for an active session detail', async () => {
     await withIsolatedStateEnv(async () => {
       const wd = await mkdtemp(join(tmpdir(), 'omx-workflow-foreign-team-active-'));
       try {
         const stateDir = join(wd, '.omx', 'state');
         await mkdir(stateDir, { recursive: true });
-        await writeFile(join(stateDir, 'team-state.json'), JSON.stringify({
+        await chmod(wd, 0o700);
+        await chmod(join(wd, '.omx'), 0o700);
+        await chmod(stateDir, 0o700);
+        const authority = await initializeStateAuthority({
+          startup_cwd: wd,
+          observed_cwd: wd,
+          launch_id: 'workflow-foreign-team-active',
+          session_binding: { canonical_session_id: 'foreign-team-session' },
+        });
+        const sessionStateDir = join(stateDir, 'sessions', 'foreign-team-session');
+        await mkdir(sessionStateDir, { recursive: true, mode: 0o700 });
+        await writeFile(join(sessionStateDir, 'team-state.json'), JSON.stringify({
           active: true,
           mode: 'team',
+          session_id: 'foreign-team-session',
           current_phase: 'team-exec',
         }, null, 2));
-        await writeFile(join(stateDir, 'skill-active-state.json'), JSON.stringify({
+        await writeFile(join(sessionStateDir, 'skill-active-state.json'), JSON.stringify({
           version: 1,
           active: true,
           skill: 'team',
@@ -326,10 +348,13 @@ describe('workflow transition rules', () => {
           active_skills: [{ skill: 'team', phase: 'team-exec', active: true }],
         }, null, 2));
 
-        await assert.rejects(
-          reconcileWorkflowTransition(wd, 'deep-interview', { action: 'write', source: 'test' }),
-          /team is already active/,
-        );
+        const result = await reconcileWorkflowTransition(wd, 'deep-interview', {
+          action: 'write',
+          source: 'test',
+          sessionId: 'foreign-team-session',
+          expectedRootIdentity: authority.generation.root_identity,
+        });
+        assert.equal(result.decision.allowed, true);
       } finally {
         await rm(wd, { recursive: true, force: true });
       }

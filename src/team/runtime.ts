@@ -4174,14 +4174,7 @@ export async function startTeam(
             reason: dispatchOutcome.reason,
             cwd: leaderCwd,
           });
-          return {
-            ok: false,
-            workerIndex,
-            workerName,
-            error: new Error(
-              `prompt_worker_stopped:${workerName}:${dispatchOutcome.reason}`,
-            ),
-          };
+          return { ok: true, workerIndex, workerName };
         }
         return {
           ok: false,

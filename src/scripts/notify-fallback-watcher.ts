@@ -16,7 +16,6 @@ import { spawn, type ChildProcess } from "child_process";
 import { dirname, join, resolve } from "path";
 import { homedir } from "os";
 import { StringDecoder } from "string_decoder";
-import { spawnPlatformCommandSync } from "../utils/platform-command.js";
 import { drainPendingTeamDispatch } from "./notify-hook/team-dispatch.js";
 import {
 	maybeAutoNudge,
@@ -28,7 +27,7 @@ import {
 } from "./notify-hook/auto-nudge.js";
 import { getScopedStatePath } from "./notify-hook/state-io.js";
 
-import { checkPaneReadyForTeamSendKeys } from "./notify-hook/team-tmux-guard.js";
+import { checkPaneReadyForTeamSendKeys, sendPaneInput } from "./notify-hook/team-tmux-guard.js";
 import {
 	checkWorkerPanesAlive,
 	isLeaderStale,
@@ -266,8 +265,9 @@ async function retainActiveAuthority(): Promise<ResolvedStateAuthorityContext> {
 		throw new Error("notify fallback watcher authority binding is no longer active");
 	}
 	const root = resolve(dirname(authority.generation.canonical_omx_root));
+	const environment = new Map(Object.entries(process.env));
 	for (const name of ["OMX_ROOT", "OMX_STATE_ROOT"] as const) {
-		const value = process.env[name]?.trim();
+		const value = environment.get(name)?.trim();
 		if (value && resolve(authority.workspace_identity.canonical_path, value) !== root) {
 			throw new Error(`${name} conflicts with authenticated state authority`);
 		}
@@ -1019,47 +1019,19 @@ async function resolveActiveTeamState(): Promise<ActiveTeamResult> {
 
 async function emitRalphContinueSteer(
 	paneId: string,
+	expectedPanePid: number,
 	message: string,
 ): Promise<void> {
-	const markedText = `${message} ${DEFAULT_MARKER}`;
-	await new Promise<void>((resolve) => {
-		const { result: typed } = spawnPlatformCommandSync(
-			"tmux",
-			["send-keys", "-t", paneId, "-l", markedText],
-			{ encoding: "utf-8" },
-		);
-		if (typed.error) throw new Error(typed.error.message);
-		if (typed.status !== 0)
-			throw new Error(
-				(typed.stderr || typed.stdout || "").trim() || "tmux send-keys failed",
-			);
-		setTimeout(resolve, 100);
+	const sendResult = await sendPaneInput({
+		paneTarget: paneId,
+		prompt: `${message} ${DEFAULT_MARKER}`,
+		submitKeyPresses: 2,
+		submitDelayMs: 100,
+		exactPaneId: paneId,
+		expectedPanePid,
 	});
-	await new Promise<void>((resolve) => {
-		const { result: submitA } = spawnPlatformCommandSync(
-			"tmux",
-			["send-keys", "-t", paneId, "C-m"],
-			{ encoding: "utf-8" },
-		);
-		if (submitA.error) throw new Error(submitA.error.message);
-		if (submitA.status !== 0)
-			throw new Error(
-				(submitA.stderr || submitA.stdout || "").trim() ||
-					"tmux send-keys C-m failed",
-			);
-		setTimeout(resolve, 100);
-	});
-	const { result: submitB } = spawnPlatformCommandSync(
-		"tmux",
-		["send-keys", "-t", paneId, "C-m"],
-		{ encoding: "utf-8" },
-	);
-	if (submitB.error) throw new Error(submitB.error.message);
-	if (submitB.status !== 0) {
-		throw new Error(
-			(submitB.stderr || submitB.stdout || "").trim() ||
-				"tmux send-keys C-m failed",
-		);
+	if (!sendResult.ok) {
+		throw new Error(sendResult.error || sendResult.reason || "tmux send-keys failed");
 	}
 }
 
@@ -1536,8 +1508,14 @@ async function runRalphContinueSteerTick(): Promise<void> {
 			return { sent: false, skipped: true };
 		}
 
+		const expectedPanePid = paneGuard.exactPaneProof?.pid;
+		if (!Number.isSafeInteger(expectedPanePid) || expectedPanePid <= 0) {
+			lastRalphContinueSteer.last_reason = "exact_pane_unavailable";
+			return { sent: false, skipped: true };
+		}
+
 		await requireRetainedActiveAuthority();
-		await emitRalphContinueSteer(paneId, RALPH_CONTINUE_TEXT);
+		await emitRalphContinueSteer(paneId, expectedPanePid, RALPH_CONTINUE_TEXT);
 		await writeRalphSteerTimestamp(nowIso);
 		lastRalphContinueSteer.last_sent_at = nowIso;
 		lastRalphContinueSteer.shared_last_sent_at = nowIso;
@@ -1608,8 +1586,6 @@ function parentIsGone(): boolean {
 
 async function writeState(extra: Record<string, unknown> = {}): Promise<void> {
 	await requireRetainedActiveAuthority();
-	const testControlPlaneEnabled = process.env.NODE_ENV === "test"
-		&& process.env.OMX_NOTIFY_FALLBACK_TEST_BOOTSTRAP_AUTHORITY === "1";
 	const state = {
 		pid: process.pid,
 		parent_pid: parentPid,
@@ -1627,15 +1603,13 @@ async function writeState(extra: Record<string, unknown> = {}): Promise<void> {
 		dispatch_drain: {
 			max_per_tick: dispatchTickMax,
 			...lastDispatchDrain,
-			enabled: testControlPlaneEnabled,
-			run_count: testControlPlaneEnabled ? dispatchDrainRuns : 0,
-			reason: testControlPlaneEnabled ? undefined : "control_plane_disabled",
+			enabled: true,
+			run_count: dispatchDrainRuns,
 		},
 		leader_nudge: {
 			...lastLeaderNudge,
-			enabled: testControlPlaneEnabled,
-			run_count: testControlPlaneEnabled ? leaderNudgeRuns : 0,
-			reason: testControlPlaneEnabled ? undefined : "control_plane_disabled",
+			enabled: true,
+			run_count: leaderNudgeRuns,
 		},
 		ralph_continue_steer: {
 			...lastRalphContinueSteer,
@@ -1645,8 +1619,7 @@ async function writeState(extra: Record<string, unknown> = {}): Promise<void> {
 		},
 		fallback_auto_nudge: {
 			...lastFallbackAutoNudge,
-			enabled: testControlPlaneEnabled,
-			reason: testControlPlaneEnabled ? undefined : "control_plane_disabled",
+			enabled: true,
 			stall_ms: AUTO_NUDGE_STALL_MS,
 		},
 		authority_backoff: lastAuthorityBackoff,
@@ -2470,9 +2443,6 @@ async function shouldSuppressInteractiveFallbackTicks(): Promise<boolean> {
 async function pumpTeamControlPlaneTick(
 	authority: ResolvedStateAuthorityContext,
 ): Promise<CycleActivitySummary> {
-	if (process.env.NODE_ENV !== "test" || process.env.OMX_NOTIFY_FALLBACK_TEST_BOOTSTRAP_AUTHORITY !== "1") {
-		return { active: false, reason: "control_plane_disabled" };
-	}
 	const dispatchActive = await runDispatchDrainTick(authority);
 	if (await shouldSuppressInteractiveFallbackTicks()) {
 		return { active: dispatchActive, reason: dispatchActive ? "dispatch_drain" : "deep_interview_locked" };

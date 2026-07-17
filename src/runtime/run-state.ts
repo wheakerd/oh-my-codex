@@ -1,8 +1,13 @@
 import { existsSync } from 'node:fs';
-import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { getStateFilePath, resolveStateScope, resolveWritableStateScope } from '../mcp/state-paths.js';
+import {
+  atomicWriteAuthorityJson,
+  ensureAuthorityDirectory,
+  resolveStateAuthorityForGuard,
+} from '../state/authority.js';
 import {
   classifyRunOutcome,
   compatibilityRunOutcomeFromTerminalLifecycleOutcome,
@@ -144,16 +149,6 @@ function getRunStatePath(workingDirectory?: string, sessionId?: string): string 
   return getStateFilePath(RUN_STATE_FILENAME, workingDirectory, sessionId);
 }
 
-async function writeAtomicFile(path: string, data: string): Promise<void> {
-  const tmpPath = `${path}.tmp.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}`;
-  await writeFile(tmpPath, data, 'utf-8');
-  try {
-    await rename(tmpPath, path);
-  } catch (error) {
-    await unlink(tmpPath).catch(() => {});
-    throw error;
-  }
-}
 
 export async function readRunState(
   workingDirectory?: string,
@@ -176,8 +171,16 @@ export async function syncRunStateFromModeState(
   explicitSessionId?: string,
 ): Promise<RunState> {
   const scope = await resolveWritableStateScope(workingDirectory, explicitSessionId);
+  const cwd = workingDirectory ?? process.cwd();
+  const authority = await resolveStateAuthorityForGuard({
+    startup_cwd: cwd,
+    observed_cwd: cwd,
+    session_id: scope.sessionId,
+  });
   const path = join(scope.stateDir, RUN_STATE_FILENAME);
-  await mkdir(scope.stateDir, { recursive: true });
+  await ensureAuthorityDirectory(authority.canonical_state_root, scope.stateDir, {
+    expected_root_identity: authority.generation.root_identity,
+  });
 
   let existing: RunState | null = null;
   if (existsSync(path)) {
@@ -188,6 +191,9 @@ export async function syncRunStateFromModeState(
     }
   }
   const next = buildRunState(state, existing);
-  await writeAtomicFile(path, JSON.stringify(next, null, 2));
+  await atomicWriteAuthorityJson(path, next, {
+    authority_root: authority.canonical_state_root,
+    expected_root_identity: authority.generation.root_identity,
+  });
   return next;
 }

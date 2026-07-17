@@ -754,9 +754,6 @@ async function persistStatefulSkillSeedState(
   const config = STATEFUL_SKILL_SEED_CONFIG[nextSkill.skill as StatefulSkillMode];
   if (!config) return nextSkill;
   await assertKeywordMutationAuthority(stateDir, options.expectedRootIdentity);
-  if (resolve(sourceCwd, '.omx', 'state') !== resolve(stateDir)) {
-    keywordStateError(AUTHORITY_DIAGNOSTIC_CODES.workspaceMismatch, 'keyword source workspace does not match the persisted state-authority root');
-  }
 
   const { absolutePath, relativePath } = resolveSeedStateFilePath(
     stateDir,

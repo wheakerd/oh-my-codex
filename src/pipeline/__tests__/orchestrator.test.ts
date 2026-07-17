@@ -598,7 +598,7 @@ describe('Pipeline Orchestrator', () => {
       assert.ok(ran.includes('after-skip'));
     });
 
-    it('materializes ralplan consensus handoff artifacts when ralplan is skipped', async () => {
+    it('rejects skipped ralplan handoff without tracker-backed native consensus evidence', async () => {
       const plansDir = join(tempDir, '.omx', 'plans');
       const statePath = pipelineStatePath(tempDir, 'ralplan-state.json');
       await mkdir(plansDir, { recursive: true });
@@ -606,13 +606,12 @@ describe('Pipeline Orchestrator', () => {
       await writeFile(join(plansDir, 'prd-skip.md'), '# Plan\n');
       await writeFile(join(plansDir, 'test-spec-skip.md'), '# Test Spec\n');
       await writeFile(statePath, JSON.stringify({
-        mode: 'ralplan',
-        current_phase: 'complete',
-        planning_complete: true,
-        ralplan_consensus_gate: {
-          complete: true,
-          ralplan_architect_review: { agent_role: 'architect', verdict: 'approve', summary: 'architect ok' },
-          ralplan_critic_review: { agent_role: 'critic', verdict: 'approve', summary: 'critic ok' },
+        handoff_artifacts: {
+          ralplan_consensus_gate: {
+            complete: true,
+            ralplan_architect_review: { agent_role: 'architect', verdict: 'approve', summary: 'architect ok' },
+            ralplan_critic_review: { agent_role: 'critic', verdict: 'approve', summary: 'critic ok' },
+          },
         },
       }));
 
@@ -624,20 +623,8 @@ describe('Pipeline Orchestrator', () => {
         sessionId: PIPELINE_TEST_SESSION_ID,
       });
 
-      assert.equal(result.status, 'completed');
-      assert.equal(result.stageResults.ralplan.status, 'skipped');
-
-      const ext = await readPipelineState(tempDir);
-      const handoffs = ext?.handoff_artifacts as Record<string, unknown>;
-      assert.ok(handoffs.ralplan, 'skipped ralplan handoff should remain visible');
-      assert.deepEqual(handoffs.ralplan_consensus_gate, {
-        complete: true,
-        sequence: ['architect-review', 'critic-review'],
-        ralplan_architect_review: { agent_role: 'architect', verdict: 'approve', summary: 'architect ok' },
-        ralplan_critic_review: { agent_role: 'critic', verdict: 'approve', summary: 'critic ok' },
-        source: pipelineStatePath(tempDir, 'ralplan-state.json'),
-        blockedReason: null,
-      });
+      assert.equal(result.status, 'failed');
+      assert.equal(result.error, 'ralplan_consensus_evidence_missing');
     });
 
     it('fires onStageTransition callback', async () => {

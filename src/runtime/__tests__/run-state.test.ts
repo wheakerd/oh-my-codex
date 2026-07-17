@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { chmod, mkdir, mkdtemp, readFile, rm } from 'node:fs/promises';
+import { access, chmod, mkdir, mkdtemp, readFile, rename, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
@@ -84,6 +84,27 @@ describe('run state sync', () => {
       assert.equal(synced.outcome, 'blocked_on_user');
       assert.equal(synced.lifecycle_outcome, 'askuserQuestion');
       assert.equal(persisted.lifecycle_outcome, 'askuserQuestion');
+    } finally {
+      restoreAuthority();
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects run-state writes after the committed authority root is replaced', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-run-state-replaced-'));
+    let restoreAuthority = () => {};
+    try {
+      restoreAuthority = await establishFixtureAuthority(wd, 'run-state-replaced');
+      const stateRoot = join(wd, '.omx', 'state');
+      const displacedRoot = join(wd, '.omx', 'state-old');
+      await rename(stateRoot, displacedRoot);
+      await mkdir(stateRoot, { recursive: true, mode: 0o700 });
+
+      await assert.rejects(
+        syncRunStateFromModeState({ mode: 'ralph', active: true }, wd, 'run-state-replaced'),
+        /replaced|fingerprint|authority/i,
+      );
+      await assert.rejects(access(join(stateRoot, 'sessions', 'run-state-replaced', 'run-state.json')));
     } finally {
       restoreAuthority();
       await rm(wd, { recursive: true, force: true });

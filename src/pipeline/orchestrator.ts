@@ -79,7 +79,7 @@ export async function runPipeline(config: PipelineConfig): Promise<PipelineResul
     ...modeState,
     ...pipelineExtension,
     current_phase: config.stages[0].name,
-  }, cwd);
+  }, cwd, undefined, { trustedPipelineProgress: true });
 
   // Execute stages sequentially
   const stageResults: Record<string, StageResult> = {};
@@ -223,7 +223,7 @@ export async function runPipeline(config: PipelineConfig): Promise<PipelineResul
         current_phase: 'failed',
         completed_at: new Date().toISOString(),
         error: result.error,
-      }, cwd);
+      }, cwd, undefined, { trustedPipelineProgress: true });
 
       return {
         status: 'failed',
@@ -247,7 +247,7 @@ export async function runPipeline(config: PipelineConfig): Promise<PipelineResul
           current_phase: 'failed',
           completed_at: new Date().toISOString(),
           error,
-        }, cwd);
+        }, cwd, undefined, { trustedPipelineProgress: true });
 
         return {
           status: 'failed',

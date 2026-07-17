@@ -17,6 +17,8 @@ import {
   readWorkspaceAuthorityAnchor,
   resolveStateAuthorityForGuard,
   sameRootFilesystemIdentity,
+  withStateAuthorityTransaction,
+  type ResolvedStateAuthorityContext,
   type RootFilesystemIdentity,
   type WorkspaceIdentity,
 } from '../state/authority.js';
@@ -50,6 +52,7 @@ interface AuthenticatedAuthorityTuple {
 }
 
 let authorityTuple: AuthenticatedAuthorityTuple | undefined;
+let retainedAuthorityContext: ResolvedStateAuthorityContext | undefined;
 
 async function retainActiveAuthorityTuple(): Promise<AuthenticatedAuthorityTuple> {
   const authority = await resolveStateAuthorityForGuard({
@@ -57,6 +60,7 @@ async function retainActiveAuthorityTuple(): Promise<AuthenticatedAuthorityTuple
     observed_cwd: cwd,
     session_id: process.env.OMX_SESSION_ID || undefined,
   });
+  retainedAuthorityContext = authority;
   const binding = authority.session_binding;
   const anchor = await readWorkspaceAuthorityAnchor(authority.workspace_identity);
   if (!binding || !anchor?.active_lease
@@ -99,11 +103,18 @@ async function requireRetainedActiveAuthority(): Promise<void> {
 async function withRetainedActiveAuthority<T>(
   callback: (stateRoot: string) => Promise<T>,
 ): Promise<T> {
+  const context = retainedAuthorityContext;
+  if (!context) {
+    stopping = true;
+    throw new Error('watcher authority changed or terminalized');
+  }
   try {
-    await requireRetainedActiveAuthority();
-    const result = await callback(stateDir);
-    await requireRetainedActiveAuthority();
-    return result;
+    return await withStateAuthorityTransaction(context, async (active) => {
+      await requireRetainedActiveAuthority();
+      const result = await callback(active.canonical_state_root);
+      await requireRetainedActiveAuthority();
+      return result;
+    });
   } catch (error) {
     stopping = true;
     throw error;

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
@@ -7,6 +7,11 @@ import { describe, it } from 'node:test';
 import { ralplanCommand } from '../../cli/ralplan.js';
 import { readSubagentTrackingState, subagentTrackingPath } from '../../subagents/tracker.js';
 import { dispatchCodexNativeHook } from '../codex-native-hook.js';
+import {
+  initializeStateAuthority,
+  mintStateAuthorityTransportCapability,
+} from '../../state/authority.js';
+import { buildStateAuthorityTransportEnv } from '../../state/transport-env.js';
 
 // #3181 durable bootstrap-order recovery: a crash/restart AFTER the authenticated adapted
 // Architect role intent is durably recorded but BEFORE the first worker spawn must, on the
@@ -51,6 +56,20 @@ async function withFreshEnv(fn: () => Promise<void>): Promise<void> {
   }
 }
 
+async function installAuthenticatedAuthority(cwd: string, sessionId: string): Promise<void> {
+  await mkdir(join(cwd, '.omx', 'state'), { recursive: true, mode: 0o700 });
+  await chmod(join(cwd, '.omx'), 0o700);
+  await chmod(join(cwd, '.omx', 'state'), 0o700);
+  const authority = await initializeStateAuthority({
+    startup_cwd: cwd,
+    observed_cwd: cwd,
+    launch_id: `${sessionId}-launch`,
+    session_binding: { canonical_session_id: sessionId },
+  });
+  await mintStateAuthorityTransportCapability(authority);
+  Object.assign(process.env, buildStateAuthorityTransportEnv(authority, { OMX_SESSION_ID: sessionId }));
+}
+
 // Both plugin and legacy delivery drive the same native hook + CLI + tracker recovery path.
 // Leader attestation is established only on the strictly-gated fresh leader PreToolUse
 // entry point (the role-intent command's own PreToolUse fires before it executes); both
@@ -61,6 +80,7 @@ const DELIVERIES: Array<{ label: string; event: 'SessionStart' | 'PreToolUse' }>
 ];
 
 async function seedAuthenticatedLeader(cwd: string, sessionId: string, event: 'SessionStart' | 'PreToolUse'): Promise<void> {
+  await installAuthenticatedAuthority(cwd, sessionId);
   if (event === 'SessionStart') {
     await dispatchCodexNativeHook({ hook_event_name: 'SessionStart', cwd, session_id: sessionId }, { cwd, sessionOwnerPid: process.pid });
   } else {

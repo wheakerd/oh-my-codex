@@ -89,15 +89,33 @@ describe('modes/base tmux pane capture', () => {
       const prevTmux = process.env.TMUX;
       const prevPath = process.env.PATH;
       const prevHudOwner = process.env.OMX_TMUX_HUD_OWNER;
+      const prevTmuxBinary = process.env.TMUX_BINARY;
       process.env.TMUX_PANE = '%123';
       const wd = await mkdtemp(join(tmpdir(), 'omx-mode-pane-'));
       try {
         const fakeBin = join(wd, 'fake-bin');
         await mkdir(fakeBin, { recursive: true });
         const fakeTmux = join(fakeBin, 'tmux');
+        process.env.TMUX_BINARY = fakeTmux;
         await writeFile(fakeTmux, `#!/usr/bin/env bash
+if [[ "$1" == "list-panes" ]]; then
+  printf '%%123\\t0\\t4242\\n'
+  exit 0
+fi
+if [[ "$1" == "set-option" ]]; then
+  printf '%s' "\${@: -1}" > "$0.owner"
+  exit 0
+fi
+if [[ "$1" == "show-option" ]]; then
+  cat "$0.owner"
+  exit 0
+fi
 if [[ "$1" == "display-message" && "$*" == *"#{window_id}"* ]]; then
   echo "@7"
+  exit 0
+fi
+if [[ "$1" == "display-message" && "$*" == *"#{session_name}"* ]]; then
+  echo "test-session"
   exit 0
 fi
 exit 1
@@ -111,6 +129,9 @@ exit 1
         const raw = JSON.parse(await readFile(modeStatePath(wd, 'ralph'), 'utf-8'));
         assert.equal(raw.tmux_pane_id, '%123');
         assert.equal(raw.tmux_window_id, '@7');
+        assert.equal(raw.tmux_pane_pid, 4242);
+        assert.equal(raw.tmux_session_name, 'test-session');
+        assert.match(raw.tmux_pane_owner_id, /^ralph:/);
         assert.ok(typeof raw.tmux_pane_set_at === 'string' && raw.tmux_pane_set_at.length > 0);
       } finally {
         if (typeof prev === 'string') process.env.TMUX_PANE = prev;
@@ -121,6 +142,8 @@ exit 1
         else delete process.env.PATH;
         if (typeof prevHudOwner === 'string') process.env.OMX_TMUX_HUD_OWNER = prevHudOwner;
         else delete process.env.OMX_TMUX_HUD_OWNER;
+        if (typeof prevTmuxBinary === 'string') process.env.TMUX_BINARY = prevTmuxBinary;
+        else delete process.env.TMUX_BINARY;
         await rm(wd, { recursive: true, force: true });
       }
     });

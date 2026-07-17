@@ -1754,6 +1754,26 @@ esac
           dirPrefix: 'omx-runtime-startup-no-evidence-bin-',
           tmuxScript: (tmuxLogPath) => `#!/bin/sh
 set -eu
+owner_file="${tmuxLogPath}.owner"
+if [ "\${1:-}" = "list-panes" ] && [ "\${2:-}" = "-a" ]; then
+  printf '%%1\t0\t2000004321\n%%2\t0\t2000004321\n%%3\t0\t2000003333\n'
+  exit 0
+fi
+
+if [ "\${1:-}" = "set-option" ]; then
+  case "$*" in
+    *"@omx_team_pane_owner_id"*)
+      owner=""
+      for arg in "$@"; do owner="$arg"; done
+      printf '%s\n' "$owner" > "$owner_file"
+      ;;
+  esac
+  exit 0
+fi
+if [ "\${1:-}" = "show-option" ] && [ -f "$owner_file" ]; then
+  cat "$owner_file"
+  exit 0
+fi
 printf '%s\\n' "$*" >> "${tmuxLogPath}"
 case "$1" in
   -V)
@@ -2649,6 +2669,26 @@ esac
           dirPrefix: 'omx-runtime-interactive-mcp-cleanup-bin-',
           tmuxScript: (tmuxLogPath) => `#!/bin/sh
 set -eu
+owner_file="${tmuxLogPath}.owner"
+if [ "\${1:-}" = "list-panes" ] && [ "\${2:-}" = "-a" ]; then
+  printf '%%1\t0\t2000001111\n%%2\t0\t2000002222\n%%3\t0\t2000003333\n'
+  exit 0
+fi
+
+if [ "\${1:-}" = "set-option" ]; then
+  case "$*" in
+    *"@omx_team_pane_owner_id"*)
+      owner=""
+      for arg in "$@"; do owner="$arg"; done
+      printf '%s\n' "$owner" > "$owner_file"
+      ;;
+  esac
+  exit 0
+fi
+if [ "\${1:-}" = "show-option" ] && [ -f "$owner_file" ]; then
+  cat "$owner_file"
+  exit 0
+fi
 printf '%s\n' "$*" >> "${tmuxLogPath}"
 case "\${1:-}" in
   -V)
@@ -2764,6 +2804,26 @@ esac
           dirPrefix: 'omx-runtime-pane-pid-bin-',
           tmuxScript: (tmuxLogPath) => `#!/bin/sh
 set -eu
+owner_file="${tmuxLogPath}.owner"
+if [ "\${1:-}" = "list-panes" ] && [ "\${2:-}" = "-a" ]; then
+  printf '%%1\t0\t2000001111\n%%2\t0\t2000002222\n%%3\t0\t2000003333\n'
+  exit 0
+fi
+
+if [ "\${1:-}" = "set-option" ]; then
+  case "$*" in
+    *"@omx_team_pane_owner_id"*)
+      owner=""
+      for arg in "$@"; do owner="$arg"; done
+      printf '%s\n' "$owner" > "$owner_file"
+      ;;
+  esac
+  exit 0
+fi
+if [ "\${1:-}" = "show-option" ] && [ -f "$owner_file" ]; then
+  cat "$owner_file"
+  exit 0
+fi
 printf '%s\n' "$*" >> "${tmuxLogPath}"
 case "\${1:-}" in
   -V)
@@ -2899,6 +2959,26 @@ esac
           dirPrefix: 'omx-runtime-startup-direct-fast-bin-',
           tmuxScript: () => `#!/bin/sh
 set -eu
+owner_file="${cwd}/startup-direct.owner"
+if [ "\${1:-}" = "list-panes" ] && [ "\${2:-}" = "-a" ]; then
+  printf '%%1\t0\t2000004242\n%%2\t0\t2000004242\n%%3\t0\t2000003333\n'
+  exit 0
+fi
+
+if [ "\${1:-}" = "set-option" ]; then
+  case "$*" in
+    *"@omx_team_pane_owner_id"*)
+      owner=""
+      for arg in "$@"; do owner="$arg"; done
+      printf '%s\n' "$owner" > "$owner_file"
+      ;;
+  esac
+  exit 0
+fi
+if [ "\${1:-}" = "show-option" ] && [ -f "$owner_file" ]; then
+  cat "$owner_file"
+  exit 0
+fi
 order_file="${cwd}/startup-order.log"
 count_file="${cwd}/startup-capture-count"
 case "$1" in
@@ -3024,6 +3104,26 @@ esac
           dirPrefix: 'omx-runtime-ready-prompt-evidence-bin-',
           tmuxScript: () => `#!/bin/sh
 set -eu
+owner_file="${cwd}/ready-prompt.owner"
+if [ "\${1:-}" = "list-panes" ] && [ "\${2:-}" = "-a" ]; then
+  printf '%%1\t0\t2000004242\n%%2\t0\t2000004242\n%%3\t0\t2000003333\n'
+  exit 0
+fi
+
+if [ "\${1:-}" = "set-option" ]; then
+  case "$*" in
+    *"@omx_team_pane_owner_id"*)
+      owner=""
+      for arg in "$@"; do owner="$arg"; done
+      printf '%s\n' "$owner" > "$owner_file"
+      ;;
+  esac
+  exit 0
+fi
+if [ "\${1:-}" = "show-option" ] && [ -f "$owner_file" ]; then
+  cat "$owner_file"
+  exit 0
+fi
 count_file="${cwd}/capture-count"
 case "$1" in
   -V)
@@ -3167,6 +3267,26 @@ esac
           dirPrefix: 'omx-runtime-ready-timeout-no-evidence-bin-',
           tmuxScript: (tmuxLogPath) => `#!/bin/sh
 set -eu
+owner_file="${tmuxLogPath}.owner"
+if [ "\${1:-}" = "list-panes" ] && [ "\${2:-}" = "-a" ]; then
+  printf '%%1\t0\t2000004242\n%%2\t0\t2000004242\n%%3\t0\t2000003333\n'
+  exit 0
+fi
+
+if [ "\${1:-}" = "set-option" ]; then
+  case "$*" in
+    *"@omx_team_pane_owner_id"*)
+      owner=""
+      for arg in "$@"; do owner="$arg"; done
+      printf '%s\n' "$owner" > "$owner_file"
+      ;;
+  esac
+  exit 0
+fi
+if [ "\${1:-}" = "show-option" ] && [ -f "$owner_file" ]; then
+  cat "$owner_file"
+  exit 0
+fi
 printf '%s\\n' "$*" >> "${tmuxLogPath}"
 case "$1" in
   -V)
@@ -3282,6 +3402,26 @@ esac
           dirPrefix: 'omx-runtime-parallel-ready-bin-',
           tmuxScript: () => `#!/bin/sh
 set -eu
+owner_file="${cwd}/parallel-ready.owner"
+if [ "\${1:-}" = "list-panes" ] && [ "\${2:-}" = "-a" ]; then
+  printf '%%1\t0\t2000004242\n%%2\t0\t2000004242\n%%3\t0\t2000003333\n'
+  exit 0
+fi
+
+if [ "\${1:-}" = "set-option" ]; then
+  case "$*" in
+    *"@omx_team_pane_owner_id"*)
+      owner=""
+      for arg in "$@"; do owner="$arg"; done
+      printf '%s\n' "$owner" > "$owner_file"
+      ;;
+  esac
+  exit 0
+fi
+if [ "\${1:-}" = "show-option" ] && [ -f "$owner_file" ]; then
+  cat "$owner_file"
+  exit 0
+fi
 order_file="${cwd}/ready-order.log"
 case "$1" in
   -V)

@@ -17,6 +17,7 @@ import {
   type SkillActiveEntry,
 } from "../state/skill-active.js";
 import {
+  attestLeaderThread,
   isTrustedSubagentThread,
   OMX_ADAPTED_PROVENANCE,
   readSubagentSessionSummary,
@@ -3551,6 +3552,20 @@ function readRequestedSpawnRole(payload: CodexHookPayload): string {
 function isTypedAgentRolePayload(payload: CodexHookPayload): boolean {
 	const agentRole = readPayloadAgentRole(payload);
 	return agentRole !== "" && resolveInstalledRoleName(agentRole) !== null;
+}
+
+function hasStrictNativeLeaderProvenance(payload: CodexHookPayload, nativeSessionId: string, threadId: string): boolean {
+  if (!nativeSessionId || nativeSessionId !== threadId || readPayloadThreadId(payload) !== nativeSessionId) return false;
+  const source = safeObject(payload.source);
+  const subagent = source.subagent;
+  if (subagent !== undefined && subagent !== null) return false;
+  const roleCarrierValues = [
+    payload.agent_role,
+    payload.agentRole,
+    payload.agent_type,
+    payload.agentType,
+  ];
+  return roleCarrierValues.every((value) => value === undefined || value === null || value === '');
 }
 
 function buildNativeUnknownRolePreToolUseOutput(
@@ -10842,14 +10857,7 @@ export async function dispatchCodexNativeHook(
     ultragoalSteeringAdditionalContext = steeringProposal && !isSubagentPromptSubmit
       ? await applyUserPromptUltragoalSteering(workspaceCwd, prompt).catch((error) => `OMX native UserPromptSubmit rejected bounded .omx/ultragoal steering for G002-cli-and-prompt-submit-bridge: ${error instanceof Error ? error.message : String(error)}`)
       : null;
-    const hasKeywordIntent = Boolean(
-      promptClassification
-      && (
-        promptClassification.matches.length !== 0
-        || promptClassification.hasExplicitLikeInvocation
-        || promptClassification.reservedInput !== null
-      )
-    );
+    const hasKeywordIntent = Boolean(promptClassification?.matches.length);
     if (hasKeywordIntent && !authority) {
       return {
         hookEventName,
@@ -11076,6 +11084,46 @@ export async function dispatchCodexNativeHook(
         safeString(currentSessionState?.native_session_id).trim(),
       )
       : false;
+    const pointerNativeSessionId = normalizeSessionId(sessionEvidence.raw?.native_session_id) ?? '';
+    const pointerCanonicalSessionId = normalizeSessionId(sessionEvidence.raw?.session_id) ?? '';
+    const hasAuthorityBoundNativePointer = Boolean(
+      sessionEvidence.present
+      && pointerNativeSessionId === payloadSessionId
+      && pointerCanonicalSessionId
+      && authority
+      && authorityBindsSessionId(authority, pointerCanonicalSessionId),
+    );
+    const mayAttestNativeLeader = Boolean(
+      authority
+      && payloadSessionId
+      && hasStrictNativeLeaderProvenance(payload, payloadSessionId, threadId)
+      && authorityBindsSessionId(authority, payloadSessionId)
+      && !rootPointerConflict
+      && (!sessionEvidence.present || hasAuthorityBoundNativePointer)
+    );
+    if (mayAttestNativeLeader && !isKnownSubagentPreToolUse) {
+      if (!currentSessionState && !sessionEvidence.present) {
+        const sessionState = await reconcileNativeSessionStart(workspaceCwd, payloadSessionId, {
+          pid: options.sessionOwnerPid ?? resolveSessionOwnerPid(payload),
+        });
+        canonicalSessionId = normalizeSessionId(sessionState.session_id) ?? '';
+        resolvedNativeSessionId = normalizeSessionId(sessionState.native_session_id) ?? payloadSessionId;
+      } else if (!currentSessionState) {
+        canonicalSessionId = pointerCanonicalSessionId;
+        resolvedNativeSessionId = pointerNativeSessionId;
+      }
+      if (
+        canonicalSessionId
+        && resolvedNativeSessionId === payloadSessionId
+        && authorityBindsSessionId(authority!, canonicalSessionId)
+      ) {
+        attestLeaderThread(workspaceCwd, {
+          sessionId: canonicalSessionId,
+          leaderThreadId: payloadSessionId,
+          source: 'native-pretooluse',
+        }, stateDir);
+      }
+    }
     const preToolUseSessionId = payloadSessionId
       ? await resolveInternalSessionIdForPayload(
         cwd,

@@ -1,15 +1,15 @@
-import { describe, it, mock } from 'node:test';
+import { afterEach, beforeEach, describe, it, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
-import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import {
   detectKeywords,
   detectPrimaryKeyword,
   classifyKeywordInput,
   KEYWORD_INERT_DIAGNOSTIC_ORDER,
-  recordSkillActivation,
+  recordSkillActivation as rawRecordSkillActivation,
   DEEP_INTERVIEW_STATE_FILE,
   DEEP_INTERVIEW_BLOCKED_APPROVAL_INPUTS,
   DEEP_INTERVIEW_INPUT_LOCK_MESSAGE,
@@ -23,6 +23,134 @@ import {
   KEYWORD_TRIGGER_DEFINITIONS,
 } from '../keyword-registry.js';
 import { evaluateResolvedPromptTurn } from '../prompt-session-provenance.js';
+import {
+  initializeStateAuthority,
+  mintStateAuthorityTransportCapability,
+  rolloverStateAuthorityToAlternateRoot,
+} from '../../state/authority.js';
+import { buildStateAuthorityTransportEnv } from '../../state/transport-env.js';
+
+const AUTHORITY_ENV_KEYS = [
+  'OMX_STARTUP_CWD',
+  'OMX_ROOT',
+  'OMX_STATE_ROOT',
+  'OMX_TEAM_STATE_ROOT',
+  'OMX_SESSION_ID',
+  'OMX_STATE_AUTHORITY_PATH',
+  'OMX_STATE_AUTHORITY_ID',
+  'OMX_STATE_AUTHORITY_GENERATION_ID',
+  'OMX_STATE_AUTHORITY_WORKSPACE_DIGEST',
+  'OMX_STATE_AUTHORITY_CAPABILITY',
+] as const;
+let savedAuthorityEnvironment: Map<string, string | undefined>;
+const testAuthorities = new Map<string, Awaited<ReturnType<typeof initializeStateAuthority>>>();
+const TEST_AUTHORITY_ISSUER = {
+  kind: 'first-party-launcher' as const,
+  package_version: 'test',
+  package_digest: '0'.repeat(64),
+};
+
+beforeEach(() => {
+  savedAuthorityEnvironment = new Map(AUTHORITY_ENV_KEYS.map((key) => [key, process.env[key]]));
+  testAuthorities.clear();
+});
+
+afterEach(() => {
+  for (const [key, value] of savedAuthorityEnvironment) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+});
+
+let keywordAuthorityLock: Promise<void> = Promise.resolve();
+
+async function withKeywordAuthorityLock<T>(operation: () => Promise<T>): Promise<T> {
+  const previous = keywordAuthorityLock;
+  let release!: () => void;
+  keywordAuthorityLock = new Promise<void>((resolve) => { release = resolve; });
+  await previous;
+  try {
+    return await operation();
+  } finally {
+    release();
+  }
+}
+
+async function secureKeywordFixtureDirectories(root: string): Promise<void> {
+  await chmod(root, 0o700).catch(() => {});
+  for (const entry of await readdir(root, { withFileTypes: true }).catch(() => [])) {
+    if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
+    await secureKeywordFixtureDirectories(join(root, entry.name));
+  }
+}
+
+async function withKeywordTestAuthority<T>(
+  input: Parameters<typeof rawRecordSkillActivation>[0],
+  operation: (authority: Awaited<ReturnType<typeof initializeStateAuthority>>, sourceCwd: string) => Promise<T>,
+): Promise<T> {
+  return withKeywordAuthorityLock(async () => {
+    const previousEnvironment = new Map(AUTHORITY_ENV_KEYS.map((key) => [key, process.env[key]]));
+    try {
+      const resolvedStateDir = resolve(input.stateDir);
+      const sourceCwd = input.sourceCwd
+        ?? (resolvedStateDir.endsWith('/.omx/state')
+          ? dirname(dirname(resolvedStateDir))
+          : `${resolvedStateDir}-workspace`);
+      let authority = testAuthorities.get(sourceCwd);
+      if (!authority) {
+        await mkdir(sourceCwd, { recursive: true, mode: 0o700 });
+        await mkdir(join(sourceCwd, '.omx', 'state'), { recursive: true, mode: 0o700 });
+        await chmod(sourceCwd, 0o700);
+        await chmod(join(sourceCwd, '.omx'), 0o700);
+        await chmod(join(sourceCwd, '.omx', 'state'), 0o700);
+        authority = await initializeStateAuthority({
+          startup_cwd: sourceCwd,
+          observed_cwd: sourceCwd,
+          launch_id: `keyword-detector-test-${testAuthorities.size}`,
+          session_binding: { canonical_session_id: input.sessionId ?? 'keyword-detector-test' },
+        });
+        await secureKeywordFixtureDirectories(sourceCwd);
+        await mkdir(resolvedStateDir, { recursive: true, mode: 0o700 });
+        await secureKeywordFixtureDirectories(dirname(resolvedStateDir));
+        await secureKeywordFixtureDirectories(resolvedStateDir);
+        if (resolvedStateDir !== resolve(authority.canonical_state_root)) {
+          authority = await rolloverStateAuthorityToAlternateRoot({
+            context: authority,
+            transport_capability: (await mintStateAuthorityTransportCapability(authority)).capability,
+            proposed_state_root: resolvedStateDir,
+            creation_root: resolvedStateDir,
+            launch_id: `keyword-detector-test-boxed-${testAuthorities.size}`,
+            consumer_kind: 'boxed',
+            issuer: TEST_AUTHORITY_ISSUER,
+          });
+        }
+        await mintStateAuthorityTransportCapability(authority);
+        testAuthorities.set(sourceCwd, authority);
+      }
+      await secureKeywordFixtureDirectories(dirname(resolvedStateDir));
+      await secureKeywordFixtureDirectories(resolvedStateDir);
+      Object.assign(process.env, buildStateAuthorityTransportEnv(authority, {
+        OMX_SESSION_ID: input.sessionId ?? 'keyword-detector-test',
+      }));
+      return await operation(authority, sourceCwd);
+    } finally {
+      for (const [key, value] of previousEnvironment) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  });
+}
+
+async function recordSkillActivation(
+  input: Parameters<typeof rawRecordSkillActivation>[0],
+): ReturnType<typeof rawRecordSkillActivation> {
+  return withKeywordTestAuthority(input, async (authority, sourceCwd) => rawRecordSkillActivation({
+    ...input,
+    sourceCwd: input.sourceCwd ?? sourceCwd,
+    expectedRootIdentity: input.expectedRootIdentity ?? authority.generation.root_identity,
+  }));
+}
 
 async function withIsolatedHome<T>(prefix: string, run: (homeDir: string) => Promise<T>): Promise<T> {
   const homeDir = await mkdtemp(join(tmpdir(), `omx-keyword-home-${prefix}-`));
@@ -4253,7 +4381,12 @@ deepMaxRounds = 21
     try {
       await mkdir(stateDir, { recursive: true });
 
-      await persistDeepInterviewModeState(
+      await withKeywordTestAuthority({
+        stateDir,
+        sourceCwd: cwd,
+        text: '$deep-interview initialize persistence test',
+        sessionId: 'sess-sync',
+      }, async (authority) => persistDeepInterviewModeState(
         stateDir,
         {
           version: 1,
@@ -4275,8 +4408,8 @@ deepMaxRounds = 21
         },
         '2026-02-25T00:00:00.000Z',
         null,
-        { sessionId: 'sess-sync' },
-      );
+        { sessionId: 'sess-sync', expectedRootIdentity: authority.generation.root_identity },
+      ));
 
       const modeState = JSON.parse(
         await readFile(join(stateDir, 'sessions', 'sess-sync', DEEP_INTERVIEW_STATE_FILE), 'utf-8'),
@@ -4311,7 +4444,12 @@ deepMaxRounds = 21
         }, null, 2),
       );
 
-      await persistDeepInterviewModeState(
+      await withKeywordTestAuthority({
+        stateDir,
+        sourceCwd: cwd,
+        text: '$deep-interview reactivate question enforcement test',
+        sessionId: 'sess-reactivate',
+      }, async (authority) => persistDeepInterviewModeState(
         stateDir,
         {
           version: 1,
@@ -4333,8 +4471,8 @@ deepMaxRounds = 21
         },
         '2026-04-10T00:11:00.000Z',
         null,
-        { sessionId: 'sess-reactivate' },
-      );
+        { sessionId: 'sess-reactivate', expectedRootIdentity: authority.generation.root_identity },
+      ));
 
       const reactivated = JSON.parse(
         await readFile(join(stateDir, 'sessions', 'sess-reactivate', DEEP_INTERVIEW_STATE_FILE), 'utf-8'),
@@ -4810,17 +4948,23 @@ deepMaxRounds = 21
     });
 
     try {
-      const blockingFile = join(cwd, 'state-root-file');
-      await writeFile(blockingFile, 'not a directory');
-
-      const result = await recordSkillActivation({
-        stateDir: join(blockingFile, 'nested', 'state-dir'),
+      const stateDir = join(cwd, '.omx', 'state');
+      const result = await withKeywordTestAuthority({
+        stateDir,
+        sourceCwd: cwd,
         text: 'please run $autopilot',
-        nowIso: '2026-02-25T00:00:00.000Z',
+      }, async (authority) => {
+        await mkdir(join(stateDir, 'autopilot-state.json'));
+        return rawRecordSkillActivation({
+          stateDir,
+          sourceCwd: cwd,
+          text: 'please run $autopilot',
+          nowIso: '2026-02-25T00:00:00.000Z',
+          expectedRootIdentity: authority.generation.root_identity,
+        });
       });
 
-      assert.ok(result);
-      assert.equal(result.skill, 'autopilot');
+      assert.equal(result, null);
       assert.equal(warnings.length, 1);
       assert.match(String(warnings[0][0]), /failed to persist keyword activation state/);
     } finally {

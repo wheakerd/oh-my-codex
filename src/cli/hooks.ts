@@ -1,5 +1,6 @@
+import { randomUUID } from 'node:crypto';
 import { existsSync } from 'fs';
-import { mkdir, readFile, writeFile } from 'fs/promises';
+import { chmod, mkdir, readFile, writeFile } from 'fs/promises';
 import { join } from 'path';
 import { pathToFileURL } from 'url';
 import { buildHookEvent } from '../hooks/extensibility/events.js';
@@ -7,6 +8,11 @@ import { dispatchHookEvent } from '../hooks/extensibility/dispatcher.js';
 import { discoverHookPlugins, isHookPluginsEnabled } from '../hooks/extensibility/loader.js';
 import type { HookPluginDescriptor } from '../hooks/extensibility/types.js';
 import { resolveCommittedAuthorityRuntimeStateScope } from '../mcp/state-paths.js';
+import {
+  AUTHORITY_DIAGNOSTIC_CODES,
+  StateAuthorityError,
+  initializeStateAuthority,
+} from '../state/authority.js';
 
 const HELP = `
 Usage:
@@ -206,10 +212,27 @@ function pluginStatusFromResult(result: Record<string, unknown>): string {
   return 'unknown';
 }
 
+async function resolveHooksTestAuthorityScope(cwd: string) {
+  try {
+    return await resolveCommittedAuthorityRuntimeStateScope(cwd);
+  } catch (error) {
+    if (!(error instanceof StateAuthorityError)
+      || error.code !== AUTHORITY_DIAGNOSTIC_CODES.anchorMissing) throw error;
+    await chmod(join(cwd, '.omx'), 0o700);
+    await initializeStateAuthority({
+      startup_cwd: cwd,
+      observed_cwd: cwd,
+      launch_id: `hooks-test-${randomUUID()}`,
+      session_binding: { canonical_session_id: 'omx-hooks-test' },
+    });
+    return resolveCommittedAuthorityRuntimeStateScope(cwd);
+  }
+}
+
 async function testHooks(): Promise<void> {
   const cwd = process.cwd();
   const discovered = await discoverHookPlugins(cwd);
-  const authorityScope = await resolveCommittedAuthorityRuntimeStateScope(cwd);
+  const authorityScope = await resolveHooksTestAuthorityScope(cwd);
 
   const event = buildHookEvent('turn-complete', {
     source: 'native',

@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, it } from 'node:test';
 import { questionCommand } from '../question.js';
 import { AUTOPILOT_DEEP_INTERVIEW_QUESTION_OWNER_ENV } from '../../question/autopilot-wait.js';
-import { markQuestionAnswered, readQuestionRecord } from '../../question/state.js';
+import { createQuestionRecord, markQuestionAnswered, readQuestionRecord } from '../../question/state.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(__dirname, '..', '..', '..');
@@ -923,6 +923,40 @@ esac
       else delete process.env.OMX_STATE_ROOT;
       if (typeof originalOmxTeamStateRoot === 'string') process.env.OMX_TEAM_STATE_ROOT = originalOmxTeamStateRoot;
       else delete process.env.OMX_TEAM_STATE_ROOT;
+    }
+  });
+
+  it('answers through the caller-provided authoritative state directory', async () => {
+    const cwd = await makeRepo();
+    const authoritativeStateDir = join(cwd, 'committed-state');
+    const { record } = await createQuestionRecord(cwd, {
+      question: 'Pick one',
+      options: [{ label: 'A', value: 'a' }],
+      allow_other: false,
+      other_label: 'Other',
+      multi_select: false,
+    }, 'sess-q', new Date(), { stateDir: authoritativeStateDir });
+    const writes: string[] = [];
+    const originalWrite = process.stdout.write;
+    process.stdout.write = ((chunk: string | Uint8Array) => {
+      writes.push(String(chunk));
+      return true;
+    }) as typeof process.stdout.write;
+    try {
+      await questionCommand([
+        '--answer-question-id',
+        record.question_id,
+        '--answer',
+        JSON.stringify({ answer: { kind: 'option', value: 'a' } }),
+        '--session-id',
+        'sess-q',
+        '--json',
+      ], { stateDir: authoritativeStateDir });
+      const payload = JSON.parse(writes.join('')) as { ok: boolean; record_path: string };
+      assert.equal(payload.ok, true);
+      assert.match(payload.record_path, /committed-state/);
+    } finally {
+      process.stdout.write = originalWrite;
     }
   });
 

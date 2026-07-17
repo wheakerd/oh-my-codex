@@ -12,6 +12,7 @@ import { writeFile, mkdir } from 'fs/promises';
 import { join } from 'path';
 import { logNotifyHookEvent } from './log.js';
 import { safeString } from './utils.js';
+import { resolveStateAuthorityForGuard } from '../../state/authority.js';
 
 /** Structured patterns that reliably indicate a verification verdict. */
 const VERDICT_PATTERNS = [
@@ -46,12 +47,26 @@ async function maybePersistRuntimeVisualFeedback({ cwd, output, sessionId, state
 
   const { buildVisualLoopFeedback } = await import('../../visual/verdict.js');
   const { recordRalphVisualFeedback } = await import('../../ralph/persistence.js');
+  const authority = await resolveStateAuthorityForGuard({
+    startup_cwd: cwd,
+    observed_cwd: cwd,
+    session_id: sessionId || undefined,
+  });
+  if (stateDir !== authority.canonical_state_root) {
+    throw new Error('runtime visual feedback state directory does not match the committed authority state root');
+  }
 
   for (const candidate of candidates) {
     try {
       const parsed = JSON.parse(candidate);
       const feedback = buildVisualLoopFeedback(parsed);
-      await recordRalphVisualFeedback(cwd, feedback, sessionId || undefined, stateDir || undefined);
+      await recordRalphVisualFeedback(
+        cwd,
+        feedback,
+        sessionId || undefined,
+        authority.canonical_state_root,
+        authority.generation.root_identity,
+      );
       return;
     } catch {
       // Try next candidate

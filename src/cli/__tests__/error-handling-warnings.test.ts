@@ -25,9 +25,7 @@ describe('error-handling warning guards', () => {
     assert.equal(esrchGuardCount, 1);
     assert.match(source, /export async function reapStaleNotifyFallbackWatcher/);
     assert.match(source, /failed to stop stale notify fallback watcher/);
-    assert.match(source, /failed to write notify fallback watcher pid file/);
     assert.match(source, /failed to write hook-derived watcher pid file/);
-    assert.match(source, /failed to remove notify fallback watcher pid file/);
     assert.match(source, /failed to remove hook-derived watcher pid file/);
     assert.match(source, /buildWindowsMsysBackgroundHelperBootstrapScript/);
     assert.match(source, /detached:\s*shouldDetachBackgroundHelper\(options\.env,\s*process\.platform\),\s+stdio: "ignore",\s+windowsHide: true,/);

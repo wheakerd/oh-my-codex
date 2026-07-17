@@ -64,7 +64,22 @@ if [[ "$cmd" == "paste-buffer" ]]; then
 fi
 if [[ "$cmd" == "show-option" ]]; then
   if [[ "$*" == *"@omx_team_pane_owner_id" ]]; then
-    echo "delivery-smoke-owner"
+    target=""
+    while [[ "$#" -gt 0 ]]; do
+      if [[ "$1" == "-t" ]]; then
+        shift
+        target="$1"
+        break
+      fi
+      shift
+    done
+    owner_path="${tmuxLogPath}.owner.$target"
+
+    if [[ -f "$owner_path" ]]; then
+      cat "$owner_path"
+    else
+      echo "delivery-smoke-owner"
+    fi
     exit 0
   fi
   exit 1
@@ -105,7 +120,7 @@ if [[ "$cmd" == "display-message" ]]; then
     exit 0
   fi
   if [[ "$fmt" == "#S" ]]; then
-    echo "session-test"
+    if [[ -f "${tmuxLogPath}.session" ]]; then cat "${tmuxLogPath}.session"; else echo "session-test"; fi
     exit 0
   fi
   exit 0
@@ -116,9 +131,32 @@ fi
 if [[ "$cmd" == "list-panes" ]]; then
   if [[ "$#" -eq 3 && "$1" == "-a" && "$2" == "-F" && "$3" == "#{pane_id}\t#{pane_dead}\t#{pane_pid}" ]]; then
     printf '%%10\t0\t111\n%%11\t0\t112\n%%12\t0\t113\n%%95\t0\t195\n%%96\t0\t196\n'
+  elif [[ "$#" -eq 4 && "$1" == "-t" && "$3" == "-F" && "$4" == "#{pane_pid}" ]]; then
+    case "$2" in
+      %10) echo 111 ;;
+      %11) echo 112 ;;
+      %12) echo 113 ;;
+      %95) echo 195 ;;
+      %96) echo 196 ;;
+      *) exit 1 ;;
+    esac
   else
     printf '%%10\t111\n%%11\t112\n%%12\t113\n%%95\t195\n%%96\t196\n'
   fi
+  exit 0
+fi
+if [[ "$cmd" == "set-option" && "$*" == *"@omx_team_pane_owner_id" ]]; then
+  target=""
+  owner=""
+  while [[ "$#" -gt 0 ]]; do
+    if [[ "$1" == "-t" ]]; then
+      shift
+      target="$1"
+    fi
+    owner="$1"
+    shift || true
+  done
+  printf '%s' "$owner" > "${tmuxLogPath}.owner.$target"
   exit 0
 fi
 exit 0
@@ -148,7 +186,7 @@ function writeJson(file, value) {
 }
 function nowIso() { return new Date().toISOString(); }
 if (argv[0] === 'schema') {
-  process.stdout.write(JSON.stringify({ schema_version: 1, commands: ['acquire-authority','renew-authority','queue-dispatch','mark-notified','mark-delivered','mark-failed','request-replay','capture-snapshot'], events: [], transport: 'tmux' }) + '\\n');
+  process.stdout.write(JSON.stringify({ schema_version: 1, commands: ['acquire-authority','renew-authority','queue-dispatch','mark-notified','mark-delivered','mark-failed','remove-dispatch-records','request-replay','capture-snapshot'], events: [], transport: 'tmux' }) + '\n');
   process.exit(0);
 }
 if (argv[0] !== 'exec') process.exit(1);
@@ -286,8 +324,12 @@ async function configurePaneIds(teamName: string, cwd: string, leaderPaneId: str
   assert.ok(config, 'missing team config');
   if (!config) throw new Error('missing team config');
   config.leader_pane_id = leaderPaneId;
+  config.tmux_session = config.tmux_session || `omx-${teamName}`;
+  config.leader_pane_pid = panePids[leaderPaneId];
   config.hud_pane_id = '%96';
+  config.hud_pane_pid = panePids['%96'];
   config.tmux_pane_owner_id = 'delivery-smoke-owner';
+  await writeFile(join(cwd, 'tmux.log.session'), String(config.tmux_session ?? ''));
   config.workers = config.workers.map((worker) => {
     const paneId = workerPaneIds[worker.name] ?? worker.pane_id;
     return {
@@ -382,6 +424,7 @@ describe('team message delivery end-to-end smoke tests', () => {
         assert.match(tmuxLog, /set-buffer -b omx-pane-input-.* -- Read .*mailbox\/leader-fixed\.json; new msg from worker-1\. Review it; decide next step\./);
         assert.match(tmuxLog, /show-buffer -b omx-pane-input-/);
         assert.match(tmuxLog, /send-keys -t %95 C-u/);
+        assertExactPaneProofBeforeTargetEffect(tmuxLog, '%95');
         assert.match(tmuxLog, /paste-buffer -t %95 -b omx-pane-input-.* -p -d/);
       });
     } finally {

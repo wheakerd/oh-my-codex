@@ -705,7 +705,9 @@ export async function resolveCommittedAuthorityRuntimeStateScope(
   workingDirectory?: string,
   explicitSessionId?: string,
 ): Promise<ResolvedAuthorityRuntimeStateScope> {
-  return resolveAuthorityRuntimeStateScope(workingDirectory, explicitSessionId);
+  const scope = await resolveAuthorityRuntimeStateScope(workingDirectory, explicitSessionId);
+  assertAmbientStateRootAliasesMatchAuthority(scope.authority);
+  return scope;
 }
 
 export async function getCompatibilityReadScopedStateDirs(

@@ -8,7 +8,7 @@ import { readModeState, startMode as rawStartMode } from '../../modes/base.js';
 import { getBaseStateDir, getStatePath } from '../../state/paths.js';
 import { writeRoleRoutingMarker } from '../../subagents/role-routing-marker.js';
 import { subagentTrackingPath } from '../../subagents/tracker.js';
-import { cancelRalplanConsensus, runRalplanConsensus as rawRunRalplanConsensus } from '../runtime.js';
+import { cancelRalplanConsensus, runRalplanConsensus as rawRunRalplanConsensus, type RalplanReviewResult } from '../runtime.js';
 
 import { createHash } from 'node:crypto';
 import { initializeStateAuthority, mintStateAuthorityTransportCapability } from '../../state/authority.js';
@@ -93,6 +93,7 @@ async function writeNativeSubagentTracking(cwd: string, sessionId: string): Prom
             completed_at: architectCompletedAt,
             turn_count: 1,
             role: 'architect',
+            provenance_kind: 'native_subagent',
           },
           'thread-critic': {
             thread_id: 'thread-critic',
@@ -102,11 +103,33 @@ async function writeNativeSubagentTracking(cwd: string, sessionId: string): Prom
             completed_at: criticCompletedAt,
             turn_count: 1,
             role: 'critic',
+            provenance_kind: 'native_subagent',
           },
         },
       },
     },
   }, null, 2));
+}
+
+async function prepareNativeConsensusFixture(cwd: string, sessionId: string): Promise<void> {
+  await mkdir(join(sessionStatePath(cwd, sessionId), '..'), { recursive: true });
+  await writeFile(join(sessionStatePath(cwd, sessionId), '..', '..', '..', 'session.json'), JSON.stringify({ session_id: sessionId }));
+  await writeNativeSubagentTracking(cwd, sessionId);
+}
+
+function nativeReviewMetadata(
+  sessionId: string,
+  threadId: 'thread-architect' | 'thread-critic',
+  agentRole: 'architect' | 'critic',
+): Pick<RalplanReviewResult, 'agent_role' | 'artifact_path' | 'provenance_kind' | 'session_id' | 'thread_id' | 'tracker_path'> {
+  return {
+    provenance_kind: 'native_subagent',
+    session_id: sessionId,
+    thread_id: threadId,
+    artifact_path: `.omx/artifacts/${agentRole}.md`,
+    tracker_path: '.omx/state/subagent-tracking.json',
+    agent_role: agentRole,
+  };
 }
 
 async function writeAdaptedSubagentTracking(cwd: string, sessionId: string): Promise<void> {
@@ -167,8 +190,7 @@ describe('ralplan runtime', () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-ralplan-runtime-'));
     const sessionId = 'sess-ralplan-success';
     try {
-      await mkdir(join(sessionStatePath(cwd, sessionId), '..'), { recursive: true });
-      await writeFile(join(sessionStatePath(cwd, sessionId), '..', '..', '..', 'session.json'), JSON.stringify({ session_id: sessionId }));
+      await prepareNativeConsensusFixture(cwd, sessionId);
 
       const seenPhases: string[] = [];
       const result = await runRalplanConsensus({
@@ -190,18 +212,18 @@ describe('ralplan runtime', () => {
           seenPhases.push(String(state.current_phase));
           assert.equal(state.current_phase, 'architect-review');
           assert.equal(state.iteration, 1);
-          return { verdict: 'approve', summary: 'architect-ok', artifacts: { architected: true } };
+          return { verdict: 'approve', summary: 'architect-ok', artifacts: { architected: true }, ...nativeReviewMetadata(sessionId, 'thread-architect', 'architect') };
         },
         async criticReview() {
           const state = await readScopedRalplanState(cwd, sessionId);
           seenPhases.push(String(state.current_phase));
           assert.equal(state.current_phase, 'critic-review');
           assert.equal(state.iteration, 1);
-          return { verdict: 'approve', summary: 'critic-ok', artifacts: { critiqued: true } };
+          return { verdict: 'approve', summary: 'critic-ok', artifacts: { critiqued: true }, ...nativeReviewMetadata(sessionId, 'thread-critic', 'critic') };
         },
       }, { task: 'implement live ralplan runtime', cwd });
 
-      assert.equal(result.status, 'completed');
+      assert.equal(result.status, 'completed', result.error ?? 'ralplan did not complete');
       assert.equal(result.phase, 'complete');
       assert.equal(result.iteration, 1);
       assert.equal(result.planningComplete, true);
@@ -226,36 +248,38 @@ describe('ralplan runtime', () => {
         ralplan_architect_review: {
           agent_role: 'architect',
           iteration: 1,
-          sequence_index: 1,
           verdict: 'approve',
           summary: 'architect-ok',
           artifacts: { architected: true },
+          ...nativeReviewMetadata(sessionId, 'thread-architect', 'architect'),
         },
         ralplan_critic_review: {
           agent_role: 'critic',
           iteration: 1,
-          sequence_index: 2,
           verdict: 'approve',
           summary: 'critic-ok',
           artifacts: { critiqued: true },
+          ...nativeReviewMetadata(sessionId, 'thread-critic', 'critic'),
         },
         architect_review: {
           agent_role: 'architect',
           iteration: 1,
-          sequence_index: 1,
           verdict: 'approve',
           summary: 'architect-ok',
           artifacts: { architected: true },
+          ...nativeReviewMetadata(sessionId, 'thread-architect', 'architect'),
         },
         critic_review: {
           agent_role: 'critic',
           iteration: 1,
-          sequence_index: 2,
           verdict: 'approve',
           summary: 'critic-ok',
           artifacts: { critiqued: true },
+          ...nativeReviewMetadata(sessionId, 'thread-critic', 'critic'),
         },
         blocked_reason: null,
+        blockedReason: null,
+        source: 'state-write-ralplan-terminal',
       });
       assert.equal(Array.isArray(finalState?.review_history), true);
     } finally {
@@ -266,6 +290,8 @@ describe('ralplan runtime', () => {
   it('records planning-only terminal state when consensus approves without a selected execution lane', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-ralplan-runtime-planning-only-'));
     try {
+      const sessionId = 'sess-ralplan-planning-only';
+      await prepareNativeConsensusFixture(cwd, sessionId);
       const result = await runRalplanConsensus({
         async draft() {
           const plansDir = join(cwd, '.omx', 'plans');
@@ -276,14 +302,14 @@ describe('ralplan runtime', () => {
           return { summary: 'draft', planPath: prdPath };
         },
         async architectReview() {
-          return { verdict: 'approve', summary: 'architect ok' };
+          return { verdict: 'approve', summary: 'architect ok', ...nativeReviewMetadata(sessionId, 'thread-architect', 'architect') };
         },
         async criticReview() {
-          return { verdict: 'approve', summary: 'critic ok' };
+          return { verdict: 'approve', summary: 'critic ok', ...nativeReviewMetadata(sessionId, 'thread-critic', 'critic') };
         },
-      }, { task: 'planning only approval', cwd, maxIterations: 1 });
+      }, { task: 'planning only approval', cwd, sessionId, maxIterations: 1 });
 
-      assert.equal(result.status, 'completed');
+      assert.equal(result.status, 'completed', result.error ?? 'ralplan did not complete');
       assert.equal(result.executionHandoffStarted, false);
       const finalState = await readModeState('ralplan', cwd);
       const ralplanHandoff = (finalState?.handoff_artifacts as { ralplan?: Record<string, unknown> } | undefined)?.ralplan;
@@ -299,6 +325,8 @@ describe('ralplan runtime', () => {
   it('starts the selected execution handoff only after Critic approval completes consensus', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-ralplan-runtime-execution-handoff-'));
     try {
+      const sessionId = 'sess-ralplan-execution-handoff';
+      await prepareNativeConsensusFixture(cwd, sessionId);
       const result = await runRalplanConsensus({
         async draft() {
           const plansDir = join(cwd, '.omx', 'plans');
@@ -310,15 +338,15 @@ describe('ralplan runtime', () => {
         },
         async architectReview() {
           assert.equal(await readModeState('ultragoal', cwd), null);
-          return { verdict: 'approve', summary: 'architect ok' };
+          return { verdict: 'approve', summary: 'architect ok', ...nativeReviewMetadata(sessionId, 'thread-architect', 'architect') };
         },
         async criticReview() {
           assert.equal(await readModeState('ultragoal', cwd), null);
-          return { verdict: 'approve', summary: 'critic ok' };
+          return { verdict: 'approve', summary: 'critic ok', ...nativeReviewMetadata(sessionId, 'thread-critic', 'critic') };
         },
-      }, { task: 'approval starts ultragoal', cwd, maxIterations: 1, selectedExecutionLane: 'ultragoal' });
+      }, { task: 'approval starts ultragoal', cwd, sessionId, maxIterations: 1, selectedExecutionLane: 'ultragoal' });
 
-      assert.equal(result.status, 'completed');
+      assert.equal(result.status, 'completed', result.error ?? 'ralplan did not complete');
       assert.equal(result.executionHandoffStarted, true);
       const ultragoalState = await readModeState('ultragoal', cwd) as Record<string, unknown>;
       assert.equal(ultragoalState.active, true);
@@ -335,6 +363,8 @@ describe('ralplan runtime', () => {
   it('passes and enforces reusable Architect lane on re-review iterations', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-ralplan-runtime-architect-reuse-'));
     try {
+      const sessionId = 'sess-ralplan-architect-reuse';
+      await prepareNativeConsensusFixture(cwd, sessionId);
       const architectThreads: Array<string | undefined> = [];
       const result = await runRalplanConsensus({
         async draft(ctx) {
@@ -352,14 +382,15 @@ describe('ralplan runtime', () => {
             summary: `architect-${ctx.iteration}`,
             agent_role: 'architect',
             thread_id: ctx.reusableRoleLanes.architect?.thread_id ?? 'thread-architect',
+            ...nativeReviewMetadata(sessionId, 'thread-architect', 'architect'),
           };
         },
         async criticReview(ctx) {
-          return { verdict: ctx.iteration === 1 ? 'iterate' : 'approve', summary: `critic-${ctx.iteration}` };
+          return { verdict: ctx.iteration === 1 ? 'iterate' : 'approve', summary: `critic-${ctx.iteration}`, ...nativeReviewMetadata(sessionId, 'thread-critic', 'critic') };
         },
-      }, { task: 'reuse architect lane', cwd, maxIterations: 3 });
+      }, { task: 'reuse architect lane', cwd, sessionId, maxIterations: 3 });
 
-      assert.equal(result.status, 'completed');
+      assert.equal(result.status, 'completed', result.error ?? 'ralplan did not complete');
       assert.deepEqual(architectThreads, [undefined, 'thread-architect']);
       assert.deepEqual(result.architectReviews.map((review) => review.thread_id), ['thread-architect', 'thread-architect']);
     } finally {
@@ -538,15 +569,13 @@ describe('ralplan runtime', () => {
     }
   });
 
-  it('preserves existing tracker completion for review threads without native-required mode', async () => {
+  it('preserves existing tracker completion for native review threads', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-ralplan-runtime-preserve-completion-'));
     const sessionId = 'sess-ralplan-preserve-completion';
     const architectCompletedAt = '2026-05-28T00:00:00.000Z';
     const criticCompletedAt = '2026-05-28T00:10:00.000Z';
     try {
-      await mkdir(join(sessionStatePath(cwd, sessionId), '..'), { recursive: true });
-      await writeFile(join(sessionStatePath(cwd, sessionId), '..', '..', '..', 'session.json'), JSON.stringify({ session_id: sessionId }));
-      await writeNativeSubagentTracking(cwd, sessionId);
+      await prepareNativeConsensusFixture(cwd, sessionId);
 
       const result = await runRalplanConsensus({
         async draft() {
@@ -562,7 +591,7 @@ describe('ralplan runtime', () => {
             verdict: 'approve',
             summary: 'architect ok',
             thread_id: 'thread-architect',
-            agent_role: 'architect',
+            ...nativeReviewMetadata(sessionId, 'thread-architect', 'architect'),
           };
         },
         async criticReview() {
@@ -570,7 +599,7 @@ describe('ralplan runtime', () => {
             verdict: 'approve',
             summary: 'critic ok',
             thread_id: 'thread-critic',
-            agent_role: 'critic',
+            ...nativeReviewMetadata(sessionId, 'thread-critic', 'critic'),
           };
         },
       }, {
@@ -580,7 +609,7 @@ describe('ralplan runtime', () => {
         maxIterations: 1,
       });
 
-      assert.equal(result.status, 'completed');
+      assert.equal(result.status, 'completed', result.error ?? 'ralplan did not complete');
       const tracking = JSON.parse(await readFile(subagentTrackingPath(cwd), 'utf-8')) as {
         sessions?: Record<string, { threads?: Record<string, { completed_at?: string }> }>;
       };
@@ -878,8 +907,7 @@ describe('ralplan runtime', () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-ralplan-runtime-loop-'));
     const sessionId = 'sess-ralplan-loop';
     try {
-      await mkdir(join(sessionStatePath(cwd, sessionId), '..'), { recursive: true });
-      await writeFile(join(sessionStatePath(cwd, sessionId), '..', '..', '..', 'session.json'), JSON.stringify({ session_id: sessionId }));
+      await prepareNativeConsensusFixture(cwd, sessionId);
 
       const draftIterations: number[] = [];
       const criticVerdicts: string[] = [];
@@ -901,7 +929,7 @@ describe('ralplan runtime', () => {
         async architectReview(ctx) {
           const state = await readScopedRalplanState(cwd, sessionId);
           assert.equal(state.current_phase, 'architect-review');
-          return { verdict: 'approve', summary: `architect-${ctx.iteration}` };
+          return { verdict: 'approve', summary: `architect-${ctx.iteration}`, ...nativeReviewMetadata(sessionId, 'thread-architect', 'architect') };
         },
         async criticReview(ctx) {
           const state = await readScopedRalplanState(cwd, sessionId);
@@ -909,11 +937,11 @@ describe('ralplan runtime', () => {
           criticCalls += 1;
           const verdict = criticCalls === 1 ? 'iterate' : 'approve';
           criticVerdicts.push(verdict);
-          return { verdict, summary: `critic-${ctx.iteration}-${verdict}` };
+          return { verdict, summary: `critic-${ctx.iteration}-${verdict}`, ...nativeReviewMetadata(sessionId, 'thread-critic', 'critic') };
         },
-      }, { task: 'loop until approval', cwd, maxIterations: 3 });
+      }, { task: 'loop until approval', cwd, sessionId, maxIterations: 3 });
 
-      assert.equal(result.status, 'completed');
+      assert.equal(result.status, 'completed', result.error ?? 'ralplan did not complete');
       assert.equal(result.iteration, 2);
       assert.deepEqual(draftIterations, [1, 2]);
       assert.deepEqual(criticVerdicts, ['iterate', 'approve']);

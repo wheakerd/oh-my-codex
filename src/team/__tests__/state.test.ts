@@ -149,14 +149,14 @@ if (argv[0] === 'schema') {
   process.stdout.write(JSON.stringify({
     schema_version: 1,
     commands: [
-      'acquire-authority',
-      'renew-authority',
-      'queue-dispatch',
-      'mark-notified',
-      'mark-delivered',
-      'mark-failed',
-      'request-replay',
-      'capture-snapshot',
+      'AcquireAuthority',
+      'RenewAuthority',
+      'QueueDispatch',
+      'MarkNotified',
+      'MarkDelivered',
+      'MarkFailed',
+      'RequestReplay',
+      'CaptureSnapshot',
     ],
     events: [],
     transport: 'tmux',
@@ -442,7 +442,7 @@ describe('team state', () => {
 set -eu
 printf '%s\n' "$*" >> "${runtimeLogPath}"
 if [[ "\${1:-}" == "schema" ]]; then
-  printf '{"schema_version":1,"commands":["acquire-authority","renew-authority","queue-dispatch","mark-notified","mark-delivered","mark-failed","request-replay","capture-snapshot"],"events":[],"transport":"tmux"}\n'
+  printf '{"schema_version":1,"commands":["acquire-authority","renew-authority","queue-dispatch","mark-notified","mark-delivered","mark-failed","remove-dispatch-records","request-replay","capture-snapshot"],"events":[],"transport":"tmux"}\n'
   exit 0
 fi
 if [[ "\${1:-}" == "exec" ]]; then
