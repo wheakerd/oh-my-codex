@@ -392,6 +392,7 @@ export async function questionCommand(args: string[], options: QuestionCommandOp
     await appendQuestionEvent(cwd, 'question-error', errorRecord, {
       recordPath,
       timeoutMs: waitTimeoutMs,
+      ...(options.stateDir ? { stateDir: options.stateDir } : {}),
     });
     await finalizeDirectDeepInterviewObligation(
       cwd,
@@ -417,6 +418,7 @@ export async function questionCommand(args: string[], options: QuestionCommandOp
       await appendQuestionEvent(cwd, 'question-error', finalRecord, {
         recordPath,
         timeoutMs: waitTimeoutMs,
+        ...(options.stateDir ? { stateDir: options.stateDir } : {}),
       });
     }
     await finalizeDirectDeepInterviewObligation(

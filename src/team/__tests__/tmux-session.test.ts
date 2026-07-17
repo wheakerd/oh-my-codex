@@ -473,6 +473,14 @@ state_dir="$(dirname "${logPath}")"
 accepted_file="$state_dir/accepted"
 printf '%s\n' "$*" >> "${logPath}"
 case "$1" in
+  list-panes)
+    printf '%s\n' '%1	0	42424	omx-team-x'
+    exit 0
+    ;;
+  show-option)
+    printf '%s\n' 'team:test'
+    exit 0
+    ;;
   capture-pane)
     if [ -f "$accepted_file" ]; then
       cat <<'EOF'
@@ -497,10 +505,10 @@ EOF
 esac
 `,
       async ({ logPath }) => {
-        await sendToWorker('omx-team-x', 1, 'check inbox');
+        await sendToWorker('omx-team-x', 1, 'check inbox', '%1', 'claude', 42424, 'team:test', 'omx-team-x');
         const log = await readFile(logPath, 'utf-8');
-        const acceptIndex = log.indexOf('send-keys -t omx-team-x:1 -l -- 2');
-        const submitIndex = log.indexOf('send-keys -t omx-team-x:1 -l -- check inbox');
+        const acceptIndex = log.indexOf('send-keys -t %1 -l -- 2');
+        const submitIndex = log.indexOf('send-keys -t %1 -l -- check inbox');
         assert.notEqual(acceptIndex, -1, `expected bypass acceptance in log:\n${log}`);
         assert.notEqual(submitIndex, -1, `expected worker text submission in log:\n${log}`);
         assert.ok(acceptIndex < submitIndex, `expected bypass acceptance before worker text:\n${log}`);
@@ -517,6 +525,14 @@ state_dir="$(dirname "${logPath}")"
 text_sent_file="$state_dir/text-sent"
 printf '%s\n' "$*" >> "${logPath}"
 case "$1" in
+  list-panes)
+    printf '%s\n' '%1	0	42424	omx-team-x'
+    exit 0
+    ;;
+  show-option)
+    printf '%s\n' 'team:test'
+    exit 0
+    ;;
   capture-pane)
     if printf '%s\n' "$*" | grep -q -- ' -S -80'; then
       if [ -f "$text_sent_file" ]; then
@@ -547,16 +563,16 @@ EOF
 esac
 `,
       async ({ logPath }) => {
-        await sendToWorker('omx-team-x', 1, 'check inbox');
+        await sendToWorker('omx-team-x', 1, 'check inbox', '%1', 'codex', 42424, 'team:test', 'omx-team-x');
         const log = await readFile(logPath, 'utf-8');
-        const enterCount = (log.match(/send-keys -t omx-team-x:1 C-m/g) || []).length;
+        const enterCount = (log.match(/send-keys -t %1 C-m/g) || []).length;
         assert.equal(
           enterCount,
           2,
           `expected only the baseline submit presses when the queued banner is stale scrollback:\n${log}`,
         );
-        assert.match(log, /capture-pane -t omx-team-x:1 -p/);
-        assert.match(log, /capture-pane -t omx-team-x:1 -p -S -80/);
+        assert.match(log, /capture-pane -t %1 -p/);
+        assert.match(log, /capture-pane -t %1 -p -S -80/);
       },
     );
   });
@@ -571,6 +587,14 @@ text_sent_file="$state_dir/text-sent"
 enter_count_file="$state_dir/enter-count"
 printf '%s\n' "$*" >> "${logPath}"
 case "$1" in
+  list-panes)
+    printf '%s\n' '%1	0	42424	omx-team-x'
+    exit 0
+    ;;
+  show-option)
+    printf '%s\n' 'team:test'
+    exit 0
+    ;;
   capture-pane)
     enter_count=0
     if [ -f "$enter_count_file" ]; then
@@ -619,9 +643,9 @@ EOF
 esac
 `,
       async ({ logPath }) => {
-        await sendToWorker('omx-team-x', 1, 'check inbox');
+        await sendToWorker('omx-team-x', 1, 'check inbox', '%1', 'codex', 42424, 'team:test', 'omx-team-x');
         const log = await readFile(logPath, 'utf-8');
-        const enterCount = (log.match(/send-keys -t omx-team-x:1 C-m/g) || []).length;
+        const enterCount = (log.match(/send-keys -t %1 C-m/g) || []).length;
         assert.ok(
           enterCount >= 4,
           `expected extra submit nudges when Codex queues the trigger:\n${log}`,
@@ -639,6 +663,14 @@ state_dir="$(dirname "${logPath}")"
 text_sent_file="$state_dir/text-sent"
 printf '%s\n' "$*" >> "${logPath}"
 case "$1" in
+  list-panes)
+    printf '%s\n' '%1	0	42424	omx-team-x'
+    exit 0
+    ;;
+  show-option)
+    printf '%s\n' 'team:test'
+    exit 0
+    ;;
   capture-pane)
     if printf '%s\n' "$*" | grep -q -- ' -S -80'; then
       cat <<'EOF'
@@ -670,11 +702,11 @@ esac
 `,
       async ({ logPath }) => {
         await assert.rejects(
-          () => sendToWorker('omx-team-x', 1, 'check inbox'),
+          () => sendToWorker('omx-team-x', 1, 'check inbox', '%1', 'codex', 42424, 'team:test', 'omx-team-x'),
           /submit_queued_after_tool_call/,
         );
         const log = await readFile(logPath, 'utf-8');
-        const enterCount = (log.match(/send-keys -t omx-team-x:1 C-m/g) || []).length;
+        const enterCount = (log.match(/send-keys -t %1 C-m/g) || []).length;
         assert.ok(
           enterCount >= 4,
           `expected repeated submit nudges before failing closed on stuck queued banner:\n${log}`,
@@ -693,6 +725,14 @@ state_dir="$(dirname "${logPath}")"
 text_sent_file="$state_dir/text-sent"
 printf '%s\n' "$*" >> "${logPath}"
 case "$1" in
+  list-panes)
+    printf '%s\n' '%1	0	42424	omx-team-x'
+    exit 0
+    ;;
+  show-option)
+    printf '%s\n' 'team:test'
+    exit 0
+    ;;
   capture-pane)
     if [ -f "$text_sent_file" ]; then
       cat <<'EOF'
@@ -721,11 +761,11 @@ esac
 `,
       async ({ logPath }) => {
         await assert.rejects(
-          () => sendToWorker('omx-team-x', 1, trigger),
+          () => sendToWorker('omx-team-x', 1, trigger, '%1', 'codex', 42424, 'team:test', 'omx-team-x'),
           /submit_failed/,
         );
         const log = await readFile(logPath, 'utf-8');
-        const enterCount = (log.match(/send-keys -t omx-team-x:1 C-m/g) || []).length;
+        const enterCount = (log.match(/send-keys -t %1 C-m/g) || []).length;
         assert.ok(
           enterCount >= 4,
           `expected repeated submit nudges before failing on the still-visible wrapped draft:\n${log}`,

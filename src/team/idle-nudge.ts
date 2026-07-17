@@ -89,12 +89,11 @@ async function sendToWorkerByPaneId(
         undefined,
         target.panePid,
         target.teamOwnerId,
+        sessionName,
         target.hudPaneId,
       );
     } else {
-      // Blank pane IDs retain legacy session-target compatibility and are not
-      // explicit Team pane effects.
-      await sendToWorker(sessionName, 0, message);
+      return false;
     }
     return true;
   } catch {

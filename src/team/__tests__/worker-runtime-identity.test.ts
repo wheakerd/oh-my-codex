@@ -357,7 +357,11 @@ fs.appendFileSync(${JSON.stringify(tmuxLogPath)}, args.join(' ') + '\\n');
 switch (args[0] || '') {
   case '-V': console.log('tmux 3.2a'); break;
   case 'split-window': console.log('%31'); break;
-  case 'list-panes': console.log('42424'); break;
+  case 'list-panes':
+    if (args.includes('-a')) console.log('%11\t0\t42424\tomx-team-low-role-scale\n%21\t0\t42424\tomx-team-low-role-scale\n%31\t0\t42424\tomx-team-low-role-scale');
+    else console.log('42424');
+    break;
+  case 'show-option': console.log('team:low-role-scale'); break;
   case 'capture-pane': console.log(''); break;
 }
 `,
@@ -524,7 +528,11 @@ fs.appendFileSync(${JSON.stringify(tmuxLogPath)}, args.join(' ') + '\\n');
 switch (args[0] || '') {
   case '-V': console.log('tmux 3.2a'); break;
   case 'split-window': console.log('%31'); break;
-  case 'list-panes': console.log('42424'); break;
+  case 'list-panes':
+    if (args.includes('-a')) console.log('%11\t0\t42424\tomx-team-exact-role-cli\n%21\t0\t42424\tomx-team-exact-role-cli\n%31\t0\t42424\tomx-team-exact-role-cli');
+    else console.log('42424');
+    break;
+  case 'show-option': console.log('team:exact-role-cli'); break;
   case 'capture-pane': console.log(''); break;
 }
 `,
@@ -713,8 +721,17 @@ if (command === 'display-message') {
   process.exit(0);
 }
 if (command === 'list-panes') {
-  if (args.join(' ').includes('#{pane_pid}')) process.exit(0);
-  console.log('%1\\tzsh\\tzsh\\n%2\\tzsh\\tzsh\\n%3\\tzsh\\tzsh');
+  if (args.includes('-a')) {
+    console.log('%1\t0\t42424\tleader\n%2\t0\t42424\tleader\n%3\t0\t42424\tleader');
+  } else if (args.join(' ').includes('#{pane_pid}')) {
+    console.log('42424');
+  } else {
+    console.log('%1\tzsh\tzsh\n%2\tzsh\tzsh\n%3\tzsh\tzsh');
+  }
+  process.exit(0);
+}
+if (command === 'show-option') {
+  console.log('team:provider-env');
   process.exit(0);
 }
 if (command === 'show-environment' || command === 'source-file' || command === 'set-environment') {

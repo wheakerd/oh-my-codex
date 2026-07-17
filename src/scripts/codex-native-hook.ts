@@ -157,6 +157,7 @@ import {
   MAX_NATIVE_STDIN_JSON_BYTES,
   extractRawCodexHookEventName,
 } from "./hook-payload-guard.js";
+import { evaluateCodex01445PreToolUse } from "../ralplan/documented-leader-preflight.js";
 
 type CodexHookEventName =
   | "SessionStart"
@@ -11073,6 +11074,16 @@ export async function dispatchCodexNativeHook(
       };
     }
   } else if (hookEventName === "PreToolUse") {
+    const documentedLeaderProofDenial = evaluateCodex01445PreToolUse(payload);
+    if (documentedLeaderProofDenial) {
+      outputJson = documentedLeaderProofDenial;
+      return {
+        hookEventName,
+        omxEventName,
+        skillState,
+        outputJson,
+      };
+    }
     const payloadSessionId = readPayloadSessionId(payload);
     const rootPointerConflict = await readLiveRootSessionPointerConflict(stateDir, payloadSessionId);
     const isKnownSubagentPreToolUse = authority && payloadSessionId

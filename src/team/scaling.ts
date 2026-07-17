@@ -300,11 +300,13 @@ async function notifyWorkerPaneOutcome(
   sessionName: string,
   workerIndex: number,
   message: string,
-  paneId?: string,
-  workerCli?: 'codex' | 'claude' | 'gemini',
+  paneId: string | undefined,
+  workerCli: TeamWorkerCli | undefined,
+  panePid: number | undefined,
+  teamOwnerId: string | undefined,
 ): Promise<DispatchOutcome> {
   try {
-    await sendToWorker(sessionName, workerIndex, message, paneId, workerCli);
+    await sendToWorker(sessionName, workerIndex, message, paneId, workerCli, panePid, teamOwnerId, sessionName);
     return { ok: true, transport: 'tmux_send_keys', reason: 'tmux_send_keys_sent' };
   } catch (error) {
     return {
@@ -683,7 +685,7 @@ export async function scaleUp(
           if (dispatchPolicy.dispatch_mode === 'hook_preferred_with_fallback') {
             return { ok: true, transport: 'hook', reason: 'queued_for_hook_dispatch' };
           }
-          return await notifyWorkerPaneOutcome(sessionName, workerIndex, message, paneId, workerCli);
+          return await notifyWorkerPaneOutcome(sessionName, workerIndex, message, paneId, workerCli, panePid ?? undefined, config.tmux_pane_owner_id);
         },
       });
       let outcome = queued;
@@ -695,7 +697,7 @@ export async function scaleUp(
         if (receipt && (receipt.status === 'notified' || receipt.status === 'delivered')) {
           outcome = { ok: true, transport: 'hook', reason: `hook_receipt_${receipt.status}`, request_id: queued.request_id };
         } else {
-          const fallback = await notifyWorkerPaneOutcome(sessionName, workerIndex, triggerDirective.text, paneId, workerCli);
+          const fallback = await notifyWorkerPaneOutcome(sessionName, workerIndex, triggerDirective.text, paneId, workerCli, panePid ?? undefined, config.tmux_pane_owner_id);
           if (receipt?.status === 'failed') {
             if (fallback.ok) {
               await transitionDispatchRequest(
@@ -773,9 +775,17 @@ export async function scaleUp(
         }
       }
       // Retry dispatch once if a trust prompt is blocking the worker pane (fixes #393).
-      if (!outcome.ok && dismissTrustPromptIfPresent(sessionName, workerIndex, paneId)) {
+      if (!outcome.ok && dismissTrustPromptIfPresent(
+        sessionName,
+        workerIndex,
+        paneId,
+        panePid ?? undefined,
+        config.tmux_pane_owner_id,
+        sessionName,
+        config.hud_pane_id ?? undefined,
+      )) {
         waitForWorkerReady(sessionName, workerIndex, readyTimeoutMs, paneId);
-        const retry = await notifyWorkerPaneOutcome(sessionName, workerIndex, triggerDirective.text, paneId, workerCli);
+        const retry = await notifyWorkerPaneOutcome(sessionName, workerIndex, triggerDirective.text, paneId, workerCli, panePid ?? undefined, config.tmux_pane_owner_id);
         if (retry.ok) {
           outcome = retry;
         }

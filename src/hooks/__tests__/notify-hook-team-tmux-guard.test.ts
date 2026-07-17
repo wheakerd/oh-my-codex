@@ -21,8 +21,8 @@ function isolatedChildEnv(fakeBinDir: string): NodeJS.ProcessEnv {
 }
 
 function liveExactPaneProof(): string {
-  return `if [[ "\${1:-}" == "list-panes" && "$#" -eq 4 && "\${2:-}" == "-a" && "\${3:-}" == "-F" && "\${4:-}" == "#{pane_id}\t#{pane_dead}\t#{pane_pid}" ]]; then
-  printf '%%42\\t0\\t4242\\n'
+  return `if [[ "\${1:-}" == "list-panes" && "$#" -eq 4 && "\${2:-}" == "-a" && "\${3:-}" == "-F" && "\${4:-}" == "#{pane_id}\t#{pane_dead}\t#{pane_pid}\t#{session_name}" ]]; then
+  printf '%%42\t0\t4242\tteam-test\n'
   exit 0
 fi`;
 }
@@ -117,7 +117,7 @@ function runEvaluatePaneInjectionReadinessInChild(params: {
 }
 
 describe('notify-hook team tmux guard bridge', () => {
-  it('submits without typing when typePrompt=false', async () => {
+  it('delivers a notification only when its exact pane proof matches', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-team-tmux-guard-'));
     const fakeBinDir = join(cwd, 'fake-bin');
     const tmuxLogPath = join(cwd, 'tmux.log');
@@ -133,6 +133,7 @@ describe('notify-hook team tmux guard bridge', () => {
         moduleUrl,
         paneTarget: '%42',
         exactPaneId: '%42',
+        expectedPanePid: 4242,
         prompt: 'hello bridge',
         submitKeyPresses: 2,
         typePrompt: false,
@@ -623,7 +624,7 @@ exit 0
   });
 });
 
-it('rejects omitted and mismatched exact pane identities before any tmux effect', async () => {
+it('fails closed before any tmux effect when the notification pane binding is omitted or mismatched', async () => {
   const cwd = await mkdtemp(join(tmpdir(), 'omx-team-tmux-binding-'));
   const fakeBinDir = join(cwd, 'fake-bin');
   try {
@@ -651,6 +652,7 @@ it('rejects omitted and mismatched exact pane identities before any tmux effect'
     });
     assert.equal(mismatched.status, 0, mismatched.stderr);
     assert.equal(JSON.parse(mismatched.stdout).exactPaneProof.reason, 'pane_target_mismatch');
+    assert.equal(await readFile(join(cwd, 'tmux.log'), 'utf-8').catch(() => ''), '');
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }
@@ -665,7 +667,7 @@ it('rejects an exact live pane whose start command identifies the HUD', async ()
     await writeFile(join(fakeBinDir, 'tmux'), `#!/bin/sh
 set -eu
 printf '%s\n' "$*" >> "${tmuxLogPath}"
-if [ "$1" = "list-panes" ]; then printf '%%42\t0\t4242\n'; exit 0; fi
+if [ "$1" = "list-panes" ]; then printf '%%42\t0\t4242\tteam-test\n'; exit 0; fi
 case "$*" in
   *'#{pane_start_command}'*) echo 'node dist/cli/omx.js hud --watch' ;;
 esac
@@ -704,7 +706,7 @@ printf '%s\n' "$*" >> "${tmuxLogPath}"
 if [ "$1" = "list-panes" ]; then
   count=0; [ ! -f "${countPath}" ] || count=$(cat "${countPath}")
   count=$((count + 1)); printf '%s' "$count" > "${countPath}"
-  if [ "$count" -eq 1 ]; then printf '%%42\t0\t4242\n'; else printf '%%42\t0\t4343\n'; fi
+  if [ "$count" -eq 1 ]; then printf '%%42\t0\t4242\tteam-test\n'; else printf '%%42\t0\t4343\tteam-test\n'; fi
 fi
 `);
     await chmod(join(fakeBinDir, 'tmux'), 0o755);
@@ -737,7 +739,7 @@ it('rejects a same-PID owner takeover before any Team pane input effect', async 
     await writeFile(join(fakeBinDir, 'tmux'), `#!/bin/sh
 set -eu
 printf '%s\n' "$*" >> "${tmuxLogPath}"
-if [ "$1" = "list-panes" ]; then printf '%%42\t0\t4242\n'; exit 0; fi
+if [ "$1" = "list-panes" ]; then printf '%%42\t0\t4242\tteam-test\n'; exit 0; fi
 if [ "$1" = "display-message" ]; then echo codex; exit 0; fi
 if [ "$1" = "show-option" ]; then echo team:foreign; exit 0; fi
 `);
@@ -777,7 +779,7 @@ printf '%s\n' "$*" >> "${tmuxLogPath}"
 if [ "$1" = "list-panes" ]; then
   count=0; [ ! -f "${countPath}" ] || count=$(cat "${countPath}")
   count=$((count + 1)); printf '%s' "$count" > "${countPath}"
-  if [ "$count" -le 3 ]; then printf '%%42\t0\t4242\n'; else printf '%%42\t0\t4343\n'; fi
+  if [ "$count" -le 3 ]; then printf '%%42\t0\t4242\tteam-test\n'; else printf '%%42\t0\t4343\tteam-test\n'; fi
   exit 0
 fi
 if [ "$1" = "display-message" ]; then echo codex; exit 0; fi
@@ -815,7 +817,7 @@ it('rejects a foreign-owner Team pane before inspecting readiness content', asyn
     await writeFile(join(fakeBinDir, 'tmux'), `#!/bin/sh
 set -eu
 printf '%s\n' "$*" >> "${tmuxLogPath}"
-if [ "$1" = "list-panes" ]; then printf '%%42\t0\t4242\n'; exit 0; fi
+if [ "$1" = "list-panes" ]; then printf '%%42\t0\t4242\tteam-test\n'; exit 0; fi
 if [ "$1" = "show-option" ]; then echo team:foreign; exit 0; fi
 if [ "$1" = "display-message" ]; then echo foreign-command; exit 0; fi
 if [ "$1" = "capture-pane" ]; then echo foreign-content; exit 0; fi
@@ -857,7 +859,7 @@ printf '%s\n' "$*" >> "${tmuxLogPath}"
 if [ "$1" = "list-panes" ]; then
   count=0; [ ! -f "${countPath}" ] || count=$(cat "${countPath}")
   count=$((count + 1)); printf '%s' "$count" > "${countPath}"
-  if [ "$count" -eq 1 ]; then printf '%%42\t0\t4242\n'; else printf '%%42\t0\t4343\n'; fi
+  if [ "$count" -eq 1 ]; then printf '%%42\t0\t4242\tteam-test\n'; else printf '%%42\t0\t4343\tteam-test\n'; fi
   exit 0
 fi
 if [ "$1" = "show-option" ]; then echo team:alpha; exit 0; fi
@@ -932,7 +934,7 @@ it('authorizes Team ownership before reading the start command', async () => {
     await writeFile(join(fakeBinDir, 'tmux'), `#!/bin/sh
 set -eu
 printf '%s\n' "$*" >> "${tmuxLogPath}"
-if [ "$1" = "list-panes" ]; then printf '%%42\t0\t4242\n'; exit 0; fi
+if [ "$1" = "list-panes" ]; then printf '%%42\t0\t4242\tteam-test\n'; exit 0; fi
 if [ "$1" = "show-option" ]; then echo team:foreign; exit 0; fi
 if [ "$1" = "display-message" ]; then echo foreign-command; exit 0; fi
 `);

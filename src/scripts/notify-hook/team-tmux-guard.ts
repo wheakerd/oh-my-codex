@@ -70,7 +70,7 @@ export async function verifyExactPaneLive(exactPaneId: any, expectedPanePid?: nu
   }
 
   try {
-    const proof = await readExactPaneProof(identity.paneId);
+    const proof = await readExactPaneProof(identity.paneId, process.env.OMX_TEST_TMUX_BIN || 'tmux');
     if (proof.status === 'live' && proof.paneId === identity.paneId) {
       if (typeof expectedPanePid === 'number' && proof.pid !== expectedPanePid) {
         return {

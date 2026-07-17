@@ -22,22 +22,22 @@ import { drainPendingTeamDispatch } from '../../scripts/notify-hook/team-dispatc
 import { teamCommand } from '../../cli/team.js';
 import { installTeamTestAuthority } from './authority-fixture.js';
 
-const EXACT_GLOBAL_PANE_PROOF_COMMAND = 'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}';
+const EXACT_GLOBAL_PANE_PROOF_COMMAND = 'list-panes -a -F #{pane_id}\t#{pane_dead}\t#{pane_pid}\t#{session_name}';
 
 function assertExactPaneProofBeforeTargetEffect(tmuxLog: string, paneId: string): void {
   const commands = tmuxLog.trim().split('\n').filter(Boolean);
-  let effectIndex = -1;
-  for (let index = commands.length - 1; index >= 0; index -= 1) {
-    if (commands[index]?.startsWith(`send-keys -t ${paneId} `)) {
-      effectIndex = index;
-      break;
-    }
+  const effectIndexes = commands
+    .map((command, index) => command.startsWith(`send-keys -t ${paneId} `) ? index : -1)
+    .filter((index) => index >= 0);
+  assert.ok(effectIndexes.length > 0, `expected send-keys target effect for ${paneId}`);
+  for (const effectIndex of effectIndexes) {
+    const proofIndex = commands.lastIndexOf(EXACT_GLOBAL_PANE_PROOF_COMMAND, effectIndex);
+    assert.ok(proofIndex >= 0, `expected exact global pane proof before send-keys for ${paneId}; log=${JSON.stringify(commands)}`);
+    assert.ok(
+      proofIndex > commands.lastIndexOf(`send-keys -t ${paneId} `, effectIndex - 1),
+      `expected a fresh exact pane proof for every send-keys effect on ${paneId}; log=${JSON.stringify(commands)}`,
+    );
   }
-  assert.ok(effectIndex >= 0, `expected send-keys target effect for ${paneId}`);
-  assert.ok(
-    commands.slice(0, effectIndex).includes(EXACT_GLOBAL_PANE_PROOF_COMMAND),
-    `expected exact global pane proof before send-keys for ${paneId}; log=${JSON.stringify(commands)}`,
-  );
 }
 
 function buildFakeTmux(tmuxLogPath: string): string {
@@ -143,11 +143,23 @@ fi
 if [[ "$cmd" == "list-panes" ]]; then
   pane_proofs_path="${tmuxLogPath}.pane-proofs"
   pane_format="\${@: -1}"
-  if [[ "$#" -eq 3 && "$1" == "-a" && "$2" == "-F" && "$pane_format" == "#{pane_id}\t#{pane_dead}\t#{pane_pid}" ]]; then
+  session_name="session-test"
+  if [[ -f "${tmuxLogPath}.session" ]]; then session_name="$(cat "${tmuxLogPath}.session")"; fi
+  if [[ "$#" -eq 3 && "$1" == "-a" && "$2" == "-F" && ( "$pane_format" == "#{pane_id}\t#{pane_dead}\t#{pane_pid}" || "$pane_format" == "#{pane_id}\t#{pane_dead}\t#{pane_pid}\t#{session_name}" ) ]]; then
     if [[ -f "$pane_proofs_path" ]]; then
-      cat "$pane_proofs_path"
+      if [[ "$pane_format" == "#{pane_id}\t#{pane_dead}\t#{pane_pid}\t#{session_name}" ]]; then
+        while IFS=$'\t' read -r pane_id pane_dead pane_pid; do
+          printf '%s\t%s\t%s\t%s\n' "$pane_id" "$pane_dead" "$pane_pid" "$session_name"
+        done < "$pane_proofs_path"
+      else
+        cat "$pane_proofs_path"
+      fi
     else
-      printf '%%10\t0\t111\n%%11\t0\t112\n%%12\t0\t113\n%%95\t0\t195\n%%96\t0\t196\n'
+      if [[ "$pane_format" == "#{pane_id}\t#{pane_dead}\t#{pane_pid}\t#{session_name}" ]]; then
+        printf '%%10\t0\t111\t%s\n%%11\t0\t112\t%s\n%%12\t0\t113\t%s\n%%95\t0\t195\t%s\n%%96\t0\t196\t%s\n' "$session_name" "$session_name" "$session_name" "$session_name" "$session_name"
+      else
+        printf '%%10\t0\t111\n%%11\t0\t112\n%%12\t0\t113\n%%95\t0\t195\n%%96\t0\t196\n'
+      fi
     fi
   elif [[ "$#" -eq 4 && "$1" == "-t" && "$3" == "-F" && "$pane_format" == "#{pane_pid}" ]]; then
     if [[ -f "$pane_proofs_path" ]]; then

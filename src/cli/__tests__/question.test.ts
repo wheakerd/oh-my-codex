@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -8,31 +8,86 @@ import { afterEach, beforeEach, describe, it } from 'node:test';
 import { questionCommand } from '../question.js';
 import { AUTOPILOT_DEEP_INTERVIEW_QUESTION_OWNER_ENV } from '../../question/autopilot-wait.js';
 import { createQuestionRecord, markQuestionAnswered, readQuestionRecord } from '../../question/state.js';
+import {
+  initializeStateAuthority,
+  mintStateAuthorityTransportCapability,
+} from '../../state/authority.js';
+import { buildStateAuthorityTransportEnv } from '../../state/transport-env.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(__dirname, '..', '..', '..');
 const omxBin = join(repoRoot, 'dist', 'cli', 'omx.js');
 const tempDirs: string[] = [];
+const fixtureAuthorities = new Map<string, Awaited<ReturnType<typeof initializeStateAuthority>>>();
 let originalProcessExitCode: string | number | null | undefined;
+
+const STATE_AUTHORITY_ENV_KEYS = [
+  'OMX_STARTUP_CWD',
+  'OMX_ROOT',
+  'OMX_STATE_ROOT',
+  'OMX_TEAM_STATE_ROOT',
+  'OMX_STATE_AUTHORITY_PATH',
+  'OMX_STATE_AUTHORITY_ID',
+  'OMX_STATE_AUTHORITY_GENERATION_ID',
+  'OMX_STATE_AUTHORITY_WORKSPACE_DIGEST',
+  'OMX_STATE_AUTHORITY_CAPABILITY',
+  'OMX_SESSION_ID',
+] as const;
 
 async function makeRepo(): Promise<string> {
   const cwd = await mkdtemp(join(tmpdir(), 'omx-question-cli-'));
+  const omxDir = join(cwd, '.omx');
+  const stateDir = join(omxDir, 'state');
   tempDirs.push(cwd);
-  await mkdir(join(cwd, '.omx', 'state', 'sessions', 'sess-q', 'questions'), { recursive: true });
-  await writeFile(join(cwd, '.omx', 'state', 'session.json'), JSON.stringify({ session_id: 'sess-q' }));
+  await mkdir(join(stateDir, 'sessions', 'sess-q', 'questions'), { recursive: true, mode: 0o700 });
+  await chmod(omxDir, 0o700);
+  await chmod(stateDir, 0o700);
+  const authority = await initializeStateAuthority({
+    startup_cwd: cwd,
+    observed_cwd: cwd,
+    launch_id: 'question-cli-sess-q',
+    session_binding: { canonical_session_id: 'sess-q' },
+  });
+  await mintStateAuthorityTransportCapability(authority);
+  fixtureAuthorities.set(cwd, authority);
+  await writeFile(join(stateDir, 'session.json'), JSON.stringify({ session_id: 'sess-q' }));
   return cwd;
 }
 
 function makeQuestionCliEnv(cwd: string, overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { ...process.env, ...overrides, OMX_ROOT: cwd };
-  delete env.OMX_STATE_ROOT;
-  delete env.OMX_TEAM_STATE_ROOT;
+  const authority = fixtureAuthorities.get(cwd);
+  if (!authority) throw new Error(`missing committed question fixture authority for ${cwd}`);
+  const sessionId = overrides.OMX_SESSION_ID || 'sess-q';
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    ...overrides,
+    ...buildStateAuthorityTransportEnv(authority, {
+      ...Object.fromEntries(STATE_AUTHORITY_ENV_KEYS.map((key) => [key, undefined])),
+      OMX_SESSION_ID: sessionId,
+    }),
+  };
+  for (const [key, value] of Object.entries(env)) {
+    if (value === undefined) delete env[key];
+  }
   return env;
+}
+
+function installQuestionCliEnv(cwd: string): () => void {
+  const previous = new Map(STATE_AUTHORITY_ENV_KEYS.map((key) => [key, process.env[key]]));
+  Object.assign(process.env, makeQuestionCliEnv(cwd));
+  return () => {
+    for (const key of STATE_AUTHORITY_ENV_KEYS) {
+      const value = previous.get(key);
+      if (typeof value === 'string') process.env[key] = value;
+      else delete process.env[key];
+    }
+  };
 }
 
 afterEach(async () => {
   process.exitCode = originalProcessExitCode;
   await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
+  fixtureAuthorities.clear();
 });
 
 async function waitForQuestionRecordFile(
@@ -818,7 +873,7 @@ esac
     assert.doesNotMatch(tmuxLog, /new-session/);
   });
 
-  it('runs inline in interactive Windows non-attached sessions instead of hard-failing on missing TMUX', async () => {
+  it('runs inline in interactive Windows non-attached sessions instead of hard-failing on missing TMUX', { skip: process.platform !== 'win32' }, async () => {
     const cwd = await makeRepo();
     const originalPlatformDescriptor = Object.getOwnPropertyDescriptor(process, 'platform');
     const originalStdinIsTTY = process.stdin.isTTY;
@@ -838,6 +893,7 @@ esac
     const originalOmxTeamStateRoot = process.env.OMX_TEAM_STATE_ROOT;
     const writes: string[] = [];
     const stderrWrites: string[] = [];
+    const restoreQuestionCliEnv = installQuestionCliEnv(cwd);
 
     Object.defineProperty(process, 'platform', { value: 'win32' });
     Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
@@ -923,12 +979,13 @@ esac
       else delete process.env.OMX_STATE_ROOT;
       if (typeof originalOmxTeamStateRoot === 'string') process.env.OMX_TEAM_STATE_ROOT = originalOmxTeamStateRoot;
       else delete process.env.OMX_TEAM_STATE_ROOT;
+      restoreQuestionCliEnv();
     }
   });
 
   it('answers through the caller-provided authoritative state directory', async () => {
     const cwd = await makeRepo();
-    const authoritativeStateDir = join(cwd, 'committed-state');
+    const authoritativeStateDir = join(cwd, '.omx', 'state');
     const { record } = await createQuestionRecord(cwd, {
       question: 'Pick one',
       options: [{ label: 'A', value: 'a' }],
@@ -936,6 +993,7 @@ esac
       other_label: 'Other',
       multi_select: false,
     }, 'sess-q', new Date(), { stateDir: authoritativeStateDir });
+    const restoreQuestionCliEnv = installQuestionCliEnv(cwd);
     const writes: string[] = [];
     const originalWrite = process.stdout.write;
     process.stdout.write = ((chunk: string | Uint8Array) => {
@@ -947,16 +1005,17 @@ esac
         '--answer-question-id',
         record.question_id,
         '--answer',
-        JSON.stringify({ answer: { kind: 'option', value: 'a' } }),
+        JSON.stringify({ answer: { kind: 'option', value: 'a', selected_labels: ['A'], selected_values: ['a'] } }),
         '--session-id',
         'sess-q',
         '--json',
       ], { stateDir: authoritativeStateDir });
       const payload = JSON.parse(writes.join('')) as { ok: boolean; record_path: string };
-      assert.equal(payload.ok, true);
-      assert.match(payload.record_path, /committed-state/);
+      assert.equal(payload.ok, true, JSON.stringify(payload));
+      assert.match(payload.record_path, /\.omx[/\\]state/);
     } finally {
       process.stdout.write = originalWrite;
+      restoreQuestionCliEnv();
     }
   });
 

@@ -1,8 +1,13 @@
 import { existsSync } from 'node:fs';
 import { mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
-import { getStateDir } from '../mcp/state-paths.js';
-import { writeAtomic } from '../team/state.js';
+import { basename, dirname, join } from 'node:path';
+import { getBaseStateDir, getStateDir } from '../mcp/state-paths.js';
+import {
+  atomicWriteAuthorityFile,
+  captureRootFilesystemIdentity,
+  ensureAuthorityDirectory,
+  type RootFilesystemIdentity,
+} from '../state/authority.js';
 import { sleep } from '../utils/sleep.js';
 import { appendQuestionAnsweredEventOnce, appendQuestionEvent, normalizeSubmittedAnswers, resolveQuestionRunId } from './events.js';
 import {
@@ -68,9 +73,33 @@ export function getQuestionRecordPathForStateDir(stateDir: string, questionId: s
   return join(getQuestionStateDirForStateDir(stateDir, sessionId), `${questionId}.json`);
 }
 
-export async function writeQuestionRecord(recordPath: string, record: QuestionRecord): Promise<void> {
-  await mkdir(dirname(recordPath), { recursive: true });
-  await writeAtomic(recordPath, `${JSON.stringify(record, null, 2)}\n`);
+function questionStateRootForRecordPath(recordPath: string): string {
+  const questionsDir = dirname(recordPath);
+  const parent = dirname(questionsDir);
+  return basename(parent) === 'sessions' ? dirname(parent) : parent;
+}
+
+async function prepareQuestionStateRoot(
+  cwd: string,
+  stateDir?: string,
+): Promise<{ stateDir: string; rootIdentity: RootFilesystemIdentity }> {
+  const root = stateDir ?? getBaseStateDir(cwd);
+  await mkdir(root, { recursive: true, mode: 0o700 });
+  return { stateDir: root, rootIdentity: await captureRootFilesystemIdentity(root) };
+}
+
+export async function writeQuestionRecord(
+  recordPath: string,
+  record: QuestionRecord,
+  options: { stateDir: string; expectedRootIdentity: RootFilesystemIdentity },
+): Promise<void> {
+  await ensureAuthorityDirectory(options.stateDir, dirname(recordPath), {
+    expected_root_identity: options.expectedRootIdentity,
+  });
+  await atomicWriteAuthorityFile(recordPath, `${JSON.stringify(record, null, 2)}\n`, {
+    authority_root: options.stateDir,
+    expected_root_identity: options.expectedRootIdentity,
+  });
 }
 
 export async function readQuestionRecord(recordPath: string): Promise<QuestionRecord | null> {
@@ -111,13 +140,19 @@ export async function createQuestionRecord(
   const recordPath = options.stateDir
     ? getQuestionRecordPathForStateDir(options.stateDir, questionId, sessionId)
     : getQuestionRecordPath(cwd, questionId, sessionId);
-  await writeQuestionRecord(recordPath, record);
+  const storage = await prepareQuestionStateRoot(cwd, options.stateDir);
+  await writeQuestionRecord(recordPath, record, {
+    stateDir: storage.stateDir,
+    expectedRootIdentity: storage.rootIdentity,
+  });
   if (options.emitEvent) {
     await appendQuestionEvent(cwd, 'question-created', record, {
       recordPath,
       timeoutMs: options.timeoutMs,
       runId: options.runId,
       now,
+      stateDir: storage.stateDir,
+      expectedRootIdentity: storage.rootIdentity,
     });
   }
   return { recordPath, record };
@@ -126,11 +161,17 @@ export async function createQuestionRecord(
 export async function updateQuestionRecord(
   recordPath: string,
   updater: (record: QuestionRecord) => QuestionRecord,
+  options: { stateDir?: string; expectedRootIdentity?: RootFilesystemIdentity } = {},
 ): Promise<QuestionRecord> {
   const current = await readQuestionRecord(recordPath);
   if (!current) throw new Error(`Question record not found: ${recordPath}`);
   const updated = updater(current);
-  await writeQuestionRecord(recordPath, updated);
+  const stateDir = options.stateDir ?? questionStateRootForRecordPath(recordPath);
+  const storage = await prepareQuestionStateRoot(stateDir, stateDir);
+  await writeQuestionRecord(recordPath, updated, {
+    stateDir: storage.stateDir,
+    expectedRootIdentity: options.expectedRootIdentity ?? storage.rootIdentity,
+  });
   return updated;
 }
 
@@ -171,6 +212,7 @@ export async function markQuestionAnswered(
 async function persistQuestionAnswered(
   recordPath: string,
   answerOrAnswers: QuestionAnswer | QuestionAnswerEntry[],
+  options: { stateDir?: string; expectedRootIdentity?: RootFilesystemIdentity } = {},
 ): Promise<QuestionRecord> {
   const updated = await updateQuestionRecord(recordPath, (record) => {
     const answers = Array.isArray(answerOrAnswers)
@@ -185,7 +227,7 @@ async function persistQuestionAnswered(
       answers,
       error: undefined,
     };
-  });
+  }, options);
   return updated;
 }
 
@@ -466,6 +508,7 @@ export async function submitQuestionAnswerById(
   const recordPath = options.stateDir
     ? getQuestionRecordPathForStateDir(options.stateDir, normalizedQuestionId, options.sessionId)
     : getQuestionRecordPath(cwd, normalizedQuestionId, options.sessionId);
+  const storage = await prepareQuestionStateRoot(cwd, options.stateDir);
   const result = await withQuestionSubmitLock(recordPath, async () => {
     const current = await readQuestionRecord(recordPath);
     if (!current) throw new QuestionSubmitError('question_unknown', `Unknown question id: ${normalizedQuestionId}`);
@@ -483,8 +526,16 @@ export async function submitQuestionAnswerById(
     } catch (error) {
       throw new QuestionSubmitError('question_invalid_answer', error instanceof Error ? error.message : String(error));
     }
-    const record = await persistQuestionAnswered(recordPath, answers);
-    await appendQuestionAnsweredEventOnce(cwd, record, { recordPath, runId: options.runId });
+    const record = await persistQuestionAnswered(recordPath, answers, {
+      stateDir: storage.stateDir,
+      expectedRootIdentity: storage.rootIdentity,
+    });
+    await appendQuestionAnsweredEventOnce(cwd, record, {
+      recordPath,
+      runId: options.runId,
+      stateDir: storage.stateDir,
+      expectedRootIdentity: storage.rootIdentity,
+    });
     return { recordPath, record };
   });
   runAnsweredQuestionSideEffects(result.record, options);

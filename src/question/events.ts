@@ -1,6 +1,13 @@
 import { existsSync } from 'node:fs';
-import { appendFile, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
+import {
+  atomicWriteAuthorityFile,
+  captureRootFilesystemIdentity,
+  ensureAuthorityDirectory,
+  sameRootFilesystemIdentity,
+  type RootFilesystemIdentity,
+} from '../state/authority.js';
 import { sleep } from '../utils/sleep.js';
 import { getBaseStateDir } from '../mcp/state-paths.js';
 import type { QuestionAnswerEntry, QuestionRecord } from './types.js';
@@ -33,7 +40,43 @@ export interface QuestionEventRecord {
 }
 
 export function getQuestionEventsPath(cwd: string): string {
-  return join(getBaseStateDir(cwd), 'question-events.jsonl');
+  return getQuestionEventsPathForStateDir(getBaseStateDir(cwd));
+}
+
+export function getQuestionEventsPathForStateDir(stateDir: string): string {
+  return join(stateDir, 'question-events.jsonl');
+}
+
+export interface QuestionEventStorageOptions {
+  stateDir?: string;
+  expectedRootIdentity?: RootFilesystemIdentity;
+}
+
+async function resolveQuestionEventStorage(
+  cwd: string,
+  options: QuestionEventStorageOptions,
+): Promise<{ stateDir: string; rootIdentity: RootFilesystemIdentity }> {
+  const stateDir = options.stateDir ?? getBaseStateDir(cwd);
+  await mkdir(stateDir, { recursive: true, mode: 0o700 });
+  const rootIdentity = await captureRootFilesystemIdentity(stateDir);
+  if (options.expectedRootIdentity && !sameRootFilesystemIdentity(options.expectedRootIdentity, rootIdentity)) {
+    throw new Error('question event state root was replaced before mutation');
+  }
+  return { stateDir, rootIdentity: options.expectedRootIdentity ?? rootIdentity };
+}
+
+async function writeQuestionEvent(
+  eventsPath: string,
+  stateDir: string,
+  rootIdentity: RootFilesystemIdentity,
+  event: QuestionEventRecord,
+): Promise<void> {
+  await ensureAuthorityDirectory(stateDir, dirname(eventsPath), { expected_root_identity: rootIdentity });
+  const existing = existsSync(eventsPath) ? await readFile(eventsPath, 'utf-8') : '';
+  await atomicWriteAuthorityFile(eventsPath, `${existing}${JSON.stringify(event)}\n`, {
+    authority_root: stateDir,
+    expected_root_identity: rootIdentity,
+  });
 }
 
 function questionEventLockOwnerToken(): string {
@@ -167,32 +210,41 @@ export async function appendQuestionEvent(
   cwd: string,
   type: QuestionEventType,
   record: QuestionRecord,
-  options: { recordPath?: string; timeoutMs?: number; runId?: string; now?: Date } = {},
+  options: { recordPath?: string; timeoutMs?: number; runId?: string; now?: Date } & QuestionEventStorageOptions = {},
 ): Promise<QuestionEventRecord> {
+  const storage = await resolveQuestionEventStorage(cwd, options);
+  const path = getQuestionEventsPathForStateDir(storage.stateDir);
   const event = buildQuestionEvent(type, record, options);
-  const path = getQuestionEventsPath(cwd);
-  await mkdir(dirname(path), { recursive: true });
-  await appendFile(path, `${JSON.stringify(event)}\n`);
+  await withQuestionEventLock(path, 'append', async () => {
+    await writeQuestionEvent(path, storage.stateDir, storage.rootIdentity, event);
+  });
   return event;
 }
 
 export async function appendQuestionAnsweredEventOnce(
   cwd: string,
   record: QuestionRecord,
-  options: { recordPath?: string; timeoutMs?: number; runId?: string; now?: Date } = {},
+  options: { recordPath?: string; timeoutMs?: number; runId?: string; now?: Date } & QuestionEventStorageOptions = {},
 ): Promise<{ event: QuestionEventRecord; appended: boolean }> {
-  const path = getQuestionEventsPath(cwd);
+  const storage = await resolveQuestionEventStorage(cwd, options);
+  const path = getQuestionEventsPathForStateDir(storage.stateDir);
   return await withQuestionEventLock(path, `answered-${record.question_id}`, async () => {
     const existing = (await readAllQuestionEventsFromPath(path, { type: 'question-answered' }))
       .find((event) => event.question_id === record.question_id);
     if (existing) return { event: existing, appended: false };
-    const event = await appendQuestionEvent(cwd, 'question-answered', record, options);
+    const event = buildQuestionEvent('question-answered', record, options);
+    await writeQuestionEvent(path, storage.stateDir, storage.rootIdentity, event);
     return { event, appended: true };
   });
 }
 
-export async function readQuestionEvents(cwd: string, options: { limit?: number; type?: QuestionEventType } = {}): Promise<QuestionEventRecord[]> {
-  const path = getQuestionEventsPath(cwd);
+export async function readQuestionEvents(
+  cwd: string,
+  options: { limit?: number; type?: QuestionEventType } & Pick<QuestionEventStorageOptions, 'stateDir'> = {},
+): Promise<QuestionEventRecord[]> {
+  const path = options.stateDir
+    ? getQuestionEventsPathForStateDir(options.stateDir)
+    : getQuestionEventsPath(cwd);
   const limit = Math.max(1, Math.min(options.limit ?? 100, 1000));
   const events = await readAllQuestionEventsFromPath(path, { type: options.type });
   return events.slice(-limit);

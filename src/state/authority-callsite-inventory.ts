@@ -3465,6 +3465,15 @@ export const AUTHORITY_CALLSITE_INVENTORY = [
   ),
   entry(
     'src/question/events.ts',
+    'resolveQuestionEventStorage',
+    'authority-context',
+    'questions',
+    'Resolves event storage only from the supplied committed state root; cwd resolution is legacy pre-commit compatibility.',
+    phase1,
+  ),
+
+  entry(
+    'src/question/events.ts',
     'appendQuestionAnsweredEventOnce',
     'authority-context',
     'questions',
@@ -3533,6 +3542,14 @@ export const AUTHORITY_CALLSITE_INVENTORY = [
     'authority-context',
     'questions',
     'resolveReturnTarget reads, writes, guards, or transports state only through its classified committed-authority dependency.',
+    phase1,
+  ),
+  entry(
+    'src/question/state.ts',
+    'prepareQuestionStateRoot',
+    'authority-context',
+    'questions',
+    'Pins question record mutations to the supplied committed state root and its filesystem identity.',
     phase1,
   ),
   entry(

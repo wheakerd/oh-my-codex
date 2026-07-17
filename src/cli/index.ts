@@ -201,6 +201,7 @@ import {
   captureRootFilesystemIdentity,
   ensureAuthorityDirectory,
   initializeStateAuthority,
+  ensureStateAuthorityTransportCapability,
   isObservedCwdCompatibleWithStateAuthority,
   mintStateAuthorityTransportCapability,
   publishStateAuthorityLaunchTransport,
@@ -814,8 +815,9 @@ async function resolveStandaloneCommittedAuthority(
     const scope = await resolveCommittedAuthorityRuntimeStateScope(cwd);
     assertStateAuthorityTransportAliasesMatch(scope.authority, process.env);
     if (surface === "HUD") {
-      const capability = await mintStateAuthorityTransportCapability(scope.authority);
-      await validateStateAuthorityTransportCapability(scope.authority, capability.capability);
+      await ensureStateAuthorityTransportCapability(scope.authority, {
+        inherited_capability: process.env[OMX_STATE_AUTHORITY_CAPABILITY_ENV],
+      });
     }
     return scope;
   } catch (error) {

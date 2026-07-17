@@ -121,6 +121,7 @@ import {
   initializeStateAuthority,
   resolveStateAuthority,
   rolloverStateAuthorityToAlternateRoot,
+  validateStateAuthorityTransportCapability,
 } from "../../state/authority.js";
 
 
@@ -6629,6 +6630,35 @@ describe("launch state authority transport", () => {
     }
   });
 
+
+  it("reuses the inherited HUD transport bearer without invalidating concurrent consumers", async () => {
+    const workspace = await mkdtemp(join(tmpdir(), "omx-hud-inherited-transport-"));
+    const previousCwd = process.cwd();
+    const previousEnv = new Map(STATE_AUTHORITY_ENV_KEYS.map((key) => [key, process.env[key]]));
+    try {
+      const authority = await establishLaunchAuthority(workspace, "hud-inherited-transport");
+      const transport = buildStateAuthorityTransportEnv(authority, process.env);
+      Object.assign(process.env, transport);
+      process.chdir(workspace);
+      mock.method(console, "log", () => {});
+      mock.method(console, "error", () => {});
+
+      await main(["hud", "--json"]);
+
+      await validateStateAuthorityTransportCapability(
+        authority,
+        transport.OMX_STATE_AUTHORITY_CAPABILITY!,
+      );
+    } finally {
+      process.chdir(previousCwd);
+      for (const key of STATE_AUTHORITY_ENV_KEYS) {
+        const value = previousEnv.get(key);
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      await rm(workspace, { recursive: true, force: true });
+    }
+  });
 
   it("keeps HUD and team help authority-free without replacing the parent generation", async () => {
     const workspace = await mkdtemp(join(tmpdir(), "omx-alternate-surface-authority-"));

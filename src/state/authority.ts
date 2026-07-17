@@ -216,6 +216,14 @@ export interface MintStateAuthorityTransportCapabilityInput {
   now?: Date;
   /** Bounded test hook; production callers use the 30-day maximum lifetime. */
   ttl_ms?: number;
+  /** Refuse to replace a live bearer; used by auxiliary authenticated surfaces. */
+  only_if_transport_absent_or_expired?: boolean;
+}
+
+export interface EnsureStateAuthorityTransportCapabilityInput {
+  /** A bearer inherited from the authenticated launcher environment. */
+  inherited_capability?: string;
+  now?: Date;
 }
 
 export interface MintedStateAuthorityTransportCapability {
@@ -5279,6 +5287,16 @@ export async function mintStateAuthorityTransportCapability(
 				"cannot mint transport capability for a stale authority context",
 			);
 		}
+		if (
+			input.only_if_transport_absent_or_expired &&
+			anchor.transport_capability?.status === 'active' &&
+			new Date(anchor.transport_capability.expires_at).getTime() > now.getTime()
+		) {
+			authorityError(
+				AUTHORITY_DIAGNOSTIC_CODES.transportCapabilityInvalid,
+				'an active state-authority transport capability must be inherited rather than replaced',
+			);
+		}
 		const metadata: StateAuthorityTransportCapabilityMetadata = {
 			schema_version: 1,
 			status: "active",
@@ -5315,6 +5333,31 @@ export async function mintStateAuthorityTransportCapability(
 	} finally {
 		await releaseWorkspaceAuthorityLock(lock);
 	}
+}
+
+/**
+ * Reuses an authenticated inherited bearer and only mints when no active bearer
+ * exists or the recorded bearer has expired. This prevents auxiliary surfaces
+ * from replacing the single persisted digest while launcher consumers are live.
+ */
+export async function ensureStateAuthorityTransportCapability(
+  context: ResolvedStateAuthorityContext,
+  input: EnsureStateAuthorityTransportCapabilityInput = {},
+): Promise<MintedStateAuthorityTransportCapability> {
+  const now = input.now ?? new Date();
+  if (input.inherited_capability !== undefined) {
+    const metadata = await validateStateAuthorityTransportCapability(
+      context,
+      input.inherited_capability,
+      now,
+    );
+    return { capability: input.inherited_capability, metadata };
+  }
+
+  return await mintStateAuthorityTransportCapability(context, {
+    now,
+    only_if_transport_absent_or_expired: true,
+  });
 }
 
 /** Validates and remembers an inherited opaque transport bearer. */

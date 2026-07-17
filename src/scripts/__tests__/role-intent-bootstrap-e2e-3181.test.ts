@@ -8,7 +8,6 @@ import { describe, it } from 'node:test';
 
 import { ralplanCommand } from '../../cli/ralplan.js';
 import { readSubagentTrackingState, recordSubagentTurnForSession } from '../../subagents/tracker.js';
-import { parseRoleIntentCorrelationToken } from '../../leader/contract.js';
 import { dispatchCodexNativeHook } from '../codex-native-hook.js';
 import {
   initializeStateAuthority,
@@ -134,7 +133,7 @@ describe('#3181 end-to-end fresh App turn bootstrap', () => {
     }
   });
 
-  it('PreToolUse (leader turn) bootstraps the pointer + attestation when SessionStart did not, so the first role-intent write succeeds', async () => {
+  it('denies the canonical installed-role command before undocumented native fields can attest authority', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-3181-e2e-pretool-'));
     const priorEnv = { OMX_SESSION_ID: process.env.OMX_SESSION_ID, CODEX_SESSION_ID: process.env.CODEX_SESSION_ID, SESSION_ID: process.env.SESSION_ID };
     try {
@@ -144,9 +143,7 @@ describe('#3181 end-to-end fresh App turn bootstrap', () => {
       const nativeSessionId = 'codex-native-exec-leader';
       Object.assign(process.env, await installAuthenticatedAuthority(cwd, nativeSessionId));
 
-      // Fresh exec turn where the first event reaching OMX is a leader PreToolUse (no
-      // prior SessionStart pointer). The leader turn carries thread_id == session_id.
-      await dispatchCodexNativeHook(
+      const result = await dispatchCodexNativeHook(
         {
           hook_event_name: 'PreToolUse',
           cwd,
@@ -159,17 +156,16 @@ describe('#3181 end-to-end fresh App turn bootstrap', () => {
         { cwd, sessionOwnerPid: process.pid },
       );
 
-      const afterPreTool = await readSubagentTrackingState(cwd);
-      const attested = afterPreTool.sessions[nativeSessionId];
-      assert.equal(attested?.leader_thread_id, nativeSessionId);
-      assert.equal(attested?.leader_attest_source, 'native-pretooluse');
-
-      const res = await invokeRoleIntent(cwd, ['role-intent', 'write', '--role', 'architect', '--parent-thread', nativeSessionId, '--json']);
-      assert.equal(res.exitCode, undefined);
-      const receipt = JSON.parse(res.stdout.join('\n')) as { ok: boolean; intent: { role: string } };
-      assert.equal(receipt.ok, true);
-      assert.equal(receipt.intent.role, 'architect');
-      assert.equal((await readSubagentTrackingState(cwd)).pending_role_intents.length, 1);
+      assert.deepEqual(result.outputJson, {
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse',
+          permissionDecision: 'deny',
+          permissionDecisionReason: 'unsupported_documented_leader_proof: Codex 0.144.5 hooks do not expose documented root identity required for adapted Ralplan.',
+        },
+      });
+      const state = await readSubagentTrackingState(cwd);
+      assert.equal(state.sessions[nativeSessionId]?.leader_attested_at, undefined);
+      assert.deepEqual(state.pending_role_intents, []);
     } finally {
       if (priorEnv.OMX_SESSION_ID !== undefined) process.env.OMX_SESSION_ID = priorEnv.OMX_SESSION_ID;
       if (priorEnv.CODEX_SESSION_ID !== undefined) process.env.CODEX_SESSION_ID = priorEnv.CODEX_SESSION_ID;
@@ -178,42 +174,16 @@ describe('#3181 end-to-end fresh App turn bootstrap', () => {
     }
   });
 
-  it('compiled SessionStart then PreToolUse attests the same native leader before the actual role-intent CLI dispatch', async () => {
+  it('compiled hook denies the documented canonical role-intent command without attesting a leader', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-3181-e2e-compiled-'));
     const home = await mkdtemp(join(tmpdir(), 'omx-3181-home-'));
     const codexHome = await mkdtemp(join(tmpdir(), 'omx-3181-codex-home-'));
     const nativeSessionId = 'codex-native-compiled-leader';
-    const inheritedAuthorityKeys = [
-      'OMX_ROOT', 'OMX_STATE_ROOT', 'OMX_TEAM_STATE_ROOT', 'OMX_STARTUP_CWD',
-      OMX_STATE_AUTHORITY_PATH_ENV, OMX_STATE_AUTHORITY_ID_ENV, OMX_STATE_AUTHORITY_GENERATION_ID_ENV,
-      OMX_STATE_AUTHORITY_WORKSPACE_DIGEST_ENV, OMX_STATE_AUTHORITY_CAPABILITY_ENV,
-    ];
-    const inheritedAuthorityEnvironment = new Map(inheritedAuthorityKeys.map((key) => [key, process.env[key]]));
-    for (const key of inheritedAuthorityKeys) delete process.env[key];
     const environment = {
       ...buildHermeticChildEnvironment(home, codexHome),
       ...await installAuthenticatedAuthority(cwd, nativeSessionId),
     };
     try {
-      assert.equal(existsSync(join(cwd, '.omx', 'state', 'session.json')), false, 'compiled fixture must start without a canonical pointer');
-      assert.equal(existsSync(join(cwd, '.omx', 'state', 'subagent-tracking.json')), false, 'compiled fixture must start without a tracker');
-      const sessionStart = runCompiled(cwd, environment, 'scripts/codex-native-hook.js', [], {
-        hook_event_name: 'SessionStart', cwd, session_id: nativeSessionId,
-      });
-      assert.equal(sessionStart.status, 0, String(sessionStart.stderr));
-      assert.equal((await readSubagentTrackingState(cwd)).sessions[nativeSessionId]?.leader_attested_at, undefined);
-      const compiledPointerPath = join(cwd, '.omx', 'state', 'session.json');
-      const compiledPointer = JSON.parse(String(await readFile(compiledPointerPath))) as Record<string, unknown>;
-      assert.equal(compiledPointer.native_session_id, nativeSessionId, 'SessionStart must commit the native leader identity before PreToolUse');
-      Object.assign(environment, await refreshAuthenticatedAuthority(cwd, nativeSessionId, environment));
-      const preToolAuthority = await resolveStateAuthorityForGuard({
-        startup_cwd: cwd,
-        observed_cwd: cwd,
-        session_id: nativeSessionId,
-      });
-      assert.equal(preToolAuthority.session_binding?.canonical_session_id, nativeSessionId);
-      assert.equal(preToolAuthority.session_binding?.aliases.native_session_id, nativeSessionId);
-
       const preToolUse = runCompiled(cwd, environment, 'scripts/codex-native-hook.js', [], {
         hook_event_name: 'PreToolUse',
         cwd,
@@ -224,37 +194,17 @@ describe('#3181 end-to-end fresh App turn bootstrap', () => {
         tool_input: { command: 'omx ralplan role-intent write --role architect --parent-thread "$CODEX_THREAD_ID" --json' },
       });
       assert.equal(preToolUse.status, 0, String(preToolUse.stderr));
-      const trackingAfterPreTool = await readSubagentTrackingState(cwd);
-      const attested = trackingAfterPreTool.sessions[nativeSessionId];
-      assert.equal(attested?.leader_thread_id, nativeSessionId, JSON.stringify(trackingAfterPreTool));
-      assert.equal(attested?.leader_attest_source, 'native-pretooluse');
-
-      Object.assign(environment, await refreshAuthenticatedAuthority(cwd, nativeSessionId, environment));
-      const cli = runCompiled(cwd, environment, 'cli/omx.js', [
-        'ralplan', 'role-intent', 'write', '--role', 'architect', '--parent-thread', nativeSessionId, '--json',
-      ]);
-      assert.equal(cli.status, 0, String(cli.stderr));
-      const receipt = JSON.parse(String(cli.stdout)) as {
-        ok: boolean;
-        intent: { role: string; session_id: string; parent_thread_id: string; correlation_token: string };
-        spawn_task_name: string;
-      };
-      assert.equal(receipt.ok, true);
-      assert.equal(receipt.intent.role, 'architect');
-      assert.equal(receipt.intent.parent_thread_id, nativeSessionId);
-      assert.ok(receipt.intent.session_id);
-      assert.match(receipt.spawn_task_name, /^omx_role_intent_[a-z0-9_]+$/);
-      assert.equal(parseRoleIntentCorrelationToken(receipt.spawn_task_name), receipt.intent.correlation_token);
+      assert.deepEqual(JSON.parse(String(preToolUse.stdout)), {
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse',
+          permissionDecision: 'deny',
+          permissionDecisionReason: 'unsupported_documented_leader_proof: Codex 0.144.5 hooks do not expose documented root identity required for adapted Ralplan.',
+        },
+      });
       const tracking = await readSubagentTrackingState(cwd);
-      assert.equal(tracking.sessions[receipt.intent.session_id]?.leader_thread_id, nativeSessionId);
-      assert.equal(tracking.pending_role_intents.length, 1);
-      assert.equal(tracking.pending_role_intents[0]?.correlation_token, receipt.intent.correlation_token);
+      assert.equal(tracking.sessions[nativeSessionId]?.leader_attested_at, undefined);
+      assert.deepEqual(tracking.pending_role_intents, []);
     } finally {
-      for (const key of inheritedAuthorityKeys) {
-        const value = inheritedAuthorityEnvironment.get(key);
-        if (value === undefined) delete process.env[key];
-        else process.env[key] = value;
-      }
       await rm(cwd, { recursive: true, force: true });
       await rm(home, { recursive: true, force: true });
       await rm(codexHome, { recursive: true, force: true });

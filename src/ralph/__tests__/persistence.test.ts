@@ -4,7 +4,11 @@ import { mkdtemp, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promise
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
-import { ensureCanonicalRalphArtifacts, recordRalphVisualFeedback } from '../persistence.js';
+import {
+  __setRalphVisualFeedbackBarrierForTest,
+  ensureCanonicalRalphArtifacts,
+  recordRalphVisualFeedback,
+} from '../persistence.js';
 import { VISUAL_NEXT_ACTIONS_LIMIT } from '../../visual/constants.js';
 import { captureRootFilesystemIdentity } from '../../state/authority.js';
 
@@ -146,6 +150,61 @@ describe('ensureCanonicalRalphArtifacts', () => {
       assert.equal(progress.visual_feedback[0].qualitative_feedback.next_actions.length > 0, true);
       assert.equal(progress.visual_feedback[0].next_actions.length <= VISUAL_NEXT_ACTIONS_LIMIT, true);
     } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('serializes concurrent authoritative visual feedback without stale ledger overwrites', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-ralph-visual-concurrent-'));
+    let releaseFirstRead: (() => void) | undefined;
+    try {
+      const stateRoot = join(cwd, '.omx', 'state');
+      const sessionId = 'sessConcurrent';
+      await mkdir(join(stateRoot, 'sessions', sessionId), { recursive: true, mode: 0o700 });
+      const expectedRootIdentity = await captureRootFilesystemIdentity(stateRoot);
+      const artifacts = await ensureCanonicalRalphArtifacts(cwd, sessionId, stateRoot, expectedRootIdentity);
+      let barrierCalls = 0;
+      let signalFirstRead!: () => void;
+      const firstReadReached = new Promise<void>((resolve) => {
+        signalFirstRead = resolve;
+      });
+      __setRalphVisualFeedbackBarrierForTest(() => {
+        barrierCalls += 1;
+        if (barrierCalls === 1) {
+          signalFirstRead();
+          return new Promise<void>((resolve) => {
+            releaseFirstRead = resolve;
+          });
+        }
+      });
+
+      const first = recordRalphVisualFeedback(cwd, {
+        score: 71,
+        verdict: 'revise',
+        category_match: false,
+        differences: ['first'],
+        suggestions: ['first suggestion'],
+      }, sessionId, stateRoot, expectedRootIdentity);
+      await firstReadReached;
+      const second = recordRalphVisualFeedback(cwd, {
+        score: 72,
+        verdict: 'revise',
+        category_match: false,
+        differences: ['second'],
+        suggestions: ['second suggestion'],
+      }, sessionId, stateRoot, expectedRootIdentity);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(barrierCalls, 1, 'the second writer must not read a stale ledger while the first holds the lock');
+
+      releaseFirstRead?.();
+      await Promise.all([first, second]);
+      const progress = JSON.parse(await readFile(artifacts.canonicalProgressPath, 'utf-8')) as {
+        visual_feedback: Array<{ score: number }>;
+      };
+      assert.deepEqual(progress.visual_feedback.map((entry) => entry.score), [71, 72]);
+    } finally {
+      __setRalphVisualFeedbackBarrierForTest(null);
+      releaseFirstRead?.();
       await rm(cwd, { recursive: true, force: true });
     }
   });

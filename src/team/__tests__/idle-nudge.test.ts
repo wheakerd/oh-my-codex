@@ -6,7 +6,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DEFAULT_NUDGE_CONFIG, NudgeTracker, capturePane, isPaneIdle } from '../idle-nudge.js';
 
-const WORKER_TARGET = '';
+const WORKER_TARGET = '%2';
+const WORKER_PROOF_TARGET = {
+  paneId: WORKER_TARGET,
+  workerIndex: 0,
+  panePid: 12345,
+  teamOwnerId: 'omx-team-a-owner',
+};
 
 function buildFakeTmux(tmuxLogPath: string): string {
   return `#!/usr/bin/env bash
@@ -66,10 +72,10 @@ if [[ "\$cmd" == "send-keys" ]]; then
 fi
 
 if [[ "\$cmd" == "list-panes" ]]; then
-  if [[ "$#" -eq 3 && "$1" == "-a" && "$2" == "-F" && "$3" == "#{pane_id}\t#{pane_dead}\t#{pane_pid}" ]]; then
-    printf '%%2\t0\t12345\n'
+  if [[ "$#" -eq 3 && "$1" == "-a" && "$2" == "-F" && "$3" == "#{pane_id}\t#{pane_dead}\t#{pane_pid}\t#{session_name}" ]]; then
+    printf '%%2\t0\t12345\tomx-team-a\n'
   else
-    printf '0 12345\\n'
+    printf '12345\n'
   fi
   exit 0
 fi
@@ -162,15 +168,15 @@ describe('idle-nudge', () => {
       await withMockedNow(10_000, async (setNow) => {
         const tracker = new NudgeTracker({ delayMs: 0, maxCount: 3, message: 'nudge' });
 
-        const first = await tracker.checkAndNudge([WORKER_TARGET], undefined, 'omx-team-a');
+        const first = await tracker.checkAndNudge([WORKER_PROOF_TARGET], undefined, 'omx-team-a');
         assert.deepEqual(first, [WORKER_TARGET]);
         const firstLog = await readFile(tmuxLogPath, 'utf-8');
         const firstCommands = firstLog.trim().split('\n').filter(Boolean);
-        const nudgeEffectIndex = firstCommands.findIndex((command) => command.startsWith('send-keys -t omx-team-a:0 '));
+        const nudgeEffectIndex = firstCommands.findIndex((command) => command.startsWith(`send-keys -t ${WORKER_TARGET} `));
         assert.ok(nudgeEffectIndex >= 0, 'expected nudge send-keys target effect');
 
         setNow(11_000); // < 5000ms scan interval
-        const second = await tracker.checkAndNudge([WORKER_TARGET], undefined, 'omx-team-a');
+        const second = await tracker.checkAndNudge([WORKER_PROOF_TARGET], undefined, 'omx-team-a');
         assert.deepEqual(second, []);
 
         const secondLog = await readFile(tmuxLogPath, 'utf-8');
@@ -196,12 +202,12 @@ describe('idle-nudge', () => {
       await withMockedNow(10_000, async (setNow) => {
         const tracker = new NudgeTracker({ delayMs: 0, maxCount: 1, message: 'nudge' });
 
-        const first = await tracker.checkAndNudge([WORKER_TARGET], undefined, 'omx-team-a');
+        const first = await tracker.checkAndNudge([WORKER_PROOF_TARGET], undefined, 'omx-team-a');
         assert.deepEqual(first, [WORKER_TARGET]);
         const firstLog = await readFile(tmuxLogPath, 'utf-8');
 
         setNow(16_000); // > 5000ms scan interval
-        const second = await tracker.checkAndNudge([WORKER_TARGET], undefined, 'omx-team-a');
+        const second = await tracker.checkAndNudge([WORKER_PROOF_TARGET], undefined, 'omx-team-a');
         assert.deepEqual(second, []);
 
         const secondLog = await readFile(tmuxLogPath, 'utf-8');
@@ -224,23 +230,23 @@ describe('idle-nudge', () => {
       await withMockedNow(10_000, async (setNow) => {
         const tracker = new NudgeTracker({ delayMs: 10_000, maxCount: 3, message: 'nudge' });
 
-        const r1 = await tracker.checkAndNudge([WORKER_TARGET], undefined, 'omx-team-a');
+        const r1 = await tracker.checkAndNudge([WORKER_PROOF_TARGET], undefined, 'omx-team-a');
         assert.deepEqual(r1, []);
 
         setNow(16_000);
-        const r2 = await tracker.checkAndNudge([WORKER_TARGET], undefined, 'omx-team-a');
+        const r2 = await tracker.checkAndNudge([WORKER_PROOF_TARGET], undefined, 'omx-team-a');
         assert.deepEqual(r2, []);
 
         setNow(22_000);
-        const r3 = await tracker.checkAndNudge([WORKER_TARGET], undefined, 'omx-team-a');
+        const r3 = await tracker.checkAndNudge([WORKER_PROOF_TARGET], undefined, 'omx-team-a');
         assert.deepEqual(r3, []);
 
         setNow(28_000);
-        const r4 = await tracker.checkAndNudge([WORKER_TARGET], undefined, 'omx-team-a');
+        const r4 = await tracker.checkAndNudge([WORKER_PROOF_TARGET], undefined, 'omx-team-a');
         assert.deepEqual(r4, []);
 
         setNow(39_000);
-        const r5 = await tracker.checkAndNudge([WORKER_TARGET], undefined, 'omx-team-a');
+        const r5 = await tracker.checkAndNudge([WORKER_PROOF_TARGET], undefined, 'omx-team-a');
         assert.deepEqual(r5, [WORKER_TARGET]);
         assert.equal(tracker.totalNudges, 1);
       });
@@ -253,7 +259,7 @@ describe('idle-nudge', () => {
 
       await withMockedNow(10_000, async () => {
         const tracker = new NudgeTracker({ delayMs: 0, maxCount: 3, message: 'nudge' });
-        const nudged = await tracker.checkAndNudge([WORKER_TARGET], undefined, 'omx-team-a');
+        const nudged = await tracker.checkAndNudge([WORKER_PROOF_TARGET], undefined, 'omx-team-a');
         assert.deepEqual(nudged, []);
         assert.equal(tracker.totalNudges, 0);
         assert.deepEqual(tracker.getSummary(), {});

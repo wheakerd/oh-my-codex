@@ -5799,6 +5799,7 @@ async function notifyWorkerOutcome(
       worker.worker_cli,
       worker.pid,
       config.tmux_pane_owner_id,
+      config.tmux_session,
       config.hud_pane_id ?? undefined,
     );
     return {

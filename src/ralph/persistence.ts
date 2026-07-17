@@ -21,6 +21,49 @@ const PRD_PREFIX = 'prd-';
 const PRD_SUFFIX = '.md';
 const DEFAULT_VISUAL_THRESHOLD = 90;
 
+const ralphVisualFeedbackWriteQueues = new Map<string, Promise<void>>();
+let ralphVisualFeedbackBarrierForTest: (() => void | Promise<void>) | undefined;
+
+export function __setRalphVisualFeedbackBarrierForTest(
+  barrier: (() => void | Promise<void>) | null,
+): void {
+  ralphVisualFeedbackBarrierForTest = barrier ?? undefined;
+}
+
+async function withRalphVisualFeedbackWriteLock<T>(lockKey: string, fn: () => Promise<T>): Promise<T> {
+  const predecessor = ralphVisualFeedbackWriteQueues.get(lockKey) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const tail = predecessor.catch(() => undefined).then(() => current);
+  ralphVisualFeedbackWriteQueues.set(lockKey, tail);
+
+  await predecessor.catch(() => undefined);
+  try {
+    return await fn();
+  } finally {
+    release();
+    if (ralphVisualFeedbackWriteQueues.get(lockKey) === tail) {
+      ralphVisualFeedbackWriteQueues.delete(lockKey);
+    }
+  }
+}
+
+function ralphVisualFeedbackWriteLockKey(
+  canonicalProgressPath: string,
+  expectedRootIdentity?: RootFilesystemIdentity,
+): string {
+  if (!expectedRootIdentity) return canonicalProgressPath;
+  return [
+    canonicalProgressPath,
+    expectedRootIdentity.canonical_path,
+    expectedRootIdentity.device,
+    expectedRootIdentity.inode,
+    expectedRootIdentity.birthtime_ns,
+  ].join('\u0000');
+}
+
 export interface RalphVisualFeedback {
   score: number;
   verdict: VisualVerdictStatus;
@@ -189,9 +232,17 @@ async function ensureCanonicalProgressLedgerFile(
   );
 }
 
-async function readCanonicalProgressLedger(canonicalProgressPath: string): Promise<RalphProgressLedger> {
+async function readCanonicalProgressLedger(
+  canonicalProgressPath: string,
+  authorityStateRoot?: string,
+  expectedRootIdentity?: RootFilesystemIdentity,
+): Promise<RalphProgressLedger> {
   if (!existsSync(canonicalProgressPath)) {
-    await ensureCanonicalProgressLedgerFile(canonicalProgressPath);
+    await ensureCanonicalProgressLedgerFile(
+      canonicalProgressPath,
+      authorityStateRoot,
+      expectedRootIdentity,
+    );
   }
   try {
     const parsed = JSON.parse(await readFile(canonicalProgressPath, 'utf-8')) as RalphProgressLedger;
@@ -362,48 +413,64 @@ export async function recordRalphVisualFeedback(
       'authoritative visual feedback requires the committed root identity',
     );
   }
-  const ledger = await readCanonicalProgressLedger(canonicalProgressPath);
-  const threshold = Number.isFinite(feedback.threshold) ? Number(feedback.threshold) : DEFAULT_VISUAL_THRESHOLD;
-  const nextActions = [
-    ...feedback.suggestions,
-    ...feedback.differences.map((diff) => `Resolve difference: ${diff}`),
-  ]
-    .map((line) => line.trim())
-    .filter((line) => line.length > 0)
-    .slice(0, VISUAL_NEXT_ACTIONS_LIMIT);
-  const entry = {
-    recorded_at: new Date().toISOString(),
-    score: feedback.score,
-    verdict: feedback.verdict,
-    category_match: feedback.category_match,
-    threshold,
-    passes_threshold: feedback.score >= threshold,
-    differences: feedback.differences,
-    suggestions: feedback.suggestions,
-    reasoning: feedback.reasoning ?? '',
-    next_actions: nextActions,
-    qualitative_feedback: {
-      summary: feedback.reasoning ?? feedback.verdict,
-      next_actions: nextActions,
+
+  await withRalphVisualFeedbackWriteLock(
+    ralphVisualFeedbackWriteLockKey(canonicalProgressPath, expectedRootIdentity),
+    async () => {
+      if (baseStateDir && expectedRootIdentity) {
+        await assertPersistedRalphStateRootIdentity(baseStateDir, expectedRootIdentity);
+        await ensureAuthorityDirectory(baseStateDir, join(canonicalProgressPath, '..'), {
+          expected_root_identity: expectedRootIdentity,
+        });
+      } else {
+        await mkdir(join(canonicalProgressPath, '..'), { recursive: true });
+      }
+
+      const ledger = await readCanonicalProgressLedger(
+        canonicalProgressPath,
+        baseStateDir,
+        expectedRootIdentity,
+      );
+      await ralphVisualFeedbackBarrierForTest?.();
+      const threshold = Number.isFinite(feedback.threshold) ? Number(feedback.threshold) : DEFAULT_VISUAL_THRESHOLD;
+      const nextActions = [
+        ...feedback.suggestions,
+        ...feedback.differences.map((diff) => `Resolve difference: ${diff}`),
+      ]
+        .map((line) => line.trim())
+        .filter((line) => line.length > 0)
+        .slice(0, VISUAL_NEXT_ACTIONS_LIMIT);
+      const entry = {
+        recorded_at: new Date().toISOString(),
+        score: feedback.score,
+        verdict: feedback.verdict,
+        category_match: feedback.category_match,
+        threshold,
+        passes_threshold: feedback.score >= threshold,
+        differences: feedback.differences,
+        suggestions: feedback.suggestions,
+        reasoning: feedback.reasoning ?? '',
+        next_actions: nextActions,
+        qualitative_feedback: {
+          summary: feedback.reasoning ?? feedback.verdict,
+          next_actions: nextActions,
+        },
+      };
+      const visualFeedback = Array.isArray(ledger.visual_feedback) ? ledger.visual_feedback : [];
+      visualFeedback.push(entry);
+      ledger.visual_feedback = visualFeedback.slice(-30);
+      ledger.updated_at = new Date().toISOString();
+      const content = `${stableJsonPretty(ledger)}\n`;
+      if (baseStateDir && expectedRootIdentity) {
+        await atomicWriteAuthorityFile(canonicalProgressPath, content, {
+          authority_root: baseStateDir,
+          expected_root_identity: expectedRootIdentity,
+        });
+      } else {
+        await writeFile(canonicalProgressPath, content);
+      }
     },
-  };
-  const visualFeedback = Array.isArray(ledger.visual_feedback) ? ledger.visual_feedback : [];
-  visualFeedback.push(entry);
-  ledger.visual_feedback = visualFeedback.slice(-30);
-  ledger.updated_at = new Date().toISOString();
-  const content = `${stableJsonPretty(ledger)}\n`;
-  if (baseStateDir && expectedRootIdentity) {
-    await ensureAuthorityDirectory(baseStateDir, join(canonicalProgressPath, '..'), {
-      expected_root_identity: expectedRootIdentity,
-    });
-    await atomicWriteAuthorityFile(canonicalProgressPath, content, {
-      authority_root: baseStateDir,
-      expected_root_identity: expectedRootIdentity,
-    });
-  } else {
-    await mkdir(join(canonicalProgressPath, '..'), { recursive: true });
-    await writeFile(canonicalProgressPath, content);
-  }
+  );
 }
 
 export async function ensureCanonicalRalphArtifacts(

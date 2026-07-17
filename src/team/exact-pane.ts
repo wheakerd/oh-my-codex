@@ -1,7 +1,7 @@
 import { spawnPlatformCommand, spawnPlatformCommandSync } from '../utils/platform-command.js';
 
 export type ExactPaneProof =
-  | { status: 'live'; paneId: string; pid: number }
+  | { status: 'live'; paneId: string; pid: number; sessionName: string }
   | { status: 'gone'; paneId: string; reason: 'absent' | 'dead' }
   | {
     status: 'unavailable';
@@ -12,11 +12,7 @@ export type ExactPaneProof =
 
 const EXACT_PANE_ID_PATTERN = /^%[0-9]+$/;
 const PANE_PID_PATTERN = /^[0-9]+$/;
-const LIST_PANES_ARGS = ['list-panes', '-a', '-F', '#{pane_id}\t#{pane_dead}\t#{pane_pid}'];
-
-function exactPaneTmuxCommand(): string {
-  return process.env.OMX_TEST_TMUX_BIN || 'tmux';
-}
+const LIST_PANES_ARGS = ['list-panes', '-a', '-F', '#{pane_id}\t#{pane_dead}\t#{pane_pid}\t#{session_name}'];
 
 function unavailable(
   paneId: string,
@@ -42,13 +38,13 @@ function parseExactPaneProof(paneId: string, stdout: string): ExactPaneProof {
   const lines = stdout.replace(/\r\n/g, '\n').split('\n');
   if (lines.at(-1) === '') lines.pop();
   const paneIds = new Set<string>();
-  let matched: { paneDead: string; pid: string } | null = null;
+  let matched: { paneDead: string; pid: string; sessionName: string } | null = null;
 
   for (const line of lines) {
     const fields = line.split('\t');
-    if (fields.length !== 3) return unavailable(paneId, 'malformed_snapshot');
+    if (fields.length !== 4) return unavailable(paneId, 'malformed_snapshot');
 
-    const [snapshotPaneId, paneDead, pid] = fields;
+    const [snapshotPaneId, paneDead, pid, sessionName] = fields;
     if (!EXACT_PANE_ID_PATTERN.test(snapshotPaneId) || paneIds.has(snapshotPaneId)) {
       return unavailable(paneId, 'malformed_snapshot');
     }
@@ -61,16 +57,18 @@ function parseExactPaneProof(paneId: string, stdout: string): ExactPaneProof {
     } else if (parsePositiveSafeInteger(pid) === null) {
       return unavailable(paneId, 'malformed_snapshot');
     }
-
+    if (!sessionName || sessionName.includes('\n') || sessionName.includes('\r')) {
+      return unavailable(paneId, 'malformed_snapshot');
+    }
     paneIds.add(snapshotPaneId);
-    if (snapshotPaneId === paneId) matched = { paneDead, pid };
+    if (snapshotPaneId === paneId) matched = { paneDead, pid, sessionName };
   }
 
   if (matched === null) return { status: 'gone', paneId, reason: 'absent' };
   const pid = parsePositiveSafeInteger(matched.pid);
   if (pid === null) return unavailable(paneId, 'malformed_snapshot');
   if (matched.paneDead !== '0') return { status: 'gone', paneId, reason: 'dead' };
-  return { status: 'live', paneId, pid };
+  return { status: 'live', paneId, pid, sessionName: matched.sessionName };
 }
 
 export function readExactPaneProofSync(paneId: string): ExactPaneProof {
@@ -78,7 +76,7 @@ export function readExactPaneProofSync(paneId: string): ExactPaneProof {
     return unavailable(paneId, 'invalid_pane_id');
   }
 
-  const { result } = spawnPlatformCommandSync(exactPaneTmuxCommand(), LIST_PANES_ARGS, {
+  const { result } = spawnPlatformCommandSync('tmux', LIST_PANES_ARGS, {
     encoding: 'utf-8',
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -105,7 +103,7 @@ export function readExactPaneProofsSync(paneIds: readonly string[]): ExactPanePr
     return invalidProofs.map((proof, index) => proof ?? unavailable(paneIds[index]!, 'query_failed'));
   }
 
-  const { result } = spawnPlatformCommandSync(exactPaneTmuxCommand(), LIST_PANES_ARGS, {
+  const { result } = spawnPlatformCommandSync('tmux', LIST_PANES_ARGS, {
     encoding: 'utf-8',
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -118,12 +116,12 @@ export function readExactPaneProofsSync(paneIds: readonly string[]): ExactPanePr
   return paneIds.map((paneId) => parseExactPaneProof(paneId, stdout));
 }
 
-export function readExactPaneProof(paneId: string): Promise<ExactPaneProof> {
+export function readExactPaneProof(paneId: string, tmuxCommand = 'tmux'): Promise<ExactPaneProof> {
   if (!EXACT_PANE_ID_PATTERN.test(paneId)) {
     return Promise.resolve(unavailable(paneId, 'invalid_pane_id'));
   }
 
-  const { child } = spawnPlatformCommand(exactPaneTmuxCommand(), LIST_PANES_ARGS, {
+  const { child } = spawnPlatformCommand(tmuxCommand, LIST_PANES_ARGS, {
     stdio: ['ignore', 'pipe', 'pipe'],
   });
 

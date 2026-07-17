@@ -513,7 +513,7 @@ async function capturePaneAsync(target: string): Promise<string> {
 
 export async function captureWorkerPane(
   sessionName: string,
-  workerIndex: number,
+  _workerIndex: number,
   workerPaneId: string,
   expectedPanePid: number,
   expectedTeamOwnerId: string,
@@ -525,8 +525,10 @@ export async function captureWorkerPane(
     || !expectedTeamOwnerId.trim()
     || workerPaneId === hudPaneId) return '';
   if (!paneHasOmxTeamOwnerTag(workerPaneId, expectedTeamOwnerId)) return '';
-  const currentPid = getWorkerPanePid(sessionName, workerIndex, workerPaneId);
-  if (currentPid !== expectedPanePid) return '';
+  const exactPaneProof = readExactPaneProofSync(workerPaneId);
+  if (exactPaneProof.status !== 'live'
+    || exactPaneProof.pid !== expectedPanePid
+    || exactPaneProof.sessionName !== sessionName) return '';
   return await capturePaneAsync(workerPaneId);
 }
 
@@ -2483,16 +2485,22 @@ export async function evaluateStartupDirectTriggerSafety(
   return evaluateStartupDirectTriggerSafetyCapture(result.stdout, workerCli);
 }
 
-function acceptClaudeBypassPermissionsPrompt(target: string): void {
+function acceptClaudeBypassPermissionsPrompt(target: string, authority: WorkerInputAuthority): void {
+  assertWorkerInputAuthority(authority);
   runTmux(['send-keys', '-t', target, '-l', '--', '2']);
   sleepFractionalSeconds(0.12);
+  assertWorkerInputAuthority(authority);
   runTmux(['send-keys', '-t', target, 'C-m']);
 }
 
-function dismissClaudeBypassPermissionsPromptIfPresent(target: string, captured: string): boolean {
+function dismissClaudeBypassPermissionsPromptIfPresent(
+  target: string,
+  captured: string,
+  authority?: WorkerInputAuthority,
+): boolean {
   if (process.env.OMX_TEAM_AUTO_ACCEPT_BYPASS === '0') return false;
-  if (!paneHasClaudeBypassPermissionsPrompt(captured)) return false;
-  acceptClaudeBypassPermissionsPrompt(target);
+  if (!paneHasClaudeBypassPermissionsPrompt(captured) || !authority) return false;
+  acceptClaudeBypassPermissionsPrompt(target, authority);
   return true;
 }
 
@@ -2622,7 +2630,31 @@ export function shouldAttemptAdaptiveRetry(
   return true;
 }
 
-function sendLiteralTextOrThrow(target: string, text: string): void {
+interface WorkerInputAuthority {
+  paneId: string;
+  panePid: number;
+  teamOwnerId: string;
+  sessionName: string;
+  hudPaneId?: string;
+}
+
+function assertWorkerInputAuthority(authority: WorkerInputAuthority): void {
+  const exactPaneProof = readExactPaneProofSync(authority.paneId);
+  if (authority.paneId === authority.hudPaneId
+    || !Number.isSafeInteger(authority.panePid)
+    || authority.panePid <= 0
+    || !authority.teamOwnerId.trim()
+    || !authority.sessionName.trim()
+    || exactPaneProof.status !== 'live'
+    || exactPaneProof.pid !== authority.panePid
+    || exactPaneProof.sessionName !== authority.sessionName
+    || !paneHasOmxTeamOwnerTag(authority.paneId, authority.teamOwnerId)) {
+    throw new Error(`sendToWorker: pane authorization failed for ${authority.paneId}`);
+  }
+}
+
+function sendLiteralTextOrThrow(target: string, text: string, authority: WorkerInputAuthority): void {
+  assertWorkerInputAuthority(authority);
   const send = runTmux(['send-keys', '-t', target, '-l', '--', text]);
   if (!send.ok) {
     throw new Error(`sendToWorker: failed to send text: ${send.stderr}`);
@@ -2642,16 +2674,20 @@ async function attemptSubmitRounds(
   rounds: number,
   queueFirstRound: boolean,
   submitKeyPressesPerRound: number,
+  authority: WorkerInputAuthority,
 ): Promise<boolean> {
   const presses = Math.max(1, Math.floor(submitKeyPressesPerRound));
   for (let round = 0; round < rounds; round++) {
     await sleep(100);
     if (round === 0 && queueFirstRound) {
+      assertWorkerInputAuthority(authority);
       await sendKeyAsync(target, 'Tab');
       await sleep(80);
+      assertWorkerInputAuthority(authority);
       await sendKeyAsync(target, 'C-m');
     } else {
       for (let press = 0; press < presses; press++) {
+        assertWorkerInputAuthority(authority);
         await sendKeyAsync(target, 'C-m');
         if (press < presses - 1) {
           await sleep(200);
@@ -2833,16 +2869,30 @@ export function dismissTrustPromptIfPresent(
   sessionName: string,
   workerIndex: number,
   workerPaneId?: string,
+  expectedPanePid?: number,
+  expectedTeamOwnerId?: string,
+  expectedSessionName?: string,
+  hudPaneId?: string,
 ): boolean {
-  if (process.env.OMX_TEAM_AUTO_TRUST === '0') return false;
-  if (!isTmuxAvailable()) return false;
+  if (process.env.OMX_TEAM_AUTO_TRUST === '0' || !isTmuxAvailable()) return false;
+  if (!workerPaneId?.startsWith('%')
+    || expectedPanePid === undefined
+    || !expectedTeamOwnerId?.trim()
+    || !expectedSessionName?.trim()) return false;
+  const authority: WorkerInputAuthority = {
+    paneId: workerPaneId,
+    panePid: expectedPanePid,
+    teamOwnerId: expectedTeamOwnerId,
+    sessionName: expectedSessionName,
+    hudPaneId,
+  };
   const target = paneTarget(sessionName, workerIndex, workerPaneId);
   const result = runTmux(sharedBuildVisibleCapturePaneArgv(target));
-  if (!result.ok) return false;
-  if (!paneHasTrustPrompt(result.stdout)) return false;
-  // Trust prompt detected; send C-m twice to dismiss (trust + follow-up splash)
+  if (!result.ok || !paneHasTrustPrompt(result.stdout)) return false;
+  assertWorkerInputAuthority(authority);
   runTmux(['send-keys', '-t', target, 'C-m']);
   sleepFractionalSeconds(0.12);
+  assertWorkerInputAuthority(authority);
   runTmux(['send-keys', '-t', target, 'C-m']);
   return true;
 }
@@ -2890,119 +2940,76 @@ export async function sendToWorker(
   workerCli?: TeamWorkerCli,
   expectedPanePid?: number,
   expectedTeamOwnerId?: string,
+  expectedSessionName?: string,
   hudPaneId?: string,
 ): Promise<void> {
   assertWorkerTriggerText(text);
-  if (workerPaneId?.startsWith('%') && expectedPanePid !== undefined) {
-    const exactPaneProof = readExactPaneProofSync(workerPaneId);
-    if (workerPaneId === hudPaneId
-      || !Number.isSafeInteger(expectedPanePid)
-      || (expectedPanePid ?? 0) <= 0
-      || !expectedTeamOwnerId?.trim()
-      || !paneHasOmxTeamOwnerTag(workerPaneId, expectedTeamOwnerId)
-      || exactPaneProof.status !== 'live'
-      || exactPaneProof.pid !== expectedPanePid) {
-      throw new Error(`sendToWorker: pane authorization failed for ${workerPaneId}`);
-    }
+  if (!workerPaneId?.startsWith('%') || expectedPanePid === undefined || !expectedTeamOwnerId?.trim() || !expectedSessionName?.trim()) {
+    throw new Error(`sendToWorker: exact pane authorization required for worker ${workerIndex}`);
   }
-
+  const authority: WorkerInputAuthority = { paneId: workerPaneId, panePid: expectedPanePid, teamOwnerId: expectedTeamOwnerId, sessionName: expectedSessionName, hudPaneId };
   const target = paneTarget(sessionName, workerIndex, workerPaneId);
   const strategy = resolveSendStrategyFromEnv();
   const resolvedWorkerCli = resolveWorkerCliForSend(workerIndex, workerCli);
-
-  // Guard: if the trust prompt is still present, advance it first so our trigger text
-  // doesn't get typed into the trust screen and ignored.
   const capturedStr = await capturePaneAsync(target);
   const paneBusy = paneHasActiveTask(capturedStr);
-  if (dismissClaudeBypassPermissionsPromptIfPresent(target, capturedStr)) {
-    await sleep(200);
-  }
+  if (dismissClaudeBypassPermissionsPromptIfPresent(target, capturedStr, authority)) await sleep(200);
   if (paneHasTrustPrompt(capturedStr)) {
+    assertWorkerInputAuthority(authority);
     await sendKeyAsync(target, 'C-m');
     await sleep(120);
+    assertWorkerInputAuthority(authority);
     await sendKeyAsync(target, 'C-m');
     await sleep(200);
   }
-
-  sendLiteralTextOrThrow(target, text);
-
-  // Allow the input buffer to settle before sending C-m
+  sendLiteralTextOrThrow(target, text, authority);
   await sleep(150);
 
-  const allowAutoInterruptRetry = process.env[OMX_TEAM_AUTO_INTERRUPT_RETRY_ENV] !== '0';
-  const submitPlan = buildWorkerSubmitPlan(strategy, resolvedWorkerCli, paneBusy, allowAutoInterruptRetry);
+  const submitPlan = buildWorkerSubmitPlan(
+    strategy,
+    resolvedWorkerCli,
+    paneBusy,
+    process.env[OMX_TEAM_AUTO_INTERRUPT_RETRY_ENV] !== '0',
+  );
   if (submitPlan.shouldInterrupt) {
-    // Explicit interrupt mode: abort current turn first, then submit the new command.
+    assertWorkerInputAuthority(authority);
     await sendKeyAsync(target, 'C-c');
     await sleep(100);
   }
+  if (await attemptSubmitRounds(target, text, submitPlan.rounds, submitPlan.queueFirstRound, submitPlan.submitKeyPressesPerRound, authority)) return;
 
-  // Submit deterministically using CLI-specific plan:
-  // - Codex: queue-first Tab+C-m when configured/busy, then double C-m rounds.
-  // - Claude: direct C-m rounds only (never queue-first Tab).
-  if (await attemptSubmitRounds(
-    target,
-    text,
-    submitPlan.rounds,
-    submitPlan.queueFirstRound,
-    submitPlan.submitKeyPressesPerRound,
-  )) return;
-
-  // Adaptive escalation for "likely unsent trigger text at ready prompt" cases:
-  // clear line, re-send trigger, then re-submit with deterministic C-m rounds.
   const latestCapture = await capturePaneAsync(target);
   if (shouldAttemptAdaptiveRetry(strategy, paneBusy, submitPlan.allowAdaptiveRetry, latestCapture || null, text)) {
-    // Keep this branch non-interrupting to avoid canceling active turns on false positives.
+    assertWorkerInputAuthority(authority);
     await sendKeyAsync(target, 'C-u');
     await sleep(80);
-    sendLiteralTextOrThrow(target, text);
+    sendLiteralTextOrThrow(target, text, authority);
     await sleep(120);
-    if (await attemptSubmitRounds(target, text, 4, false, submitPlan.submitKeyPressesPerRound)) return;
+    if (await attemptSubmitRounds(target, text, 4, false, submitPlan.submitKeyPressesPerRound, authority)) return;
   }
+  if (process.env.OMX_TEAM_STRICT_SUBMIT === '1') throw new Error('sendToWorker: submit_failed (trigger text still visible after retries)');
 
-  // Fail-open by default: Codex may keep the last submitted line visible even after executing it.
-  // If you need strictness for debugging, set OMX_TEAM_STRICT_SUBMIT=1.
-  const strict = process.env.OMX_TEAM_STRICT_SUBMIT === '1';
-  if (strict) {
-    throw new Error('sendToWorker: submit_failed (trigger text still visible after retries)');
-  }
-
-  // One last best-effort double C-m nudge, then verify.
+  assertWorkerInputAuthority(authority);
   await sendKeyAsync(target, 'C-m');
   await sleep(120);
+  assertWorkerInputAuthority(authority);
   await sendKeyAsync(target, 'C-m');
-
-  // Post-submit verification: wait briefly and confirm the worker consumed the
-  // trigger (draft disappeared or active-task indicator appeared). Fixes #391.
   await sleep(300);
-  const [verifyCapture, verifyVisibleCapture] = await Promise.all([
-    capturePaneAsync(target),
-    captureVisiblePaneAsync(target),
-  ]);
-  if (verifyCapture) {
-    if (paneHasActiveTask(verifyCapture)) return;
-    if (
-      !normalizeWorkerTriggerForDraftMatch(verifyCapture).includes(normalizeWorkerTriggerForDraftMatch(text))
-      && !paneHasQueuedCodexSubmission(verifyVisibleCapture)
-    ) {
-      return;
-    }
-    // Draft still visible and no active task — one more C-m attempt.
-    await sendKeyAsync(target, 'C-m');
-    await sleep(150);
-    await sendKeyAsync(target, 'C-m');
-    const finalVisibleCapture = await captureVisiblePaneAsync(target);
-    if (paneHasQueuedCodexSubmission(finalVisibleCapture)) {
-      throw new Error('sendToWorker: submit_queued_after_tool_call');
-    }
-    const finalCapture = await capturePaneAsync(target);
-    if (
-      normalizeWorkerTriggerForDraftMatch(finalCapture).includes(normalizeWorkerTriggerForDraftMatch(text))
-      && !paneHasActiveTask(finalCapture)
-      && paneLooksReady(finalCapture)
-    ) {
-      throw new Error('sendToWorker: submit_failed (trigger text still visible after retries)');
-    }
+
+  const [verifyCapture, verifyVisibleCapture] = await Promise.all([capturePaneAsync(target), captureVisiblePaneAsync(target)]);
+  if (!verifyCapture || paneHasActiveTask(verifyCapture)) return;
+  if (!normalizeWorkerTriggerForDraftMatch(verifyCapture).includes(normalizeWorkerTriggerForDraftMatch(text)) && !paneHasQueuedCodexSubmission(verifyVisibleCapture)) return;
+
+  assertWorkerInputAuthority(authority);
+  await sendKeyAsync(target, 'C-m');
+  await sleep(150);
+  assertWorkerInputAuthority(authority);
+  await sendKeyAsync(target, 'C-m');
+  const finalVisibleCapture = await captureVisiblePaneAsync(target);
+  if (paneHasQueuedCodexSubmission(finalVisibleCapture)) throw new Error('sendToWorker: submit_queued_after_tool_call');
+  const finalCapture = await capturePaneAsync(target);
+  if (normalizeWorkerTriggerForDraftMatch(finalCapture).includes(normalizeWorkerTriggerForDraftMatch(text)) && !paneHasActiveTask(finalCapture) && paneLooksReady(finalCapture)) {
+    throw new Error('sendToWorker: submit_failed (trigger text still visible after retries)');
   }
 }
 

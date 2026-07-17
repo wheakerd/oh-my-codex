@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, rename, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, it } from 'node:test';
+import { captureRootFilesystemIdentity } from '../../state/authority.js';
 import {
   createQuestionRecord,
   getQuestionRecordPath,
@@ -78,6 +79,73 @@ describe('question state', () => {
     assert.equal(event?.context_summary, 'Decision — Pick one');
     assert.equal(event?.option_schema?.[0]?.options[0]?.description, 'Alpha lane');
     assert.equal(event?.state?.timeout_ms, 1234);
+  });
+
+  it('keeps explicit authoritative roots for created, answered, and error event mutations', async () => {
+    const cwd = await makeRepo();
+    const stateDir = join(cwd, 'committed-state');
+    const ambientStateDir = join(cwd, 'ambient-state');
+    const { record, recordPath } = await createQuestionRecord(cwd, {
+      question: 'Pick one',
+      options: [{ label: 'A', value: 'a' }],
+      allow_other: false,
+      other_label: 'Other',
+      multi_select: false,
+    }, 'sess-authoritative', new Date('2026-07-17T00:00:00.000Z'), {
+      emitEvent: true,
+      stateDir,
+    });
+
+    await submitQuestionAnswerById(cwd, record.question_id, {
+      answer: {
+        kind: 'option',
+        value: 'a',
+        selected_labels: ['A'],
+        selected_values: ['a'],
+      },
+    }, { sessionId: 'sess-authoritative', stateDir });
+
+    const { recordPath: errorRecordPath } = await createQuestionRecord(cwd, {
+      question: 'Report failure',
+      options: [{ label: 'Retry', value: 'retry' }],
+      allow_other: false,
+      other_label: 'Other',
+      multi_select: false,
+    }, 'sess-authoritative', new Date('2026-07-17T00:01:00.000Z'), { stateDir });
+    const errored = await markQuestionTerminalError(errorRecordPath, 'error', 'question_failed', 'boom');
+    await appendQuestionEvent(cwd, 'question-error', errored, { recordPath: errorRecordPath, stateDir });
+
+    const authoritativeEvents = await readQuestionEvents(cwd, { stateDir });
+    assert.deepEqual(
+      authoritativeEvents.map((event) => event.type),
+      ['question-created', 'question-answered', 'question-error'],
+    );
+    assert.equal(await readQuestionRecord(recordPath).then((value) => value?.status), 'answered');
+    assert.deepEqual(await readQuestionEvents(cwd, { stateDir: ambientStateDir }), []);
+  });
+
+  it('rejects event writes when the explicit authoritative root is replaced', async () => {
+    const cwd = await makeRepo();
+    const stateDir = join(cwd, 'committed-state');
+    const { record } = await createQuestionRecord(cwd, {
+      question: 'Pick one',
+      options: [{ label: 'A', value: 'a' }],
+      allow_other: false,
+      other_label: 'Other',
+      multi_select: false,
+    }, 'sess-replaced-root', new Date('2026-07-17T00:00:00.000Z'), { stateDir });
+    const rootIdentity = await captureRootFilesystemIdentity(stateDir);
+    await rename(stateDir, `${stateDir}.replaced`);
+    await mkdir(stateDir, { recursive: true });
+
+    await assert.rejects(
+      () => appendQuestionEvent(cwd, 'question-error', record, {
+        stateDir,
+        expectedRootIdentity: rootIdentity,
+      }),
+      /state root was replaced before mutation/,
+    );
+    assert.deepEqual(await readQuestionEvents(cwd, { stateDir }), []);
   });
 
   it('closes the renderer pane after accepting an answer so stale question panes do not remain visible', async () => {

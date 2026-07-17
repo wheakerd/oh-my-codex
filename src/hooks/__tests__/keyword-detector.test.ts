@@ -84,6 +84,13 @@ async function secureKeywordFixtureDirectories(root: string): Promise<void> {
   }
 }
 
+function isAuthorityFixtureStateDirectory(stateDir: string): boolean {
+  const segments = stateDir.split(/[\\/]+/).filter(Boolean);
+  return segments.length >= 2
+    && segments[segments.length - 2] === '.omx'
+    && segments[segments.length - 1] === 'state';
+}
+
 async function withKeywordTestAuthority<T>(
   input: Parameters<typeof rawRecordSkillActivation>[0],
   operation: (authority: Awaited<ReturnType<typeof initializeStateAuthority>>, sourceCwd: string) => Promise<T>,
@@ -92,8 +99,9 @@ async function withKeywordTestAuthority<T>(
     const previousEnvironment = new Map(AUTHORITY_ENV_KEYS.map((key) => [key, process.env[key]]));
     try {
       const resolvedStateDir = resolve(input.stateDir);
+      const isAuthorityStateDirectory = isAuthorityFixtureStateDirectory(resolvedStateDir);
       const sourceCwd = input.sourceCwd
-        ?? (resolvedStateDir.endsWith('/.omx/state')
+        ?? (isAuthorityStateDirectory
           ? dirname(dirname(resolvedStateDir))
           : `${resolvedStateDir}-workspace`);
       let authority = testAuthorities.get(sourceCwd);
@@ -110,7 +118,7 @@ async function withKeywordTestAuthority<T>(
           session_binding: { canonical_session_id: input.sessionId ?? 'keyword-detector-test' },
         });
         await secureKeywordFixtureDirectories(sourceCwd);
-        const creationRoot = resolvedStateDir.endsWith('/.omx/state')
+        const creationRoot = isAuthorityStateDirectory
           ? dirname(dirname(resolvedStateDir))
           : dirname(resolvedStateDir);
         await mkdir(creationRoot, { recursive: true, mode: 0o700 });
@@ -256,6 +264,13 @@ async function assertAutopilotRecoverySnapshot(
   assert.doesNotMatch(recoverySnapshot, /task seed: continue/);
   return snapshotPath;
 }
+
+describe('keyword authority fixture path classification', () => {
+  it('recognizes a Windows-shaped authority state path without filesystem access', () => {
+    assert.equal(isAuthorityFixtureStateDirectory(String.raw`C:\workspace\.omx\state`), true);
+    assert.equal(isAuthorityFixtureStateDirectory(String.raw`C:\workspace\.omx\state-backup`), false);
+  });
+});
 
 describe('keyword detector team compatibility', () => {
   it('keeps explicit $skill order in detectKeywords results (left-to-right)', () => {

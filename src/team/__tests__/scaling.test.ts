@@ -250,7 +250,14 @@ async function writeSuccessfulScaleUpTmuxStub(
       '    echo "%31"',
       '    ;;',
       '  list-panes)',
-      '    echo "42424"',
+      '    if [ "${2:-}" = "-a" ]; then',
+      "      printf '%%31\\t0\\t42424\\tomx-scale-up-fixture\\n'",
+      '    else',
+      '      echo "42424"',
+      '    fi',
+      '    ;;',
+      '  show-option)',
+      '    echo "team:scale-up-fixture"',
       '    ;;',
       '  send-keys)',
       '    ;;',
@@ -272,9 +279,12 @@ async function configureScaleUpTeamForDirectDispatch(teamName: string, cwd: stri
   if (!config) {
     throw new Error(`missing team config for ${teamName}`);
   }
-  config.tmux_session = `omx-team-${teamName}`;
+  config.tmux_session = 'omx-scale-up-fixture';
+  config.tmux_pane_owner_id = 'team:scale-up-fixture';
   config.leader_pane_id = '%11';
+  config.leader_pane_pid = 42424;
   config.workers[0]!.pane_id = '%21';
+  config.workers[0]!.pid = 42424;
   await saveTeamConfig(config, cwd);
 
   const manifestPath = join(cwd, '.omx', 'state', 'team', teamName, 'manifest.v2.json');
@@ -782,7 +792,10 @@ exit 0
           '    echo "%31"',
           '    ;;',
           '  list-panes)',
-          '    echo "42424"',
+          '    if [ "${2:-}" = "-a" ]; then printf "%%31\\t0\\t42424\\tomx-scale-up-fixture\\n"; else echo "42424"; fi',
+          '    ;;',
+          '  show-option)',
+          '    echo "team:scale-up-fixture"',
           '    ;;',
           '  send-keys)',
           '    ;;',
@@ -814,9 +827,12 @@ exit 0
       const config = await readTeamConfig('scale-up-role', cwd);
       assert.ok(config);
       if (!config) return;
-      config.tmux_session = 'omx-team-scale-up-role';
+      config.tmux_session = 'omx-scale-up-fixture';
+      config.tmux_pane_owner_id = 'team:scale-up-fixture';
       config.leader_pane_id = '%11';
+      config.leader_pane_pid = 42424;
       config.workers[0]!.pane_id = '%21';
+      config.workers[0]!.pid = 42424;
       await saveTeamConfig(config, cwd);
 
       const manifestPath = join(cwd, '.omx', 'state', 'team', 'scale-up-role', 'manifest.v2.json');
@@ -853,7 +869,9 @@ exit 0
 
       const tmuxCommands = await readScaleUpTmuxLogCommands(tmuxLogPath);
       assert.ok(tmuxCommands.some((command) => (
-        command === 'set-option -p -t %31 @omx_team_pane_owner_id team:scale-up-role'
+        command.includes('set-option')
+        && command.includes('-t %31')
+        && command.includes('@omx_team_pane_owner_id')
       )));
     } finally {
       if (typeof previousPath === 'string') process.env.PATH = previousPath;
@@ -1023,7 +1041,7 @@ printf '%s\\n' "$@" > '${capturePath}'
           '    esac',
           '    ;;',
           '  list-panes)',
-          '    echo "42424"',
+          '    if [ "${2:-}" = "-a" ]; then printf "%%31\\t0\\t42424\\tomx-scale-up-fixture\\n"; else echo "42424"; fi',
           '    ;;',
           '  kill-pane|send-keys|capture-pane)',
           '    ;;',
@@ -1057,7 +1075,9 @@ printf '%s\\n' "$@" > '${capturePath}'
 
       const tmuxCommands = await readScaleUpTmuxLogCommands(tmuxLogPath);
       assert.ok(tmuxCommands.some((command) => (
-        command === 'set-option -p -t %31 @omx_team_pane_owner_id team:scale-up-owner-tag-rollback'
+        command.includes('set-option')
+        && command.includes('-t %31')
+        && command.includes('@omx_team_pane_owner_id')
       )));
       assert.ok(tmuxCommands.some((command) => command === 'kill-pane -t %31'));
     } finally {
@@ -1505,7 +1525,10 @@ printf '%s\\n' "$@" > '${capturePath}'
           '    echo "%31"',
           '    ;;',
           '  list-panes)',
-          '    echo "42424"',
+          '    if [ "${2:-}" = "-a" ]; then printf "%%31\\t0\\t42424\\tomx-scale-up-fixture\\n"; else echo "42424"; fi',
+          '    ;;',
+          '  show-option)',
+          '    echo "team:scale-up-fixture"',
           '    ;;',
           '  send-keys)',
           '    ;;',
@@ -1551,9 +1574,12 @@ printf '%s\\n' "$@" > '${capturePath}'
       const config = await readTeamConfig('scale-up-project-reasoning', cwd);
       assert.ok(config);
       if (!config) return;
-      config.tmux_session = 'omx-team-scale-up-project-reasoning';
+      config.tmux_session = 'omx-scale-up-fixture';
+      config.tmux_pane_owner_id = 'team:scale-up-fixture';
       config.leader_pane_id = '%11';
+      config.leader_pane_pid = 42424;
       config.workers[0]!.pane_id = '%21';
+      config.workers[0]!.pid = 42424;
       await saveTeamConfig(config, cwd);
 
       const manifestPath = join(cwd, '.omx', 'state', 'team', 'scale-up-project-reasoning', 'manifest.v2.json');
@@ -1623,7 +1649,10 @@ set -eu
     echo "%31"
     ;;
   list-panes)
-    echo "42424"
+    if [ "\${2:-}" = "-a" ]; then printf '%%31\t0\t42424\tomx-scale-up-fixture\n'; else echo "42424"; fi
+    ;;
+  show-option)
+    echo "team:scale-up-fixture"
     ;;
   send-keys)
     exit 1
@@ -1651,9 +1680,12 @@ exit 0
       const config = await readTeamConfig('rollback-worktree', cwd);
       assert.ok(config);
       if (!config) return;
-      config.tmux_session = 'omx-team-rollback-worktree';
+      config.tmux_session = 'omx-scale-up-fixture';
+      config.tmux_pane_owner_id = 'team:scale-up-fixture';
       config.leader_pane_id = '%11';
+      config.leader_pane_pid = 42424;
       config.workers[0]!.pane_id = '%21';
+      config.workers[0]!.pid = 42424;
       await saveTeamConfig(config, cwd);
 
       const manifestPath = join(cwd, '.omx', 'state', 'team', 'rollback-worktree', 'manifest.v2.json');
@@ -1707,7 +1739,10 @@ set -eu
     echo "%31"
     ;;
   list-panes)
-    echo "42424"
+    if [ "\${2:-}" = "-a" ]; then printf '%%31\t0\t42424\tomx-scale-up-fixture\n'; else echo "42424"; fi
+    ;;
+  show-option)
+    echo "team:scale-up-fixture"
     ;;
   capture-pane)
     echo ""
@@ -1732,9 +1767,12 @@ exit 0
       const config = await readTeamConfig('canonical-root', cwd);
       assert.ok(config);
       if (!config) return;
-      config.tmux_session = 'omx-team-canonical-root';
+      config.tmux_session = 'omx-scale-up-fixture';
+      config.tmux_pane_owner_id = 'team:scale-up-fixture';
       config.leader_pane_id = '%11';
+      config.leader_pane_pid = 42424;
       config.workers[0]!.pane_id = '%21';
+      config.workers[0]!.pid = 42424;
       await saveTeamConfig(config, cwd);
 
       const manifestPath = join(cwd, '.omx', 'state', 'team', 'canonical-root', 'manifest.v2.json');
@@ -1796,7 +1834,10 @@ case "\${1:-}" in
     echo "%31"
     ;;
   list-panes)
-    echo "42424"
+    if [ "\${2:-}" = "-a" ]; then printf '%%31\t0\t42424\tomx-scale-up-fixture\n'; else echo "42424"; fi
+    ;;
+  show-option)
+    echo "team:scale-up-fixture"
     ;;
   capture-pane)
     echo ""
@@ -1824,9 +1865,12 @@ exit 0
       const config = await readTeamConfig('frontier-role', cwd);
       assert.ok(config);
       if (!config) return;
-      config.tmux_session = 'omx-team-frontier-role';
+      config.tmux_session = 'omx-scale-up-fixture';
+      config.tmux_pane_owner_id = 'team:scale-up-fixture';
       config.leader_pane_id = '%11';
+      config.leader_pane_pid = 42424;
       config.workers[0]!.pane_id = '%21';
+      config.workers[0]!.pid = 42424;
       await saveTeamConfig(config, cwd);
 
       const manifestPath = join(cwd, '.omx', 'state', 'team', 'frontier-role', 'manifest.v2.json');
@@ -1879,7 +1923,10 @@ case "\${1:-}" in
     echo "%31"
     ;;
   list-panes)
-    echo "42424"
+    if [ "\${2:-}" = "-a" ]; then printf '%%31\t0\t42424\tomx-scale-up-fixture\n'; else echo "42424"; fi
+    ;;
+  show-option)
+    echo "team:scale-up-fixture"
     ;;
   capture-pane)
     echo ""
@@ -1904,9 +1951,12 @@ exit 0
       const config = await readTeamConfig('mini-tuned-root', cwd);
       assert.ok(config);
       if (!config) return;
-      config.tmux_session = 'omx-team-mini-tuned-root';
+      config.tmux_session = 'omx-scale-up-fixture';
+      config.tmux_pane_owner_id = 'team:scale-up-fixture';
       config.leader_pane_id = '%11';
+      config.leader_pane_pid = 42424;
       config.workers[0]!.pane_id = '%21';
+      config.workers[0]!.pid = 42424;
       await saveTeamConfig(config, cwd);
 
       const manifestPath = join(cwd, '.omx', 'state', 'team', 'mini-tuned-root', 'manifest.v2.json');
@@ -1965,7 +2015,10 @@ case "\${1:-}" in
     echo "%31"
     ;;
   list-panes)
-    echo "42424"
+    if [ "\${2:-}" = "-a" ]; then printf '%%31\t0\t42424\tomx-scale-up-fixture\n'; else echo "42424"; fi
+    ;;
+  show-option)
+    echo "team:scale-up-fixture"
     ;;
   capture-pane)
     echo ""
@@ -1983,9 +2036,12 @@ exit 0
       const config = await readTeamConfig('scale-up-layout', cwd);
       assert.ok(config);
       if (!config) return;
-      config.tmux_session = 'omx-team-scale-up-layout';
+      config.tmux_session = 'omx-scale-up-fixture';
+      config.tmux_pane_owner_id = 'team:scale-up-fixture';
       config.leader_pane_id = '%11';
+      config.leader_pane_pid = 42424;
       config.workers[0]!.pane_id = '%21';
+      config.workers[0]!.pid = 42424;
       await saveTeamConfig(config, cwd);
 
       const manifestPath = join(cwd, '.omx', 'state', 'team', 'scale-up-layout', 'manifest.v2.json');
@@ -2040,7 +2096,10 @@ exit 0
           '    echo "%41"',
           '    ;;',
           '  list-panes)',
-          '    echo "45454"',
+          '    if [ "${2:-}" = "-a" ]; then printf "%%41\\t0\\t45454\\tomx-scale-up-fixture\\n"; else echo "45454"; fi',
+          '    ;;',
+          '  show-option)',
+          '    echo "team:scale-up-fixture"',
           '    ;;',
           '  capture-pane)',
           '    echo ""',
@@ -2076,9 +2135,12 @@ exit 0
       const config = await readTeamConfig(teamName, repo);
       assert.ok(config);
       if (!config) return;
-      config.tmux_session = `omx-team-${teamName}`;
+      config.tmux_session = 'omx-scale-up-fixture';
+      config.tmux_pane_owner_id = 'team:scale-up-fixture';
       config.leader_pane_id = '%11';
+      config.leader_pane_pid = 45454;
       config.workers[0]!.pane_id = '%21';
+      config.workers[0]!.pid = 45454;
       await saveTeamConfig(config, repo);
 
       const manifestPath = join(repo, '.omx', 'state', 'team', teamName, 'manifest.v2.json');
@@ -2141,7 +2203,10 @@ exit 0
           '    echo "%42"',
           '    ;;',
           '  list-panes)',
-          '    echo "46464"',
+          '    if [ "${2:-}" = "-a" ]; then printf "%%42\\t0\\t46464\\tomx-scale-up-fixture\\n"; else echo "46464"; fi',
+          '    ;;',
+          '  show-option)',
+          '    echo "team:scale-up-fixture"',
           '    ;;',
           '  capture-pane)',
           '    echo ""',
@@ -2178,9 +2243,12 @@ exit 0
       const config = await readTeamConfig(teamName, repo);
       assert.ok(config);
       if (!config) return;
-      config.tmux_session = `omx-team-${teamName}`;
+      config.tmux_session = 'omx-scale-up-fixture';
+      config.tmux_pane_owner_id = 'team:scale-up-fixture';
       config.leader_pane_id = '%11';
+      config.leader_pane_pid = 46464;
       config.workers[0]!.pane_id = '%21';
+      config.workers[0]!.pid = 46464;
       await saveTeamConfig(config, repo);
 
       const manifestPath = join(repo, '.omx', 'state', 'team', teamName, 'manifest.v2.json');

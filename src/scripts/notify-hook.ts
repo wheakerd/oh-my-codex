@@ -73,6 +73,7 @@ import { isManagedOmxSessionAtPromptContext } from './notify-hook/managed-tmux.j
 import { logNotifyHookEvent } from './notify-hook/log.js';
 import { reconcileRalphSessionResume } from './notify-hook/ralph-session-resume.js';
 import { sendPaneInput } from './notify-hook/team-tmux-guard.js';
+import { readExactPaneProof } from '../team/exact-pane.js';
 import {
   buildOperationalContext,
   deriveAssistantSignalEvents,
@@ -1327,9 +1328,15 @@ async function main() {
         } else {
           const csPaneId = await resolveNudgePaneTarget(stateDir, cwd, payload, leaderWriteDecision!.context);
           if (csPaneId) {
+            const csPaneProof = await readExactPaneProof(csPaneId);
+            if (csPaneProof.status !== 'live' || csPaneProof.paneId !== csPaneId) {
+              throw new Error('exact_pane_unavailable');
+            }
             const csText = `${csResult.message} ${DEFAULT_MARKER}`;
             const sendResult = await sendPaneInput({
               paneTarget: csPaneId,
+              exactPaneId: csPaneId,
+              expectedPanePid: csPaneProof.pid,
               prompt: csText,
               submitKeyPresses: 2,
               submitDelayMs: 100,
