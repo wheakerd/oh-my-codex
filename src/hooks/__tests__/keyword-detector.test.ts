@@ -110,15 +110,17 @@ async function withKeywordTestAuthority<T>(
           session_binding: { canonical_session_id: input.sessionId ?? 'keyword-detector-test' },
         });
         await secureKeywordFixtureDirectories(sourceCwd);
-        await mkdir(resolvedStateDir, { recursive: true, mode: 0o700 });
-        await secureKeywordFixtureDirectories(dirname(resolvedStateDir));
-        await secureKeywordFixtureDirectories(resolvedStateDir);
+        const creationRoot = resolvedStateDir.endsWith('/.omx/state')
+          ? dirname(dirname(resolvedStateDir))
+          : dirname(resolvedStateDir);
+        await mkdir(creationRoot, { recursive: true, mode: 0o700 });
+        await secureKeywordFixtureDirectories(creationRoot);
         if (resolvedStateDir !== resolve(authority.canonical_state_root)) {
           authority = await rolloverStateAuthorityToAlternateRoot({
             context: authority,
             transport_capability: (await mintStateAuthorityTransportCapability(authority)).capability,
             proposed_state_root: resolvedStateDir,
-            creation_root: resolvedStateDir,
+            creation_root: creationRoot,
             launch_id: `keyword-detector-test-boxed-${testAuthorities.size}`,
             consumer_kind: 'boxed',
             issuer: TEST_AUTHORITY_ISSUER,
@@ -150,6 +152,12 @@ async function recordSkillActivation(
     sourceCwd: input.sourceCwd ?? sourceCwd,
     expectedRootIdentity: input.expectedRootIdentity ?? authority.generation.root_identity,
   }));
+}
+
+async function createSecureKeywordFixtureRoot(prefix: string): Promise<string> {
+  const root = await mkdtemp(join(tmpdir(), `omx-keyword-${prefix}-`));
+  await chmod(root, 0o700);
+  return root;
 }
 
 async function withIsolatedHome<T>(prefix: string, run: (homeDir: string) => Promise<T>): Promise<T> {
@@ -4726,6 +4734,15 @@ deepMaxRounds = 21
           updated_at: '2026-05-29T23:05:00.000Z',
         }, null, 2),
       );
+      await writeFile(
+        join(stateDir, 'sessions', sessionId, 'autopilot-state.json'),
+        JSON.stringify({
+          active: true,
+          mode: 'autopilot',
+          current_phase: 'ultraqa',
+          session_id: sessionId,
+        }, null, 2),
+      );
 
       const result = await recordSkillActivation({
         stateDir,
@@ -4748,6 +4765,10 @@ deepMaxRounds = 21
       assert.equal(ultragoal.active, false);
       assert.equal(ultragoal.current_phase, 'completed');
       assert.match(ultragoal.auto_completed_reason || '', /mode transiting: ultragoal -> ultraqa/);
+      const autopilot = JSON.parse(
+        await readFile(join(stateDir, 'sessions', sessionId, 'autopilot-state.json'), 'utf-8'),
+      ) as { current_phase?: string };
+      assert.equal(autopilot.current_phase, 'ultraqa');
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -4883,6 +4904,15 @@ deepMaxRounds = 21
         }, null, 2),
       );
       await writeFile(
+        join(stateDir, 'sessions', sessionId, 'autopilot-state.json'),
+        JSON.stringify({
+          active: true,
+          mode: 'autopilot',
+          current_phase: 'deep-interview',
+          session_id: sessionId,
+        }, null, 2),
+      );
+      await writeFile(
         join(stateDir, 'ultragoal-state.json'),
         JSON.stringify({
           active: true,
@@ -4907,6 +4937,10 @@ deepMaxRounds = 21
       assert.equal(rootUltragoal.active, true);
       assert.equal(rootUltragoal.current_phase, 'executing');
       assert.equal(existsSync(join(stateDir, 'sessions', sessionId, 'deep-interview-state.json')), false);
+      const autopilot = JSON.parse(
+        await readFile(join(stateDir, 'sessions', sessionId, 'autopilot-state.json'), 'utf-8'),
+      ) as { current_phase?: string };
+      assert.equal(autopilot.current_phase, 'deep-interview');
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -6030,7 +6064,8 @@ describe('applyRalplanGate', () => {
 
 describe('recordSkillActivation prompt provenance', () => {
   it('writes only the authorized explicit payload session and stamps its owner', async () => {
-    const stateDir = await mkdtemp(join(tmpdir(), 'omx-keyword-provenance-'));
+    const fixtureRoot = await createSecureKeywordFixtureRoot('provenance');
+    const stateDir = join(fixtureRoot, 'state');
     try {
       const context = evaluateResolvedPromptTurn({
         producer: 'native',
@@ -6048,12 +6083,13 @@ describe('recordSkillActivation prompt provenance', () => {
       assert.equal(existsSync(join(stateDir, 'sessions', 'payload-session', SKILL_ACTIVE_STATE_FILE)), true);
       assert.equal(existsSync(join(stateDir, SKILL_ACTIVE_STATE_FILE)), false);
     } finally {
-      await rm(stateDir, { recursive: true, force: true });
+      await rm(fixtureRoot, { recursive: true, force: true });
     }
   });
 
   it('rejects nested foreign owners before direct activation writes', async () => {
-    const stateDir = await mkdtemp(join(tmpdir(), 'omx-keyword-nested-owner-'));
+    const fixtureRoot = await createSecureKeywordFixtureRoot('nested-owner');
+    const stateDir = join(fixtureRoot, 'state');
     try {
       const targetDir = join(stateDir, 'sessions', 'target');
       await mkdir(targetDir, { recursive: true });
@@ -6074,12 +6110,13 @@ describe('recordSkillActivation prompt provenance', () => {
       assert.equal(await readFile(statePath, 'utf8'), original);
       assert.equal(existsSync(join(targetDir, 'ralph-state.json')), false);
     } finally {
-      await rm(stateDir, { recursive: true, force: true });
+      await rm(fixtureRoot, { recursive: true, force: true });
     }
   });
 
   it('rejects malformed target state before direct activation writes', async () => {
-    const stateDir = await mkdtemp(join(tmpdir(), 'omx-keyword-malformed-owner-'));
+    const fixtureRoot = await createSecureKeywordFixtureRoot('malformed-owner');
+    const stateDir = join(fixtureRoot, 'state');
     try {
       const targetDir = join(stateDir, 'sessions', 'target');
       await mkdir(targetDir, { recursive: true });
@@ -6096,12 +6133,13 @@ describe('recordSkillActivation prompt provenance', () => {
       assert.equal(await readFile(malformedPath, 'utf8'), '{ malformed');
       assert.equal(existsSync(join(targetDir, SKILL_ACTIVE_STATE_FILE)), false);
     } finally {
-      await rm(stateDir, { recursive: true, force: true });
+      await rm(fixtureRoot, { recursive: true, force: true });
     }
   });
 
   it('rejects target enumeration failures before direct activation writes', async () => {
-    const stateDir = await mkdtemp(join(tmpdir(), 'omx-keyword-enumeration-owner-'));
+    const fixtureRoot = await createSecureKeywordFixtureRoot('enumeration-owner');
+    const stateDir = join(fixtureRoot, 'state');
     try {
       const sessionsDir = join(stateDir, 'sessions');
       await mkdir(sessionsDir, { recursive: true });
@@ -6117,7 +6155,7 @@ describe('recordSkillActivation prompt provenance', () => {
       assert.equal(rejections, 1);
       assert.equal(await readFile(targetPath, 'utf8'), 'not-a-directory');
     } finally {
-      await rm(stateDir, { recursive: true, force: true });
+      await rm(fixtureRoot, { recursive: true, force: true });
     }
   });
 });

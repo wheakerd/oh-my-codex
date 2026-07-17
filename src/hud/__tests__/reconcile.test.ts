@@ -2143,7 +2143,8 @@ describe('reconcileHudForPromptSubmit cramped-window guard (#2754)', () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-hud-cramped-'));
     const fakeBinDir = join(cwd, 'fake-bin');
     const tmuxLogPath = join(cwd, 'tmux.log');
-    const originalPath = process.env.PATH;
+    const pathKey = process.platform === 'win32' ? 'Path' : 'PATH';
+    const originalPath = process.env[pathKey] ?? process.env.PATH;
 
     try {
       await mkdir(fakeBinDir, { recursive: true });
@@ -2163,7 +2164,7 @@ if [[ "$cmd" == "list-panes" ]]; then
 fi
 `,
       );
-      process.env.PATH = prependPath(fakeBinDir, originalPath);
+      process.env[pathKey] = prependPath(fakeBinDir, originalPath);
 
       const created: string[] = [];
       const result = await reconcileHudForPromptSubmit('/repo', {
@@ -2187,7 +2188,8 @@ fi
       assert.match(log, /\[list-panes\]\[-t\]\[%1\]/);
       assert.match(log, /\[display-message\]\[-p\]\[-t\]\[%1\]\[#\{window_width\}\t#\{window_height\}\]/);
     } finally {
-      process.env.PATH = originalPath;
+      if (originalPath === undefined) delete process.env[pathKey];
+      else process.env[pathKey] = originalPath;
       await rm(cwd, { recursive: true, force: true });
     }
   });

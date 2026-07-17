@@ -162,11 +162,12 @@ describe('state paths', () => {
     process.env.OMX_STATE_ROOT = '/tmp/ignored-state-root';
     process.env.OMX_TEAM_STATE_ROOT = '/tmp/explicit-team-state';
     try {
-      assert.equal(getBaseStateDir('/tmp/source'), '/tmp/explicit-team-state');
-      assert.equal(getStateDir('/tmp/source', 'sess1'), '/tmp/explicit-team-state/sessions/sess1');
-      assert.equal(getStatePath('ralph', '/tmp/source', 'sess1'), '/tmp/explicit-team-state/sessions/sess1/ralph-state.json');
+      const expectedTeamRoot = resolvePath('/tmp/explicit-team-state');
+      assert.equal(getBaseStateDir('/tmp/source'), expectedTeamRoot);
+      assert.equal(getStateDir('/tmp/source', 'sess1'), join(expectedTeamRoot, 'sessions', 'sess1'));
+      assert.equal(getStatePath('ralph', '/tmp/source', 'sess1'), join(expectedTeamRoot, 'sessions', 'sess1', 'ralph-state.json'));
       assert.deepEqual(getBaseStateDirWithSource('/tmp/source'), {
-        baseStateDir: '/tmp/explicit-team-state',
+        baseStateDir: expectedTeamRoot,
         rootSource: 'team-env',
       });
     } finally {
@@ -187,11 +188,12 @@ describe('state paths', () => {
     process.env.OMX_STATE_ROOT = '/tmp/ignored-state-root';
     delete process.env.OMX_TEAM_STATE_ROOT;
     try {
-      assert.equal(getBaseStateDir('/tmp/source'), '/tmp/omx-box/.omx/state');
-      assert.equal(getStateDir('/tmp/source', 'sess1'), '/tmp/omx-box/.omx/state/sessions/sess1');
-      assert.equal(getStatePath('ralph', '/tmp/source', 'sess1'), '/tmp/omx-box/.omx/state/sessions/sess1/ralph-state.json');
+      const expectedBoxedStateRoot = join(resolvePath('/tmp/omx-box'), '.omx', 'state');
+      assert.equal(getBaseStateDir('/tmp/source'), expectedBoxedStateRoot);
+      assert.equal(getStateDir('/tmp/source', 'sess1'), join(expectedBoxedStateRoot, 'sessions', 'sess1'));
+      assert.equal(getStatePath('ralph', '/tmp/source', 'sess1'), join(expectedBoxedStateRoot, 'sessions', 'sess1', 'ralph-state.json'));
       assert.deepEqual(getBaseStateDirWithSource('/tmp/source'), {
-        baseStateDir: '/tmp/omx-box/.omx/state',
+        baseStateDir: expectedBoxedStateRoot,
         rootSource: 'omx-root-env',
       });
     } finally {
@@ -446,21 +448,22 @@ describe('state paths', () => {
   });
 
   it('builds global state paths', () => {
-    const base = getBaseStateDir('/repo');
-    assert.equal(base, '/repo/.omx/state');
-    assert.equal(getStateDir('/repo'), '/repo/.omx/state');
-    assert.equal(getStatePath('team', '/repo'), '/repo/.omx/state/team-state.json');
+    const expectedBase = join(resolvePath('/repo'), '.omx', 'state');
+    assert.equal(getBaseStateDir('/repo'), expectedBase);
+    assert.equal(getStateDir('/repo'), expectedBase);
+    assert.equal(getStatePath('team', '/repo'), join(expectedBase, 'team-state.json'));
   });
 
   it('builds session state paths', () => {
-    assert.equal(getStateDir('/repo', 'sess1'), '/repo/.omx/state/sessions/sess1');
+    const expectedSessionDir = join(resolvePath('/repo'), '.omx', 'state', 'sessions', 'sess1');
+    assert.equal(getStateDir('/repo', 'sess1'), expectedSessionDir);
     assert.equal(
       getStatePath('ralph', '/repo', 'sess1'),
-      '/repo/.omx/state/sessions/sess1/ralph-state.json'
+      join(expectedSessionDir, 'ralph-state.json'),
     );
     assert.equal(
       getStateFilePath('hud-state.json', '/repo', 'sess1'),
-      '/repo/.omx/state/sessions/sess1/hud-state.json'
+      join(expectedSessionDir, 'hud-state.json'),
     );
   });
 

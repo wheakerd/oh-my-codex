@@ -43,7 +43,7 @@ import {
   type DownstreamAuthority,
   type TrackedWorkflowMode,
 } from '../state/workflow-transition.js';
-import { reconcileWorkflowTransition } from '../state/workflow-transition-reconcile.js';
+import { completeWorkflowModeState, reconcileWorkflowTransition } from '../state/workflow-transition-reconcile.js';
 import {
   clearDeepInterviewQuestionObligation,
   type DeepInterviewQuestionEnforcementState,
@@ -3737,16 +3737,22 @@ async function reconcileAutopilotSupervisedChildModeStates(
     }
   }
 
-  const transition = await reconcileWorkflowTransition(cwd, childSkill, {
-    action: 'activate',
-    baseStateDir: stateDir,
-    currentModes: activeChildModes,
-    nowIso,
-    sessionId,
-    source: 'autopilot-supervised-child',
-  });
+  const decision = evaluateWorkflowTransition(activeChildModes, childSkill);
+  if (!decision.allowed) {
+    throw new Error(buildWorkflowTransitionError(activeChildModes, childSkill, 'activate'));
+  }
+  const completedPaths: string[] = [];
+  for (const sourceMode of decision.autoCompleteModes) {
+    completedPaths.push(...await completeWorkflowModeState(cwd, sourceMode, childSkill, {
+      baseStateDir: stateDir,
+      expectedRootIdentity: options.expectedRootIdentity,
+      nowIso,
+      sessionId,
+      source: 'autopilot-supervised-child',
+    }));
+  }
   await persistAutopilotSupervisedChildPhaseState(cwd, stateDir, sessionId, childSkill, nowIso, options);
-  return { completedPaths: transition.completedPaths, effectivePhase };
+  return { completedPaths, effectivePhase };
 }
 
 function isDeepInterviewRuntimeConfig(value: unknown): value is DeepInterviewRuntimeConfig {
@@ -3897,17 +3903,6 @@ export async function recordSkillActivation(rawInput: RecordSkillActivationInput
   const sessionStatePath = input.sessionId
     ? join(input.stateDir, 'sessions', input.sessionId, SKILL_ACTIVE_STATE_FILE)
     : null;
-  const skillStateTargets = [
-    ...(suppressRootMutation ? [] : [rootStatePath]),
-    ...(sessionStatePath ? [sessionStatePath] : []),
-  ];
-  for (const targetPath of skillStateTargets) {
-    try {
-      if (!(await lstat(targetPath)).isFile()) return null;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return null;
-    }
-  }
   if (resolvedPromptTurnContext && input.sessionId) {
     const preflight = await preflightKeywordTargetState(
       input.stateDir,
@@ -3918,6 +3913,17 @@ export async function recordSkillActivation(rawInput: RecordSkillActivationInput
     if (preflight.status === 'rejected') {
       await input.onProvenanceRejected?.(preflight.diagnostic);
       return null;
+    }
+  }
+  const skillStateTargets = [
+    ...(suppressRootMutation ? [] : [rootStatePath]),
+    ...(sessionStatePath ? [sessionStatePath] : []),
+  ];
+  for (const targetPath of skillStateTargets) {
+    try {
+      if (!(await lstat(targetPath)).isFile()) return null;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return null;
     }
   }
   const previousRoot = suppressRootMutation ? null : await readExistingSkillState(rootStatePath);

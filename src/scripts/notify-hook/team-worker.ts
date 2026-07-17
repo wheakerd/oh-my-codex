@@ -487,6 +487,7 @@ async function checkLeaderPaneReadyForWorkerStateReminder(paneTarget) {
 		requireRunningAgent: true,
 		requireReady: false,
 		requireIdle: false,
+		exactPaneId: paneTarget,
 	});
 }
 
@@ -706,6 +707,7 @@ export async function maybeNotifyLeaderAllWorkersIdle({
 		);
 		const sendResult = await sendPaneInput({
 			paneTarget: finalTmuxTarget,
+			exactPaneId: finalTmuxTarget,
 			prompt: message,
 			submitKeyPresses: 2,
 			submitDelayMs: 100,
@@ -890,6 +892,7 @@ export async function maybeNotifyLeaderWorkerIdle({
 		);
 		const sendResult = await sendPaneInput({
 			paneTarget: finalTmuxTarget,
+			exactPaneId: finalTmuxTarget,
 			prompt: message,
 			submitKeyPresses: 2,
 			submitDelayMs: 100,

@@ -641,6 +641,28 @@ async function main() {
     ? leaderWriteDecision.context.authorization
     : null;
   const canWriteLeaderScopedState = Boolean(leaderWriteDecision?.scope && leaderAuthorization);
+  if (!isTeamWorker && canWriteLeaderScopedState) {
+    try {
+      const authority = await resolveStateAuthorityForMutation({
+        startup_cwd: cwd,
+        observed_cwd: cwd,
+        session_id: leaderAuthorization!.targetSessionId,
+      });
+      if (
+        !sameFilePath(authority.canonical_state_root, stateDir)
+        || authority.session_binding?.canonical_session_id !== leaderAuthorization!.targetSessionId
+      ) {
+        return;
+      }
+      await ensureAuthorityDirectory(
+        authority.canonical_state_root,
+        join(authority.canonical_state_root, 'sessions', leaderAuthorization!.targetSessionId),
+        { expected_root_identity: authority.generation.root_identity },
+      );
+    } catch {
+      return;
+    }
+  }
   let currentOmxSessionId = isTeamWorker
     ? ''
     : leaderWriteDecision?.scope?.targetSessionId || '';

@@ -16,6 +16,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildTmuxSessionName } from '../../cli/index.js';
 import { initializeStateAuthority, mintStateAuthorityTransportCapability } from '../../state/authority.js';
+import { hardenTestAuthorityTreeSync } from '../../team/__tests__/authority-fixture.js';
 import { buildStateAuthorityTransportEnv } from '../../state/transport-env.js';
 
 const fixtureAuthorityEnv = new Map<string, NodeJS.ProcessEnv>();
@@ -126,8 +127,18 @@ if [[ "$cmd" == "display-message" ]]; then
     echo "${paneInMode}"
     exit 0
   fi
+  if [[ "$format" == "#{@omx_pane_instance_id}" ]]; then
+    echo "omx-scroll-test"
+    exit 0
+  fi
   echo "unsupported format: $format" >&2
   exit 1
+fi
+if [[ "$cmd" == "show-option" ]]; then
+  if [[ "\${@: -1}" == "@omx_pane_instance_id" ]]; then
+    echo "omx-scroll-test"
+  fi
+  exit 0
 fi
 if [[ "$cmd" == "capture-pane" ]]; then
   printf "› ready\n"
@@ -179,7 +190,12 @@ async function setupFixture(cwd: string, paneInMode: '0' | '1', skipIfScrolling 
     pid_start_ticks: readLinuxStartTicks(process.pid),
     pid_cmdline: readLinuxCmdline(process.pid),
   });
-  await writeJson(join(sessionStateDir, 'ralph-state.json'), { active: true, iteration: 0 });
+  await writeJson(join(sessionStateDir, 'ralph-state.json'), {
+    active: true,
+    iteration: 0,
+    tmux_pane_id: '%42',
+    owner_codex_session_id: sessionId,
+  });
   await writeJson(join(omxDir, 'tmux-hook.json'), {
     enabled: true,
     target: { type: 'pane', value: '%42' },
@@ -197,6 +213,7 @@ async function setupFixture(cwd: string, paneInMode: '0' | '1', skipIfScrolling 
 
   await writeFile(fakeTmuxPath, fakeTmuxScript(cwd, paneInMode));
   await chmod(fakeTmuxPath, 0o755);
+  hardenTestAuthorityTreeSync(cwd);
 
   return { stateDir, fakeBinDir, hookStatePath: join(stateDir, 'tmux-hook-state.json') };
 }

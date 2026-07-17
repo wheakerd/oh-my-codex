@@ -64,6 +64,12 @@ set -eu
 echo "$@" >> "${tmuxLogPath}"
 cmd="$1"
 shift || true
+if [[ "$cmd" == "show-option" ]]; then
+  case "\${@: -1}" in
+    @omx_instance_id|@omx_pane_instance_id) echo "notify-hook-all-workers-idle" ;;
+  esac
+  exit 0
+fi
 if [[ "$cmd" == "display-message" ]]; then
   if [[ "\${@: -1}" == "#{session_name}\t#{pane_id}\t#{pane_pid}" ]]; then
     target=""
@@ -73,7 +79,13 @@ if [[ "$cmd" == "display-message" ]]; then
         *) shift ;;
       esac
     done
-    printf 'fixture-session\t%s\t12345\n' "$target"
+    printf '%s\t%s\t12345\n' "\${OMX_TEST_TMUX_SESSION_NAME:-fixture-session}" "$target"
+  elif [[ "\${@: -1}" == "#S" ]]; then
+    echo "\${OMX_TEST_TMUX_SESSION_NAME:-fixture-session}"
+  elif [[ "\${@: -1}" == "#{pane_current_command}" || "\${@: -1}" == "#{pane_start_command}" ]]; then
+    echo "codex"
+  elif [[ "\${@: -1}" == "#{pane_in_mode}" ]]; then
+    echo "0"
   fi
   exit 0
 fi
@@ -105,8 +117,16 @@ fi
 if [[ "$cmd" == "send-keys" ]]; then
   exit 0
 fi
+if [[ "$cmd" == "list-sessions" ]]; then
+  printf '%s\tnotify-hook-all-workers-idle\n' "\${OMX_TEST_TMUX_SESSION_NAME:-fixture-session}"
+  exit 0
+fi
 if [[ "$cmd" == "list-panes" ]]; then
-  echo "%1 12345"
+  if [[ "$*" == *"#{pane_dead}"* ]]; then
+    printf '%%1\t0\t12345\n%s\t0\t12345\n' "\${OMX_TEST_TMUX_PANE_ID:-%1}"
+  else
+    printf '%s 12345\n' "\${OMX_TEST_TMUX_PANE_ID:-%1}"
+  fi
   exit 0
 fi
 exit 0
@@ -152,6 +172,25 @@ function writeWorkerIdentityFixture(cwd: string, workerEnv: string): string {
   return stateRoot;
 }
 
+function resolveFixtureTmuxBinding(cwd: string, workerEnv: string): {
+  sessionName: string;
+  paneId: string;
+} {
+  try {
+    const [teamName] = workerEnv.split('/');
+    const config = JSON.parse(readFileSync(join(cwd, '.omx', 'state', 'team', teamName, 'config.json'), 'utf8')) as {
+      tmux_session?: unknown;
+      leader_pane_id?: unknown;
+    };
+    return {
+      sessionName: typeof config.tmux_session === 'string' ? config.tmux_session : 'fixture-session',
+      paneId: typeof config.leader_pane_id === 'string' ? config.leader_pane_id : '%1',
+    };
+  } catch {
+    return { sessionName: 'fixture-session', paneId: '%1' };
+  }
+}
+
 function runNotifyHookAsWorker(
   cwd: string,
   fakeBinDir: string,
@@ -159,6 +198,7 @@ function runNotifyHookAsWorker(
   extraEnv: Record<string, string> = {},
 ): ReturnType<typeof spawnSync> {
   const stateRoot = writeWorkerIdentityFixture(cwd, workerEnv);
+  const tmuxBinding = resolveFixtureTmuxBinding(cwd, workerEnv);
   hardenTestAuthorityTreeSync(cwd);
   const payload = {
     cwd,
@@ -183,6 +223,8 @@ function runNotifyHookAsWorker(
       OMX_TEAM_ALL_IDLE_COOLDOWN_MS: '500', // short cooldown for tests
       TMUX: '',
       TMUX_PANE: '',
+      OMX_TEST_TMUX_SESSION_NAME: tmuxBinding.sessionName,
+      OMX_TEST_TMUX_PANE_ID: tmuxBinding.paneId,
       ...extraEnv,
     },
   });
@@ -374,7 +416,11 @@ if [[ "$cmd" == "display-message" ]]; then
     exit 0
   fi
   if [[ "$format" == "#{session_name}\t#{pane_id}\t#{pane_pid}" && "$target" == "%181" ]]; then
-    printf 'shell-pane-all-idle\t%%181\t12345\n'
+    printf 'devsess:81\t%%181\t12345\n'
+    exit 0
+  fi
+  if [[ "$format" == "#S" ]]; then
+    echo "devsess:81"
     exit 0
   fi
   exit 0
@@ -407,8 +453,20 @@ fi
 if [[ "$cmd" == "send-keys" ]]; then
   exit 0
 fi
+if [[ "$cmd" == "show-option" ]]; then
+  echo "notify-hook-all-workers-idle"
+  exit 0
+fi
+if [[ "$cmd" == "list-sessions" ]]; then
+  printf 'devsess:81\tnotify-hook-all-workers-idle\n'
+  exit 0
+fi
 if [[ "$cmd" == "list-panes" ]]; then
-  echo "%1 12345"
+  if [[ "$*" == *"#{pane_dead}"* ]]; then
+    printf '%%181\t0\t12345\n'
+  else
+    printf '%%181 12345\n'
+  fi
   exit 0
 fi
 exit 0
@@ -495,7 +553,11 @@ if [[ "$cmd" == "display-message" ]]; then
     exit 0
   fi
   if [[ "$format" == "#{session_name}\t#{pane_id}\t#{pane_pid}" && "$target" == "%182" ]]; then
-    printf 'busy-leader-all-idle\t%%182\t12345\n'
+    printf 'busy-all-idle:0\t%%182\t12345\n'
+    exit 0
+  fi
+  if [[ "$format" == "#S" ]]; then
+    echo "busy-all-idle:0"
     exit 0
   fi
   exit 0
@@ -532,8 +594,20 @@ fi
 if [[ "$cmd" == "send-keys" ]]; then
   exit 0
 fi
+if [[ "$cmd" == "show-option" ]]; then
+  echo "notify-hook-all-workers-idle"
+  exit 0
+fi
+if [[ "$cmd" == "list-sessions" ]]; then
+  printf 'busy-all-idle:0\tnotify-hook-all-workers-idle\n'
+  exit 0
+fi
 if [[ "$cmd" == "list-panes" ]]; then
-  echo "%1 12345"
+  if [[ "$*" == *"#{pane_dead}"* ]]; then
+    printf '%%182\t0\t12345\n'
+  else
+    printf '%%182 12345\n'
+  fi
   exit 0
 fi
 exit 0

@@ -6,7 +6,12 @@ import { dirname, join } from 'path';
 import { tmpdir } from 'os';
 import { spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
-import { initializeStateAuthority, mintStateAuthorityTransportCapability } from '../../state/authority.js';
+import {
+  initializeStateAuthority,
+  mintStateAuthorityTransportCapability,
+  resolveStateAuthorityForGuard,
+  validateStateAuthorityTransportCapability,
+} from '../../state/authority.js';
 import { buildStateAuthorityTransportEnv } from '../../state/transport-env.js';
 import { hardenTestAuthorityTreeSync } from '../../team/__tests__/authority-fixture.js';
 
@@ -42,11 +47,20 @@ async function establishCommittedAuthority(
     launch_id: `cli-session-scope-${sessionId}`,
     session_binding: { canonical_session_id: sessionId },
   });
-  await mintStateAuthorityTransportCapability(authority);
-  return buildStateAuthorityTransportEnv(authority, {
-    ...Object.fromEntries(STATE_AUTHORITY_ENV_KEYS.map((key) => [key, undefined])),
-    OMX_SESSION_ID: sessionId,
+  const mintedCapability = await mintStateAuthorityTransportCapability(authority);
+  await validateStateAuthorityTransportCapability(authority, mintedCapability.capability);
+  const refreshedAuthority = await resolveStateAuthorityForGuard({
+    startup_cwd: cwd,
+    observed_cwd: cwd,
+    session_id: sessionId,
   });
+  return {
+    ...buildStateAuthorityTransportEnv(refreshedAuthority, {
+      ...Object.fromEntries(STATE_AUTHORITY_ENV_KEYS.map((key) => [key, undefined])),
+      OMX_SESSION_ID: sessionId,
+    }),
+    OMX_STATE_AUTHORITY_CAPABILITY: mintedCapability.capability,
+  };
 }
 
 function unauthenticatedEnv(overrides: NodeJS.ProcessEnv): NodeJS.ProcessEnv {

@@ -79,7 +79,7 @@ if [[ "$cmd" == "display-message" ]]; then
     esac
     shift || true
   done
-  if [[ "$fmt" == "#{@omx_instance_id}" ]]; then
+  if [[ "$fmt" == "#{@omx_instance_id}" || "$fmt" == "#{@omx_pane_instance_id}" ]]; then
     echo "notify-hook-team-dispatch"
     exit 0
   fi
@@ -104,13 +104,17 @@ if [[ "$cmd" == "display-message" ]]; then
     exit 0
   fi
   if [[ "$fmt" == "#S" ]]; then
-    echo "session-test"
+    echo "\${OMX_TEST_TMUX_SESSION_NAME:-session-test}"
     exit 0
   fi
   exit 0
 fi
 if [[ "$cmd" == "show-option" && "$*" == *"@omx_team_pane_owner_id" ]]; then
-  echo "team:alpha"
+  echo "team:\${OMX_TEST_TEAM_NAME:-alpha}"
+  exit 0
+fi
+if [[ "$cmd" == "list-sessions" ]]; then
+  printf '%s\tnotify-hook-team-dispatch\n' "\${OMX_TEST_TMUX_SESSION_NAME:-session-test}"
   exit 0
 fi
 
@@ -187,9 +191,17 @@ function assertFreshExactProofBeforePaneEffects(tmuxLog: string, paneId: string)
   }
 }
 
-function bindCanonicalTeamPaneAuthority(config: { tmux_pane_owner_id?: string; hud_pane_id?: string | null }, hudPaneId = '%88'): void {
+function bindCanonicalTeamPaneAuthority(config: any, hudPaneId = '%88'): void {
+  const panePid = (paneId: string | undefined): number | undefined => {
+    const pane = Number(paneId?.slice(1));
+    return Number.isSafeInteger(pane) && pane > 0 ? pane * 101 : undefined;
+  };
   config.tmux_pane_owner_id = 'team:alpha';
   config.hud_pane_id = hudPaneId;
+  config.leader_pane_pid ??= panePid(config.leader_pane_id);
+  for (const worker of config.workers || []) {
+    worker.pid ??= panePid(worker.pane_id);
+  }
 }
 
 
@@ -326,6 +338,13 @@ async function initTeamState(
     undefined,
     transport,
   );
+  process.env.OMX_TEST_TEAM_NAME = teamName;
+  process.env.OMX_TEST_TMUX_SESSION_NAME = typeof config.tmux_session === 'string'
+    ? config.tmux_session
+    : 'session-test';
+  process.env.OMX_TEST_TMUX_PANE_ID = typeof config.leader_pane_id === 'string'
+    ? config.leader_pane_id
+    : '%42';
   hardenTestAuthorityTreeSync(cwd);
   return config;
 }

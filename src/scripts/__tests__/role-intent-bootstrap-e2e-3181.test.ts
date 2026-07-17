@@ -13,8 +13,16 @@ import { dispatchCodexNativeHook } from '../codex-native-hook.js';
 import {
   initializeStateAuthority,
   mintStateAuthorityTransportCapability,
+  resolveStateAuthorityForGuard,
 } from '../../state/authority.js';
-import { buildStateAuthorityTransportEnv } from '../../state/transport-env.js';
+import {
+  buildStateAuthorityTransportEnv,
+  OMX_STATE_AUTHORITY_PATH_ENV,
+  OMX_STATE_AUTHORITY_ID_ENV,
+  OMX_STATE_AUTHORITY_GENERATION_ID_ENV,
+  OMX_STATE_AUTHORITY_WORKSPACE_DIGEST_ENV,
+  OMX_STATE_AUTHORITY_CAPABILITY_ENV,
+} from '../../state/transport-env.js';
 
 async function invokeRoleIntent(cwd: string, args: string[]) {
   const stdout: string[] = [];
@@ -41,6 +49,8 @@ function buildHermeticChildEnvironment(home: string, codexHome: string): NodeJS.
     'OMX_TEAM_INTERNAL_WORKER', 'OMX_TEAM_LEADER_CWD', 'OMX_TEAM_MODE',
     'OMX_QUESTION_RETURN_PANE', 'OMX_LEADER_PANE_ID', 'OMX_TMUX_HUD_OWNER',
     'CODEX_SESSION_ID', 'CODEX_THREAD_ID', 'CODEX_TURN_ID', 'SESSION_ID', 'TMUX', 'TMUX_PANE',
+    OMX_STATE_AUTHORITY_PATH_ENV, OMX_STATE_AUTHORITY_ID_ENV, OMX_STATE_AUTHORITY_GENERATION_ID_ENV,
+    OMX_STATE_AUTHORITY_WORKSPACE_DIGEST_ENV, OMX_STATE_AUTHORITY_CAPABILITY_ENV,
   ]) delete environment[key];
   return environment;
 }
@@ -67,6 +77,20 @@ async function installAuthenticatedAuthority(cwd: string, sessionId: string): Pr
   });
   await mintStateAuthorityTransportCapability(authority);
   return buildStateAuthorityTransportEnv(authority, { OMX_SESSION_ID: sessionId });
+}
+
+async function refreshAuthenticatedAuthority(
+  cwd: string,
+  sessionId: string,
+  environment: NodeJS.ProcessEnv,
+): Promise<NodeJS.ProcessEnv> {
+  const authority = await resolveStateAuthorityForGuard({
+    startup_cwd: cwd,
+    observed_cwd: cwd,
+    session_id: sessionId,
+  });
+  await mintStateAuthorityTransportCapability(authority);
+  return buildStateAuthorityTransportEnv(authority, { ...environment, OMX_SESSION_ID: sessionId });
 }
 
 describe('#3181 end-to-end fresh App turn bootstrap', () => {
@@ -159,6 +183,13 @@ describe('#3181 end-to-end fresh App turn bootstrap', () => {
     const home = await mkdtemp(join(tmpdir(), 'omx-3181-home-'));
     const codexHome = await mkdtemp(join(tmpdir(), 'omx-3181-codex-home-'));
     const nativeSessionId = 'codex-native-compiled-leader';
+    const inheritedAuthorityKeys = [
+      'OMX_ROOT', 'OMX_STATE_ROOT', 'OMX_TEAM_STATE_ROOT', 'OMX_STARTUP_CWD',
+      OMX_STATE_AUTHORITY_PATH_ENV, OMX_STATE_AUTHORITY_ID_ENV, OMX_STATE_AUTHORITY_GENERATION_ID_ENV,
+      OMX_STATE_AUTHORITY_WORKSPACE_DIGEST_ENV, OMX_STATE_AUTHORITY_CAPABILITY_ENV,
+    ];
+    const inheritedAuthorityEnvironment = new Map(inheritedAuthorityKeys.map((key) => [key, process.env[key]]));
+    for (const key of inheritedAuthorityKeys) delete process.env[key];
     const environment = {
       ...buildHermeticChildEnvironment(home, codexHome),
       ...await installAuthenticatedAuthority(cwd, nativeSessionId),
@@ -171,23 +202,18 @@ describe('#3181 end-to-end fresh App turn bootstrap', () => {
       });
       assert.equal(sessionStart.status, 0, String(sessionStart.stderr));
       assert.equal((await readSubagentTrackingState(cwd)).sessions[nativeSessionId]?.leader_attested_at, undefined);
-      const unattestedCli = runCompiled(cwd, environment, 'cli/omx.js', [
-        'ralplan', 'role-intent', 'write', '--role', 'architect', '--parent-thread', nativeSessionId, '--json',
-      ]);
-      assert.notEqual(unattestedCli.status, 0, 'SessionStart-only state must not authorize the actual CLI');
-      assert.deepEqual(JSON.parse(String(unattestedCli.stdout)), { ok: false, reason: 'native_anchor_unavailable' });
-
       const compiledPointerPath = join(cwd, '.omx', 'state', 'session.json');
       const compiledPointer = JSON.parse(String(await readFile(compiledPointerPath))) as Record<string, unknown>;
-      compiledPointer.native_session_id = nativeSessionId;
-      await writeFile(compiledPointerPath, `${JSON.stringify(compiledPointer)}\n`);
-      const compiledSessionPointerPath = join(cwd, '.omx', 'state', 'sessions', nativeSessionId, 'session.json');
-      if (existsSync(compiledSessionPointerPath)) {
-        const compiledSessionPointer = JSON.parse(String(await readFile(compiledSessionPointerPath))) as Record<string, unknown>;
-        compiledSessionPointer.native_session_id = nativeSessionId;
-        await writeFile(compiledSessionPointerPath, `${JSON.stringify(compiledSessionPointer)}\n`);
-      }
-      Object.assign(environment, await installAuthenticatedAuthority(cwd, nativeSessionId));
+      assert.equal(compiledPointer.native_session_id, nativeSessionId, 'SessionStart must commit the native leader identity before PreToolUse');
+      Object.assign(environment, await refreshAuthenticatedAuthority(cwd, nativeSessionId, environment));
+      const preToolAuthority = await resolveStateAuthorityForGuard({
+        startup_cwd: cwd,
+        observed_cwd: cwd,
+        session_id: nativeSessionId,
+      });
+      assert.equal(preToolAuthority.session_binding?.canonical_session_id, nativeSessionId);
+      assert.equal(preToolAuthority.session_binding?.aliases.native_session_id, nativeSessionId);
+
       const preToolUse = runCompiled(cwd, environment, 'scripts/codex-native-hook.js', [], {
         hook_event_name: 'PreToolUse',
         cwd,
@@ -198,11 +224,12 @@ describe('#3181 end-to-end fresh App turn bootstrap', () => {
         tool_input: { command: 'omx ralplan role-intent write --role architect --parent-thread "$CODEX_THREAD_ID" --json' },
       });
       assert.equal(preToolUse.status, 0, String(preToolUse.stderr));
-      const attested = (await readSubagentTrackingState(cwd)).sessions[nativeSessionId];
-      assert.equal(attested?.leader_thread_id, nativeSessionId);
+      const trackingAfterPreTool = await readSubagentTrackingState(cwd);
+      const attested = trackingAfterPreTool.sessions[nativeSessionId];
+      assert.equal(attested?.leader_thread_id, nativeSessionId, JSON.stringify(trackingAfterPreTool));
       assert.equal(attested?.leader_attest_source, 'native-pretooluse');
 
-      Object.assign(environment, await installAuthenticatedAuthority(cwd, nativeSessionId));
+      Object.assign(environment, await refreshAuthenticatedAuthority(cwd, nativeSessionId, environment));
       const cli = runCompiled(cwd, environment, 'cli/omx.js', [
         'ralplan', 'role-intent', 'write', '--role', 'architect', '--parent-thread', nativeSessionId, '--json',
       ]);
@@ -223,6 +250,11 @@ describe('#3181 end-to-end fresh App turn bootstrap', () => {
       assert.equal(tracking.pending_role_intents.length, 1);
       assert.equal(tracking.pending_role_intents[0]?.correlation_token, receipt.intent.correlation_token);
     } finally {
+      for (const key of inheritedAuthorityKeys) {
+        const value = inheritedAuthorityEnvironment.get(key);
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
       await rm(cwd, { recursive: true, force: true });
       await rm(home, { recursive: true, force: true });
       await rm(codexHome, { recursive: true, force: true });
@@ -247,7 +279,7 @@ describe('#3181 end-to-end fresh App turn bootstrap', () => {
       const pointerBefore = await readFile(pointerPath);
       const trackerBefore = await readSubagentTrackingState(cwd);
 
-      Object.assign(environment, await installAuthenticatedAuthority(cwd, canonicalNativeSessionId));
+      Object.assign(environment, await refreshAuthenticatedAuthority(cwd, canonicalNativeSessionId, environment));
       const preToolUse = runCompiled(cwd, environment, 'scripts/codex-native-hook.js', [], {
         hook_event_name: 'PreToolUse',
         cwd,

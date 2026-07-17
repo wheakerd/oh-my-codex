@@ -18,7 +18,6 @@ import {
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 import { runProcess } from './process-runner.js';
-import { resolvePaneTarget, resolveSessionToPane } from './tmux-injection.js';
 import { evaluatePaneInjectionReadiness, sendPaneInput } from './team-tmux-guard.js';
 import {
   buildCapturePaneArgv,
@@ -484,22 +483,33 @@ function resolveDispatchPaneAuthority(request, config, paneTarget) {
   };
 }
 
+function isExactPaneId(value) {
+  return /^%\d+$/.test(safeString(value).trim());
+}
+
 function defaultInjectTarget(request, config) {
   if (request.to_worker === 'leader-fixed') {
     const leaderPaneId = resolveLeaderPaneId(config);
-    if (leaderPaneId) return { type: 'pane', value: leaderPaneId };
-    return null;
+    if (!leaderPaneId) return null;
+    return isExactPaneId(leaderPaneId)
+      ? { type: 'pane', value: leaderPaneId, source: 'persisted_leader_pane' }
+      : { error: 'exact_pane_unavailable' };
   }
-  if (request.pane_id) return { type: 'pane', value: request.pane_id };
-  if (typeof request.worker_index === 'number' && Array.isArray(config?.workers)) {
-    const worker = config.workers.find((candidate) => Number(candidate?.index) === request.worker_index);
-    if (worker?.pane_id) return { type: 'pane', value: worker.pane_id };
+
+  const worker = typeof request.worker_index === 'number' && Array.isArray(config?.workers)
+    ? config.workers.find((candidate) => Number(candidate?.index) === request.worker_index)
+    : null;
+  const requestedPaneId = safeString(request.pane_id).trim();
+  const configuredPaneId = safeString(worker?.pane_id).trim();
+
+  if (requestedPaneId && configuredPaneId && requestedPaneId !== configuredPaneId) {
+    return { error: 'exact_pane_mismatch' };
   }
-  if (typeof request.worker_index === 'number' && config.tmux_session) {
-    return { type: 'pane', value: `${config.tmux_session}.${request.worker_index}` };
-  }
-  if (config.tmux_session) return { type: 'session', value: config.tmux_session };
-  return null;
+  const paneId = requestedPaneId || configuredPaneId;
+  if (!paneId) return null;
+  return isExactPaneId(paneId)
+    ? { type: 'pane', value: paneId, source: requestedPaneId ? 'request_exact_pane' : 'persisted_worker_pane' }
+    : { error: 'exact_pane_unavailable' };
 }
 
 async function appendLeaderNotificationDeferredEvent({
@@ -795,21 +805,20 @@ async function injectDispatchRequest(request, config, cwd, stateDir, authority: 
   if (!target) {
     return { ok: false, reason: 'missing_tmux_target' };
   }
+  if (target.error) {
+    return { ok: false, reason: target.error };
+  }
+  const resolution = {
+    paneTarget: target.value,
+    reason: target.source,
+    source: target.source,
+  };
   const leaderTargeted = request.to_worker === 'leader-fixed';
-  let resolution;
-  if (target.type === 'session') {
-    const paneId = await resolveSessionToPane(target.value).catch(() => null);
-    resolution = paneId
-      ? { paneTarget: paneId, reason: 'session_target_resolved' }
-      : { paneTarget: null, reason: 'target_not_found' };
-  } else {
-    resolution = await resolvePaneTarget(target, '', '', '', {});
-  }
-  if (!resolution.paneTarget) {
-    return { ok: false, reason: `target_resolution_failed:${resolution.reason}` };
-  }
   const isLeaderMailboxDispatch = request.to_worker === 'leader-fixed';
   const paneAuthority = resolveDispatchPaneAuthority(request, config, resolution.paneTarget);
+  if (!paneAuthority.expectedPanePid) {
+    return { ok: false, reason: 'missing_exact_pane_pid' };
+  }
 
   const paneGuard = await evaluatePaneInjectionReadiness(resolution.paneTarget, {
     skipIfScrolling: true,
@@ -827,6 +836,7 @@ async function injectDispatchRequest(request, config, cwd, stateDir, authority: 
       pane_source: resolution.source || null,
       readiness_evidence: paneGuard.readinessEvidence || null,
       pane_current_command: paneGuard.paneCurrentCommand || null,
+      exactPaneProof: paneGuard.exactPaneProof || null,
       tmux_injection_attempted: false,
     };
   }
@@ -1000,6 +1010,7 @@ function buildDispatchAttemptEvidence(result, fallback = {}) {
     pane_source: safeString(result?.pane_source || fallback.pane_source || '').trim() || null,
     readiness_evidence: safeString(result?.readiness_evidence || fallback.readiness_evidence || '').trim() || null,
     pane_current_command: safeString(result?.pane_current_command || fallback.pane_current_command || '').trim() || null,
+    exact_pane_proof: result?.exactPaneProof || fallback.exactPaneProof || null,
     tmux_injection_attempted:
       typeof result?.tmux_injection_attempted === 'boolean'
         ? result.tmux_injection_attempted
@@ -1041,10 +1052,9 @@ export async function drainPendingTeamDispatch({
   for (const teamName of teams) {
     if (processed >= maxPerTick) break;
     const teamDirPath = join(teamRoot, teamName);
-    const manifestPath = join(teamDirPath, 'manifest.v2.json');
     const configPath = join(teamDirPath, 'config.json');
     const requestsPath = join(teamDirPath, 'dispatch', 'requests.json');
-    const config = await readJson(existsSync(manifestPath) ? manifestPath : configPath, {});
+    const config = await readJson(configPath, {});
     const claims = [];
     await withDispatchLock(teamDirPath, async () => {
       const bridgeRequests = await readBridgeDispatchRequests(stateDir, teamName);

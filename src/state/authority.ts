@@ -1121,7 +1121,10 @@ export async function ensureAuthorityDirectory(
   options: Pick<AtomicAuthorityWriteOptions, 'expected_root_identity'> = {},
 ): Promise<string> {
   const canonicalRoot = canonicalizeExistingAuthorityPath(root, 'authority root');
-  const target = assertPathInput(directory, 'authority directory');
+  const target = canonicalizeAuthorityPathForCreation(
+    assertPathInput(directory, 'authority directory'),
+    'authority directory',
+  );
   if (!isAuthorityPathWithin(canonicalRoot, target)) {
     authorityError(AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot, `authority directory escapes root: ${target}`);
   }

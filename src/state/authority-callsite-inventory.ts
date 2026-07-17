@@ -3609,14 +3609,6 @@ export const AUTHORITY_CALLSITE_INVENTORY = [
   ),
   entry(
     'src/ralplan/consensus-gate.ts',
-    'hasScopedRoleRoutingUnavailableEvidence',
-    'bootstrap-only',
-    'ralph',
-    'hasScopedRoleRoutingUnavailableEvidence checks bounded canonical and local compatibility marker candidates before exact cwd and session validation.',
-    phase0,
-  ),
-  entry(
-    'src/ralplan/consensus-gate.ts',
     'trackerBackedReviewProblem',
     'bootstrap-only',
     'ralph',
@@ -6344,7 +6336,7 @@ export const AUTHORITY_DYNAMIC_CALL_WAIVERS: readonly AuthorityDynamicCallWaiver
   {
     path: 'src/cli/index.ts',
     symbol: 'reapStaleNotifyFallbackWatcher',
-    source_range: '8605:27-8605:74',
+    source_range: '8607:27-8607:74',
     classification: 'authority-context',
     owner: 'cli-launch',
     rationale:

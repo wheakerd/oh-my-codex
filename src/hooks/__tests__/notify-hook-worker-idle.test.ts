@@ -133,15 +133,23 @@ echo "$@" >> "${tmuxLogPath}"
 cmd="$1"
 shift || true
 if [[ "$cmd" == "show-option" ]]; then
-  echo "notify-worker-idle"
+  case "\${@: -1}" in
+    @omx_instance_id|@omx_pane_instance_id) echo "notify-worker-idle" ;;
+  esac
   exit 0
 fi
 if [[ "$cmd" == "display-message" ]]; then
   if [[ "\${@: -1}" == "#{@omx_instance_id}" || "\${@: -1}" == "#{@omx_pane_instance_id}" ]]; then
     echo "notify-worker-idle"
   elif [[ "\${@: -1}" == "#S" ]]; then
-    echo "session-test"
-  elif [[ "\${@: -1}" == "#{session_name}\t#{pane_id}\t#{pane_pid}" ]]; then
+    echo "\${OMX_TEST_TMUX_SESSION_NAME:-session-test}"
+  elif [[ "\${@: -1}" == "#{pane_in_mode}" ]]; then
+    echo "0"
+  elif [[ "\${@: -1}" == "#{pane_current_command}" ]]; then
+    echo "codex"
+  elif [[ "\${@: -1}" == "#{pane_start_command}" ]]; then
+    :
+  else
     target=""
     while (($#)); do
       case "$1" in
@@ -149,7 +157,7 @@ if [[ "$cmd" == "display-message" ]]; then
         *) shift ;;
       esac
     done
-    printf 'session-test\t%s\t12345\n' "$target"
+    printf '%s\t%s\t12345\n' "\${OMX_TEST_TMUX_SESSION_NAME:-session-test}" "$target"
   fi
   exit 0
 fi
@@ -181,11 +189,17 @@ fi
 if [[ "$cmd" == "send-keys" ]]; then
   exit 0
 fi
+if [[ "$cmd" == "list-sessions" ]]; then
+  printf '%s\tnotify-worker-idle\n' "\${OMX_TEST_TMUX_SESSION_NAME:-session-test}"
+  exit 0
+fi
 if [[ "$cmd" == "list-panes" ]]; then
-  if [[ "$*" == *"pane_active"* ]]; then
+  if [[ "$*" == *"#{pane_dead}"* ]]; then
+    printf '%s\t0\t12345\n' "\${OMX_TEST_TMUX_PANE_ID:-%1}"
+  elif [[ "$*" == *"pane_active"* ]]; then
     printf '%%1\t1\tcodex\tcodex\n'
   else
-    echo "%1 12345"
+    printf '%s 12345\n' "\${OMX_TEST_TMUX_PANE_ID:-%1}"
   fi
   exit 0
 fi
@@ -230,9 +244,16 @@ function writeWorkerIdentityFixture(cwd: string, workerEnv: string): string {
 		);
 	}
 	const manifestPath = join(stateRoot, "team", teamName, "manifest.v2.json");
+	const configPath = join(stateRoot, "team", teamName, "config.json");
+	if (!existsSync(manifestPath) && existsSync(configPath)) {
+		const config = JSON.parse(readFileSync(configPath, "utf8")) as Record<string, unknown>;
+		writeFileSync(manifestPath, JSON.stringify({ ...config, schema_version: 2 }, null, 2));
+	}
 	if (existsSync(manifestPath)) {
 		const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as {
 			workers?: Array<Record<string, unknown>>;
+			tmux_session?: unknown;
+			leader_pane_id?: unknown;
 		};
 		const workerIdentity = JSON.parse(
 			readFileSync(identityPath, "utf8"),
@@ -249,9 +270,16 @@ function writeWorkerIdentityFixture(cwd: string, workerEnv: string): string {
 				worktree_path: cwd,
 			},
 		];
+		if (existsSync(configPath)) {
+			const config = JSON.parse(readFileSync(configPath, "utf8")) as {
+				tmux_session?: unknown;
+				leader_pane_id?: unknown;
+			};
+			manifest.tmux_session = config.tmux_session;
+			manifest.leader_pane_id = config.leader_pane_id;
+		}
 		writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
 	}
-	const configPath = join(stateRoot, "team", teamName, "config.json");
 	if (existsSync(configPath)) {
 		const config = JSON.parse(readFileSync(configPath, "utf8")) as {
 			workers?: Array<Record<string, unknown>>;
@@ -276,6 +304,42 @@ function writeWorkerIdentityFixture(cwd: string, workerEnv: string): string {
 	return stateRoot;
 }
 
+function resolveFixtureTmuxBinding(
+	cwd: string,
+	workerEnv: string,
+): { sessionName: string; paneId: string } {
+	try {
+		const [teamName] = workerEnv.split("/");
+		const config = JSON.parse(
+			readFileSync(
+				join(
+					cwd,
+					".omx",
+					"state",
+					"sessions",
+					"notify-worker-idle",
+					"team",
+					teamName,
+					"config.json",
+				),
+				"utf8",
+			),
+		) as { tmux_session?: unknown; leader_pane_id?: unknown };
+		return {
+			sessionName:
+				typeof config.tmux_session === "string"
+					? config.tmux_session
+					: "session-test",
+			paneId:
+				typeof config.leader_pane_id === "string"
+					? config.leader_pane_id
+					: "%1",
+		};
+	} catch {
+		return { sessionName: "session-test", paneId: "%1" };
+	}
+}
+
 function runNotifyHookAsWorker(
 	cwd: string,
 	fakeBinDir: string,
@@ -285,6 +349,7 @@ function runNotifyHookAsWorker(
 ): ReturnType<typeof spawnSync> {
 	if (options.writeIdentity !== false)
 		writeWorkerIdentityFixture(cwd, workerEnv);
+	const tmuxBinding = resolveFixtureTmuxBinding(cwd, workerEnv);
 	const payload = {
 		cwd,
 		type: "agent-turn-complete",
@@ -318,6 +383,8 @@ function runNotifyHookAsWorker(
 						? ""
 						: join(cwd, ".omx", "state", "sessions", "notify-worker-idle"),
 				OMX_TEAM_LEADER_CWD: options.writeIdentity === false ? "" : cwd,
+				OMX_TEST_TMUX_SESSION_NAME: tmuxBinding.sessionName,
+				OMX_TEST_TMUX_PANE_ID: tmuxBinding.paneId,
 				...extraEnv,
 			},
 		},
@@ -658,13 +725,11 @@ if [[ "$cmd" == "display-message" ]]; then
       *) format="$1"; shift ;;
     esac
   done
-  if [[ "$format" == "#{session_name}\t#{pane_id}\t#{pane_pid}" ]]; then
-    printf 'session-test\t%s\t12345\n' "$target"
-    exit 0
-  fi
   if [[ "$format" == "#{pane_current_command}" && "$target" == "%79" ]]; then
     echo "zsh"
+    exit 0
   fi
+  printf '%s\t%s\t12345\n' "\${OMX_TEST_TMUX_SESSION_NAME:-session-test}" "$target"
   exit 0
 fi
 if [[ "$cmd" == "set-buffer" ]]; then
@@ -696,7 +761,11 @@ if [[ "$cmd" == "send-keys" ]]; then
   exit 0
 fi
 if [[ "$cmd" == "list-panes" ]]; then
-  echo "%1 12345"
+  if [[ "$*" == *"#{pane_dead}"* ]]; then
+    printf '%s\t0\t12345\n' "\${OMX_TEST_TMUX_PANE_ID:-%1}"
+  else
+    echo "%1 12345"
+  fi
   exit 0
 fi
 exit 0
@@ -810,14 +879,11 @@ if [[ "$cmd" == "display-message" ]]; then
     echo "0"
     exit 0
   fi
-  if [[ "$format" == "#{session_name}\t#{pane_id}\t#{pane_pid}" ]]; then
-    printf 'session-test\t%s\t12345\n' "$target"
-    exit 0
-  fi
   if [[ "$format" == "#{pane_current_command}" && "$target" == "%81" ]]; then
     echo "codex"
     exit 0
   fi
+  printf '%s\t%s\t12345\n' "\${OMX_TEST_TMUX_SESSION_NAME:-session-test}" "$target"
   exit 0
 fi
 if [[ "$cmd" == "capture-pane" ]]; then
@@ -853,7 +919,11 @@ if [[ "$cmd" == "send-keys" ]]; then
   exit 0
 fi
 if [[ "$cmd" == "list-panes" ]]; then
-  echo "%1 12345"
+  if [[ "$*" == *"#{pane_dead}"* ]]; then
+    printf '%s\t0\t12345\n' "\${OMX_TEST_TMUX_PANE_ID:-%1}"
+  else
+    echo "%1 12345"
+  fi
   exit 0
 fi
 exit 0

@@ -26,11 +26,17 @@ const EXACT_GLOBAL_PANE_PROOF_COMMAND = 'list-panes -a -F #{pane_id}\t#{pane_dea
 
 function assertExactPaneProofBeforeTargetEffect(tmuxLog: string, paneId: string): void {
   const commands = tmuxLog.trim().split('\n').filter(Boolean);
-  const effectIndex = commands.findIndex((command) => command.startsWith(`send-keys -t ${paneId} `));
+  let effectIndex = -1;
+  for (let index = commands.length - 1; index >= 0; index -= 1) {
+    if (commands[index]?.startsWith(`send-keys -t ${paneId} `)) {
+      effectIndex = index;
+      break;
+    }
+  }
   assert.ok(effectIndex >= 0, `expected send-keys target effect for ${paneId}`);
   assert.ok(
     commands.slice(0, effectIndex).includes(EXACT_GLOBAL_PANE_PROOF_COMMAND),
-    `expected exact global pane proof before send-keys for ${paneId}`,
+    `expected exact global pane proof before send-keys for ${paneId}; log=${JSON.stringify(commands)}`,
   );
 }
 
@@ -103,35 +109,56 @@ if [[ "$cmd" == "display-message" ]]; then
     echo "0"
     exit 0
   fi
-  if [[ "$fmt" == "#{pane_id}" ]]; then
-    echo "\${target:-%42}"
-    exit 0
+  pane_id="\${target:-%42}"
+  pane_pid=""
+  if [[ -f "${tmuxLogPath}.pane-proofs" ]]; then
+    while IFS=$'\t' read -r proof_pane_id proof_pane_dead proof_pane_pid; do
+      if [[ "$proof_pane_id" == "$pane_id" ]]; then
+        pane_pid="$proof_pane_pid"
+        break
+      fi
+    done < "${tmuxLogPath}.pane-proofs"
   fi
+  pane_owner="delivery-smoke-owner"
+  if [[ -f "${tmuxLogPath}.owner.$pane_id" ]]; then pane_owner="$(cat "${tmuxLogPath}.owner.$pane_id")"; fi
+  session_name="session-test"
+  if [[ -f "${tmuxLogPath}.session" ]]; then session_name="$(cat "${tmuxLogPath}.session")"; fi
   if [[ "$fmt" == "#{pane_current_path}" ]]; then
     dirname "${tmuxLogPath}"
     exit 0
   fi
-  if [[ "$fmt" == "#{pane_start_command}" ]]; then
-    echo "codex"
-    exit 0
-  fi
-  if [[ "$fmt" == "#{pane_current_command}" ]]; then
-    echo "codex"
-    exit 0
-  fi
-  if [[ "$fmt" == "#S" ]]; then
-    if [[ -f "${tmuxLogPath}.session" ]]; then cat "${tmuxLogPath}.session"; else echo "session-test"; fi
-    exit 0
-  fi
+  rendered="$fmt"
+  rendered="\${rendered//\#\{pane_id\}/$pane_id}"
+  rendered="\${rendered//\#\{pane_pid\}/$pane_pid}"
+  rendered="\${rendered//\#\{@omx_team_pane_owner_id\}/$pane_owner}"
+  rendered="\${rendered//\#\{pane_start_command\}/codex}"
+  rendered="\${rendered//\#\{pane_current_command\}/codex}"
+  rendered="\${rendered//\#S/$session_name}"
+  printf '%s\n' "$rendered"
   exit 0
 fi
 if [[ "$cmd" == "send-keys" ]]; then
   exit 0
 fi
 if [[ "$cmd" == "list-panes" ]]; then
-  if [[ "$#" -eq 3 && "$1" == "-a" && "$2" == "-F" && "$3" == "#{pane_id}\t#{pane_dead}\t#{pane_pid}" ]]; then
-    printf '%%10\t0\t111\n%%11\t0\t112\n%%12\t0\t113\n%%95\t0\t195\n%%96\t0\t196\n'
-  elif [[ "$#" -eq 4 && "$1" == "-t" && "$3" == "-F" && "$4" == "#{pane_pid}" ]]; then
+  pane_proofs_path="${tmuxLogPath}.pane-proofs"
+  pane_format="\${@: -1}"
+  if [[ "$#" -eq 3 && "$1" == "-a" && "$2" == "-F" && "$pane_format" == "#{pane_id}\t#{pane_dead}\t#{pane_pid}" ]]; then
+    if [[ -f "$pane_proofs_path" ]]; then
+      cat "$pane_proofs_path"
+    else
+      printf '%%10\t0\t111\n%%11\t0\t112\n%%12\t0\t113\n%%95\t0\t195\n%%96\t0\t196\n'
+    fi
+  elif [[ "$#" -eq 4 && "$1" == "-t" && "$3" == "-F" && "$pane_format" == "#{pane_pid}" ]]; then
+    if [[ -f "$pane_proofs_path" ]]; then
+      while IFS=$'\t' read -r pane_id pane_dead pane_pid; do
+        if [[ "$pane_id" == "$2" ]]; then
+          echo "$pane_pid"
+          exit 0
+        fi
+      done < "$pane_proofs_path"
+      exit 1
+    fi
     case "$2" in
       %10) echo 111 ;;
       %11) echo 112 ;;
@@ -140,6 +167,22 @@ if [[ "$cmd" == "list-panes" ]]; then
       %96) echo 196 ;;
       *) exit 1 ;;
     esac
+  elif [[ "$pane_format" == "#{pane_id}\t#{pane_active}\t#{pane_current_command}\t#{pane_start_command}" ]]; then
+    if [[ -f "$pane_proofs_path" ]]; then
+      while IFS=$'\t' read -r pane_id pane_dead pane_pid; do
+        printf '%s\t0\tcodex\tcodex\n' "$pane_id"
+      done < "$pane_proofs_path"
+    else
+      printf '%%10\t0\tcodex\tcodex\n%%11\t0\tcodex\tcodex\n%%12\t0\tcodex\tcodex\n%%95\t1\tcodex\tcodex\n%%96\t0\tcodex\tcodex\n'
+    fi
+  elif [[ "$pane_format" == "#{pane_id} #{pane_pid}" ]]; then
+    if [[ -f "$pane_proofs_path" ]]; then
+      while IFS=$'\t' read -r pane_id pane_dead pane_pid; do
+        printf '%s %s\n' "$pane_id" "$pane_pid"
+      done < "$pane_proofs_path"
+    else
+      printf '%%10 111\n%%11 112\n%%12 113\n%%95 195\n%%96 196\n'
+    fi
   else
     printf '%%10\t111\n%%11\t112\n%%12\t113\n%%95\t195\n%%96\t196\n'
   fi
@@ -186,7 +229,7 @@ function writeJson(file, value) {
 }
 function nowIso() { return new Date().toISOString(); }
 if (argv[0] === 'schema') {
-  process.stdout.write(JSON.stringify({ schema_version: 1, commands: ['acquire-authority','renew-authority','queue-dispatch','mark-notified','mark-delivered','mark-failed','remove-dispatch-records','request-replay','capture-snapshot'], events: [], transport: 'tmux' }) + '\n');
+  process.stdout.write(JSON.stringify({ schema_version: 1, commands: ['acquire-authority','renew-authority','queue-dispatch','mark-notified','mark-delivered','mark-failed','remove-dispatch-records','request-replay','capture-snapshot'], events: [], transport: 'tmux' }) + '\\n');
   process.exit(0);
 }
 if (argv[0] !== 'exec') process.exit(1);
@@ -329,7 +372,6 @@ async function configurePaneIds(teamName: string, cwd: string, leaderPaneId: str
   config.hud_pane_id = '%96';
   config.hud_pane_pid = panePids['%96'];
   config.tmux_pane_owner_id = 'delivery-smoke-owner';
-  await writeFile(join(cwd, 'tmux.log.session'), String(config.tmux_session ?? ''));
   config.workers = config.workers.map((worker) => {
     const paneId = workerPaneIds[worker.name] ?? worker.pane_id;
     return {
@@ -339,6 +381,25 @@ async function configurePaneIds(teamName: string, cwd: string, leaderPaneId: str
     };
   });
   await saveTeamConfig(config, cwd);
+  const paneProofs = new Map<string, number>();
+  if (config.leader_pane_id && config.leader_pane_pid) {
+    paneProofs.set(config.leader_pane_id, config.leader_pane_pid);
+  }
+  if (config.hud_pane_id && config.hud_pane_pid) {
+    paneProofs.set(config.hud_pane_id, config.hud_pane_pid);
+  }
+  for (const worker of config.workers) {
+    if (worker.pane_id && worker.pid) paneProofs.set(worker.pane_id, worker.pid);
+  }
+  await writeFile(join(cwd, 'tmux.log.session'), String(config.tmux_session));
+  await writeFile(
+    join(cwd, 'tmux.log.pane-proofs'),
+    [...paneProofs].map(([paneId, panePid]) => `${paneId}\t0\t${panePid}\n`).join(''),
+  );
+  await Promise.all([...paneProofs.keys()].map((paneId) => writeFile(
+    join(cwd, `tmux.log.owner.${paneId}`),
+    String(config.tmux_pane_owner_id),
+  )));
 }
 
 function parseJsonLines(raw: string): Array<Record<string, unknown>> {

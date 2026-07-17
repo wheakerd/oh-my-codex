@@ -29,6 +29,7 @@ import {
   normalizeTeamWorkerLaunchArgs,
   parseTeamWorkerLaunchArgs,
 } from './model-contract.js';
+import { readExactPaneProofSync } from './exact-pane.js';
 
 import { sleep, sleepSync } from '../utils/sleep.js';
 import {
@@ -2893,12 +2894,14 @@ export async function sendToWorker(
 ): Promise<void> {
   assertWorkerTriggerText(text);
   if (workerPaneId?.startsWith('%') && expectedPanePid !== undefined) {
+    const exactPaneProof = readExactPaneProofSync(workerPaneId);
     if (workerPaneId === hudPaneId
       || !Number.isSafeInteger(expectedPanePid)
       || (expectedPanePid ?? 0) <= 0
       || !expectedTeamOwnerId?.trim()
       || !paneHasOmxTeamOwnerTag(workerPaneId, expectedTeamOwnerId)
-      || getWorkerPanePid(sessionName, workerIndex, workerPaneId) !== expectedPanePid) {
+      || exactPaneProof.status !== 'live'
+      || exactPaneProof.pid !== expectedPanePid) {
       throw new Error(`sendToWorker: pane authorization failed for ${workerPaneId}`);
     }
   }

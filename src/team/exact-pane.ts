@@ -14,6 +14,10 @@ const EXACT_PANE_ID_PATTERN = /^%[0-9]+$/;
 const PANE_PID_PATTERN = /^[0-9]+$/;
 const LIST_PANES_ARGS = ['list-panes', '-a', '-F', '#{pane_id}\t#{pane_dead}\t#{pane_pid}'];
 
+function exactPaneTmuxCommand(): string {
+  return process.env.OMX_TEST_TMUX_BIN || 'tmux';
+}
+
 function unavailable(
   paneId: string,
   reason: Extract<ExactPaneProof, { status: 'unavailable' }>['reason'],
@@ -74,7 +78,7 @@ export function readExactPaneProofSync(paneId: string): ExactPaneProof {
     return unavailable(paneId, 'invalid_pane_id');
   }
 
-  const { result } = spawnPlatformCommandSync('tmux', LIST_PANES_ARGS, {
+  const { result } = spawnPlatformCommandSync(exactPaneTmuxCommand(), LIST_PANES_ARGS, {
     encoding: 'utf-8',
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -101,7 +105,7 @@ export function readExactPaneProofsSync(paneIds: readonly string[]): ExactPanePr
     return invalidProofs.map((proof, index) => proof ?? unavailable(paneIds[index]!, 'query_failed'));
   }
 
-  const { result } = spawnPlatformCommandSync('tmux', LIST_PANES_ARGS, {
+  const { result } = spawnPlatformCommandSync(exactPaneTmuxCommand(), LIST_PANES_ARGS, {
     encoding: 'utf-8',
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -119,7 +123,7 @@ export function readExactPaneProof(paneId: string): Promise<ExactPaneProof> {
     return Promise.resolve(unavailable(paneId, 'invalid_pane_id'));
   }
 
-  const { child } = spawnPlatformCommand('tmux', LIST_PANES_ARGS, {
+  const { child } = spawnPlatformCommand(exactPaneTmuxCommand(), LIST_PANES_ARGS, {
     stdio: ['ignore', 'pipe', 'pipe'],
   });
 

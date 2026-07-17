@@ -1230,6 +1230,7 @@ describe("notify-fallback watcher", () => {
 			sessionDir,
 			`rollout-test-fallback-stream-utf8-${sid}.jsonl`,
 		);
+		let hiddenRolloutPath: string | undefined;
 
 		try {
 			hardenTestAuthorityTreeSync(wd);
@@ -1327,7 +1328,7 @@ describe("notify-fallback watcher", () => {
 				"incomplete UTF-8 and JSON line should not emit",
 			);
 
-			const hiddenRolloutPath = `${rolloutPath}.missing`;
+			hiddenRolloutPath = `${rolloutPath}.missing`;
 			await rename(rolloutPath, hiddenRolloutPath);
 			await sleep(250);
 			assert.equal(
@@ -1359,6 +1360,8 @@ describe("notify-fallback watcher", () => {
 			assert.match(turnLines[0], new RegExp(utf8Turn));
 			assert.match(turnLines[0], /split emoji 🧪 preserved/);
 		} finally {
+			if (hiddenRolloutPath)
+				await rename(hiddenRolloutPath, rolloutPath).catch(() => {});
 			await rm(wd, { recursive: true, force: true });
 			await rm(tempHome, { recursive: true, force: true });
 			await rm(rolloutPath, { force: true });
@@ -1374,6 +1377,7 @@ describe("notify-fallback watcher", () => {
 			sessionDir,
 			`rollout-test-fallback-stream-${sid}.jsonl`,
 		);
+		let child: ReturnType<typeof spawn> | undefined;
 
 		try {
 			hardenTestAuthorityTreeSync(wd);
@@ -1428,7 +1432,7 @@ describe("notify-fallback watcher", () => {
 				"logs",
 				`turns-${new Date().toISOString().split("T")[0]}.jsonl`,
 			);
-			const child = spawn(
+			child = spawn(
 				process.execPath,
 				[
 					watcherScript,
@@ -1485,6 +1489,10 @@ describe("notify-fallback watcher", () => {
 			assert.match(turnLines[0], new RegExp(newTurn));
 			assert.doesNotMatch(turnLines[0], new RegExp(oldTurn));
 		} finally {
+			if (child && isPidAlive(child.pid)) {
+				child.kill("SIGTERM");
+				await waitForExit(child, 4000).catch(() => {});
+			}
 			await rm(wd, { recursive: true, force: true });
 			await rm(tempHome, { recursive: true, force: true });
 			await rm(rolloutPath, { force: true });
@@ -3767,7 +3775,7 @@ exit 0
 			);
 			assert.equal(request?.status, "failed");
 			assert.equal(request?.attempt_count, 1);
-			assert.equal(request?.last_reason, "exact_pane_unavailable");
+			assert.equal(request?.last_reason, "missing_exact_pane_pid");
 		} finally {
 			if (typeof previousRuntimeBridge === "string")
 				process.env.OMX_RUNTIME_BRIDGE = previousRuntimeBridge;
@@ -6550,7 +6558,7 @@ exit 0
 				wd,
 			);
 			assert.equal(request?.status, "failed");
-			assert.equal(request?.last_reason, "exact_pane_unavailable");
+			assert.equal(request?.last_reason, "missing_exact_pane_pid");
 		} finally {
 			if (typeof previousRuntimeBridge === "string")
 				process.env.OMX_RUNTIME_BRIDGE = previousRuntimeBridge;

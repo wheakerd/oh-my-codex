@@ -813,8 +813,10 @@ async function resolveStandaloneCommittedAuthority(
   try {
     const scope = await resolveCommittedAuthorityRuntimeStateScope(cwd);
     assertStateAuthorityTransportAliasesMatch(scope.authority, process.env);
-    const capability = await mintStateAuthorityTransportCapability(scope.authority);
-    await validateStateAuthorityTransportCapability(scope.authority, capability.capability);
+    if (surface === "HUD") {
+      const capability = await mintStateAuthorityTransportCapability(scope.authority);
+      await validateStateAuthorityTransportCapability(scope.authority, capability.capability);
+    }
     return scope;
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);

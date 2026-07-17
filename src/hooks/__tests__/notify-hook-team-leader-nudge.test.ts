@@ -9,7 +9,7 @@ import {
 	rm,
 	writeFile,
 } from "node:fs/promises";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -377,7 +377,7 @@ if [[ "$cmd" == "display-message" ]]; then
     "#{@omx_instance_id}"|"#{@omx_pane_instance_id}") echo "notify-team-leader-nudge" ;;
     "#{pane_current_command}"|"#{pane_start_command}") echo "codex" ;;
     "#{pane_in_mode}") echo "0" ;;
-    "#S") echo "session-test" ;;
+    "#S") echo "\${OMX_TEST_TMUX_SESSION_NAME:-session-test}" ;;
   esac
   exit 0
 fi
@@ -385,6 +385,10 @@ if [[ "$cmd" == "show-option" ]]; then
   case "\${@: -1}" in
     "@omx_instance_id"|"@omx_pane_instance_id") echo "notify-team-leader-nudge" ;;
   esac
+  exit 0
+fi
+if [[ "$cmd" == "list-sessions" ]]; then
+  printf '%s\tnotify-team-leader-nudge\n' "\${OMX_TEST_TMUX_SESSION_NAME:-session-test}"
   exit 0
 fi
 if [[ "$cmd" == "set-buffer" ]]; then
@@ -420,10 +424,12 @@ if [[ "$cmd" == "capture-pane" ]]; then
   exit 0
 fi
 if [[ "$cmd" == "list-panes" ]]; then
-  if [[ "$*" == *"#{pane_pid}"* ]]; then
-    printf '%s\n' '%1 12345' '%2 12346'
+  if [[ "$*" == *"#{pane_dead}"* ]]; then
+    printf '%%1\t0\t12345\n%s\t0\t12345\n' "\${OMX_TEST_TMUX_PANE_ID:-%1}"
+  elif [[ "$*" == *"#{pane_pid}"* ]]; then
+    printf '%s 12345\n' "\${OMX_TEST_TMUX_PANE_ID:-%1}"
   else
-    printf '%s\n' $'%1\t1\tcodex\tcodex' $'%2\t0\tcodex\tcodex'
+    printf '%s\t1\tcodex\tcodex\n' "\${OMX_TEST_TMUX_PANE_ID:-%1}"
   fi
   exit 0
 fi
@@ -435,12 +441,16 @@ function buildFakeTmuxWithListPanes(
 	tmuxLogPath: string,
 	listPaneLines: string[],
 ): string {
-	const escapedLines = listPaneLines
-		.map((line) =>
-			line.includes("\t")
-				? line
-				: `${line.trim().split(/\s+/)[0] ?? ""}\t1\tcodex\tcodex`,
-		)
+	const paneRows = listPaneLines.map((line) => {
+		const [paneId = "", panePid = "12345"] = line.trim().split(/\s+/);
+		return { paneId, panePid };
+	});
+	const escapedPaneLines = paneRows
+		.map(({ paneId }) => `${paneId}\t1\tcodex\tcodex`)
+		.map((line) => line.replaceAll("\\", "\\\\").replaceAll('"', '\\"'))
+		.join("\\n");
+	const escapedExactPaneLines = paneRows
+		.map(({ paneId, panePid }) => `${paneId}\t0\t${panePid}`)
 		.map((line) => line.replaceAll("\\", "\\\\").replaceAll('"', '\\"'))
 		.join("\\n");
 	return `#!/usr/bin/env bash
@@ -453,7 +463,7 @@ if [[ "$cmd" == "display-message" ]]; then
     "#{@omx_instance_id}"|"#{@omx_pane_instance_id}") echo "notify-team-leader-nudge" ;;
     "#{pane_current_command}"|"#{pane_start_command}") echo "codex" ;;
     "#{pane_in_mode}") echo "0" ;;
-    "#S") echo "session-test" ;;
+    "#S") echo "\${OMX_TEST_TMUX_SESSION_NAME:-session-test}" ;;
   esac
   exit 0
 fi
@@ -461,6 +471,10 @@ if [[ "$cmd" == "show-option" ]]; then
   case "\${@: -1}" in
     "@omx_instance_id"|"@omx_pane_instance_id") echo "notify-team-leader-nudge" ;;
   esac
+  exit 0
+fi
+if [[ "$cmd" == "list-sessions" ]]; then
+  printf '%s\tnotify-team-leader-nudge\n' "\${OMX_TEST_TMUX_SESSION_NAME:-session-test}"
   exit 0
 fi
 if [[ "$cmd" == "set-buffer" ]]; then
@@ -496,11 +510,60 @@ if [[ "$cmd" == "capture-pane" ]]; then
   exit 0
 fi
 if [[ "$cmd" == "list-panes" ]]; then
-  printf "%b\\n" "${escapedLines}"
+  if [[ "$*" == *"#{pane_dead}"* ]]; then
+    printf "%b\\n" "${escapedExactPaneLines}"
+  else
+    printf "%b\\n" "${escapedPaneLines}"
+  fi
   exit 0
 fi
 exit 0
 `;
+}
+
+function resolveFixtureTmuxBinding(cwd: string): { sessionName: string; paneId: string } {
+	try {
+		const stateDir = join(
+			cwd,
+			".omx",
+			"state",
+			"sessions",
+			"notify-team-leader-nudge",
+		);
+		const teamState = existsSync(join(stateDir, "team-state.json"))
+			? (JSON.parse(
+					readFileSync(join(stateDir, "team-state.json"), "utf8"),
+				) as { team_name?: unknown })
+			: {};
+		const teamRoot = join(stateDir, "team");
+		const teamName =
+			typeof teamState.team_name === "string"
+				? teamState.team_name
+				: readdirSync(teamRoot).find((name) =>
+					existsSync(join(teamRoot, name, "manifest.v2.json")),
+				);
+		if (!teamName) throw new Error("missing team");
+		const teamDir = join(teamRoot, teamName);
+		const configPath = join(teamDir, "config.json");
+		const config = JSON.parse(
+			readFileSync(
+				existsSync(configPath) ? configPath : join(teamDir, "manifest.v2.json"),
+				"utf8",
+			),
+		) as { tmux_session?: unknown; leader_pane_id?: unknown };
+		return {
+			sessionName:
+				typeof config.tmux_session === "string"
+					? config.tmux_session
+					: "session-test",
+			paneId:
+				typeof config.leader_pane_id === "string"
+					? config.leader_pane_id
+					: "%1",
+		};
+	} catch {
+		return { sessionName: "session-test", paneId: "%1" };
+	}
 }
 
 function runNotifyHook(
@@ -510,6 +573,7 @@ function runNotifyHook(
 ): ReturnType<typeof spawnSync> {
 	const sessionId = extraEnv.OMX_SESSION_ID || "notify-team-leader-nudge";
 	hardenTestAuthorityTreeSync(cwd);
+	const tmuxBinding = resolveFixtureTmuxBinding(cwd);
 	const authorityEnv = fixtureAuthorityEnv.get(cwd) ?? {};
 	const payload = {
 		cwd,
@@ -530,6 +594,7 @@ function runNotifyHook(
 				...process.env,
 				...authorityEnv,
 				PATH: `${fakeBinDir}:${process.env.PATH || ""}`,
+				OMX_TEST_TMUX_BIN: join(fakeBinDir, "tmux"),
 				OMX_TEAM_LEADER_NUDGE_MS: "10000",
 				OMX_TEAM_LEADER_STALE_MS: "10000",
 				OMX_TEAM_WORKER: "",
@@ -538,6 +603,8 @@ function runNotifyHook(
 				OMX_MODEL_INSTRUCTIONS_FILE: "",
 				TMUX: "",
 				TMUX_PANE: "",
+				OMX_TEST_TMUX_SESSION_NAME: tmuxBinding.sessionName,
+				OMX_TEST_TMUX_PANE_ID: tmuxBinding.paneId,
 				...extraEnv,
 			},
 		},
@@ -961,7 +1028,7 @@ describe("notify-hook team leader nudge", { concurrency: false }, () => {
 
 			await writeFile(
 				fakeTmuxPath,
-				buildFakeTmuxWithListPanes(tmuxLogPath, ["%10 12345", "%11 12346"]),
+				buildFakeTmuxWithListPanes(tmuxLogPath, ["%96 12344", "%10 12345", "%11 12346"]),
 			);
 			await chmod(fakeTmuxPath, 0o755);
 
@@ -1042,7 +1109,7 @@ describe("notify-hook team leader nudge", { concurrency: false }, () => {
 
 			await writeFile(
 				fakeTmuxPath,
-				buildFakeTmuxWithListPanes(tmuxLogPath, ["%10 12345", "%11 12346"]),
+				buildFakeTmuxWithListPanes(tmuxLogPath, ["%97 12344", "%10 12345", "%11 12346"]),
 			);
 			await chmod(fakeTmuxPath, 0o755);
 
@@ -1484,7 +1551,7 @@ describe("notify-hook team leader nudge", { concurrency: false }, () => {
 			const tmuxLog = await readFile(tmuxLogPath, "utf-8");
 			assert.match(tmuxLog, /send-keys/);
 			assert.match(tmuxLog, /-t %91/);
-			assert.doesNotMatch(tmuxLog, /-t devsess:0/);
+			assert.doesNotMatch(tmuxLog, /(?:send-keys|paste-buffer) -t devsess:0/);
 			assert.match(tmuxLog, /Team alpha:/);
 			assert.match(
 				tmuxLog,
@@ -1581,7 +1648,11 @@ if [[ "$cmd" == "display-message" ]]; then
   exit 0
 fi
 if [[ "$cmd" == "list-panes" ]]; then
-  printf '%s\n' $'%11\t1\tcodex\tcodex'
+  if [[ "$*" == *"#{pane_dead}"* ]]; then
+    printf '%s\n' $'%91\t0\t12345' $'%11\t0\t12346'
+  else
+    printf '%s\n' $'%11\t1\tcodex\tcodex'
+  fi
   exit 0
 fi
 if [[ "$cmd" == "capture-pane" ]]; then
@@ -2077,7 +2148,11 @@ if [[ "$cmd" == "send-keys" ]]; then
   exit 0
 fi
 if [[ "$cmd" == "list-panes" ]]; then
-  printf '%s\n' $'%1\t1\tcodex\tcodex'
+  if [[ "$*" == *"#{pane_dead}"* ]]; then
+    printf '%s\t0\t12345\n' "\${OMX_TEST_TMUX_PANE_ID:-%1}"
+  else
+    printf '%s\t1\tcodex\tcodex\n' "\${OMX_TEST_TMUX_PANE_ID:-%1}"
+  fi
   exit 0
 fi
 exit 0
@@ -2518,7 +2593,11 @@ if [[ "$cmd" == "send-keys" ]]; then
   exit 0
 fi
 if [[ "$cmd" == "list-panes" ]]; then
-  printf '%s\n' $'%1\t1\tcodex\tcodex'
+  if [[ "$*" == *"#{pane_dead}"* ]]; then
+    printf '%s\t0\t12345\n' "\${OMX_TEST_TMUX_PANE_ID:-%1}"
+  else
+    printf '%s\t1\tcodex\tcodex\n' "\${OMX_TEST_TMUX_PANE_ID:-%1}"
+  fi
   exit 0
 fi
 exit 0
@@ -2662,7 +2741,11 @@ if [[ "$cmd" == "send-keys" ]]; then
   exit 0
 fi
 if [[ "$cmd" == "list-panes" ]]; then
-  printf '%s\n' $'%1\t1\tcodex\tcodex'
+  if [[ "$*" == *"#{pane_dead}"* ]]; then
+    printf '%s\t0\t12345\n' "\${OMX_TEST_TMUX_PANE_ID:-%1}"
+  else
+    printf '%s\t1\tcodex\tcodex\n' "\${OMX_TEST_TMUX_PANE_ID:-%1}"
+  fi
   exit 0
 fi
 exit 0
@@ -2713,7 +2796,7 @@ exit 0
 		});
 	});
 
-	it("injects leader nudge when capture-pane fails but the leader pane is a live codex pane", async () => {
+	it("defers leader nudge when capture-pane fails despite a live exact leader pane", async () => {
 		await withTempWorkingDir(async (cwd) => {
 			const omxDir = join(cwd, ".omx");
 			const stateDir = join(
@@ -2815,7 +2898,11 @@ if [[ "$cmd" == "send-keys" ]]; then
   exit 0
 fi
 if [[ "$cmd" == "list-panes" ]]; then
-  printf '%s\n' $'%1\t1\tcodex\tcodex'
+  if [[ "$*" == *"#{pane_dead}"* ]]; then
+    printf '%s\t0\t12345\n' "\${OMX_TEST_TMUX_PANE_ID:-%1}"
+  else
+    printf '%s\t1\tcodex\tcodex\n' "\${OMX_TEST_TMUX_PANE_ID:-%1}"
+  fi
   exit 0
 fi
 exit 0
@@ -2832,10 +2919,10 @@ exit 0
 
 			const tmuxLog = await readFile(tmuxLogPath, "utf-8");
 			assert.match(tmuxLog, /capture-pane -t %74 -p -S -80/);
-			assert.match(
+			assert.doesNotMatch(
 				tmuxLog,
 				/send-keys -t %74/,
-				"capture failures should not suppress leader injection into a live codex pane",
+				"capture failures must fail closed before leader injection",
 			);
 
 			const eventsPath = join(teamDir, "events", "events.ndjson");
@@ -2850,9 +2937,9 @@ exit 0
 						entry.type === "leader_notification_deferred",
 				);
 				assert.equal(
-					deferred,
-					undefined,
-					"capture failure alone should not defer a live codex leader pane",
+					deferred?.reason,
+					"pane_readiness_unverified",
+					"capture failure should defer an exact leader nudge",
 				);
 			}
 		});
@@ -2962,7 +3049,11 @@ if [[ "$cmd" == "send-keys" ]]; then
   exit 0
 fi
 if [[ "$cmd" == "list-panes" ]]; then
-  printf '%s\n' $'%1\t1\tcodex\tcodex'
+  if [[ "$*" == *"#{pane_dead}"* ]]; then
+    printf '%s\t0\t12345\n' "\${OMX_TEST_TMUX_PANE_ID:-%1}"
+  else
+    printf '%s\t1\tcodex\tcodex\n' "\${OMX_TEST_TMUX_PANE_ID:-%1}"
+  fi
   exit 0
 fi
 exit 0
@@ -3120,7 +3211,11 @@ if [[ "$cmd" == "send-keys" ]]; then
   exit 0
 fi
 if [[ "$cmd" == "list-panes" ]]; then
-  printf '%s\n' $'%1\t1\tcodex\tcodex'
+  if [[ "$*" == *"#{pane_dead}"* ]]; then
+    printf '%s\t0\t12345\n' "\${OMX_TEST_TMUX_PANE_ID:-%1}"
+  else
+    printf '%s\t1\tcodex\tcodex\n' "\${OMX_TEST_TMUX_PANE_ID:-%1}"
+  fi
   exit 0
 fi
 exit 0

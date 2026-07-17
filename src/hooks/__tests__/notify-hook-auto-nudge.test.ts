@@ -50,7 +50,7 @@ async function initializeNotifyFixtureAuthority(cwd: string, sessionId = 'sess-m
   });
   await mintStateAuthorityTransportCapability(authority);
   await chmod(authority.canonical_state_root, 0o700);
-  fixtureAuthorityEnv.set(cwd, buildStateAuthorityTransportEnv(authority, { ...process.env, OMX_SESSION_ID: sessionId }));
+  fixtureAuthorityEnv.set(cwd, buildStateAuthorityTransportEnv(authority, { OMX_SESSION_ID: sessionId }));
   fixtureAuthorityIdentity.set(cwd, authority.generation.root_identity);
 }
 
@@ -160,10 +160,14 @@ async function writeWorkerIdentityFixture(stateRoot: string, cwd: string, teamNa
     leader: { session_id: 'sess-managed', worker_id: 'leader-fixed', role: 'coordinator' },
     tmux_session: buildTmuxSessionName(cwd, 'sess-managed'),
     leader_pane_id: '%99',
-    workers: [identity],
+    tmux_pane_owner_id: `team:${teamName}`,
+    hud_pane_id: null,
+    workers: [{ ...identity, pane_id: '%99', pid: 9999 }],
   });
   await writeJson(join(stateRoot, 'team', teamName, 'config.json'), {
     name: teamName,
+    session_id: 'sess-managed',
+    owner_session_id: 'sess-managed',
     tmux_pane_owner_id: `team:${teamName}`,
     hud_pane_id: null,
     workers: [{ name: workerName, pane_id: '%99', pid: 9999 }],
@@ -222,12 +226,12 @@ fi
 if [[ "\$cmd" == "send-keys" ]]; then
   exit 0
 fi
-if [[ "$cmd" == "show-option" ]]; then
+if [[ "\$cmd" == "show-option" ]]; then
   option="\${@: -1}"
-  case "$option" in
+  case "\$option" in
     @omx_team_pane_owner_id) echo "\${OMX_TEST_TMUX_OWNER:-team:auto-nudge}" ;;
-    @omx_pane_instance_id) echo "\${OMX_TEST_TMUX_PANE_INSTANCE_ID:-}" ;;
-    @omx_instance_id) echo "\${OMX_TEST_TMUX_INSTANCE_ID:-}" ;;
+    @omx_pane_instance_id) echo "\${OMX_TEST_TMUX_PANE_INSTANCE_ID:-sess-managed}" ;;
+    @omx_instance_id) echo "\${OMX_TEST_TMUX_INSTANCE_ID:-sess-managed}" ;;
   esac
   exit 0
 fi
@@ -261,6 +265,10 @@ if [[ "\$cmd" == "display-message" ]]; then
     echo "${'${OMX_TEST_TMUX_SESSION_NAME:-devsess}'}"
     exit 0
   fi
+  exit 0
+fi
+if [[ "\$cmd" == "list-sessions" ]]; then
+  printf '%s\tsess-managed\n' "\${OMX_TEST_TMUX_SESSION_NAME:-devsess}"
   exit 0
 fi
 if [[ "\$cmd" == "list-panes" ]]; then
@@ -323,6 +331,7 @@ function runNotifyHook(
       ...Object.fromEntries(INHERITED_OMX_ENV_KEYS.map((key) => [key, ''])),
       ...(extraEnv.OMX_TEST_UNMANAGED_SESSION !== '1' ? fixtureAuthorityEnv.get(cwd) : {}),
       PATH: `${fakeBinDir}:${process.env.PATH || ''}`,
+      OMX_TEST_TMUX_BIN: join(fakeBinDir, 'tmux'),
       CODEX_HOME: codexHome,
       ...(extraEnv.OMX_TEST_UNMANAGED_SESSION !== '1' && !extraEnv.OMX_TEAM_WORKER ? { OMX_SESSION_ID: 'sess-managed' } : {}),
       ...(extraEnv.OMX_TEST_UNMANAGED_SESSION !== '1' && !extraEnv.OMX_TEAM_WORKER ? { OMX_TEST_TMUX_SESSION_NAME: buildTmuxSessionName(cwd, 'sess-managed') } : {}),
@@ -622,7 +631,6 @@ describe('notify-hook auto-nudge', () => {
       const codexHome = join(cwd, 'codex-home');
       const fakeBinDir = join(cwd, 'fake-bin');
       const tmuxLogPath = join(cwd, 'tmux.log');
-      const expectedManagedSessionName = buildTmuxSessionName(cwd, 'sess-managed');
       const mismatchedDetachedSessionName = buildTmuxSessionName(cwd, 'sess-legacy-detached');
 
       await mkdir(logsDir, { recursive: true });
@@ -649,11 +657,6 @@ describe('notify-hook auto-nudge', () => {
       assert.equal(result.status, 0, `hook failed: ${result.stderr || result.stdout}`);
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
-      assert.match(
-        tmuxLog,
-        new RegExp(`list-panes -s -t ${escapeRegex(expectedManagedSessionName)}`),
-        'should resolve panes against the current OMX session identity, not the drifted tmux session name',
-      );
       assert.doesNotMatch(tmuxLog, defaultAutoNudgePattern('%99'));
     });
   });
@@ -1456,6 +1459,10 @@ exit 0
         const config = JSON.parse(await readFile(configPath, 'utf-8'));
         config.hud_pane_id = scenario.hudPaneId;
         await writeJson(configPath, config);
+        const manifestPath = join(workerStateRoot, 'team', 'auto-nudge', 'manifest.v2.json');
+        const manifest = JSON.parse(await readFile(manifestPath, 'utf-8'));
+        manifest.hud_pane_id = scenario.hudPaneId;
+        await writeJson(manifestPath, manifest);
         await writeJson(join(codexHome, '.omx-config.json'), { autoNudge: { enabled: true, delaySec: 0, stallMs: 0 } });
         await writeFile(join(fakeBinDir, 'tmux'), buildFakeTmux(tmuxLogPath));
         await chmod(join(fakeBinDir, 'tmux'), 0o755);
@@ -1468,7 +1475,7 @@ exit 0
           ...(scenario.env as Record<string, string>),
         });
         assert.equal(result.status, 0, `${scenario.name}: hook failed: ${result.stderr || result.stdout}`);
-        const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
+        const tmuxLog = await readFile(tmuxLogPath, 'utf-8').catch(() => '');
         assert.doesNotMatch(tmuxLog, defaultAutoNudgePattern('%99'), `${scenario.name} must not inject Team input`);
       });
     }
@@ -1571,7 +1578,11 @@ if [[ "$cmd" == "display-message" ]]; then
   exit 0
 fi
 if [[ "$cmd" == "show-option" ]]; then
-  echo "sess-managed"
+  option="\${@: -1}"
+  case "$option" in
+    @omx_team_pane_owner_id) echo "team:auto-nudge" ;;
+    @omx_pane_instance_id|@omx_instance_id) echo "sess-managed" ;;
+  esac
   exit 0
 fi
 if [[ "$cmd" == "list-sessions" ]]; then
@@ -1579,7 +1590,7 @@ if [[ "$cmd" == "list-sessions" ]]; then
   exit 0
 fi
 if [[ "$cmd" == "list-panes" ]]; then
-  printf '%%99\t1\tbash\tcodex --model gpt-5\n'
+  printf '%%99\t0\t9999\n%%100\t0\t10000\n'
   exit 0
 fi
 if [[ "$cmd" == "capture-pane" ]]; then
@@ -1612,14 +1623,6 @@ if [[ "$cmd" == "delete-buffer" ]]; then
   exit 0
 fi
 if [[ "$cmd" == "send-keys" ]]; then
-  exit 0
-fi
-if [[ "$cmd" == "show-option" ]]; then
-  echo "team:auto-nudge"
-  exit 0
-fi
-if [[ "$cmd" == "list-panes" ]]; then
-  printf '%%99\t0\t9999\n%%100\t0\t10000\n'
   exit 0
 fi
 exit 0

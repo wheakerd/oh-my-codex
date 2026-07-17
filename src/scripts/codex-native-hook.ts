@@ -11086,15 +11086,17 @@ export async function dispatchCodexNativeHook(
       : false;
     const pointerNativeSessionId = normalizeSessionId(sessionEvidence.raw?.native_session_id) ?? '';
     const pointerCanonicalSessionId = normalizeSessionId(sessionEvidence.raw?.session_id) ?? '';
+    const authorityCanonicalSessionId = authority ? canonicalAuthoritySessionId(authority) : '';
     const hasAuthorityBoundNativePointer = Boolean(
       sessionEvidence.present
       && pointerNativeSessionId === payloadSessionId
-      && pointerCanonicalSessionId
+      && pointerCanonicalSessionId === authorityCanonicalSessionId
       && authority
-      && authorityBindsSessionId(authority, pointerCanonicalSessionId),
+      && authorityBindsSessionId(authority, payloadSessionId),
     );
     const mayAttestNativeLeader = Boolean(
       authority
+      && authorityCanonicalSessionId
       && payloadSessionId
       && hasStrictNativeLeaderProvenance(payload, payloadSessionId, threadId)
       && authorityBindsSessionId(authority, payloadSessionId)
@@ -11113,12 +11115,11 @@ export async function dispatchCodexNativeHook(
         resolvedNativeSessionId = pointerNativeSessionId;
       }
       if (
-        canonicalSessionId
+        canonicalSessionId === authorityCanonicalSessionId
         && resolvedNativeSessionId === payloadSessionId
-        && authorityBindsSessionId(authority!, canonicalSessionId)
       ) {
         attestLeaderThread(workspaceCwd, {
-          sessionId: canonicalSessionId,
+          sessionId: authorityCanonicalSessionId,
           leaderThreadId: payloadSessionId,
           source: 'native-pretooluse',
         }, stateDir);

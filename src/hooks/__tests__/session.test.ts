@@ -139,7 +139,8 @@ describe('session lifecycle manager', () => {
 
       await assert.rejects(
         resetSessionMetrics(cwd, 'sess-hud-symlink'),
-        (error: unknown) => (error as { code?: string }).code === AUTHORITY_DIAGNOSTIC_CODES.rootSymlink,
+        (error: unknown) => errorHasAuthorityCode(error, AUTHORITY_DIAGNOSTIC_CODES.rootSymlink)
+          || errorHasAuthorityCode(error, AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot),
       );
       assert.equal(await readFile(attackerMetricsPath, 'utf-8'), 'attacker metrics must survive');
       await rm(metricsPath);
@@ -150,7 +151,8 @@ describe('session lifecycle manager', () => {
       await symlink(attackerHudDir, sessionsPath);
       await assert.rejects(
         resetSessionMetrics(cwd, 'sess-hud-symlink'),
-        (error: unknown) => (error as { code?: string }).code === AUTHORITY_DIAGNOSTIC_CODES.rootSymlink,
+        (error: unknown) => errorHasAuthorityCode(error, AUTHORITY_DIAGNOSTIC_CODES.rootSymlink)
+          || errorHasAuthorityCode(error, AUTHORITY_DIAGNOSTIC_CODES.authorityPathEscapesRoot),
       );
       assert.equal(existsSync(join(attackerHudDir, 'sess-hud-symlink', 'hud-state.json')), false);
     } finally {
