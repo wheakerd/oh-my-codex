@@ -19273,12 +19273,34 @@ async function buildStopHookOutput(
   payload: CodexHookPayload,
   cwd: string,
   stateDir: string,
-  options: { skipAutoNudge?: boolean; skipRalphStopBlock?: boolean; canonicalSessionId?: string } = {},
+  options: { skipAutoNudge?: boolean; skipRalphStopBlock?: boolean; canonicalSessionId?: string; teamWorkerOnly?: boolean } = {},
 ): Promise<Record<string, unknown> | null> {
   if (isStopExempt(payload)) {
     return null;
   }
 
+  if (options.teamWorkerOnly === true) {
+    const teamWorkerDecision = await resolveTeamWorkerStopDecision(cwd);
+    if (teamWorkerDecision.kind === "blocked") return teamWorkerDecision.output;
+    if (teamWorkerDecision.kind === "allowed") {
+      try {
+        await maybeNudgeLeaderForAllowedWorkerStop({
+          stateDir: teamWorkerDecision.stateDir,
+          logsDir: join(cwd, ".omx", "logs"),
+          workerContext: teamWorkerDecision.workerContext,
+        });
+      } catch (err) {
+        void err;
+      }
+      return null;
+    }
+    return {
+      decision: "block",
+      stopReason: `team_worker_${readTeamWorkerEnvironment()?.workerName ?? "unknown"}_missing_worker_state`,
+      reason: "OMX cannot resolve authoritative Team worker state for Stop.",
+      systemMessage: "OMX cannot resolve authoritative Team worker state for Stop.",
+    };
+  }
   const sessionId = readPayloadSessionId(payload);
   const canonicalSessionId = options.canonicalSessionId
     ?? await resolveInternalSessionIdForPayload(cwd, sessionId);
@@ -19724,6 +19746,9 @@ export async function dispatchCodexNativeHook(
     && (!currentSessionState || !payloadMatchesSessionPointer(candidateWorkerPayloadSessionId, currentSessionState))
       ? candidateWorkerPayloadSessionId
       : "";
+  const declaredTeamWorkerStopOnly = hookEventName === "Stop"
+    && declaredTeamWorker
+    && !authoritativeWorkerPayloadSessionId;
 
   if (hookEventName === "SessionStart" && declaredTeamWorker && !authoritativeWorkerPayloadSessionId) {
     canonicalSessionId = "";
@@ -20360,7 +20385,9 @@ export async function dispatchCodexNativeHook(
     }
     outputJson = buildNativePostToolUseOutput(payload);
   } else if (hookEventName === "Stop") {
-    if (allowImplicitSessionSideEffects) {
+    if (declaredTeamWorkerStopOnly) {
+      outputJson = await buildStopHookOutput(payload, cwd, stateDir, { teamWorkerOnly: true });
+    } else if (allowImplicitSessionSideEffects) {
       outputJson = await buildStopHookOutput(payload, cwd, stateDir, {
         canonicalSessionId: canonicalSessionId || undefined,
         skipRalphStopBlock: isSubagentStop,

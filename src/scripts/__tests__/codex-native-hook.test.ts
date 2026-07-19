@@ -4661,7 +4661,7 @@ PY`,
           thread_id: "race-worker-native",
           turn_id: "race-worker-stop",
         }, { cwd });
-        assert.equal(stop.outputJson?.stopReason, "session_scope_unmatched");
+        assert.match(String(stop.outputJson?.stopReason ?? ""), /^team_worker_/);
       } finally {
         await rm(cwd, { recursive: true, force: true });
       }
@@ -4732,7 +4732,7 @@ PY`,
             thread_id: "invalid-worker-thread",
             turn_id: `invalid-worker-${pointerKind}-stop`,
           }, { cwd });
-          assert.equal(stop.outputJson?.stopReason, "session_scope_unmatched");
+          assert.match(String(stop.outputJson?.stopReason ?? ""), /^team_worker_/);
           assert.equal(existsSync(pointerPath), pointerBefore !== null);
           if (pointerBefore !== null) assert.equal(await readFile(pointerPath, "utf-8"), pointerBefore);
         }
