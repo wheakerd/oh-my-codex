@@ -2810,9 +2810,10 @@ async function buildDeclaredTeamWorkerStopOutput(
   payload: CodexHookPayload,
   cwd: string,
 ): Promise<Record<string, unknown> | null> {
+  if (isStopExempt(payload)) return null;
   const decision = await resolveTeamWorkerStopDecision(cwd);
   if (decision.kind === "blocked") {
-    if (payload.stop_hook_active === true && !decision.allowRepeatDuringStopHook) return null;
+    if ((payload.stop_hook_active === true || payload.stopHookActive === true) && !decision.allowRepeatDuringStopHook) return null;
     return decision.output;
   }
   if (decision.kind === "allowed") {
@@ -19715,20 +19716,20 @@ export async function dispatchCodexNativeHook(
       outputJson: null,
     };
   }
-  if (hookEventName === "Stop" && !hasNativeStopRuntimeSurface(cwd)) {
-    return {
-      hookEventName,
-      omxEventName: mapCodexHookEventToOmxEvent(hookEventName),
-      skillState: null,
-      outputJson: null,
-    };
-  }
   if (hookEventName === "Stop" && hasRawTeamWorkerDeclaration()) {
     return {
       hookEventName,
       omxEventName: mapCodexHookEventToOmxEvent(hookEventName),
       skillState: null,
       outputJson: await buildDeclaredTeamWorkerStopOutput(payload, cwd),
+    };
+  }
+  if (hookEventName === "Stop" && !hasNativeStopRuntimeSurface(cwd)) {
+    return {
+      hookEventName,
+      omxEventName: mapCodexHookEventToOmxEvent(hookEventName),
+      skillState: null,
+      outputJson: null,
     };
   }
   // Native hooks must use the exact pointer root selected for this dispatch.

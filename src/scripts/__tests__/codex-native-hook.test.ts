@@ -23267,12 +23267,17 @@ PY`,
         { ...payload, stop_hook_active: true },
         { cwd: workerCwd },
       );
+      const camelReplay = await dispatchCodexNativeHook(
+        { ...payload, stopHookActive: true },
+        { cwd: workerCwd },
+      );
 
       assert.equal(
         (result.outputJson as { stopReason?: string } | null)?.stopReason,
         "team_worker_worker-1_1_in_progress",
       );
       assert.equal(replay.outputJson, null);
+      assert.equal(camelReplay.outputJson, null);
     } finally {
       if (typeof prevTeamWorker === "string") process.env.OMX_TEAM_WORKER = prevTeamWorker;
       else delete process.env.OMX_TEAM_WORKER;
@@ -23352,6 +23357,10 @@ PY`,
         { ...basePayload, turn_id: "turn-stop-team-worker-repeat-2", stop_hook_active: true },
         { cwd: workerCwd },
       );
+      const exempt = await dispatchCodexNativeHook(
+        { ...basePayload, turn_id: "turn-stop-team-worker-exempt", stopReason: "context limit" },
+        { cwd: workerCwd },
+      );
 
       await writeJson(taskPath, {
         id: "1",
@@ -23369,6 +23378,7 @@ PY`,
       assert.deepEqual(first.outputJson, expectedInProgress);
       assert.deepEqual(replay.outputJson, expectedInProgress);
       assert.deepEqual(freshTurn.outputJson, expectedInProgress);
+      assert.equal(exempt.outputJson, null);
       assert.deepEqual(stateChanged.outputJson, {
         decision: "block",
         reason:
