@@ -437,6 +437,7 @@ exit 1
         await writeFile(join(stateRoot, 'session.json'), JSON.stringify({
           session_id: 'sess-authority',
           cwd,
+          state_root: stateRoot,
         }));
         await writeFile(join(stateRoot, 'sessions', 'sess-authority', 'hud-state.json'), JSON.stringify({
           last_turn_at: 'authoritative',
@@ -447,12 +448,61 @@ exit 1
           cwd,
           stateRoot,
           pluginName: 'test',
-          event: makeEvent(),
+          event: { ...makeEvent(), session_id: 'sess-authority' },
         });
         assert.deepEqual(await sdk.omx.hud.read(), {
           last_turn_at: 'authoritative',
           turn_count: 3,
         });
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+        await rm(stateRoot, { recursive: true, force: true });
+      }
+    });
+
+    it('requires a usable pointer and bound hook session for explicit HUD reads', async () => {
+      const cwd = await mkdtemp(join(tmpdir(), 'omx-sdk-hud-binding-source-'));
+      const stateRoot = await mkdtemp(join(tmpdir(), 'omx-sdk-hud-binding-root-'));
+      try {
+        const sessionDir = join(stateRoot, 'sessions', 'sess-canonical');
+        await mkdir(sessionDir, { recursive: true });
+        await writeFile(join(sessionDir, 'hud-state.json'), JSON.stringify({ turn_count: 4 }));
+        await writeFile(join(stateRoot, 'session.json'), JSON.stringify({
+          session_id: 'sess-canonical',
+          native_session_id: 'sess-native',
+          cwd,
+          state_root: stateRoot,
+        }));
+
+        let sdk = createHookPluginSdk({
+          cwd,
+          stateRoot,
+          pluginName: 'test',
+          event: { ...makeEvent(), session_id: 'sess-native' },
+        });
+        assert.deepEqual(await sdk.omx.hud.read(), { turn_count: 4 });
+
+        sdk = createHookPluginSdk({
+          cwd,
+          stateRoot,
+          pluginName: 'test',
+          event: { ...makeEvent(), session_id: 'sess-foreign' },
+        });
+        assert.equal(await sdk.omx.hud.read(), null);
+
+        await writeFile(join(stateRoot, 'session.json'), JSON.stringify({
+          session_id: 'sess-canonical',
+          cwd,
+          state_root: stateRoot,
+          pid: 2_147_483_647,
+        }));
+        sdk = createHookPluginSdk({
+          cwd,
+          stateRoot,
+          pluginName: 'test',
+          event: { ...makeEvent(), session_id: 'sess-canonical' },
+        });
+        assert.equal(await sdk.omx.hud.read(), null);
       } finally {
         await rm(cwd, { recursive: true, force: true });
         await rm(stateRoot, { recursive: true, force: true });
@@ -471,8 +521,8 @@ exit 1
         await mkdir(join(stateRoot, 'sessions'), { recursive: true });
         await writeFile(join(outside, 'hud-state.json'), JSON.stringify({ turn_count: 99 }));
         await symlink(outside, join(stateRoot, 'sessions', 'sess-escaped'), process.platform === 'win32' ? 'junction' : 'dir');
-        await writeFile(join(stateRoot, 'session.json'), JSON.stringify({ session_id: 'sess-escaped' }));
-        sdk = createHookPluginSdk({ cwd, stateRoot, pluginName: 'test', event: makeEvent() });
+        await writeFile(join(stateRoot, 'session.json'), JSON.stringify({ session_id: 'sess-escaped', cwd, state_root: stateRoot }));
+        sdk = createHookPluginSdk({ cwd, stateRoot, pluginName: 'test', event: { ...makeEvent(), session_id: 'sess-escaped' } });
         assert.equal(await sdk.omx.hud.read(), null);
 
         if (process.platform !== 'win32') {
@@ -483,8 +533,8 @@ exit 1
             join(fileSessionDir, 'hud-state.json'),
             'file',
           );
-          await writeFile(join(stateRoot, 'session.json'), JSON.stringify({ session_id: 'sess-file-escaped' }));
-          sdk = createHookPluginSdk({ cwd, stateRoot, pluginName: 'test', event: makeEvent() });
+          await writeFile(join(stateRoot, 'session.json'), JSON.stringify({ session_id: 'sess-file-escaped', cwd, state_root: stateRoot }));
+          sdk = createHookPluginSdk({ cwd, stateRoot, pluginName: 'test', event: { ...makeEvent(), session_id: 'sess-file-escaped' } });
           assert.equal(await sdk.omx.hud.read(), null);
 
           const siblingDir = join(stateRoot, 'sessions', 'sess-sibling');
@@ -493,8 +543,8 @@ exit 1
           await mkdir(siblingTargetDir, { recursive: true });
           await writeFile(join(siblingTargetDir, 'hud-state.json'), JSON.stringify({ turn_count: 55 }));
           await symlink(join(siblingTargetDir, 'hud-state.json'), join(siblingDir, 'hud-state.json'), 'file');
-          await writeFile(join(stateRoot, 'session.json'), JSON.stringify({ session_id: 'sess-sibling' }));
-          sdk = createHookPluginSdk({ cwd, stateRoot, pluginName: 'test', event: makeEvent() });
+          await writeFile(join(stateRoot, 'session.json'), JSON.stringify({ session_id: 'sess-sibling', cwd, state_root: stateRoot }));
+          sdk = createHookPluginSdk({ cwd, stateRoot, pluginName: 'test', event: { ...makeEvent(), session_id: 'sess-sibling' } });
           assert.equal(await sdk.omx.hud.read(), null);
         }
       } finally {

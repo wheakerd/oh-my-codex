@@ -281,7 +281,9 @@ function discoverSessionAuthorityBaseStateDir(workingDirectory?: string): string
             : '';
           const recordedStateRoot = typeof state.state_root === 'string'
             ? canonicalizeExistingPath(resolvePath(state.state_root))
-            : '';
+            : recordedCwd
+              ? canonicalizeExistingPath(join(recordedCwd, '.omx', 'state'))
+              : '';
           if (sessionPointerMatchesId(state as unknown as Record<string, unknown>, sessionId)
             && recordedCwd
             && recordedStateRoot === canonicalCandidate
@@ -395,7 +397,9 @@ async function readUsableSessionStateFromBaseStateDir(
     const recordedCwd = typeof state.cwd === 'string' ? canonicalizeExistingPath(resolvePath(state.cwd)) : '';
     const recordedStateRoot = typeof state.state_root === 'string'
       ? canonicalizeExistingPath(resolvePath(state.state_root))
-      : '';
+      : recordedCwd
+        ? canonicalizeExistingPath(join(recordedCwd, '.omx', 'state'))
+        : '';
     const canonicalBaseStateDir = canonicalizeExistingPath(baseStateDir);
     const canonicalObservedCwd = canonicalizeExistingPath(resolvePath(cwd));
     const authorityOwnsObservedCwd = Boolean(
@@ -450,7 +454,7 @@ function normalizeSessionMetadata(state: SessionState | null, sourcePath?: strin
 }
 
 
-async function readSessionMetadataFromBaseStateDir(
+export async function readSessionMetadataFromBaseStateDir(
   cwd: string,
   baseStateDir = getBaseStateDir(cwd),
 ): Promise<ResolvedSessionMetadata | undefined> {

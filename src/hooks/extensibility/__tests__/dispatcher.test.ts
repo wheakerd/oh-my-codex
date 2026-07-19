@@ -135,7 +135,7 @@ describe('dispatchHookEvent', () => {
       const sessionDir = join(stateRoot, 'sessions', 'sess-dispatch');
       await mkdir(dir, { recursive: true });
       await mkdir(sessionDir, { recursive: true });
-      await writeFile(join(stateRoot, 'session.json'), JSON.stringify({ session_id: 'sess-dispatch' }));
+      await writeFile(join(stateRoot, 'session.json'), JSON.stringify({ session_id: 'sess-dispatch', cwd, state_root: stateRoot }));
       await writeFile(join(sessionDir, 'hud-state.json'), JSON.stringify({ turn_count: 7 }));
       await writeFile(
         join(dir, 'root-reader.mjs'),

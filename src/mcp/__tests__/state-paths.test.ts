@@ -183,6 +183,25 @@ describe('state paths', () => {
     }
   });
 
+  it('uses a live legacy ancestor pointer when its inferred root matches exactly', async () => {
+    const parent = await mkRealTemp('omx-state-authority-legacy-');
+    const nested = join(parent, 'nested');
+    const parentState = join(parent, '.omx', 'state');
+    try {
+      await mkdir(parentState, { recursive: true });
+      await mkdir(nested, { recursive: true });
+      await writeFile(join(parentState, 'session.json'), JSON.stringify({ session_id: 'sess-legacy', cwd: parent }));
+      process.env.OMX_SESSION_ID = 'sess-legacy';
+
+      assert.deepEqual(getBaseStateDirWithSource(nested), {
+        baseStateDir: parentState,
+        rootSource: 'session-authority',
+      });
+    } finally {
+      await rm(parent, { recursive: true, force: true });
+    }
+  });
+
   it('fails explicitly when multiple ancestor pointers claim the same session authority', async () => {
     const parent = await mkRealTemp('omx-state-authority-conflict-');
     const nested = join(parent, 'nested');
@@ -214,7 +233,6 @@ describe('state paths', () => {
       await writeFile(join(parentState, 'session.json'), JSON.stringify({
         session_id: 'sess-dead',
         cwd: parent,
-        state_root: parentState,
         pid: 2_147_483_647,
       }));
       process.env.OMX_SESSION_ID = 'sess-dead';
