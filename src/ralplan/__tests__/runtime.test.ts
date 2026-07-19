@@ -189,6 +189,7 @@ describe('ralplan runtime', () => {
         ralplan_architect_review: {
           agent_role: 'architect',
           iteration: 1,
+          sequence_index: 1,
           verdict: 'approve',
           summary: 'architect-ok',
           artifacts: { architected: true },
@@ -196,6 +197,7 @@ describe('ralplan runtime', () => {
         ralplan_critic_review: {
           agent_role: 'critic',
           iteration: 1,
+          sequence_index: 2,
           verdict: 'approve',
           summary: 'critic-ok',
           artifacts: { critiqued: true },
@@ -203,6 +205,7 @@ describe('ralplan runtime', () => {
         architect_review: {
           agent_role: 'architect',
           iteration: 1,
+          sequence_index: 1,
           verdict: 'approve',
           summary: 'architect-ok',
           artifacts: { architected: true },
@@ -210,6 +213,7 @@ describe('ralplan runtime', () => {
         critic_review: {
           agent_role: 'critic',
           iteration: 1,
+          sequence_index: 2,
           verdict: 'approve',
           summary: 'critic-ok',
           artifacts: { critiqued: true },
@@ -675,7 +679,7 @@ describe('ralplan runtime', () => {
   });
 
 
-  it('accepts Autopilot-required consensus with tracker-backed OMX-adapted Architect and Critic lanes', async () => {
+  it('rejects Autopilot-required consensus with legacy OMX-adapted Architect and Critic lanes', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-ralplan-runtime-adapted-required-ok-'));
     const sessionId = 'sess-ralplan-adapted-required-ok';
     try {
@@ -724,9 +728,9 @@ describe('ralplan runtime', () => {
         requireNativeSubagents: true,
       });
 
-      assert.equal(result.status, 'completed');
-      assert.equal(result.ralplanConsensusGate.complete, true);
-      assert.equal(result.ralplanConsensusGate.blocked_reason, null);
+      assert.equal(result.status, 'failed');
+      assert.equal(result.ralplanConsensusGate.complete, false);
+      assert.equal(result.ralplanConsensusGate.blocked_reason, 'native_subagent_consensus_evidence_missing');
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

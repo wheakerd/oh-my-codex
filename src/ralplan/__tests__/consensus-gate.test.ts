@@ -204,6 +204,147 @@ describe('ralplan consensus gate state roots', () => {
   });
 
 
+  it('requires strict direct Architect-before-Critic order evidence', () => {
+    const buildGate = (
+      form: 'explicit' | 'fallback',
+      architectOrder?: string,
+      criticOrder?: string,
+    ) => {
+      const architectReview = {
+        agent_role: 'architect',
+        verdict: 'approve',
+        ...(architectOrder ? { completed_at: architectOrder } : {}),
+      };
+      const criticReview = {
+        agent_role: 'critic',
+        verdict: 'approve',
+        ...(criticOrder ? { completed_at: criticOrder } : {}),
+      };
+      return buildRalplanConsensusGateFromSources([{
+        source: `direct-order-${form}`,
+        value: form === 'explicit'
+          ? {
+            ralplan_consensus_gate: {
+              complete: true,
+              sequence: ['architect-review', 'critic-review'],
+              ralplan_architect_review: architectReview,
+              ralplan_critic_review: criticReview,
+            },
+          }
+          : {
+            sequence: ['architect-review', 'critic-review'],
+            ralplan_architect_review: architectReview,
+            ralplan_critic_review: criticReview,
+          },
+      }]);
+    };
+
+    for (const form of ['explicit', 'fallback'] as const) {
+      const valid = buildGate(form, '2026-06-12T10:00:00.000Z', '2026-06-12T10:05:00.000Z');
+      assert.equal(valid.complete, true);
+
+      for (const gate of [
+        buildGate(form, '2026-06-12T10:00:00.000Z', '2026-06-12T10:00:00.000Z'),
+        buildGate(form, '2026-06-12T10:05:00.000Z', '2026-06-12T10:00:00.000Z'),
+        buildGate(form, undefined, '2026-06-12T10:05:00.000Z'),
+        buildGate(form, '2026-06-12T10:00:00.000Z', undefined),
+      ]) {
+        assert.equal(gate.complete, false);
+        assert.equal(
+          gate.blockedReason,
+          form === 'explicit'
+            ? 'non_approving_ralplan_consensus_review'
+            : 'missing_sequential_architect_then_critic_approval',
+        );
+        if (form === 'explicit') {
+          assert.match(gate.blockedDetails?.join(' ') ?? '', /direct review order is not proven strictly architect-before-critic/i);
+        }
+      }
+    }
+  });
+
+  it('uses sequence order authoritatively and rejects contradictory timestamps', () => {
+    const buildGate = (
+      architectSequence: number | undefined,
+      criticSequence: number | undefined,
+      architectCompletedAt?: string,
+      criticCompletedAt?: string,
+    ) => buildRalplanConsensusGateFromSources([{
+      source: 'sequence-order',
+      value: {
+        ralplan_consensus_gate: {
+          complete: true,
+          sequence: ['architect-review', 'critic-review'],
+          ralplan_architect_review: {
+            agent_role: 'architect',
+            verdict: 'approve',
+            ...(architectSequence === undefined ? {} : { sequence_index: architectSequence }),
+            ...(architectCompletedAt ? { completed_at: architectCompletedAt } : {}),
+          },
+          ralplan_critic_review: {
+            agent_role: 'critic',
+            verdict: 'approve',
+            ...(criticSequence === undefined ? {} : { sequence_index: criticSequence }),
+            ...(criticCompletedAt ? { completed_at: criticCompletedAt } : {}),
+          },
+        },
+      },
+    }]);
+
+    assert.equal(buildGate(1, 2).complete, true);
+    assert.equal(buildGate(2, 1).complete, false);
+    assert.equal(buildGate(1, 1).complete, false);
+    assert.equal(buildGate(1, undefined).complete, false);
+    assert.equal(buildGate(undefined, 2).complete, false);
+    assert.equal(
+      buildGate(1, 2, '2026-06-12T10:05:00.000Z', '2026-06-12T10:00:00.000Z').complete,
+      false,
+    );
+    assert.equal(
+      buildGate(2, 1, '2026-06-12T10:00:00.000Z', '2026-06-12T10:05:00.000Z').complete,
+      false,
+    );
+  });
+
+  it('does not compare timestamp and sequence freshness domains', () => {
+    const timestampConsensus = {
+      ralplan_consensus_gate: {
+        complete: true,
+        sequence: ['architect-review', 'critic-review'],
+        ralplan_architect_review: {
+          agent_role: 'architect',
+          verdict: 'approve',
+          completed_at: '2026-06-12T10:00:00.000Z',
+        },
+        ralplan_critic_review: {
+          agent_role: 'critic',
+          verdict: 'approve',
+          completed_at: '2026-06-12T10:05:00.000Z',
+        },
+      },
+    };
+    const sequenceConsensus = {
+      ralplan_consensus_gate: {
+        complete: true,
+        sequence: ['architect-review', 'critic-review'],
+        ralplan_architect_review: { agent_role: 'architect', verdict: 'approve', sequence_index: 3 },
+        ralplan_critic_review: { agent_role: 'critic', verdict: 'approve', sequence_index: 4 },
+      },
+    };
+
+    const timestampFirst = buildRalplanConsensusGateFromSources([
+      { source: 'timestamp-first', value: timestampConsensus },
+      { source: 'sequence-second', value: sequenceConsensus },
+    ]);
+    assert.equal(timestampFirst.source, 'timestamp-first');
+
+    const sequenceFirst = buildRalplanConsensusGateFromSources([
+      { source: 'sequence-first', value: sequenceConsensus },
+      { source: 'timestamp-second', value: timestampConsensus },
+    ]);
+    assert.equal(sequenceFirst.source, 'sequence-first');
+  });
+
   it('rejects malformed complete consensus even when it appears after a valid source', () => {
     const validConsensus = {
       ralplan_consensus_gate: {
@@ -1096,9 +1237,13 @@ describe('ralplan consensus gate state roots', () => {
     const sessionId = 'sess-native-consensus-ok';
     try {
       await writeNativeSubagentTracking(cwd, sessionId);
+      const consensus = nativeConsensus(sessionId);
+      const reviews = consensus.ralplan_consensus_gate as Record<string, Record<string, unknown>>;
+      delete reviews.ralplan_architect_review!.completed_at;
+      delete reviews.ralplan_critic_review!.completed_at;
       const gate = buildRalplanConsensusGateFromSources([{
         source: 'native-consensus',
-        value: nativeConsensus(sessionId),
+        value: consensus,
       }], { cwd, sessionId });
 
       assert.equal(gate.complete, true);
@@ -1258,18 +1403,23 @@ describe('ralplan consensus gate state roots', () => {
     }
   });
 
-  it('accepts tracker-backed OMX-adapted Architect and Critic lanes only with valid ledger order and scoped routing evidence', async () => {
+  it('rejects tracker-backed OMX-adapted Architect and Critic lanes even with valid legacy marker evidence', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-ralplan-consensus-adapted-ok-'));
     const sessionId = 'sess-adapted-consensus-ok';
     try {
       await writeAdaptedSubagentTracking(cwd, sessionId);
+      const consensus = adaptedConsensus(sessionId);
+      const reviews = consensus.ralplan_consensus_gate as Record<string, Record<string, unknown>>;
+      delete reviews.ralplan_architect_review!.completed_at;
+      delete reviews.ralplan_critic_review!.completed_at;
       const gate = buildRalplanConsensusGateFromSources([{
         source: 'adapted-consensus',
-        value: adaptedConsensus(sessionId),
+        value: consensus,
       }], { cwd, sessionId });
 
-      assert.equal(gate.complete, true);
-      assert.equal(gate.blockedReason, null);
+      assert.equal(gate.complete, false);
+      assert.equal(gate.blockedReason, 'native_subagent_consensus_evidence_missing');
+      assert.match(gate.blockedDetails?.join(' ') ?? '', /unsupported omx_adapted provenance/);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -1286,7 +1436,7 @@ describe('ralplan consensus gate state roots', () => {
 
       assert.equal(gate.complete, false);
       assert.equal(gate.blockedReason, 'native_subagent_consensus_evidence_missing');
-      assert.match(gate.blockedDetails?.join(' ') ?? '', /tracker review order is missing.*critic first_seen_at/i);
+      assert.match(gate.blockedDetails?.join(' ') ?? '', /unsupported omx_adapted provenance/);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -1311,7 +1461,7 @@ describe('ralplan consensus gate state roots', () => {
 
       assert.equal(gate.complete, false);
       assert.equal(gate.blockedReason, 'native_subagent_consensus_evidence_missing');
-      assert.match(gate.blockedDetails?.join(' ') ?? '', /tracker review order is reversed/i);
+      assert.match(gate.blockedDetails?.join(' ') ?? '', /unsupported omx_adapted provenance/);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -1329,7 +1479,7 @@ describe('ralplan consensus gate state roots', () => {
 
       assert.equal(gate.complete, false);
       assert.equal(gate.blockedReason, 'native_subagent_consensus_evidence_missing');
-      assert.match(gate.blockedDetails?.join(' ') ?? '', /thread-architect has role=critic, expected architect/);
+      assert.match(gate.blockedDetails?.join(' ') ?? '', /unsupported omx_adapted provenance/);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -1349,7 +1499,7 @@ describe('ralplan consensus gate state roots', () => {
 
       assert.equal(gate.complete, false);
       assert.equal(gate.blockedReason, 'native_subagent_consensus_evidence_missing');
-      assert.match(gate.blockedDetails?.join(' ') ?? '', /distinct tracker threads/);
+      assert.match(gate.blockedDetails?.join(' ') ?? '', /unsupported omx_adapted provenance/);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -1367,7 +1517,7 @@ describe('ralplan consensus gate state roots', () => {
 
       assert.equal(gate.complete, false);
       assert.equal(gate.blockedReason, 'native_subagent_consensus_evidence_missing');
-      assert.match(gate.blockedDetails?.join(' ') ?? '', /lacks scoped role_routing_unavailable evidence/);
+      assert.match(gate.blockedDetails?.join(' ') ?? '', /unsupported omx_adapted provenance/);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

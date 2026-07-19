@@ -2,12 +2,13 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
 import { chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { HUD_TMUX_HEIGHT_LINES } from '../../hud/constants.js';
 import { DETACHED_TMUX_HISTORY_LIMIT } from '../index.js';
+import { writeSessionEnd, writeSessionStart } from '../../hooks/session.js';
 
 const CLI_SPAWN_TIMEOUT_MS = 60_000;
 
@@ -119,6 +120,75 @@ async function createLaunchFixture(
   };
 }
 
+function startHeldOmx(
+  cwd: string,
+  envOverrides: Record<string, string>,
+): ReturnType<typeof spawn> {
+  const testDir = dirname(fileURLToPath(import.meta.url));
+  const repoRoot = join(testDir, '..', '..', '..');
+  return spawn(process.execPath, [join(repoRoot, 'dist', 'cli', 'omx.js'), '--direct', '--version'], {
+    cwd,
+    env: buildRunOmxEnv(envOverrides),
+    stdio: 'inherit',
+  });
+}
+
+async function waitForPath(path: string, expectedLines: number = 1): Promise<void> {
+  for (let attempt = 0; attempt < 300; attempt += 1) {
+    if (existsSync(path)) {
+      const contents = await readFile(path, 'utf-8').catch(() => '');
+      if (contents.trim().split('\n').filter(Boolean).length >= expectedLines) return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error(`timed out waiting for ${path}`);
+}
+
+async function stopHeldOmx(child: ReturnType<typeof spawn>, releasePath: string): Promise<void> {
+  await rm(releasePath, { force: true });
+  await new Promise<void>((resolve, reject) => {
+    child.once('error', reject);
+    child.once('exit', () => resolve());
+  });
+}
+
+async function createHeldCodexFixture(wd: string): Promise<{
+  env: Record<string, string>;
+  releasePath: string;
+  rootsPath: string;
+}> {
+  const home = join(wd, 'home');
+  const fakeBin = join(wd, 'bin');
+  const releasePath = join(wd, 'hold');
+  const rootsPath = join(wd, 'roots.log');
+  await mkdir(home, { recursive: true });
+  await mkdir(fakeBin, { recursive: true });
+  await writeFile(releasePath, 'hold\n');
+  await writeExecutable(
+    join(fakeBin, 'codex'),
+    `#!/bin/sh
+printf '%s\\n' "$OMX_ROOT" >> "${rootsPath}"
+while [ -f "${releasePath}" ]; do sleep 1; done
+`,
+  );
+  await writeExecutable(join(fakeBin, 'ps'), '#!/bin/sh\nexit 0\n');
+  return {
+    releasePath,
+    rootsPath,
+    env: {
+      HOME: home,
+      PATH: `${fakeBin}:/usr/bin:/bin`,
+      OMX_AUTO_UPDATE: '0',
+      OMX_NOTIFY_FALLBACK: '0',
+      OMX_HOOK_DERIVED_SIGNALS: '0',
+      OMX_ROOT: '',
+      OMX_STATE_ROOT: '',
+      TMUX: '',
+      TMUX_PANE: '',
+    },
+  };
+}
+
 describe('omx launch fallback when tmux is unavailable', () => {
   it('surfaces direct Codex startup stderr and preserves the child exit code', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-launch-child-error-'));
@@ -223,6 +293,258 @@ exit 42
       assert.match(result.stdout, /fake-codex:.*--dangerously-bypass-approvals-and-sandbox/);
       assert.match(result.stdout, /fake-codex:.*model_reasoning_effort="xhigh"/);
       assert.doesNotMatch(result.stderr, /spawnSync tmux ENOENT/);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('passes literal max and ultra after -- with raw config args to Codex launch unchanged', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-launch-reasoning-passthrough-'));
+    try {
+      const home = join(wd, 'home');
+      const fakeBin = join(wd, 'bin');
+      const fakeCodexPath = join(fakeBin, 'codex');
+      const fakePsPath = join(fakeBin, 'ps');
+      const fakeCapturePath = join(wd, 'fake-codex-argv.json');
+      await mkdir(home, { recursive: true });
+      await mkdir(fakeBin, { recursive: true });
+      await writeFile(
+        fakeCodexPath,
+        [
+          '#!/bin/sh',
+          `exec "$NODE_BINARY" -e 'require("node:fs").writeFileSync(process.env.OMX_FAKE_CODEX_CAPTURE_PATH, JSON.stringify(process.argv.slice(1)))' -- "$@"`,
+          '',
+        ].join('\n'),
+      );
+      await chmod(fakeCodexPath, 0o755);
+      await writeFile(fakePsPath, '#!/bin/sh\nexit 0\n');
+      await chmod(fakePsPath, 0o755);
+
+      const result = runOmx(
+        wd,
+        [
+          '--direct',
+          '-c',
+          'model_reasoning_effort=MAX',
+          '--',
+          '--max',
+          '--ultra',
+          '-c',
+          'model_reasoning_effort="ultra"',
+          '-c',
+          'model_reasoning_effort=future',
+          'suffix argument with spaces',
+          '',
+          '--',
+          'after second marker',
+        ],
+        {
+          HOME: home,
+          PATH: `${fakeBin}:/usr/bin:/bin`,
+          NODE_OPTIONS: '',
+          OMX_AUTO_UPDATE: '0',
+          OMX_NOTIFY_FALLBACK: '0',
+          OMX_HOOK_DERIVED_SIGNALS: '0',
+          NODE_BINARY: process.execPath,
+          OMX_FAKE_CODEX_CAPTURE_PATH: fakeCapturePath,
+          TMUX: '',
+          TMUX_PANE: '',
+        },
+      );
+
+      if (shouldSkipForSpawnPermissions(result.error)) return;
+      assert.equal(result.status, 0, result.error || result.stderr || result.stdout);
+      const capturedArgv = JSON.parse(await readFile(fakeCapturePath, 'utf-8')) as string[];
+      const firstMarkerIndex = capturedArgv.indexOf('--');
+      assert.equal(firstMarkerIndex, 4);
+      const modelInstructionsArg = capturedArgv[firstMarkerIndex - 1];
+      assert.match(modelInstructionsArg, /^model_instructions_file="[^"\n]+"$/);
+      assert.match(modelInstructionsArg, /\.omx\/state\/sessions\/omx-[^"]+\/AGENTS\.md"$/);
+      assert.equal(capturedArgv.filter((arg) => arg.startsWith('model_instructions_file=')).length, 1);
+      assert.deepEqual(capturedArgv, [
+        '-c',
+        'model_reasoning_effort=MAX',
+        '-c',
+        modelInstructionsArg,
+        '--',
+        '--max',
+        '--ultra',
+        '-c',
+        'model_reasoning_effort="ultra"',
+        '-c',
+        'model_reasoning_effort=future',
+        'suffix argument with spaces',
+        '',
+        '--',
+        'after second marker',
+      ]);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('treats image values as variadic when detecting resume launches', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-launch-image-resume-'));
+    try {
+      const home = join(wd, 'home');
+      const fakeBin = join(wd, 'bin');
+      const fakeCapturePath = join(wd, 'fake-codex.json');
+      await mkdir(join(wd, '.omx'), { recursive: true });
+      await mkdir(join(wd, '.codex'), { recursive: true });
+      await mkdir(home, { recursive: true });
+      await mkdir(fakeBin, { recursive: true });
+      await writeFile(join(wd, '.omx', 'setup-scope.json'), JSON.stringify({ scope: 'project' }));
+      await writeFile(join(wd, '.codex', 'state_5.sqlite'), 'resume-only-sentinel');
+      await writeExecutable(
+        join(fakeBin, 'codex'),
+        `#!/bin/sh
+exec "$NODE_BINARY" -e 'const fs = require("node:fs"); const path = require("node:path"); fs.writeFileSync(process.env.OMX_FAKE_CODEX_CAPTURE_PATH, JSON.stringify({ argv: process.argv.slice(1), hasResumeSqlite: fs.existsSync(path.join(process.env.CODEX_HOME, "state_5.sqlite")) }))' -- "$@"
+`,
+      );
+
+      const cases: Array<{ args: string[]; resumes: boolean }> = [
+        { args: ['-i', 'resume'], resumes: false },
+        { args: ['--image', 'resume'], resumes: false },
+        { args: ['--image=resume'], resumes: false },
+        { args: ['-iresume'], resumes: false },
+        { args: ['-i=resume'], resumes: false },
+        { args: ['-i', 'screenshot.png', 'resume'], resumes: false },
+        { args: ['--image', 'screenshot.png', 'resume'], resumes: false },
+        { args: ['--image=screenshot.png', 'resume'], resumes: true },
+        { args: ['-iscreenshot.png', 'resume'], resumes: true },
+        { args: ['-i=screenshot.png', 'resume'], resumes: true },
+        { args: ['-i', 'one.png', '-i', 'two.png', 'resume'], resumes: false },
+        { args: ['--image', 'one.png', '--image', 'two.png', 'resume'], resumes: false },
+        { args: ['-i', 'one.png,two.png', 'resume'], resumes: false },
+        { args: ['--image', 'one.png,two.png', 'resume'], resumes: false },
+        { args: ['--image', 'one.png', '--model', 'gpt-review', 'resume'], resumes: true },
+        { args: ['--image=one.png', '--model=gpt-review', 'resume'], resumes: true },
+      ];
+
+      for (const testCase of cases) {
+        const result = runOmx(
+          wd,
+          ['--direct', ...testCase.args],
+          {
+            HOME: home,
+            PATH: `${fakeBin}:/usr/bin:/bin`,
+            NODE_BINARY: process.execPath,
+            OMX_AUTO_UPDATE: '0',
+            OMX_BYPASS_DEFAULT_SYSTEM_PROMPT: '0',
+            OMX_HOOK_DERIVED_SIGNALS: '0',
+            OMX_NOTIFY_FALLBACK: '0',
+            OMX_FAKE_CODEX_CAPTURE_PATH: fakeCapturePath,
+          },
+        );
+
+        if (shouldSkipForSpawnPermissions(result.error)) return;
+        assert.equal(result.status, 0, `${JSON.stringify(testCase.args)}: ${result.error || result.stderr || result.stdout}`);
+        const captured = JSON.parse(await readFile(fakeCapturePath, 'utf-8')) as {
+          argv: string[];
+          hasResumeSqlite: boolean;
+        };
+        assert.deepEqual(captured.argv, testCase.args);
+        assert.equal(captured.hasResumeSqlite, testCase.resumes, JSON.stringify(testCase.args));
+      }
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('ordinary launch root collision guidance', () => {
+  it('keeps the cwd default for the first launch and fails the second and third launches closed with explicit-root guidance', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-launch-root-conflict-'));
+    try {
+      execFileSync('git', ['init'], { cwd: wd, stdio: 'ignore' });
+      const fixture = await createHeldCodexFixture(wd);
+      await writeSessionStart(wd, 'first-standard-launch', { pid: process.pid });
+
+      const second = runOmx(wd, ['--direct', '--version'], fixture.env);
+      const third = runOmx(wd, ['--direct', '--version'], fixture.env);
+      if (shouldSkipForSpawnPermissions(second.error) || shouldSkipForSpawnPermissions(third.error)) return;
+      for (const result of [second, third]) {
+        assert.notEqual(result.status, 0, result.stderr || result.stdout);
+        assert.match(result.stderr, /session_pointer_owner_conflict/);
+        assert.match(result.stderr, /concurrent conversations in this checkout require distinct user-specified OMX_ROOT values/);
+        assert.match(result.stderr, /POSIX: OMX_ROOT="\$HOME\/\.omx\/instances\/second-conversation" omx/);
+        assert.match(result.stderr, /PowerShell: \$env:OMX_ROOT = "\$HOME\/\.omx\/instances\/second-conversation"; omx/);
+        assert.match(result.stderr, /cmd\.exe: set "OMX_ROOT=%USERPROFILE%\\\.omx\\instances\\second-conversation" && omx/);
+        assert.match(result.stderr, /OMX does not reroute or allocate one automatically/);
+      }
+      const resume = runOmx(wd, ['--direct', 'resume'], fixture.env);
+      if (!shouldSkipForSpawnPermissions(resume.error)) {
+        assert.notEqual(resume.status, 0, resume.stderr || resume.stdout);
+        assert.match(resume.stderr, /session_pointer_owner_conflict/);
+        assert.doesNotMatch(resume.stderr, /concurrent conversations in this checkout require distinct user-specified OMX_ROOT values/);
+      }
+      await writeSessionEnd(wd, 'first-standard-launch');
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps explicit roots literal: distinct roots launch independently while a shared root remains fatal without reroute guidance', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-launch-explicit-roots-'));
+    execFileSync('git', ['init'], { cwd: wd, stdio: 'ignore' });
+    let first: ReturnType<typeof spawn> | undefined;
+    let second: ReturnType<typeof spawn> | undefined;
+    try {
+      const fixture = await createHeldCodexFixture(wd);
+      const firstRoot = join(wd, 'first-root');
+      const secondRoot = join(wd, 'second-root');
+      first = startHeldOmx(wd, { ...fixture.env, OMX_ROOT: firstRoot });
+      second = startHeldOmx(wd, { ...fixture.env, OMX_ROOT: secondRoot });
+      await waitForPath(fixture.rootsPath, 2);
+      assert.deepEqual(
+        new Set((await readFile(fixture.rootsPath, 'utf-8')).trim().split('\n')),
+        new Set([firstRoot, secondRoot]),
+      );
+
+      const collision = runOmx(wd, ['--direct', '--version'], { ...fixture.env, OMX_ROOT: firstRoot });
+      if (shouldSkipForSpawnPermissions(collision.error)) return;
+      assert.notEqual(collision.status, 0, collision.stderr || collision.stdout);
+      assert.match(collision.stderr, /session_pointer_owner_conflict/);
+      assert.doesNotMatch(collision.stderr, /concurrent conversations in this checkout require distinct user-specified OMX_ROOT values/);
+      assert.doesNotMatch(collision.stderr, /reroute or allocate one automatically/);
+
+      await stopHeldOmx(first, fixture.releasePath);
+      first = undefined;
+      if (second.exitCode === null) {
+        await new Promise<void>((resolve) => second!.once('exit', () => resolve()));
+      }
+      second = undefined;
+    } finally {
+      if (first) first.kill('SIGKILL');
+      if (second) second.kill('SIGKILL');
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps different checkout defaults independent and relaunches through stale default-pointer evidence', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-launch-root-stale-'));
+    try {
+      const firstCheckout = join(wd, 'first-checkout');
+      const secondCheckout = join(wd, 'second-checkout');
+      await mkdir(firstCheckout, { recursive: true });
+      await mkdir(secondCheckout, { recursive: true });
+      execFileSync('git', ['init'], { cwd: firstCheckout, stdio: 'ignore' });
+      execFileSync('git', ['init'], { cwd: secondCheckout, stdio: 'ignore' });
+
+      await writeSessionStart(firstCheckout, 'first-checkout-owner', { pid: process.pid });
+      await writeSessionStart(secondCheckout, 'second-checkout-owner', { pid: process.pid });
+      assert.match(await readFile(join(firstCheckout, '.omx', 'state', 'session.json'), 'utf-8'), /first-checkout-owner/);
+      assert.match(await readFile(join(secondCheckout, '.omx', 'state', 'session.json'), 'utf-8'), /second-checkout-owner/);
+      await writeSessionEnd(firstCheckout, 'first-checkout-owner');
+      await writeSessionEnd(secondCheckout, 'second-checkout-owner');
+
+      await writeSessionStart(firstCheckout, 'stale-owner', { pid: 2_147_483_647 });
+      const fixture = await createHeldCodexFixture(wd);
+      await rm(fixture.releasePath, { force: true });
+      const relaunch = runOmx(firstCheckout, ['--direct', '--version'], fixture.env);
+      if (shouldSkipForSpawnPermissions(relaunch.error)) return;
+      assert.equal(relaunch.status, 0, relaunch.error || relaunch.stderr || relaunch.stdout);
+      assert.doesNotMatch(relaunch.stderr, /concurrent conversations in this checkout require distinct user-specified OMX_ROOT values/);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
