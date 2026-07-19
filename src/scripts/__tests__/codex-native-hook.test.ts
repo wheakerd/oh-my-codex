@@ -296,6 +296,54 @@ async function setTeamPaneIds(
 	}
 }
 
+async function configureAuthoritativeTeamWorker(
+  cwd: string,
+  teamName: string,
+  workerPaneId = "%10",
+): Promise<void> {
+  const stateRoot = join(cwd, ".omx", "state");
+  await initTeamState(teamName, "session pointer ownership regression", "executor", 1, cwd, undefined, {
+    OMX_SESSION_ID: "leader-session",
+  });
+  await setTeamPaneIds(cwd, teamName, {
+    leaderPaneId: "%42",
+    workerPaneIds: { "worker-1": workerPaneId },
+  });
+  for (const fileName of ["config.json", "manifest.v2.json"]) {
+    const filePath = join(stateRoot, "team", teamName, fileName);
+    const state = JSON.parse(await readFile(filePath, "utf-8")) as {
+      team_state_root?: string;
+      leader_cwd?: string;
+      workers?: Array<Record<string, unknown>>;
+    };
+    state.team_state_root = stateRoot;
+    state.leader_cwd = cwd;
+    state.workers = (state.workers ?? []).map((worker) => ({
+      ...worker,
+      working_dir: cwd,
+      worktree_path: cwd,
+      team_state_root: stateRoot,
+    }));
+    await writeJson(filePath, state);
+  }
+  await writeJson(join(stateRoot, "team", teamName, "workers", "worker-1", "identity.json"), {
+    name: "worker-1",
+    index: 1,
+    role: "executor",
+    pane_id: workerPaneId,
+    working_dir: cwd,
+    worktree_path: cwd,
+    team_state_root: stateRoot,
+  });
+  process.env.TMUX = "1";
+  process.env.TMUX_PANE = workerPaneId;
+  process.env.OMX_TEAM_INTERNAL_WORKER = `${teamName}/worker-1`;
+  process.env.OMX_TEAM_WORKER = `${teamName}/worker-1`;
+  process.env.OMX_TEAM_STATE_ROOT = stateRoot;
+  process.env.OMX_TEAM_LEADER_CWD = cwd;
+  process.env.OMX_SESSION_ID = "leader-session";
+}
+
 async function withIsolatedHome<T>(
 	prefix: string,
 	run: (homeDir: string) => Promise<T>,
@@ -4531,6 +4579,170 @@ PY`,
       } else {
         process.env.CODEX_HOME = originalCodexHome;
       }
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps an authoritative Team worker lifecycle scoped without replacing the live leader pointer", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-team-worker-pointer-"));
+    try {
+      const stateDir = join(cwd, ".omx", "state");
+      await writeSessionStart(cwd, "leader-session", {
+        nativeSessionId: "leader-native",
+        pid: process.pid,
+      });
+      await configureAuthoritativeTeamWorker(cwd, "pointer-team");
+      const leaderPointerBefore = await readFile(join(stateDir, "session.json"), "utf-8");
+
+      await dispatchCodexNativeHook({
+        hook_event_name: "SessionStart",
+        cwd,
+        session_id: "worker-native",
+      }, { cwd, sessionOwnerPid: process.pid });
+
+      assert.equal(await readFile(join(stateDir, "session.json"), "utf-8"), leaderPointerBefore);
+
+      const workerStop = await dispatchCodexNativeHook({
+        hook_event_name: "Stop",
+        cwd,
+        session_id: "worker-native",
+        thread_id: "worker-native",
+        turn_id: "worker-stop-turn",
+      }, { cwd });
+      assert.notEqual(workerStop.outputJson?.stopReason, "session_scope_unmatched");
+      assert.notEqual(workerStop.outputJson?.stopReason, "session_pointer_unusable");
+
+      delete process.env.OMX_TEAM_INTERNAL_WORKER;
+      delete process.env.OMX_TEAM_WORKER;
+      process.env.TMUX_PANE = "%42";
+      const leaderStop = await dispatchCodexNativeHook({
+        hook_event_name: "Stop",
+        cwd,
+        session_id: "leader-native",
+        thread_id: "leader-native",
+        turn_id: "leader-stop-turn",
+      }, { cwd });
+      assert.notEqual(leaderStop.outputJson?.stopReason, "session_scope_unmatched");
+      assert.equal(await readFile(join(stateDir, "session.json"), "utf-8"), leaderPointerBefore);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps authoritative worker payload scope independent of malformed selected-pointer evidence", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-team-worker-malformed-pointer-"));
+    try {
+      await configureAuthoritativeTeamWorker(cwd, "malformed-team");
+      const pointerPath = join(cwd, ".omx", "state", "session.json");
+      await writeFile(pointerPath, "{ malformed leader evidence", "utf-8");
+
+      await dispatchCodexNativeHook({
+        hook_event_name: "SessionStart",
+        cwd,
+        session_id: "worker-malformed-native",
+      }, { cwd, sessionOwnerPid: process.pid });
+      assert.equal(await readFile(pointerPath, "utf-8"), "{ malformed leader evidence");
+
+      const stop = await dispatchCodexNativeHook({
+        hook_event_name: "Stop",
+        cwd,
+        session_id: "worker-malformed-native",
+        thread_id: "worker-malformed-native",
+        turn_id: "worker-malformed-stop",
+      }, { cwd });
+      assert.notEqual(stop.outputJson?.stopReason, "session_pointer_unusable");
+      assert.notEqual(stop.outputJson?.stopReason, "session_scope_unmatched");
+      assert.equal(await readFile(pointerPath, "utf-8"), "{ malformed leader evidence");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  for (const [name, mutate] of [
+    ["foreign", async (cwd: string) => {
+      process.env.OMX_TEAM_STATE_ROOT = join(cwd, "foreign-state");
+    }],
+    ["nested", async (cwd: string) => {
+      process.env.OMX_TEAM_INTERNAL_WORKER = "other-team/worker-1";
+    }],
+    ["non-Team", async () => {
+      delete process.env.OMX_TEAM_INTERNAL_WORKER;
+      delete process.env.OMX_TEAM_WORKER;
+    }],
+  ] as const) {
+    it(`does not grant the Team worker pointer bypass to ${name} hook context`, async () => {
+      const cwd = await mkdtemp(join(tmpdir(), `omx-native-hook-${name}-pointer-`));
+      try {
+        await configureAuthoritativeTeamWorker(cwd, "boundary-team");
+        await mutate(cwd);
+        const pointerPath = join(cwd, ".omx", "state", "session.json");
+        await writeFile(pointerPath, "{ malformed boundary evidence", "utf-8");
+
+        await dispatchCodexNativeHook({
+          hook_event_name: "SessionStart",
+          cwd,
+          session_id: "boundary-native",
+        }, { cwd, sessionOwnerPid: process.pid });
+        assert.equal(await readFile(pointerPath, "utf-8"), "{ malformed boundary evidence");
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    });
+  }
+
+  it("does not let a Team worker adopt a stale leader-selected pointer", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-team-worker-stale-leader-"));
+    try {
+      await writeSessionStart(cwd, "stale-leader-session", {
+        nativeSessionId: "stale-leader-native",
+        pid: 2_147_483_647,
+      });
+      await configureAuthoritativeTeamWorker(cwd, "stale-leader-team");
+      const pointerPath = join(cwd, ".omx", "state", "session.json");
+      const pointerBefore = await readFile(pointerPath, "utf-8");
+
+      await dispatchCodexNativeHook({
+        hook_event_name: "SessionStart",
+        cwd,
+        session_id: "worker-after-stale-leader",
+      }, { cwd, sessionOwnerPid: process.pid });
+
+      assert.equal(await readFile(pointerPath, "utf-8"), pointerBefore);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves leader pointer ownership through the packed native-hook entrypoint", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-team-worker-packed-"));
+    try {
+      await writeSessionStart(cwd, "leader-session", {
+        nativeSessionId: "packed-leader-native",
+        pid: process.pid,
+      });
+      await configureAuthoritativeTeamWorker(cwd, "packed-team");
+      const pointerPath = join(cwd, ".omx", "state", "session.json");
+      const pointerBefore = await readFile(pointerPath, "utf-8");
+      const env = { ...process.env };
+
+      parseSingleJsonStdout(runNativeHookCli({
+        hook_event_name: "SessionStart",
+        cwd,
+        session_id: "packed-worker-native",
+      }, { cwd, env }));
+      assert.equal(await readFile(pointerPath, "utf-8"), pointerBefore);
+
+      const stopOutput = parseSingleJsonStdout(runNativeHookCli({
+        hook_event_name: "Stop",
+        cwd,
+        session_id: "packed-worker-native",
+        thread_id: "packed-worker-native",
+        turn_id: "packed-worker-stop",
+      }, { cwd, env }));
+      assert.notEqual(stopOutput.stopReason, "session_scope_unmatched");
+      assert.notEqual(stopOutput.stopReason, "session_pointer_unusable");
+      assert.equal(await readFile(pointerPath, "utf-8"), pointerBefore);
+    } finally {
       await rm(cwd, { recursive: true, force: true });
     }
   });

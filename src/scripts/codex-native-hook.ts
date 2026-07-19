@@ -19708,6 +19708,11 @@ export async function dispatchCodexNativeHook(
   let resolvedNativeSessionId = nativeSessionId;
   let skipCanonicalSessionStartContext = false;
   let isSubagentSessionStart = false;
+  const authoritativeTeamWorker = await hasAuthoritativeTeamWorkerContext(cwd);
+  if (authoritativeTeamWorker) {
+    allowImplicitSessionSideEffects = true;
+    stopAuthorizationFailure = null;
+  }
 
   if (hookEventName === "SessionStart" && nativeSessionId) {
     const transcriptPath = safeString(payload.transcript_path ?? payload.transcriptPath).trim();
@@ -19763,6 +19768,12 @@ export async function dispatchCodexNativeHook(
           transcriptPath,
         );
       }
+    } else if (authoritativeTeamWorker) {
+      // Team workers share the leader's selected state root, but they do not own
+      // its compatibility pointer. Keep lifecycle state scoped to the explicit
+      // hook payload without reconciling or replacing the live leader pointer.
+      canonicalSessionId = nativeSessionId;
+      resolvedNativeSessionId = nativeSessionId;
     } else {
       const ownerOmxSessionId = await resolveVerifiedOwnerOmxSessionId();
       try {
@@ -19808,7 +19819,7 @@ export async function dispatchCodexNativeHook(
       stopPayloadSessionId,
       undefined,
       currentSessionState,
-      pointer.status === "absent",
+      pointer.status === "absent" || authoritativeTeamWorker,
     );
     if (stopPayloadSessionId && !stopCanonicalSessionId) {
       canonicalSessionId = "";
