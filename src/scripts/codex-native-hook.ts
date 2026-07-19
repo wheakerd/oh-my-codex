@@ -19719,7 +19719,12 @@ export async function dispatchCodexNativeHook(
     ? readUnambiguousNormalizedPayloadSessionId(payload)
     : "";
 
-  if (hookEventName === "SessionStart" && nativeSessionId) {
+  if (hookEventName === "SessionStart" && authoritativeTeamWorker && !authoritativeWorkerPayloadSessionId) {
+    canonicalSessionId = "";
+    resolvedNativeSessionId = nativeSessionId;
+    skipCanonicalSessionStartContext = true;
+    allowImplicitSessionSideEffects = false;
+  } else if (hookEventName === "SessionStart" && nativeSessionId) {
     const transcriptPath = safeString(payload.transcript_path ?? payload.transcriptPath).trim();
     const subagentSessionStart = readNativeSubagentSessionStartMetadata(transcriptPath);
     if (subagentSessionStart) {
@@ -19829,19 +19834,26 @@ export async function dispatchCodexNativeHook(
   if (hookEventName === "Stop") {
     const stopPayloadSessionId = readPayloadSessionId(payload);
     const authorizedWorkerStopSessionId = authoritativeWorkerPayloadSessionId;
-    const stopCanonicalSessionId = await resolveInternalSessionIdForPayload(
-      cwd,
-      authorizedWorkerStopSessionId || stopPayloadSessionId,
-      undefined,
-      currentSessionState,
-      authoritativeTeamWorker
-        ? Boolean(authorizedWorkerStopSessionId)
-        : pointer.status === "absent",
-    );
-    if (stopPayloadSessionId && !stopCanonicalSessionId) {
+    const stopCanonicalSessionId = authoritativeTeamWorker && !authorizedWorkerStopSessionId
+      ? ""
+      : await resolveInternalSessionIdForPayload(
+        cwd,
+        authorizedWorkerStopSessionId || stopPayloadSessionId,
+        undefined,
+        currentSessionState,
+        authoritativeTeamWorker
+          ? Boolean(authorizedWorkerStopSessionId)
+          : pointer.status === "absent",
+      );
+    if ((authoritativeTeamWorker && !authorizedWorkerStopSessionId) || (stopPayloadSessionId && !stopCanonicalSessionId)) {
       canonicalSessionId = "";
       allowImplicitSessionSideEffects = false;
-      if (!stopAuthorizationFailure) {
+      if (authoritativeTeamWorker && !authorizedWorkerStopSessionId) {
+        stopAuthorizationFailure = {
+          stopReason: "session_scope_unmatched",
+          reason: "OMX cannot authorize Team worker Stop without exactly one valid explicit session id.",
+        };
+      } else if (!stopAuthorizationFailure) {
         stopAuthorizationFailure = {
           stopReason: "session_scope_unmatched",
           reason: `OMX cannot authorize Stop for unmatched session id ${stopPayloadSessionId}; the selected session pointer remains authoritative.`,

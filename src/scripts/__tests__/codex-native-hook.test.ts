@@ -4629,8 +4629,8 @@ PY`,
     }
   });
 
-  it("fails closed for invalid Team worker lifecycle identity with absent or live pointers", async () => {
-    for (const pointerKind of ["absent", "live"] as const) {
+  it("fails closed for invalid Team worker lifecycle identity across pointer states", async () => {
+    for (const pointerKind of ["absent", "live", "stale", "malformed"] as const) {
       const cwd = await mkdtemp(join(tmpdir(), `omx-native-hook-team-worker-invalid-${pointerKind}-`));
       try {
         delete process.env.OMX_TEAM_INTERNAL_WORKER;
@@ -4642,15 +4642,20 @@ PY`,
         delete process.env.TMUX_PANE;
         const pointerPath = join(cwd, ".omx", "state", "session.json");
         await configureAuthoritativeTeamWorker(cwd, "invalid-identity-team");
-        if (pointerKind === "live") {
+        if (pointerKind === "live" || pointerKind === "stale") {
           await writeSessionStart(cwd, "leader-session", {
             nativeSessionId: "invalid-test-leader-native",
-            pid: process.pid,
+            pid: pointerKind === "live" ? process.pid : 2_147_483_647,
           });
+        } else if (pointerKind === "malformed") {
+          await mkdir(dirname(pointerPath), { recursive: true });
+          await writeFile(pointerPath, "{ malformed missing-identity evidence", "utf-8");
         }
         const pointerBefore = existsSync(pointerPath) ? await readFile(pointerPath, "utf-8") : null;
 
         for (const payload of [
+          {},
+          { session_id: "" },
           { session_id: "../escape" },
           { session_id: "worker-one", sessionId: "worker-two" },
         ]) {
