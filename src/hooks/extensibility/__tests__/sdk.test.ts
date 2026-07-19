@@ -542,6 +542,27 @@ exit 1
         sdk = createHookPluginSdk({ cwd, stateRoot, pluginName: 'test', event: { ...makeEvent(), session_id: 'sess-escaped' } });
         assert.equal(await sdk.omx.hud.read(), null);
 
+        const crossSessionTarget = join(stateRoot, 'sessions', 'sess-cross-target');
+        await mkdir(crossSessionTarget, { recursive: true });
+        await writeFile(join(crossSessionTarget, 'hud-state.json'), JSON.stringify({ turn_count: 77 }));
+        await symlink(
+          crossSessionTarget,
+          join(stateRoot, 'sessions', 'sess-cross'),
+          process.platform === 'win32' ? 'junction' : 'dir',
+        );
+        await writeFile(join(stateRoot, 'session.json'), JSON.stringify({
+          session_id: 'sess-cross',
+          cwd,
+          state_root: stateRoot,
+        }));
+        sdk = createHookPluginSdk({
+          cwd,
+          stateRoot,
+          pluginName: 'test',
+          event: { ...makeEvent(), session_id: 'sess-cross' },
+        });
+        assert.equal(await sdk.omx.hud.read(), null);
+
         if (process.platform !== 'win32') {
           const fileSessionDir = join(stateRoot, 'sessions', 'sess-file-escaped');
           await mkdir(fileSessionDir, { recursive: true });

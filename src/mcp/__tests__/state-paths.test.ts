@@ -640,6 +640,7 @@ describe('state paths', () => {
         session_id: 'native-id',
         native_session_id: 'native-id',
         owner_omx_session_id: 'omx-owner-id',
+        owner_codex_session_id: 'codex-owner-id',
         cwd: wd,
       }));
       process.env.OMX_SESSION_ID = 'omx-owner-id';
@@ -654,6 +655,15 @@ describe('state paths', () => {
       assert.equal(runtimeScope.sessionId, 'native-id');
       assert.equal(runtimeScope.stateDir, join(stateDir, 'sessions', 'native-id'));
       assert.equal(runtimeScope.source, 'native-alias');
+
+      process.env.OMX_SESSION_ID = 'codex-owner-id';
+      assert.equal(await readCurrentSessionId(wd), 'native-id');
+      const codexScope = await resolveStateScope(wd);
+      assert.equal(codexScope.sessionId, 'native-id');
+      assert.equal(codexScope.stateDir, join(stateDir, 'sessions', 'native-id'));
+      const codexRuntimeScope = await resolveRuntimeStateScope(wd);
+      assert.equal(codexRuntimeScope.sessionId, 'native-id');
+      assert.equal(codexRuntimeScope.stateDir, join(stateDir, 'sessions', 'native-id'));
     } finally {
       if (typeof previousOmxSessionId === 'string') process.env.OMX_SESSION_ID = previousOmxSessionId;
       else delete process.env.OMX_SESSION_ID;
@@ -671,6 +681,7 @@ describe('state paths', () => {
         session_id: 'native-id',
         native_session_id: 'native-id',
         owner_omx_session_id: 'omx-owner-id',
+        owner_codex_session_id: 'codex-owner-id',
         cwd: wd,
       }));
 
@@ -678,6 +689,10 @@ describe('state paths', () => {
       assert.equal(scope.sessionId, 'native-id');
       assert.equal(scope.stateDir, join(stateDir, 'sessions', 'native-id'));
       assert.notEqual(scope.stateDir, join(stateDir, 'sessions', 'omx-owner-id'));
+
+      const codexScope = await resolveStateScope(wd, 'codex-owner-id');
+      assert.equal(codexScope.sessionId, 'native-id');
+      assert.equal(codexScope.stateDir, join(stateDir, 'sessions', 'native-id'));
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
@@ -859,10 +874,18 @@ describe('state paths', () => {
           session_id: 'sess-canonical',
           native_session_id: 'native-alias',
           owner_omx_session_id: 'omx-owner-alias',
+          owner_codex_session_id: 'codex-owner-alias',
           cwd: wd,
         }));
         process.env.OMX_SESSION_ID = 'omx-owner-alias';
 
+        assert.deepEqual(await resolveWritableStateScope(wd), {
+          source: 'session',
+          sessionId: 'sess-canonical',
+          stateDir: join(stateDir, 'sessions', 'sess-canonical'),
+        });
+
+        process.env.OMX_SESSION_ID = 'codex-owner-alias';
         assert.deepEqual(await resolveWritableStateScope(wd), {
           source: 'session',
           sessionId: 'sess-canonical',

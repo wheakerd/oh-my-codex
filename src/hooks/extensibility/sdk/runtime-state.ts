@@ -1,4 +1,4 @@
-import { existsSync, realpathSync } from 'fs';
+import { existsSync, lstatSync, realpathSync } from 'fs';
 import { readFile } from 'fs/promises';
 import { isAbsolute, join, relative } from 'path';
 import type {
@@ -55,6 +55,8 @@ async function readHudState(cwd: string, stateRoot?: string, requestedSessionId?
         || normalizedRequestedSessionId === metadata.ownerCodexSessionId;
       if (!requestedIsBound) return null;
       const sessionDir = join(canonicalStateRoot, 'sessions', metadata.sessionId);
+      const sessionsDir = join(canonicalStateRoot, 'sessions');
+      if (lstatSync(sessionsDir).isSymbolicLink() || lstatSync(sessionDir).isSymbolicLink()) return null;
       const hudStatePath = join(sessionDir, 'hud-state.json');
       if (!existsSync(hudStatePath)) return null;
       const canonicalSessionDir = realpathSync.native(sessionDir);

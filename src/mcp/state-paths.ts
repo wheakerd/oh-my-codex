@@ -399,7 +399,9 @@ function readSessionIdFromEnvironment(env: NodeJS.ProcessEnv = process.env): str
 function resolveCanonicalSessionId(candidate: string | undefined, metadata: ResolvedSessionMetadata | undefined): string | undefined {
   if (!candidate) return undefined;
   if (!metadata) return candidate;
-  return metadata.nativeSessionAliases.includes(candidate) || metadata.ownerOmxSessionId === candidate
+  return metadata.nativeSessionAliases.includes(candidate)
+      || metadata.ownerOmxSessionId === candidate
+      || metadata.ownerCodexSessionId === candidate
     ? metadata.sessionId
     : candidate;
 }
