@@ -53,6 +53,11 @@ async function makeRepo(): Promise<string> {
   await writeFile(join(stateDir, 'session.json'), JSON.stringify({ session_id: 'sess-q' }));
   return cwd;
 }
+function questionStorage(cwd: string): { stateDir: string; expectedRootIdentity: Awaited<ReturnType<typeof initializeStateAuthority>>['generation']['root_identity'] } {
+  const authority = fixtureAuthorities.get(cwd);
+  if (!authority) throw new Error(`missing committed question fixture authority for ${cwd}`);
+  return { stateDir: join(cwd, '.omx', 'state'), expectedRootIdentity: authority.generation.root_identity };
+}
 
 function makeQuestionCliEnv(cwd: string, overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   const authority = fixtureAuthorities.get(cwd);
@@ -187,7 +192,7 @@ describe('omx question CLI', () => {
       selected_labels: ['Other'],
       selected_values: ['free text answer'],
       other_text: 'free text answer',
-    });
+    }, questionStorage(cwd));
 
     const exitCode = await closePromise;
     assert.equal(exitCode, 0, stderr || stdout);
@@ -280,7 +285,7 @@ describe('omx question CLI', () => {
       value: 'exact-page',
       selected_labels: ['Exact page mapping'],
       selected_values: ['exact-page'],
-    });
+    }, questionStorage(cwd));
 
     const exitCode = await closePromise;
     assert.equal(exitCode, 0, stderr || stdout);
@@ -390,7 +395,7 @@ describe('omx question CLI', () => {
       value: 'kebab',
       selected_labels: ['Lowercase kebab'],
       selected_values: ['kebab'],
-    });
+    }, questionStorage(cwd));
 
     const exitCode = await closePromise;
     assert.equal(exitCode, 0, stderr || stdout);
@@ -450,7 +455,7 @@ describe('omx question CLI', () => {
     await markQuestionAnswered(recordPath, [
       { question_id: 'first', index: 0, answer: { kind: 'option', value: 'a', selected_labels: ['A'], selected_values: ['a'] } },
       { question_id: 'second', index: 1, answer: { kind: 'option', value: 'd', selected_labels: ['D'], selected_values: ['d'] } },
-    ]);
+    ], questionStorage(cwd));
 
     const exitCode = await closePromise;
     assert.equal(exitCode, 0, stderr || stdout);
@@ -855,6 +860,7 @@ esac
       selected_labels: ['A'],
       selected_values: ['a'],
     }, {
+      ...questionStorage(cwd),
       injectAnswersToPane: (paneId, answers) => {
         injectedAnswers.push({ paneId, answer: answers[0]?.answer.value ?? '' });
         return true;
@@ -985,14 +991,13 @@ esac
 
   it('answers through the caller-provided authoritative state directory', async () => {
     const cwd = await makeRepo();
-    const authoritativeStateDir = join(cwd, '.omx', 'state');
     const { record } = await createQuestionRecord(cwd, {
       question: 'Pick one',
       options: [{ label: 'A', value: 'a' }],
       allow_other: false,
       other_label: 'Other',
       multi_select: false,
-    }, 'sess-q', new Date(), { stateDir: authoritativeStateDir });
+    }, 'sess-q', new Date(), questionStorage(cwd));
     const restoreQuestionCliEnv = installQuestionCliEnv(cwd);
     const writes: string[] = [];
     const originalWrite = process.stdout.write;
@@ -1009,7 +1014,7 @@ esac
         '--session-id',
         'sess-q',
         '--json',
-      ], { stateDir: authoritativeStateDir });
+      ], questionStorage(cwd));
       const payload = JSON.parse(writes.join('')) as { ok: boolean; record_path: string };
       assert.equal(payload.ok, true, JSON.stringify(payload));
       assert.match(payload.record_path, /\.omx[/\\]state/);

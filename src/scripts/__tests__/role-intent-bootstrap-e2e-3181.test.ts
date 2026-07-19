@@ -121,7 +121,7 @@ describe('#3181 end-to-end fresh App turn bootstrap', () => {
       //    provenance — a PreToolUse attestation (next test) or a recorded tracker leader.
       const res = await invokeRoleIntent(cwd, ['role-intent', 'write', '--role', 'architect', '--parent-thread', nativeSessionId, '--json']);
       assert.equal(res.exitCode, 1);
-      assert.deepEqual(JSON.parse(res.stdout.join('\n')), { ok: false, reason: 'parent_not_active_leader' });
+      assert.deepEqual(JSON.parse(res.stdout.join('\n')), { ok: false, reason: 'unsupported_documented_leader_proof' });
 
       const finalState = await readSubagentTrackingState(cwd);
       assert.deepEqual(finalState.pending_role_intents, []);
@@ -251,7 +251,7 @@ describe('#3181 end-to-end fresh App turn bootstrap', () => {
         'ralplan', 'role-intent', 'write', '--role', 'architect', '--parent-thread', foreignNativeSessionId, '--json',
       ]);
       assert.notEqual(cli.status, 0, 'foreign native thread must not authorize the actual CLI');
-      assert.deepEqual(JSON.parse(String(cli.stdout)), { ok: false, reason: 'parent_not_active_leader' });
+      assert.deepEqual(JSON.parse(String(cli.stdout)), { ok: false, reason: 'unsupported_documented_leader_proof' });
       assert.deepEqual(await readSubagentTrackingState(cwd), trackerBefore, 'foreign CLI denial must preserve both-session tracker state');
     } finally {
       await rm(cwd, { recursive: true, force: true });

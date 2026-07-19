@@ -1,6 +1,6 @@
 import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rename, rm, stat, writeFile } from 'fs/promises';
 import { existsSync } from 'fs';
 import { spawnSync } from 'child_process';
 import { dirname, join } from 'path';
@@ -9,6 +9,7 @@ import { fileURLToPath } from 'url';
 import { reconcileRalphSessionResume } from '../../scripts/notify-hook/ralph-session-resume.js';
 import { writeSessionEnd, writeSessionStart } from '../session.js';
 import { clearTeamTestAuthority, hardenTestAuthorityTreeSync, installTeamTestAuthority } from '../../team/__tests__/authority-fixture.js';
+import { StateAuthorityError } from '../../state/authority.js';
 
 function notifyHookRepoRoot(): string {
   const testDir = dirname(fileURLToPath(import.meta.url));
@@ -427,6 +428,7 @@ describe('notify-hook Ralph session resume', () => {
     try {
       const stateDir = join(wd, '.omx', 'state');
       const currentOmxSessionId = 'sess-current';
+      const stateAuthority = await installTeamTestAuthority(wd, currentOmxSessionId);
       const currentSessionDir = join(stateDir, 'sessions', currentOmxSessionId);
       await writeJson(join(stateDir, 'session.json'), { session_id: currentOmxSessionId });
       await writeJson(join(currentSessionDir, 'ralph-state.json'), {
@@ -439,10 +441,10 @@ describe('notify-hook Ralph session resume', () => {
         owner_codex_session_id: 'codex-session-1',
       });
 
+      hardenTestAuthorityTreeSync(wd);
       const result = await reconcileRalphSessionResume({
-        stateDir,
+        stateAuthority,
         authorization: authorizedRalphScope(currentOmxSessionId, 'codex-session-1'),
-        payloadSessionId: 'codex-session-1',
         payloadThreadId: 'thread-stale-current',
         env: { OMX_RALPH_ACTIVE_STATE_STALE_MS: '1000' },
       });
@@ -468,6 +470,7 @@ describe('notify-hook Ralph session resume', () => {
     try {
       const stateDir = join(wd, '.omx', 'state');
       const currentOmxSessionId = 'sess-current';
+      const stateAuthority = await installTeamTestAuthority(wd, currentOmxSessionId);
       const currentSessionDir = join(stateDir, 'sessions', currentOmxSessionId);
       const lastTurnAt = new Date().toISOString();
       await writeJson(join(stateDir, 'session.json'), { session_id: currentOmxSessionId });
@@ -482,10 +485,10 @@ describe('notify-hook Ralph session resume', () => {
         owner_codex_session_id: 'codex-session-1',
       });
 
+      hardenTestAuthorityTreeSync(wd);
       const result = await reconcileRalphSessionResume({
-        stateDir,
+        stateAuthority,
         authorization: authorizedRalphScope(currentOmxSessionId, 'codex-session-1'),
-        payloadSessionId: 'codex-session-1',
         payloadThreadId: 'thread-fresh-current',
         env: { OMX_RALPH_ACTIVE_STATE_STALE_MS: '60000' },
       });
@@ -510,6 +513,7 @@ describe('notify-hook Ralph session resume', () => {
     try {
       const stateDir = join(wd, '.omx', 'state');
       const currentOmxSessionId = 'sess-current';
+      const stateAuthority = await installTeamTestAuthority(wd, currentOmxSessionId);
       const priorOmxSessionId = 'sess-prior';
       const currentSessionDir = join(stateDir, 'sessions', currentOmxSessionId);
       const priorSessionDir = join(stateDir, 'sessions', priorOmxSessionId);
@@ -525,10 +529,10 @@ describe('notify-hook Ralph session resume', () => {
         owner_codex_session_id: 'codex-session-1',
       });
 
+      hardenTestAuthorityTreeSync(wd);
       const result = await reconcileRalphSessionResume({
-        stateDir,
+        stateAuthority,
         authorization: authorizedRalphScope(currentOmxSessionId, 'codex-session-1', [currentOmxSessionId, priorOmxSessionId]),
-        payloadSessionId: 'codex-session-1',
         payloadThreadId: 'thread-stale-prior',
         env: { OMX_RALPH_ACTIVE_STATE_STALE_MS: '1000' },
       });
@@ -554,6 +558,7 @@ describe('notify-hook Ralph session resume', () => {
     try {
       const stateDir = join(wd, '.omx', 'state');
       const currentOmxSessionId = 'sess-current';
+      const stateAuthority = await installTeamTestAuthority(wd, currentOmxSessionId);
       const priorOmxSessionId = 'sess-prior';
       const currentSessionDir = join(stateDir, 'sessions', currentOmxSessionId);
       const priorSessionDir = join(stateDir, 'sessions', priorOmxSessionId);
@@ -569,10 +574,10 @@ describe('notify-hook Ralph session resume', () => {
         owner_codex_session_id: 'codex-session-1',
       });
 
+      hardenTestAuthorityTreeSync(wd);
       const result = await reconcileRalphSessionResume({
-        stateDir,
+        stateAuthority,
         authorization: authorizedRalphScope(currentOmxSessionId, 'codex-session-1', [currentOmxSessionId, priorOmxSessionId]),
-        payloadSessionId: 'codex-session-1',
         payloadThreadId: 'thread-interrupted',
         env: { OMX_RALPH_ACTIVE_STATE_STALE_MS: '1000' },
       });
@@ -894,6 +899,7 @@ describe('notify-hook Ralph session resume', () => {
     try {
       const stateDir = join(wd, '.omx', 'state');
       const currentOmxSessionId = 'sess-current';
+      const stateAuthority = await installTeamTestAuthority(wd, currentOmxSessionId);
       const priorOmxSessionId = 'sess-prior';
       const currentSessionDir = join(stateDir, 'sessions', currentOmxSessionId);
       const priorSessionDir = join(stateDir, 'sessions', priorOmxSessionId);
@@ -909,6 +915,7 @@ describe('notify-hook Ralph session resume', () => {
         tmux_pane_id: '%42',
       });
 
+      hardenTestAuthorityTreeSync(wd);
       await withPatchedEnv(await setupTmuxFixture(wd, '%88'), async () => {
         let releaseFirstLock: () => void = () => {};
         const firstLocked = new Promise<void>((resolve) => {
@@ -921,9 +928,8 @@ describe('notify-hook Ralph session resume', () => {
         });
 
         const firstResume = reconcileRalphSessionResume({
-          stateDir,
+          stateAuthority,
           authorization: authorizedRalphScope(currentOmxSessionId, 'codex-session-1', [currentOmxSessionId, priorOmxSessionId]),
-          payloadSessionId: 'codex-session-1',
           payloadThreadId: 'thread-concurrent-1',
           env: { ...process.env, TMUX_PANE: '%55' },
           hooks: {
@@ -939,9 +945,8 @@ describe('notify-hook Ralph session resume', () => {
         assert.equal(firstInsideLock, true);
 
         const secondResume = reconcileRalphSessionResume({
-          stateDir,
+          stateAuthority,
           authorization: authorizedRalphScope(currentOmxSessionId, 'codex-session-1', [currentOmxSessionId, priorOmxSessionId]),
-          payloadSessionId: 'codex-session-1',
           payloadThreadId: 'thread-concurrent-1',
           env: { ...process.env, TMUX_PANE: '%56' },
         });
@@ -974,6 +979,7 @@ describe('notify-hook Ralph session resume', () => {
     try {
       const stateDir = join(wd, '.omx', 'state');
       const currentOmxSessionId = 'sess-current';
+      const stateAuthority = await installTeamTestAuthority(wd, currentOmxSessionId);
       const priorOmxSessionId = 'sess-prior';
       const currentSessionDir = join(stateDir, 'sessions', currentOmxSessionId);
       const priorSessionDir = join(stateDir, 'sessions', priorOmxSessionId);
@@ -989,11 +995,11 @@ describe('notify-hook Ralph session resume', () => {
         tmux_pane_id: '%42',
       });
 
+      hardenTestAuthorityTreeSync(wd);
       await assert.rejects(
         () => reconcileRalphSessionResume({
-          stateDir,
+          stateAuthority,
           authorization: authorizedRalphScope(currentOmxSessionId, 'codex-session-1', [currentOmxSessionId, priorOmxSessionId]),
-          payloadSessionId: 'codex-session-1',
           payloadThreadId: 'thread-rollback-1',
           env: { ...process.env, TMUX_PANE: '%57' },
           hooks: {
@@ -1005,11 +1011,75 @@ describe('notify-hook Ralph session resume', () => {
         /simulated_source_write_failure/,
       );
 
-      assert.equal(existsSync(join(currentSessionDir, 'ralph-state.json')), false);
+      const recoveredTarget = JSON.parse(await readFile(join(currentSessionDir, 'ralph-state.json'), 'utf-8')) as Record<string, unknown>;
+      assert.equal(recoveredTarget.active, false);
+      assert.equal(recoveredTarget.stop_reason, 'ownership_transfer_rolled_back');
       const priorState = JSON.parse(await readFile(join(priorSessionDir, 'ralph-state.json'), 'utf-8')) as Record<string, unknown>;
       assert.equal(priorState.active, true);
       assert.equal(priorState.current_phase, 'executing');
       assert.equal(priorState.stop_reason, undefined);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+  it('completes a prepared transfer after restart without reviving the prior owner', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-notify-ralph-transfer-recovery-'));
+    try {
+      const stateDir = join(wd, '.omx', 'state');
+      const currentOmxSessionId = 'sess-current';
+      const stateAuthority = await installTeamTestAuthority(wd, currentOmxSessionId);
+      const priorOmxSessionId = 'sess-prior';
+      const sourcePath = join(stateDir, 'sessions', priorOmxSessionId, 'ralph-state.json');
+      const targetPath = join(stateDir, 'sessions', currentOmxSessionId, 'ralph-state.json');
+      const sourceState = { active: true, current_phase: 'executing', owner_omx_session_id: priorOmxSessionId, owner_codex_session_id: 'codex-session-1' };
+      const transferId = 'transfer-recovery-1';
+      const previousState = { ...sourceState, active: false, current_phase: 'cancelled', ownership_transfer_id: transferId };
+      const nextState = { ...sourceState, owner_omx_session_id: currentOmxSessionId, ownership_transfer_id: transferId };
+      await writeJson(sourcePath, previousState);
+      await writeJson(join(stateDir, 'ralph-session-resume-transfer.json'), {
+        schema_version: 1,
+        status: 'prepared',
+        transfer_id: transferId,
+        source_path: sourcePath,
+        target_path: targetPath,
+        source_state: sourceState,
+        previous_state: previousState,
+        next_state: nextState,
+      });
+
+      hardenTestAuthorityTreeSync(wd);
+      const result = await reconcileRalphSessionResume({
+        stateAuthority,
+        authorization: authorizedRalphScope(currentOmxSessionId, 'codex-session-1', [currentOmxSessionId, priorOmxSessionId]),
+      });
+      assert.equal(result.reason, 'current_ralph_active');
+      const source = JSON.parse(await readFile(sourcePath, 'utf-8')) as Record<string, unknown>;
+      const target = JSON.parse(await readFile(targetPath, 'utf-8')) as Record<string, unknown>;
+      assert.equal(source.active, false);
+      assert.equal(target.active, true);
+      assert.equal(target.owner_omx_session_id, currentOmxSessionId);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+  it('fails closed when the committed Ralph authority root is replaced', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-notify-ralph-replaced-root-'));
+    try {
+      const currentOmxSessionId = 'sess-current';
+      const stateAuthority = await installTeamTestAuthority(wd, currentOmxSessionId);
+      const replacementRoot = join(wd, '.omx', 'state-replaced');
+      await rename(stateAuthority.canonical_state_root, replacementRoot);
+      await mkdir(stateAuthority.canonical_state_root, { recursive: true, mode: 0o700 });
+      hardenTestAuthorityTreeSync(wd);
+
+      await assert.rejects(
+        () => reconcileRalphSessionResume({
+          stateAuthority,
+          authorization: authorizedRalphScope(currentOmxSessionId, 'codex-session-1'),
+        }),
+        (error: unknown) => error instanceof StateAuthorityError
+          && error.code === 'authority_root_fingerprint_mismatch',
+      );
     } finally {
       await rm(wd, { recursive: true, force: true });
     }

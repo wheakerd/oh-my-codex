@@ -5768,6 +5768,16 @@ describe('dismissTrustPromptIfPresent capture shape', () => {
 set -eu
 printf '%s\n' "$*" >> "${logPath}"
 case "$1" in
+  list-panes)
+    if [ "\${2:-}" = "-a" ]; then
+      printf '%%1\t0\t42424\tomx-team-x\n'
+    fi
+    exit 0
+    ;;
+  show-option)
+    echo 'team:omx-team-x'
+    exit 0
+    ;;
   capture-pane)
     cat <<'EOF'
 Do you trust the contents of this directory?
@@ -5784,10 +5794,20 @@ EOF
 esac
 `,
         async ({ logPath }) => {
-          assert.equal(dismissTrustPromptIfPresent('omx-team-x', 1), true);
+          assert.equal(
+            dismissTrustPromptIfPresent(
+              'omx-team-x',
+              1,
+              '%1',
+              42424,
+              'team:omx-team-x',
+              'omx-team-x',
+            ),
+            true,
+          );
           const log = await readFile(logPath, 'utf-8');
-          assert.match(log, /capture-pane -t omx-team-x:1 -p/);
-          assert.doesNotMatch(log, /capture-pane -t omx-team-x:1 -p -S/);
+          assert.match(log, /capture-pane -t %1 -p/);
+          assert.doesNotMatch(log, /capture-pane -t %1 -p -S/);
         },
       );
     } finally {
@@ -6246,16 +6266,32 @@ describe('killWorker leader pane guard', () => {
 });
 
 describe('teardownWorkerPanes shared primitive', () => {
-  it('excludes leader and hud panes in shared pane-kill primitive', async () => {
+  const binding = {
+    paneId: '%3',
+    panePid: 42424,
+    teamOwnerId: 'team-owner',
+    sessionName: 'omx-team-x',
+  };
+
+  it('kills only a pane whose fresh proof and owner tag match its immutable binding', async () => {
     await withMockTmuxFixture(
       'omx-tmux-teardown-',
       (logPath) => `#!/bin/sh
 set -eu
 printf '%s\\n' "$*" >> "${logPath}"
-exit 0
+case "$1" in
+  list-panes)
+    if [ "\${2:-}" = "-a" ]; then printf '%%3\\t0\\t42424\\tomx-team-x\\n'; fi
+    ;;
+  show-option) printf 'team-owner\\n' ;;
+esac
 `,
       async ({ logPath }) => {
-        const summary = await teardownWorkerPanes(['%1', '%2', '%3'], {
+        const summary = await teardownWorkerPanes([
+          { ...binding, paneId: '%1' },
+          { ...binding, paneId: '%2' },
+          binding,
+        ], {
           leaderPaneId: '%1',
           hudPaneId: '%2',
           graceMs: 1,
@@ -6265,7 +6301,10 @@ exit 0
         assert.equal(summary.excluded.hud, 1);
         assert.equal(summary.kill.attempted, 1);
         assert.equal(summary.kill.succeeded, 1);
+        assert.deepEqual(summary.failures, []);
         const log = await readFile(logPath, 'utf-8');
+        assert.match(log, /list-panes -a -F #\{pane_id\}/);
+        assert.match(log, /show-option -qv -p -t %3 @omx_team_pane_owner_id/);
         assert.match(log, /kill-pane -t %3/);
         assert.doesNotMatch(log, /kill-pane -t %1/);
         assert.doesNotMatch(log, /kill-pane -t %2/);
@@ -6273,35 +6312,41 @@ exit 0
     );
   });
 
-  it('uses pane-id-direct kill semantics without liveness-gated helper calls', async () => {
-    const source = await readFile(new URL('../tmux-session.js', import.meta.url), 'utf-8');
-    const primitiveBlock = source.split('export async function teardownWorkerPanes')[1] ?? '';
-    assert.equal(primitiveBlock.includes('isWorkerAlive'), false);
-    assert.equal(primitiveBlock.includes('killWorker('), false);
-  });
-
-  it('continues best-effort when a pane target is missing', async () => {
-    await withMockTmuxFixture(
-      'omx-tmux-teardown-missing-',
-      (logPath) => `#!/bin/sh
+  for (const drift of [
+    { name: 'PID', proof: '%3\\t0\\t99999\\tomx-team-x', owner: 'team-owner', reason: 'pane_pid_mismatch' },
+    { name: 'owner', proof: '%3\\t0\\t42424\\tomx-team-x', owner: 'other-owner', reason: 'owner_id_mismatch' },
+    { name: 'session', proof: '%3\\t0\\t42424\\tomx-team-recycled', owner: 'team-owner', reason: 'session_name_mismatch' },
+  ]) {
+    it(`preserves a pane when its ${drift.name} drifts after binding`, async () => {
+      await withMockTmuxFixture(
+        `omx-tmux-teardown-${drift.name}-`,
+        (logPath) => `#!/bin/sh
 set -eu
 printf '%s\\n' "$*" >> "${logPath}"
-if [ "$1" = "kill-pane" ] && [ "\${3:-}" = "%404" ]; then
-  echo "missing pane" >&2
-  exit 1
-fi
-exit 0
+case "$1" in
+  list-panes)
+    if [ "\${2:-}" = "-a" ]; then printf '${drift.proof}\\n'; fi
+    ;;
+  show-option) printf '${drift.owner}\\n' ;;
+esac
 `,
-      async ({ logPath }) => {
-        const summary = await teardownWorkerPanes(['%404', '%405'], { graceMs: 1 });
-        assert.equal(summary.kill.attempted, 2);
-        assert.equal(summary.kill.succeeded, 1);
-        assert.equal(summary.kill.failed, 1);
-        const log = await readFile(logPath, 'utf-8');
-        assert.match(log, /kill-pane -t %404/);
-        assert.match(log, /kill-pane -t %405/);
-      },
-    );
+        async ({ logPath }) => {
+          const summary = await teardownWorkerPanes([binding], { graceMs: 1 });
+          assert.equal(summary.kill.succeeded, 0);
+          assert.equal(summary.kill.failed, 1);
+          assert.deepEqual(summary.failures, [{ paneId: '%3', reason: drift.reason }]);
+          const log = await readFile(logPath, 'utf-8');
+          assert.doesNotMatch(log, /kill-pane -t %3/);
+        },
+      );
+    });
+  }
+
+  it('fails closed for a pane-id-only teardown request', async () => {
+    const summary = await teardownWorkerPanes(['%404'], { graceMs: 1 });
+    assert.equal(summary.kill.succeeded, 0);
+    assert.equal(summary.kill.failed, 1);
+    assert.deepEqual(summary.failures, [{ paneId: '%404', reason: 'missing_immutable_binding' }]);
   });
 });
 

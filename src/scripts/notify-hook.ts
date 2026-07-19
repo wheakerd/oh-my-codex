@@ -74,6 +74,7 @@ import { logNotifyHookEvent } from './notify-hook/log.js';
 import { reconcileRalphSessionResume } from './notify-hook/ralph-session-resume.js';
 import { sendPaneInput } from './notify-hook/team-tmux-guard.js';
 import { readExactPaneProof } from '../team/exact-pane.js';
+import { runProcess } from './notify-hook/process-runner.js';
 import {
   buildOperationalContext,
   deriveAssistantSignalEvents,
@@ -585,6 +586,54 @@ async function resolveNotifyWorkerMutationAuthority(
   }
   return { authority, stateRoot: resolution.stateRoot };
 }
+
+interface CodeSimplifierPaneBinding {
+  paneId: string;
+  panePid: number;
+  paneSessionName: string;
+  paneOwnerId: string;
+}
+
+async function resolveCodeSimplifierPaneBinding(
+  stateDir: string,
+  cwd: string,
+  payload: Record<string, unknown>,
+  context: ResolvedPromptTurnContext,
+): Promise<CodeSimplifierPaneBinding | null> {
+  const paneId = await resolveNudgePaneTarget(stateDir, cwd, payload, context);
+  if (!paneId) return null;
+
+  const initialProof = await readExactPaneProof(paneId);
+  if (initialProof.status !== 'live' || initialProof.paneId !== paneId) return null;
+
+  let paneOwnerId = '';
+  try {
+    const ownerResult = await runProcess(
+      'tmux',
+      ['show-option', '-qv', '-p', '-t', paneId, '@omx_team_pane_owner_id'],
+      3000,
+    );
+    paneOwnerId = safeString(ownerResult.stdout).trim();
+  } catch {
+    return null;
+  }
+  if (!paneOwnerId) return null;
+
+  const confirmedProof = await readExactPaneProof(paneId);
+  if (
+    confirmedProof.status !== 'live'
+    || confirmedProof.paneId !== initialProof.paneId
+    || confirmedProof.pid !== initialProof.pid
+    || confirmedProof.sessionName !== initialProof.sessionName
+  ) return null;
+
+  return {
+    paneId: initialProof.paneId,
+    panePid: initialProof.pid,
+    paneSessionName: initialProof.sessionName,
+    paneOwnerId,
+  };
+}
 async function main() {
   const rawPayload = process.argv[process.argv.length - 1];
   if (!rawPayload || rawPayload.startsWith('-')) {
@@ -642,6 +691,7 @@ async function main() {
     ? leaderWriteDecision.context.authorization
     : null;
   const canWriteLeaderScopedState = Boolean(leaderWriteDecision?.scope && leaderAuthorization);
+  let leaderMutationAuthority: ResolvedStateAuthorityContext | null = null;
   if (!isTeamWorker && canWriteLeaderScopedState) {
     try {
       const authority = await resolveStateAuthorityForMutation({
@@ -660,6 +710,7 @@ async function main() {
         join(authority.canonical_state_root, 'sessions', leaderAuthorization!.targetSessionId),
         { expected_root_identity: authority.generation.root_identity },
       );
+      leaderMutationAuthority = authority;
     } catch {
       return;
     }
@@ -822,7 +873,7 @@ async function main() {
   if (!isTeamWorker && canWriteLeaderScopedState) {
     try {
       const resumeResult = await reconcileRalphSessionResume({
-        stateDir,
+        stateAuthority: leaderMutationAuthority!,
         authorization: leaderAuthorization!,
         env: {
           ...process.env,
@@ -1326,17 +1377,20 @@ async function main() {
             reason: 'unmanaged_session',
           });
         } else {
-          const csPaneId = await resolveNudgePaneTarget(stateDir, cwd, payload, leaderWriteDecision!.context);
-          if (csPaneId) {
-            const csPaneProof = await readExactPaneProof(csPaneId);
-            if (csPaneProof.status !== 'live' || csPaneProof.paneId !== csPaneId) {
-              throw new Error('exact_pane_unavailable');
-            }
+          const csPaneBinding = await resolveCodeSimplifierPaneBinding(
+            stateDir,
+            cwd,
+            payload,
+            leaderWriteDecision!.context,
+          );
+          if (csPaneBinding) {
             const csText = `${csResult.message} ${DEFAULT_MARKER}`;
             const sendResult = await sendPaneInput({
-              paneTarget: csPaneId,
-              exactPaneId: csPaneId,
-              expectedPanePid: csPaneProof.pid,
+              paneTarget: csPaneBinding.paneId,
+              exactPaneId: csPaneBinding.paneId,
+              expectedPanePid: csPaneBinding.panePid,
+              expectedPaneSessionName: csPaneBinding.paneSessionName,
+              expectedPaneOwnerId: csPaneBinding.paneOwnerId,
               prompt: csText,
               submitKeyPresses: 2,
               submitDelayMs: 100,
@@ -1349,7 +1403,7 @@ async function main() {
             await logTmuxHookEvent(logsDir, {
               timestamp: new Date().toISOString(),
               type: 'code_simplifier_triggered',
-              pane_id: csPaneId,
+              pane_id: csPaneBinding.paneId,
               file_count: csResult.message.split('\n').filter(l => l.trimStart().startsWith('- ')).length,
             });
           }

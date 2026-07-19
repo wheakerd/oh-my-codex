@@ -1,32 +1,85 @@
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, rename, rm } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, rename, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, it } from 'node:test';
-import { captureRootFilesystemIdentity } from '../../state/authority.js';
+import { captureRootFilesystemIdentity, initializeStateAuthority, type RootFilesystemIdentity } from '../../state/authority.js';
 import {
-  createQuestionRecord,
+  createQuestionRecord as createQuestionRecordWithStorage,
   getQuestionRecordPath,
   getQuestionRecordPathForStateDir,
-  markQuestionAnswered,
-  markQuestionPrompting,
-  markQuestionTerminalError,
+  markQuestionAnswered as markQuestionAnsweredWithStorage,
+  markQuestionPrompting as markQuestionPromptingWithStorage,
+  markQuestionTerminalError as markQuestionTerminalErrorWithStorage,
   QuestionSubmitError,
   readQuestionRecord,
-  submitQuestionAnswerById,
+  submitQuestionAnswerById as submitQuestionAnswerByIdWithStorage,
   waitForQuestionTerminalState,
 } from '../state.js';
-import { appendQuestionAnsweredEventOnce, appendQuestionEvent, readQuestionEvents } from '../events.js';
+import { appendQuestionAnsweredEventOnce as appendQuestionAnsweredEventOnceWithStorage, appendQuestionEvent as appendQuestionEventWithStorage, readQuestionEvents } from '../events.js';
 
 const tempDirs: string[] = [];
+const fixtureRootIdentities = new Map<string, RootFilesystemIdentity>();
+
+function questionStorage(cwd: string): { stateDir: string; expectedRootIdentity: RootFilesystemIdentity } {
+  const expectedRootIdentity = fixtureRootIdentities.get(cwd);
+  if (!expectedRootIdentity) throw new Error(`missing committed question fixture authority for ${cwd}`);
+  return { stateDir: join(cwd, '.omx', 'state'), expectedRootIdentity };
+}
+
+async function createQuestionRecord(
+  cwd: string,
+  ...[input, sessionId, now, options]: Parameters<typeof createQuestionRecordWithStorage> extends [string, ...infer Rest] ? Rest : never
+) {
+  return await createQuestionRecordWithStorage(cwd, input, sessionId, now, { ...questionStorage(cwd), ...options });
+}
+
+async function submitQuestionAnswerById(
+  cwd: string,
+  ...[questionId, answerPayload, options]: Parameters<typeof submitQuestionAnswerByIdWithStorage> extends [string, ...infer Rest] ? Rest : never
+) {
+  return await submitQuestionAnswerByIdWithStorage(cwd, questionId, answerPayload, { ...questionStorage(cwd), ...options });
+}
+
+async function appendQuestionEvent(
+  cwd: string,
+  ...[type, record, options]: Parameters<typeof appendQuestionEventWithStorage> extends [string, ...infer Rest] ? Rest : never
+) {
+  return await appendQuestionEventWithStorage(cwd, type, record, { ...questionStorage(cwd), ...options });
+}
+
+async function appendQuestionAnsweredEventOnce(
+  cwd: string,
+  ...[record, options]: Parameters<typeof appendQuestionAnsweredEventOnceWithStorage> extends [string, ...infer Rest] ? Rest : never
+) {
+  return await appendQuestionAnsweredEventOnceWithStorage(cwd, record, { ...questionStorage(cwd), ...options });
+}
+
+const markQuestionAnswered = markQuestionAnsweredWithStorage;
+const markQuestionPrompting = markQuestionPromptingWithStorage;
+const markQuestionTerminalError = markQuestionTerminalErrorWithStorage;
 
 async function makeRepo(): Promise<string> {
   const cwd = await mkdtemp(join(tmpdir(), 'omx-question-state-'));
+  const omxDir = join(cwd, '.omx');
+  const stateDir = join(omxDir, 'state');
   tempDirs.push(cwd);
+  await mkdir(stateDir, { recursive: true, mode: 0o700 });
+  await chmod(omxDir, 0o700);
+  await chmod(stateDir, 0o700);
+  const authority = await initializeStateAuthority({
+    startup_cwd: cwd,
+    observed_cwd: cwd,
+    launch_id: 'question-state',
+    session_binding: { canonical_session_id: 'sess-question-state' },
+  });
+  fixtureRootIdentities.set(cwd, authority.generation.root_identity);
   return cwd;
 }
 
+
 afterEach(async () => {
+  fixtureRootIdentities.clear();
   await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
 
@@ -83,7 +136,7 @@ describe('question state', () => {
 
   it('keeps explicit authoritative roots for created, answered, and error event mutations', async () => {
     const cwd = await makeRepo();
-    const stateDir = join(cwd, 'committed-state');
+    const stateDir = questionStorage(cwd).stateDir;
     const ambientStateDir = join(cwd, 'ambient-state');
     const { record, recordPath } = await createQuestionRecord(cwd, {
       question: 'Pick one',
@@ -126,7 +179,7 @@ describe('question state', () => {
 
   it('rejects event writes when the explicit authoritative root is replaced', async () => {
     const cwd = await makeRepo();
-    const stateDir = join(cwd, 'committed-state');
+    const stateDir = questionStorage(cwd).stateDir;
     const { record } = await createQuestionRecord(cwd, {
       question: 'Pick one',
       options: [{ label: 'A', value: 'a' }],
@@ -146,6 +199,51 @@ describe('question state', () => {
       /state root was replaced before mutation/,
     );
     assert.deepEqual(await readQuestionEvents(cwd, { stateDir }), []);
+  });
+
+  it('fails closed when the root is replaced between authority resolution and question creation', async () => {
+    const cwd = await makeRepo();
+    const stateDir = questionStorage(cwd).stateDir;
+    const rootIdentity = await captureRootFilesystemIdentity(stateDir);
+    await rename(stateDir, `${stateDir}.replaced`);
+    await mkdir(stateDir, { recursive: true });
+
+    await assert.rejects(
+      () => createQuestionRecord(cwd, {
+        question: 'Pick one',
+        options: [{ label: 'A', value: 'a' }],
+        allow_other: false,
+        other_label: 'Other',
+        multi_select: false,
+      }, 'sess-replaced-root', new Date('2026-07-17T00:00:00.000Z'), {
+        stateDir,
+        expectedRootIdentity: rootIdentity,
+      }),
+      /question state root was replaced before mutation/,
+    );
+  });
+
+  it('fails closed when the root is replaced before a renderer update', async () => {
+    const cwd = await makeRepo();
+    const stateDir = questionStorage(cwd).stateDir;
+    const { recordPath, rootIdentity } = await createQuestionRecord(cwd, {
+      question: 'Pick one',
+      options: [{ label: 'A', value: 'a' }],
+      allow_other: false,
+      other_label: 'Other',
+      multi_select: false,
+    }, 'sess-replaced-root', new Date('2026-07-17T00:00:00.000Z'), { stateDir });
+    await rename(stateDir, `${stateDir}.replaced`);
+    await mkdir(stateDir, { recursive: true });
+
+    await assert.rejects(
+      () => markQuestionPrompting(recordPath, {
+        renderer: 'tmux-pane',
+        target: '%42',
+        launched_at: '2026-07-17T00:00:00.000Z',
+      }, { stateDir, expectedRootIdentity: rootIdentity }),
+      /root.*(replaced|identity|fingerprint)/i,
+    );
   });
 
   it('closes the renderer pane after accepting an answer so stale question panes do not remain visible', async () => {

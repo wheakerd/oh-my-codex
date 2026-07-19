@@ -3182,6 +3182,19 @@ export async function killWorkerByPaneIdAsync(workerPaneId: string, leaderPaneId
   await runTmuxAsync(['kill-pane', '-t', workerPaneId]);
 }
 
+export interface PaneTeardownFailure {
+  paneId: string;
+  reason: string;
+}
+
+/** Immutable identity captured when a worker pane is created. */
+export interface PaneTeardownBinding {
+  readonly paneId: string;
+  readonly panePid: number;
+  readonly teamOwnerId: string;
+  readonly sessionName: string;
+}
+
 export interface PaneTeardownSummary {
   attemptedPaneIds: string[];
   excluded: {
@@ -3194,6 +3207,7 @@ export interface PaneTeardownSummary {
     succeeded: number;
     failed: number;
   };
+  failures: PaneTeardownFailure[];
 }
 
 export interface PaneTeardownOptions {
@@ -3218,35 +3232,50 @@ function normalizePaneTarget(value: string | null | undefined): string | null {
 }
 
 function normalizePaneTargets(
-  paneIds: string[],
+  bindings: readonly (PaneTeardownBinding | string)[],
   options: PaneTeardownOptions = {},
-): { killablePaneIds: string[]; excluded: PaneTeardownSummary['excluded'] } {
+): {
+  killableBindings: PaneTeardownBinding[];
+  excluded: PaneTeardownSummary['excluded'];
+  failures: PaneTeardownFailure[];
+} {
   const leaderPaneId = normalizePaneTarget(options.leaderPaneId);
   const hudPaneId = normalizePaneTarget(options.hudPaneId);
   const excluded = { leader: 0, hud: 0, invalid: 0 };
+  const failures: PaneTeardownFailure[] = [];
   const deduped = new Set<string>();
-  const killablePaneIds: string[] = [];
+  const killableBindings: PaneTeardownBinding[] = [];
 
-  for (const paneId of paneIds) {
-    const normalized = normalizePaneTarget(paneId);
-    if (!normalized) {
+  for (const binding of bindings) {
+    if (typeof binding === 'string') {
       excluded.invalid += 1;
+      failures.push({ paneId: binding, reason: 'missing_immutable_binding' });
       continue;
     }
-    if (leaderPaneId && normalized === leaderPaneId) {
+    const paneId = normalizePaneTarget(binding.paneId);
+    if (!paneId
+      || !Number.isSafeInteger(binding.panePid)
+      || binding.panePid <= 0
+      || !binding.teamOwnerId.trim()
+      || !binding.sessionName.trim()) {
+      excluded.invalid += 1;
+      failures.push({ paneId: binding.paneId, reason: 'invalid_immutable_binding' });
+      continue;
+    }
+    if (leaderPaneId && paneId === leaderPaneId) {
       excluded.leader += 1;
       continue;
     }
-    if (hudPaneId && normalized === hudPaneId) {
+    if (hudPaneId && paneId === hudPaneId) {
       excluded.hud += 1;
       continue;
     }
-    if (deduped.has(normalized)) continue;
-    deduped.add(normalized);
-    killablePaneIds.push(normalized);
+    if (deduped.has(paneId)) continue;
+    deduped.add(paneId);
+    killableBindings.push({ ...binding, paneId });
   }
 
-  return { killablePaneIds, excluded };
+  return { killableBindings, excluded, failures };
 }
 
 export function resolveSharedSessionShutdownTopology(
@@ -3439,33 +3468,59 @@ function escapeRegExp(value: string): string {
 }
 
 /**
- * Shared pane-id-direct teardown primitive for worker pane cleanup.
- * Must remain liveness-agnostic: do not gate on isWorkerAlive/killWorker.
+ * Shared pane teardown primitive. A pane is destroyed only after a fresh global
+ * proof and owner tag both match the immutable launch-time binding.
  */
 export async function teardownWorkerPanes(
-  paneIds: string[],
+  bindings: readonly (PaneTeardownBinding | string)[],
   options: PaneTeardownOptions = {},
 ): Promise<PaneTeardownSummary> {
-  const { killablePaneIds, excluded } = normalizePaneTargets(paneIds, options);
+  const { killableBindings, excluded, failures } = normalizePaneTargets(bindings, options);
   const graceMs = options.graceMs ?? 2000;
-  const perPaneGrace = killablePaneIds.length > 0
-    ? Math.max(100, Math.floor(graceMs / killablePaneIds.length))
+  const perPaneGrace = killableBindings.length > 0
+    ? Math.max(100, Math.floor(graceMs / killableBindings.length))
     : 0;
 
   const summary: PaneTeardownSummary = {
-    attemptedPaneIds: killablePaneIds,
+    attemptedPaneIds: killableBindings.map((binding) => binding.paneId),
     excluded,
     kill: {
-      attempted: killablePaneIds.length,
+      attempted: killableBindings.length,
       succeeded: 0,
-      failed: 0,
+      failed: failures.length,
     },
+    failures,
   };
 
-  for (const paneId of killablePaneIds) {
-    const result = await runTmuxAsync(['kill-pane', '-t', paneId]);
+  for (const binding of killableBindings) {
+    const proof = readExactPaneProofSync(binding.paneId);
+    const owner = readPaneTeamOwnerTagResult(binding.paneId);
+    if (proof.status !== 'live'
+      || proof.pid !== binding.panePid
+      || proof.sessionName !== binding.sessionName
+      || owner.status !== 'value'
+      || owner.value !== binding.teamOwnerId) {
+      summary.kill.failed += 1;
+      summary.failures.push({
+        paneId: binding.paneId,
+        reason: proof.status !== 'live'
+          ? `exact_proof_${proof.status}`
+          : owner.status !== 'value'
+            ? `owner_tag_${owner.status}`
+            : proof.pid !== binding.panePid
+              ? 'pane_pid_mismatch'
+              : proof.sessionName !== binding.sessionName
+                ? 'session_name_mismatch'
+                : 'owner_id_mismatch',
+      });
+      continue;
+    }
+    const result = await runTmuxAsync(['kill-pane', '-t', binding.paneId]);
     if (result.ok) summary.kill.succeeded += 1;
-    else summary.kill.failed += 1;
+    else {
+      summary.kill.failed += 1;
+      summary.failures.push({ paneId: binding.paneId, reason: 'kill_pane_failed' });
+    }
     await sleep(perPaneGrace);
   }
 
@@ -3473,12 +3528,12 @@ export async function teardownWorkerPanes(
 }
 
 export async function killWorkerPanes(
-  paneIds: string[],
+  bindings: readonly (PaneTeardownBinding | string)[],
   leaderPaneId: string,
   graceMs: number = 2000,
   hudPaneId?: string,
 ): Promise<PaneTeardownSummary> {
-  return teardownWorkerPanes(paneIds, { leaderPaneId, hudPaneId: hudPaneId ?? null, graceMs });
+  return teardownWorkerPanes(bindings, { leaderPaneId, hudPaneId: hudPaneId ?? null, graceMs });
 }
 
 // Kill entire tmux session. Tolerates already-dead sessions.

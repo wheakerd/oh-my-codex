@@ -2961,7 +2961,7 @@ esac
 set -eu
 owner_file="${cwd}/startup-direct.owner"
 if [ "\${1:-}" = "list-panes" ] && [ "\${2:-}" = "-a" ]; then
-  printf '%%1\t0\t2000004242\tomx-team-${teamName}\n%%2\t0\t2000004242\tomx-team-${teamName}\n%%3\t0\t2000003333\tomx-team-${teamName}\n'
+  printf '%%1\t0\t2000004242\tleader:0\n%%2\t0\t2000004242\tleader:0\n%%3\t0\t2000003333\tleader:0\n'
   exit 0
 fi
 
@@ -3106,7 +3106,7 @@ esac
 set -eu
 owner_file="${cwd}/ready-prompt.owner"
 if [ "\${1:-}" = "list-panes" ] && [ "\${2:-}" = "-a" ]; then
-  printf '%%1\t0\t2000004242\tomx-team-team-ready-prompt-evidence\n%%2\t0\t2000004242\tomx-team-team-ready-prompt-evidence\n%%3\t0\t2000003333\tomx-team-team-ready-prompt-evidence\n'
+  printf '%%1\t0\t2000004242\tleader:0\n%%2\t0\t2000004242\tleader:0\n%%3\t0\t2000003333\tleader:0\n'
   exit 0
 fi
 
@@ -3269,7 +3269,7 @@ esac
 set -eu
 owner_file="${tmuxLogPath}.owner"
 if [ "\${1:-}" = "list-panes" ] && [ "\${2:-}" = "-a" ]; then
-  printf '%%1\t0\t2000004242\tomx-team-${teamName}\n%%2\t0\t2000004242\tomx-team-${teamName}\n%%3\t0\t2000003333\tomx-team-${teamName}\n'
+  printf '%%1\t0\t2000004242\tleader:0\n%%2\t0\t2000004242\tleader:0\n%%3\t0\t2000003333\tleader:0\n'
   exit 0
 fi
 
@@ -3404,7 +3404,7 @@ esac
 set -eu
 owner_file="${cwd}/parallel-ready.owner"
 if [ "\${1:-}" = "list-panes" ] && [ "\${2:-}" = "-a" ]; then
-  printf '%%1\t0\t2000004242\tomx-team-team-parallel-ready\n%%2\t0\t2000004242\tomx-team-team-parallel-ready\n%%3\t0\t2000004343\tomx-team-team-parallel-ready\n'
+  printf '%%1\t0\t2000004242\tleader:0\n%%2\t0\t2000004242\tleader:0\n%%3\t0\t2000004343\tleader:0\n'
   exit 0
 fi
 

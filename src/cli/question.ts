@@ -1,3 +1,5 @@
+import { resolveCommittedAuthorityRuntimeStateScope } from '../mcp/state-paths.js';
+import type { RootFilesystemIdentity } from '../state/authority.js';
 import { evaluateQuestionPolicy } from '../question/policy.js';
 import { appendQuestionAnsweredEventOnce, appendQuestionEvent } from '../question/events.js';
 import {
@@ -14,6 +16,7 @@ import {
   resolveAutopilotDeepInterviewQuestionWaiting,
 } from '../question/autopilot-wait.js';
 import {
+  bindQuestionRecordRootIdentity,
   createQuestionRecord,
   markQuestionTerminalError,
   markQuestionPrompting,
@@ -28,6 +31,21 @@ import { runQuestionUi } from '../question/ui.js';
 const DEFAULT_QUESTION_WAIT_TIMEOUT_MS = 30 * 60 * 1000;
 export interface QuestionCommandOptions {
   stateDir?: string;
+  expectedRootIdentity?: RootFilesystemIdentity;
+}
+
+async function resolveQuestionStorage(
+  cwd: string,
+  options: QuestionCommandOptions,
+): Promise<{ stateDir: string; expectedRootIdentity: RootFilesystemIdentity }> {
+  if (options.stateDir && options.expectedRootIdentity) {
+    return { stateDir: options.stateDir, expectedRootIdentity: options.expectedRootIdentity };
+  }
+  const scope = await resolveCommittedAuthorityRuntimeStateScope(cwd);
+  return {
+    stateDir: options.stateDir ?? scope.baseStateDir,
+    expectedRootIdentity: scope.authority.generation.root_identity,
+  };
 }
 
 
@@ -250,6 +268,8 @@ export async function questionCommand(args: string[], options: QuestionCommandOp
 
   if (parsed.ui) {
     if (!parsed.statePath) throw new Error('--ui requires --state-path');
+    const storage = await resolveQuestionStorage(process.cwd(), options);
+    bindQuestionRecordRootIdentity(parsed.statePath, storage.stateDir, storage.expectedRootIdentity);
     await runQuestionUi(parsed.statePath);
     return;
   }
@@ -263,11 +283,13 @@ export async function questionCommand(args: string[], options: QuestionCommandOp
       throw new Error(`--answer must be valid JSON: ${(error as Error).message}`);
     }
     try {
+    const storage = await resolveQuestionStorage(process.cwd(), options);
+
       const { record, recordPath } = await submitQuestionAnswerById(
         process.cwd(),
         parsed.answerQuestionId,
         answerPayload,
-        { sessionId: parsed.sessionId, ...(options.stateDir ? { stateDir: options.stateDir } : {}) },
+        { sessionId: parsed.sessionId, stateDir: storage.stateDir, expectedRootIdentity: storage.expectedRootIdentity },
       );
       printJson({
         ok: true,
@@ -303,6 +325,8 @@ export async function questionCommand(args: string[], options: QuestionCommandOp
   }
 
   const input = normalizeQuestionInput(rawInput);
+  const storage = await resolveQuestionStorage(process.cwd(), options);
+
   const cwd = process.cwd();
   const policy = await evaluateQuestionPolicy({
     cwd,
@@ -357,7 +381,8 @@ export async function questionCommand(args: string[], options: QuestionCommandOp
   const { record, recordPath } = await createQuestionRecord(cwd, input, policy.sessionId, new Date(), {
     emitEvent: true,
     timeoutMs: waitTimeoutMs,
-    ...(options.stateDir ? { stateDir: options.stateDir } : {}),
+    stateDir: storage.stateDir,
+    expectedRootIdentity: storage.expectedRootIdentity,
   });
 
   let finalRecord;
@@ -367,7 +392,7 @@ export async function questionCommand(args: string[], options: QuestionCommandOp
       recordPath,
       sessionId: policy.sessionId,
     });
-    await markQuestionPrompting(recordPath, renderer);
+    await markQuestionPrompting(recordPath, renderer, storage);
     if (renderer.renderer === 'inline-tty') {
       await runQuestionUi(
         recordPath,
@@ -380,6 +405,8 @@ export async function questionCommand(args: string[], options: QuestionCommandOp
       rendererDeathMessage: (currentRecord) => (
         `Question renderer ${currentRecord.renderer?.renderer ?? renderer.renderer} ${currentRecord.renderer?.target ?? renderer.target} exited before answering.`
       ),
+      expectedRootIdentity: storage.expectedRootIdentity,
+      stateDir: storage.stateDir,
     });
   } catch (error) {
     const message = extractErrorMessage(error);
@@ -388,11 +415,13 @@ export async function questionCommand(args: string[], options: QuestionCommandOp
       'error',
       'question_runtime_failed',
       message,
+      storage,
     );
     await appendQuestionEvent(cwd, 'question-error', errorRecord, {
       recordPath,
       timeoutMs: waitTimeoutMs,
-      ...(options.stateDir ? { stateDir: options.stateDir } : {}),
+      stateDir: storage.stateDir,
+      expectedRootIdentity: storage.expectedRootIdentity,
     });
     await finalizeDirectDeepInterviewObligation(
       cwd,
@@ -418,7 +447,8 @@ export async function questionCommand(args: string[], options: QuestionCommandOp
       await appendQuestionEvent(cwd, 'question-error', finalRecord, {
         recordPath,
         timeoutMs: waitTimeoutMs,
-        ...(options.stateDir ? { stateDir: options.stateDir } : {}),
+        stateDir: storage.stateDir,
+        expectedRootIdentity: storage.expectedRootIdentity,
       });
     }
     await finalizeDirectDeepInterviewObligation(
@@ -442,6 +472,8 @@ export async function questionCommand(args: string[], options: QuestionCommandOp
   await appendQuestionAnsweredEventOnce(cwd, finalRecord, {
     recordPath,
     timeoutMs: waitTimeoutMs,
+    stateDir: storage.stateDir,
+    expectedRootIdentity: storage.expectedRootIdentity,
   });
   await finalizeDirectDeepInterviewObligation(
     cwd,

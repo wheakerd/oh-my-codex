@@ -6,6 +6,7 @@ import {
   atomicWriteAuthorityFile,
   captureRootFilesystemIdentity,
   ensureAuthorityDirectory,
+  sameRootFilesystemIdentity,
   type RootFilesystemIdentity,
 } from '../state/authority.js';
 import { sleep } from '../utils/sleep.js';
@@ -29,6 +30,23 @@ const QUESTION_NAMESPACE = 'questions';
 const DEFAULT_POLL_INTERVAL_MS = 100;
 const QUESTION_SUBMIT_LOCK_STALE_MS = 30_000;
 const QUESTION_SUBMIT_LOCK_TIMEOUT_MS = 10_000;
+
+const questionRecordStorage = new Map<string, { stateDir: string; expectedRootIdentity: RootFilesystemIdentity }>();
+
+export function bindQuestionRecordRootIdentity(
+  recordPath: string,
+  stateDir: string,
+  expectedRootIdentity: RootFilesystemIdentity,
+): void {
+  questionRecordStorage.set(recordPath, { stateDir, expectedRootIdentity });
+}
+
+function questionRecordStorageOptions(
+  recordPath: string,
+  options: { stateDir?: string; expectedRootIdentity?: RootFilesystemIdentity },
+): { stateDir?: string; expectedRootIdentity?: RootFilesystemIdentity } {
+  return options.expectedRootIdentity ? options : { ...questionRecordStorage.get(recordPath), ...options };
+}
 
 export type InjectQuestionAnswersToPane = (
   paneId: string,
@@ -82,10 +100,15 @@ function questionStateRootForRecordPath(recordPath: string): string {
 async function prepareQuestionStateRoot(
   cwd: string,
   stateDir?: string,
+  expectedRootIdentity?: RootFilesystemIdentity,
 ): Promise<{ stateDir: string; rootIdentity: RootFilesystemIdentity }> {
   const root = stateDir ?? getBaseStateDir(cwd);
   await mkdir(root, { recursive: true, mode: 0o700 });
-  return { stateDir: root, rootIdentity: await captureRootFilesystemIdentity(root) };
+  const rootIdentity = await captureRootFilesystemIdentity(root);
+  if (expectedRootIdentity && !sameRootFilesystemIdentity(expectedRootIdentity, rootIdentity)) {
+    throw new Error('question state root was replaced before mutation');
+  }
+  return { stateDir: root, rootIdentity: expectedRootIdentity ?? rootIdentity };
 }
 
 export async function writeQuestionRecord(
@@ -113,8 +136,14 @@ export async function createQuestionRecord(
   input: QuestionInput,
   sessionId?: string,
   now = new Date(),
-  options: { emitEvent?: boolean; timeoutMs?: number; runId?: string; stateDir?: string } = {},
-): Promise<{ recordPath: string; record: QuestionRecord }> {
+  options: {
+    emitEvent?: boolean;
+    timeoutMs?: number;
+    runId?: string;
+    stateDir?: string;
+    expectedRootIdentity?: RootFilesystemIdentity;
+  } = {},
+): Promise<{ recordPath: string; record: QuestionRecord; rootIdentity: RootFilesystemIdentity }> {
   const normalizedInput = normalizeQuestionInput(input);
   const questionId = buildQuestionId(now);
   const nowIso = now.toISOString();
@@ -140,7 +169,8 @@ export async function createQuestionRecord(
   const recordPath = options.stateDir
     ? getQuestionRecordPathForStateDir(options.stateDir, questionId, sessionId)
     : getQuestionRecordPath(cwd, questionId, sessionId);
-  const storage = await prepareQuestionStateRoot(cwd, options.stateDir);
+  const storage = await prepareQuestionStateRoot(cwd, options.stateDir, options.expectedRootIdentity);
+  bindQuestionRecordRootIdentity(recordPath, storage.stateDir, storage.rootIdentity);
   await writeQuestionRecord(recordPath, record, {
     stateDir: storage.stateDir,
     expectedRootIdentity: storage.rootIdentity,
@@ -155,7 +185,7 @@ export async function createQuestionRecord(
       expectedRootIdentity: storage.rootIdentity,
     });
   }
-  return { recordPath, record };
+  return { recordPath, record, rootIdentity: storage.rootIdentity };
 }
 
 export async function updateQuestionRecord(
@@ -166,11 +196,12 @@ export async function updateQuestionRecord(
   const current = await readQuestionRecord(recordPath);
   if (!current) throw new Error(`Question record not found: ${recordPath}`);
   const updated = updater(current);
-  const stateDir = options.stateDir ?? questionStateRootForRecordPath(recordPath);
-  const storage = await prepareQuestionStateRoot(stateDir, stateDir);
+  const storageOptions = questionRecordStorageOptions(recordPath, options);
+  const stateDir = storageOptions.stateDir ?? questionStateRootForRecordPath(recordPath);
+  const storage = await prepareQuestionStateRoot(stateDir, stateDir, storageOptions.expectedRootIdentity);
   await writeQuestionRecord(recordPath, updated, {
     stateDir: storage.stateDir,
-    expectedRootIdentity: options.expectedRootIdentity ?? storage.rootIdentity,
+    expectedRootIdentity: storageOptions.expectedRootIdentity ?? storage.rootIdentity,
   });
   return updated;
 }
@@ -178,8 +209,13 @@ export async function updateQuestionRecord(
 export async function markQuestionPrompting(
   recordPath: string,
   renderer: QuestionRendererState,
-  options: { closeQuestionRenderer?: CloseQuestionRenderer } = {},
+  options: {
+    closeQuestionRenderer?: CloseQuestionRenderer;
+    stateDir?: string;
+    expectedRootIdentity?: RootFilesystemIdentity;
+  } = {},
 ): Promise<QuestionRecord> {
+  const storageOptions = questionRecordStorageOptions(recordPath, options);
   return await withQuestionSubmitLock(recordPath, async () => {
     let rendererToClose: QuestionRendererState | undefined;
     const updated = await updateQuestionRecord(recordPath, (record) => {
@@ -193,18 +229,28 @@ export async function markQuestionPrompting(
         updated_at: new Date().toISOString(),
         renderer,
       };
-    });
+    }, storageOptions);
     if (rendererToClose) maybeCloseQuestionRenderer(rendererToClose, options.closeQuestionRenderer);
     return updated;
-  });
+  }, storageOptions);
 }
 
 export async function markQuestionAnswered(
   recordPath: string,
   answerOrAnswers: QuestionAnswer | QuestionAnswerEntry[],
-  options: { injectAnswersToPane?: InjectQuestionAnswersToPane; closeQuestionRenderer?: CloseQuestionRenderer } = {},
+  options: {
+    injectAnswersToPane?: InjectQuestionAnswersToPane;
+    closeQuestionRenderer?: CloseQuestionRenderer;
+    stateDir?: string;
+    expectedRootIdentity?: RootFilesystemIdentity;
+  } = {},
 ): Promise<QuestionRecord> {
-  const updated = await withQuestionSubmitLock(recordPath, () => persistQuestionAnswered(recordPath, answerOrAnswers));
+  const storageOptions = questionRecordStorageOptions(recordPath, options);
+  const updated = await withQuestionSubmitLock(
+    recordPath,
+    () => persistQuestionAnswered(recordPath, answerOrAnswers, storageOptions),
+    storageOptions,
+  );
   runAnsweredQuestionSideEffects(updated, options);
   return updated;
 }
@@ -297,15 +343,22 @@ async function maybeRecoverStaleQuestionLock(lockDir: string): Promise<boolean> 
   return false;
 }
 
-async function withQuestionSubmitLock<T>(recordPath: string, fn: () => Promise<T>): Promise<T> {
+async function withQuestionSubmitLock<T>(
+  recordPath: string,
+  fn: () => Promise<T>,
+  options: { stateDir?: string; expectedRootIdentity?: RootFilesystemIdentity } = {},
+): Promise<T> {
   const lockDir = `${recordPath}.submit.lock`;
   const ownerPath = join(lockDir, 'owner');
   const ownerToken = lockOwnerToken();
   const deadline = Date.now() + QUESTION_SUBMIT_LOCK_TIMEOUT_MS;
-  await mkdir(dirname(lockDir), { recursive: true });
+  const stateDir = options.stateDir ?? questionStateRootForRecordPath(recordPath);
+  const rootIdentity = options.expectedRootIdentity;
+  await ensureAuthorityDirectory(stateDir, dirname(lockDir), rootIdentity ? { expected_root_identity: rootIdentity } : {});
   while (true) {
     try {
       await mkdir(lockDir);
+      await ensureAuthorityDirectory(stateDir, lockDir, rootIdentity ? { expected_root_identity: rootIdentity } : {});
       try {
         await writeFile(ownerPath, ownerToken, 'utf8');
       } catch (error) {
@@ -498,7 +551,14 @@ export async function submitQuestionAnswerById(
   cwd: string,
   questionId: string,
   answerPayload: unknown,
-  options: { sessionId?: string; runId?: string; stateDir?: string; injectAnswersToPane?: InjectQuestionAnswersToPane; closeQuestionRenderer?: CloseQuestionRenderer } = {},
+  options: {
+    sessionId?: string;
+    runId?: string;
+    stateDir?: string;
+    expectedRootIdentity?: RootFilesystemIdentity;
+    injectAnswersToPane?: InjectQuestionAnswersToPane;
+    closeQuestionRenderer?: CloseQuestionRenderer;
+  } = {},
 ): Promise<{ recordPath: string; record: QuestionRecord }> {
   const normalizedQuestionId = questionId.trim();
   if (!isValidQuestionId(normalizedQuestionId)) {
@@ -508,7 +568,7 @@ export async function submitQuestionAnswerById(
   const recordPath = options.stateDir
     ? getQuestionRecordPathForStateDir(options.stateDir, normalizedQuestionId, options.sessionId)
     : getQuestionRecordPath(cwd, normalizedQuestionId, options.sessionId);
-  const storage = await prepareQuestionStateRoot(cwd, options.stateDir);
+  const storage = await prepareQuestionStateRoot(cwd, options.stateDir, options.expectedRootIdentity);
   const result = await withQuestionSubmitLock(recordPath, async () => {
     const current = await readQuestionRecord(recordPath);
     if (!current) throw new QuestionSubmitError('question_unknown', `Unknown question id: ${normalizedQuestionId}`);
@@ -537,7 +597,7 @@ export async function submitQuestionAnswerById(
       expectedRootIdentity: storage.rootIdentity,
     });
     return { recordPath, record };
-  });
+  }, { stateDir: storage.stateDir, expectedRootIdentity: storage.rootIdentity });
   runAnsweredQuestionSideEffects(result.record, options);
   return result;
 }
@@ -547,8 +607,10 @@ export async function markQuestionTerminalError(
   status: Extract<QuestionStatus, 'aborted' | 'error'>,
   code: string,
   message: string,
+  options: { stateDir?: string; expectedRootIdentity?: RootFilesystemIdentity } = {},
 ): Promise<QuestionRecord> {
-  return updateQuestionRecord(recordPath, (record) => ({
+  const storageOptions = questionRecordStorageOptions(recordPath, options);
+  return await withQuestionSubmitLock(recordPath, () => updateQuestionRecord(recordPath, (record) => ({
     ...record,
     status,
     updated_at: new Date().toISOString(),
@@ -557,7 +619,7 @@ export async function markQuestionTerminalError(
       message,
       at: new Date().toISOString(),
     },
-  }));
+  }), storageOptions), storageOptions);
 }
 
 export function isTerminalQuestionStatus(status: QuestionStatus): boolean {
@@ -571,13 +633,20 @@ export async function waitForQuestionTerminalState(
     timeoutMs?: number;
     rendererAlive?: (record: QuestionRecord) => boolean;
     rendererDeathMessage?: (record: QuestionRecord) => string;
+    stateDir?: string;
+    expectedRootIdentity?: RootFilesystemIdentity;
   } = {},
 ): Promise<QuestionRecord> {
   const pollIntervalMs = Math.max(10, options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS);
   const timeoutMs = options.timeoutMs;
   const startedAt = Date.now();
 
+  const storageOptions = questionRecordStorageOptions(recordPath, options);
+  const stateDir = storageOptions.stateDir ?? questionStateRootForRecordPath(recordPath);
   while (true) {
+    if (storageOptions.expectedRootIdentity) {
+      await prepareQuestionStateRoot(stateDir, stateDir, storageOptions.expectedRootIdentity);
+    }
     const record = await readQuestionRecord(recordPath);
     if (!record) throw new Error(`Question record not found while waiting: ${recordPath}`);
     if (isTerminalQuestionStatus(record.status)) return record;

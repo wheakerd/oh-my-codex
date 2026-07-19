@@ -610,6 +610,65 @@ interface CachedStateAuthorityTransportCapability {
 // authority, binding, journal, and evidence record.
 const stateAuthorityTransportCapabilityCache = new Map<string, CachedStateAuthorityTransportCapability>();
 
+/**
+ * Rollover changes the authority root, so it requires a launcher-local grant
+ * in addition to the child transport bearer. Grants are module-private object
+ * identities: they are neither serializable nor reconstructible by a child
+ * which deep-imports this module.
+ */
+const stateAuthorityRolloverGrants = new Map<string, symbol>();
+const stateAuthorityRolloverContextGrants = new WeakMap<ResolvedStateAuthorityContext, symbol>();
+
+function stateAuthorityRolloverGrantKey(context: Pick<ResolvedStateAuthorityContext, 'workspace_identity' | 'generation' | 'session_binding'>): string {
+  return `${context.workspace_identity.digest}:${context.generation.generation_id}:${context.session_binding?.binding_id ?? ''}:${context.session_binding?.binding_revision ?? -1}`;
+}
+
+function mintInitializedStateAuthorityRolloverGrant(context: ResolvedStateAuthorityContext): ResolvedStateAuthorityContext {
+  const grant = Symbol('state-authority-rollover-grant');
+  stateAuthorityRolloverGrants.set(stateAuthorityRolloverGrantKey(context), grant);
+  stateAuthorityRolloverContextGrants.set(context, grant);
+  return context;
+}
+
+function attachInitializedStateAuthorityRolloverGrant(context: ResolvedStateAuthorityContext): ResolvedStateAuthorityContext {
+  const grantKey = stateAuthorityRolloverGrantKey(context);
+  const matchingGrant = stateAuthorityRolloverGrants.get(grantKey)
+    ?? [...stateAuthorityRolloverGrants.entries()].find(([key]) => (
+      key.startsWith(`${context.workspace_identity.digest}:${context.generation.generation_id}:${context.session_binding?.binding_id ?? ''}:`)
+    ))?.[1];
+  if (matchingGrant) {
+    for (const [key, grant] of stateAuthorityRolloverGrants.entries()) {
+      if (grant === matchingGrant && key !== grantKey) stateAuthorityRolloverGrants.delete(key);
+    }
+    stateAuthorityRolloverGrants.set(grantKey, matchingGrant);
+    stateAuthorityRolloverContextGrants.set(context, matchingGrant);
+  }
+  return context;
+}
+
+function assertProcessLocalStateAuthorityRolloverGrant(context: ResolvedStateAuthorityContext): void {
+  const grant = stateAuthorityRolloverContextGrants.get(context);
+  if (!grant || stateAuthorityRolloverGrants.get(stateAuthorityRolloverGrantKey(context)) !== grant) {
+    authorityError(
+      AUTHORITY_DIAGNOSTIC_CODES.intentIssuerMismatch,
+      'alternate-root rollover requires the process-local launcher authorization from the authority initialization process',
+    );
+  }
+}
+
+/** Fails before launcher-side effects when this process did not initialize the authority. */
+export function assertStateAuthorityRolloverAuthorization(context: ResolvedStateAuthorityContext): void {
+  assertProcessLocalStateAuthorityRolloverGrant(context);
+}
+
+function consumeStateAuthorityRolloverGrant(context: ResolvedStateAuthorityContext): void {
+  const grantKey = stateAuthorityRolloverGrantKey(context);
+  const grant = stateAuthorityRolloverContextGrants.get(context);
+  if (grant && stateAuthorityRolloverGrants.get(grantKey) === grant) {
+    stateAuthorityRolloverGrants.delete(grantKey);
+  }
+}
+
 function transportCapabilityCacheKey(
   workspaceDigest: string,
   generationId: string,
@@ -5699,7 +5758,7 @@ export async function initializeStateAuthority(
 							lock,
 						);
 					}
-					return {
+					return attachInitializedStateAuthorityRolloverGrant({
 						observed_cwd: canonicalizeExistingAuthorityPath(
 							input.observed_cwd ?? input.startup_cwd,
 							"observed cwd",
@@ -5710,7 +5769,7 @@ export async function initializeStateAuthority(
 						anchor_path: paths.anchor_path,
 						generation: active.generation,
 						session_binding: binding,
-					};
+					});
 				}
 				if (!(await mayTerminalizeRecordedGeneration(active.generation))) {
 					authorityError(
@@ -6061,7 +6120,7 @@ export async function initializeStateAuthority(
     } finally {
       await releaseWorkspaceAuthorityLock(finalizeLock);
     }
-    return {
+    return mintInitializedStateAuthorityRolloverGrant({
       observed_cwd: canonicalizeExistingAuthorityPath(input.observed_cwd ?? input.startup_cwd, 'observed cwd'),
       workspace_identity: workspace,
       canonical_state_root: targetGeneration.canonical_state_root,
@@ -6069,7 +6128,7 @@ export async function initializeStateAuthority(
       anchor_path: paths.anchor_path,
       generation: targetGeneration,
       session_binding: targetBinding,
-    };
+    });
   }
   authorityError(AUTHORITY_DIAGNOSTIC_CODES.lockHeld, 'timed out establishing a fenced ordinary state authority generation');
 }
@@ -7291,6 +7350,7 @@ export async function rolloverStateAuthorityToAlternateRoot(
   input: RolloverStateAuthorityToAlternateRootInput,
 ): Promise<ResolvedStateAuthorityContext> {
   await validateStateAuthorityTransportCapability(input.context, input.transport_capability);
+  assertProcessLocalStateAuthorityRolloverGrant(input.context);
   assertIssuer(input.issuer);
   safeIdentifier(input.launch_id, 'launch ID');
   const now = input.now ?? new Date();
@@ -7738,7 +7798,7 @@ export async function rolloverStateAuthorityToAlternateRoot(
     await releaseWorkspaceAuthorityLock(finalizeLock.lock);
   }
 
-  return {
+  const rolledContext = mintInitializedStateAuthorityRolloverGrant({
     observed_cwd: input.context.observed_cwd,
     workspace_identity: workspace,
     canonical_state_root: targetGeneration.canonical_state_root,
@@ -7746,5 +7806,7 @@ export async function rolloverStateAuthorityToAlternateRoot(
     anchor_path: stateAuthorityPaths(workspace).anchor_path,
     generation: targetGeneration,
     session_binding: targetBinding,
-  };
+  });
+  consumeStateAuthorityRolloverGrant(input.context);
+  return rolledContext;
 }

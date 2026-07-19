@@ -65,6 +65,7 @@ function runSendPaneInputInChild(params: {
   exactPaneId?: string;
   expectedPanePid?: number;
   expectedPaneOwnerId?: string;
+  expectedPaneSessionName?: string;
 }) {
   const payload = JSON.stringify({
     paneTarget: params.paneTarget,
@@ -76,6 +77,7 @@ function runSendPaneInputInChild(params: {
     exactPaneId: params.exactPaneId,
     expectedPanePid: params.expectedPanePid,
     expectedPaneOwnerId: params.expectedPaneOwnerId,
+    expectedPaneSessionName: params.expectedPaneSessionName,
   });
   const script = `
     const input = ${payload};
@@ -802,6 +804,52 @@ if [ "$1" = "show-option" ]; then echo team:alpha; exit 0; fi
     const parsed = JSON.parse(result.stdout);
     assert.equal(parsed.ok, false);
     assert.equal(parsed.exactPaneProof.reason, 'pane_pid_changed');
+    assert.doesNotMatch(await readFile(tmuxLogPath, 'utf8'), /send-keys|paste-buffer/);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+it('rejects a pane session replacement between binding resolution and composer clear', async () => {
+  const cwd = await mkdtemp(join(tmpdir(), 'omx-team-tmux-session-replacement-'));
+  const fakeBinDir = join(cwd, 'fake-bin');
+  const tmuxLogPath = join(cwd, 'tmux.log');
+  const countPath = join(cwd, 'proof-count');
+  const bufferPath = join(cwd, 'buffer');
+  try {
+    await mkdir(fakeBinDir, { recursive: true });
+    await writeFile(join(fakeBinDir, 'tmux'), `#!/usr/bin/env bash
+set -eu
+printf '%s\\n' "$*" >> "${tmuxLogPath}"
+if [[ "$1" == "list-panes" ]]; then
+  count=0; [[ ! -f "${countPath}" ]] || count=$(cat "${countPath}")
+  count=$((count + 1)); printf '%s' "$count" > "${countPath}"
+  if [[ "$count" -le 4 ]]; then printf '%%42\\t0\\t4242\\tteam-test\\n'; else printf '%%42\\t0\\t4242\\tforeign-session\\n'; fi
+  exit 0
+fi
+if [[ "$1" == "show-option" ]]; then echo team:alpha; exit 0; fi
+if [[ "$1" == "display-message" ]]; then echo codex; exit 0; fi
+if [[ "$1" == "set-buffer" ]]; then printf '%s' "\${@: -1}" > "${bufferPath}"; exit 0; fi
+if [[ "$1" == "show-buffer" ]]; then cat "${bufferPath}"; exit 0; fi
+`);
+    await chmod(join(fakeBinDir, 'tmux'), 0o755);
+    const moduleUrl = new URL('../../../dist/scripts/notify-hook/team-tmux-guard.js', import.meta.url).href;
+    const result = runSendPaneInputInChild({
+      fakeBinDir,
+      moduleUrl,
+      paneTarget: '%42',
+      exactPaneId: '%42',
+      expectedPanePid: 4242,
+      expectedPaneSessionName: 'team-test',
+      expectedPaneOwnerId: 'team:alpha',
+      prompt: 'must not deliver',
+      submitKeyPresses: 1,
+      typePrompt: true,
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const parsed = JSON.parse(result.stdout);
+    assert.equal(parsed.ok, false);
+    assert.equal(parsed.exactPaneProof.reason, 'pane_session_changed');
     assert.doesNotMatch(await readFile(tmuxLogPath, 'utf8'), /send-keys|paste-buffer/);
   } finally {
     await rm(cwd, { recursive: true, force: true });

@@ -28,8 +28,9 @@ import {
   assertTeamWorkerCliPolicyCompatibility,
   tagPaneTeamOwner,
   type TeamWorkerCli,
+  type PaneTeardownBinding,
 } from './tmux-session.js';
-import { execFileSync, spawnSync } from 'child_process';
+import { spawnSync } from 'child_process';
 import {
   teamReadConfig as readTeamConfig,
   teamSaveConfig as saveTeamConfig,
@@ -154,6 +155,23 @@ interface ScaleUpWorkerLaunchPlan {
   readonly workerLaunchArgs: string[];
   readonly workerCli: TeamWorkerCli;
   readonly mixedTaskRoles: readonly string[];
+}
+
+function bindWorkerPane(
+  worker: Pick<WorkerInfo, 'pane_id' | 'pid'>,
+  sessionName: string,
+  teamOwnerId: string | undefined,
+): PaneTeardownBinding | null {
+  const paneId = worker.pane_id?.trim();
+  const panePid = worker.pid;
+  const ownerId = teamOwnerId?.trim();
+  if (!paneId?.startsWith('%')
+    || typeof panePid !== 'number'
+    || !Number.isSafeInteger(panePid)
+    || panePid <= 0
+    || !ownerId
+    || !sessionName.trim()) return null;
+  return { paneId, panePid, teamOwnerId: ownerId, sessionName };
 }
 
 function buildScaleUpWorkerLaunchPlans(params: {
@@ -423,33 +441,27 @@ export async function scaleUp(
     }
 
     const addedWorkers: WorkerInfo[] = [];
+    const rollbackPaneBindings: PaneTeardownBinding[] = [];
     const createdTaskIds: string[] = [];
 
     const rollbackScaleUp = async (
       error: string,
-      context: { paneId?: string; workerName?: string; worktreePath?: string } = {},
+      context: { workerName?: string; worktreePath?: string } = {},
     ): Promise<ScaleError> => {
       for (const w of addedWorkers) {
         const idx = config.workers.findIndex((worker) => worker.name === w.name);
         if (idx >= 0) {
           config.workers.splice(idx, 1);
         }
-        try {
-          if (w.pane_id) {
-            execFileSync('tmux', ['kill-pane', '-t', w.pane_id], { stdio: 'pipe',
-      windowsHide: true,
-    });
-          }
-        } catch {}
         if (w.worktree_path) {
           await removeWorkerWorktreeRootAgentsFile(sanitized, w.name, teamStateRoot, w.worktree_path).catch(() => {});
         }
       }
 
       if (
-        context.workerName &&
-        context.worktreePath &&
-        !addedWorkers.some((worker) => worker.name === context.workerName)
+        context.workerName
+        && context.worktreePath
+        && !addedWorkers.some((worker) => worker.name === context.workerName)
       ) {
         await removeWorkerWorktreeRootAgentsFile(
           sanitized,
@@ -459,13 +471,10 @@ export async function scaleUp(
         ).catch(() => {});
       }
 
-      if (context.paneId) {
-        try {
-          execFileSync('tmux', ['kill-pane', '-t', context.paneId], { stdio: 'pipe',
-      windowsHide: true,
-    });
-        } catch {}
-      }
+      const teardown = await teardownWorkerPanes(rollbackPaneBindings);
+      const cleanupFailure = teardown.kill.failed > 0
+        ? `; cleanup_failed:${teardown.failures.map((failure) => `${failure.paneId}:${failure.reason}`).join(',')}`
+        : '';
 
       for (const taskId of createdTaskIds) {
         await rm(join(leaderCwd, '.omx', 'state', 'team', sanitized, 'tasks', `task-${taskId}.json`), { force: true }).catch(() => {});
@@ -475,7 +484,7 @@ export async function scaleUp(
       config.next_worker_index = initialNextIndex;
       await saveTeamConfig(config, leaderCwd);
 
-      return { ok: false, error };
+      return { ok: false, error: `${error}${cleanupFailure}` };
     };
 
     // Persist incoming tasks only after launch policy is frozen; the resulting
@@ -600,7 +609,6 @@ export async function scaleUp(
       const paneId = (result.stdout || '').trim().split('\n')[0]?.trim();
       if (!paneId || !paneId.startsWith('%')) {
         return await rollbackScaleUp(`Failed to capture pane ID for ${workerName}`, {
-          paneId,
           workerName,
           worktreePath: workerWorkspace?.worktreePath,
         });
@@ -610,8 +618,8 @@ export async function scaleUp(
           tagPaneTeamOwner(paneId, config.tmux_pane_owner_id);
         } catch (error) {
           return await rollbackScaleUp(
-            `Failed to tag tmux pane for ${workerName}: ${error instanceof Error ? error.message : String(error)}`,
-            { paneId, workerName, worktreePath: workerWorkspace?.worktreePath },
+            `Failed to tag tmux pane for ${workerName}: ${error instanceof Error ? error.message : String(error)}; cleanup_failed:${paneId}:immutable_binding_unavailable`,
+            { workerName, worktreePath: workerWorkspace?.worktreePath },
           );
         }
       }
@@ -638,6 +646,14 @@ export async function scaleUp(
         worktree_created: workerWorkspace ? workerWorkspace.created : undefined,
         team_state_root: teamStateRoot,
       };
+      const paneBinding = bindWorkerPane(workerInfo, sessionName, config.tmux_pane_owner_id);
+      if (!paneBinding) {
+        return await rollbackScaleUp(
+          `Failed to bind tmux pane for ${workerName}; cleanup_failed:${paneId}:immutable_binding_unavailable`,
+          { workerName, worktreePath: workerWorkspace?.worktreePath },
+        );
+      }
+      rollbackPaneBindings.push(paneBinding);
 
       await writeWorkerIdentity(sanitized, workerName, workerInfo, leaderCwd);
 
@@ -792,7 +808,6 @@ export async function scaleUp(
       }
       if (!outcome.ok) {
         return await rollbackScaleUp(`scale_up_dispatch_failed:${workerName}:${outcome.reason}`, {
-          paneId,
           workerName,
           worktreePath: workerWorkspace?.worktreePath,
         });
@@ -939,13 +954,28 @@ export async function scaleDown(
     // Phase 3: Kill tmux panes and remove from config
     const leaderPaneId = config.leader_pane_id;
     const hudPaneId = config.hud_pane_id;
-    const targetPaneIds = targetWorkers
-      .map((w) => w.pane_id)
-      .filter((paneId): paneId is string => typeof paneId === 'string' && paneId.trim().length > 0);
-    await teardownWorkerPanes(targetPaneIds, {
+    const targetPaneBindings = targetWorkers.map((worker) => bindWorkerPane(
+      worker,
+      sessionName,
+      config.tmux_pane_owner_id,
+    ));
+    const missingBindings = targetWorkers.filter((_worker, index) => targetPaneBindings[index] === null);
+    if (missingBindings.length > 0) {
+      return {
+        ok: false,
+        error: `scale_down_cleanup_failed:${missingBindings.map((worker) => `${worker.name}:immutable_binding_unavailable`).join(',')}`,
+      };
+    }
+    const teardown = await teardownWorkerPanes(targetPaneBindings as PaneTeardownBinding[], {
       leaderPaneId,
       hudPaneId,
     });
+    if (teardown.kill.failed > 0) {
+      return {
+        ok: false,
+        error: `scale_down_cleanup_failed:${teardown.failures.map((failure) => `${failure.paneId}:${failure.reason}`).join(',')}`,
+      };
+    }
     const detachedWorktreesToRollback: EnsureWorktreeResult[] = targetWorkers
       .filter((worker) =>
         worker.worktree_created === true

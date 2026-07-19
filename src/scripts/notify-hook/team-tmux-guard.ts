@@ -53,7 +53,11 @@ function exactPaneBindingFailure(target: string, exactPaneId: any): any | null {
   return null;
 }
 
-export async function verifyExactPaneLive(exactPaneId: any, expectedPanePid?: number): Promise<any> {
+export async function verifyExactPaneLive(
+  exactPaneId: any,
+  expectedPanePid?: number,
+  expectedPaneSessionName?: any,
+): Promise<any> {
   const identity = explicitPaneIdentity(exactPaneId);
   if (!identity.provided) return { ok: true, paneId: '', proof: null };
   if (!identity.paneId) {
@@ -69,8 +73,9 @@ export async function verifyExactPaneLive(exactPaneId: any, expectedPanePid?: nu
     };
   }
 
+  const expectedSession = safeString(expectedPaneSessionName).trim();
   try {
-    const proof = await readExactPaneProof(identity.paneId, process.env.OMX_TEST_TMUX_BIN || 'tmux');
+    const proof = await readExactPaneProof(identity.paneId);
     if (proof.status === 'live' && proof.paneId === identity.paneId) {
       if (typeof expectedPanePid === 'number' && proof.pid !== expectedPanePid) {
         return {
@@ -78,6 +83,14 @@ export async function verifyExactPaneLive(exactPaneId: any, expectedPanePid?: nu
           reason: EXACT_PANE_UNAVAILABLE_REASON,
           paneId: identity.paneId,
           proof: { ...proof, status: 'unavailable', reason: 'pane_pid_changed', expectedPid: expectedPanePid },
+        };
+      }
+      if (expectedSession && proof.sessionName !== expectedSession) {
+        return {
+          ok: false,
+          reason: EXACT_PANE_UNAVAILABLE_REASON,
+          paneId: identity.paneId,
+          proof: { ...proof, status: 'unavailable', reason: 'pane_session_changed', expectedSession },
         };
       }
       return { ok: true, paneId: identity.paneId, proof };
@@ -98,7 +111,12 @@ export async function verifyExactPaneLive(exactPaneId: any, expectedPanePid?: nu
   }
 }
 
-export async function verifyExactPaneOwnerLive(exactPaneId: any, expectedPanePid: number | undefined, expectedPaneOwnerId: any): Promise<any> {
+export async function verifyExactPaneOwnerLive(
+  exactPaneId: any,
+  expectedPanePid: number | undefined,
+  expectedPaneOwnerId: any,
+  expectedPaneSessionName?: any,
+): Promise<any> {
   const expectedOwner = safeString(expectedPaneOwnerId).trim();
   if (!expectedOwner || !Number.isInteger(expectedPanePid) || Number(expectedPanePid) <= 0) {
     return {
@@ -112,7 +130,7 @@ export async function verifyExactPaneOwnerLive(exactPaneId: any, expectedPanePid
       },
     };
   }
-  const beforeOwner = await verifyExactPaneLive(exactPaneId, expectedPanePid);
+  const beforeOwner = await verifyExactPaneLive(exactPaneId, expectedPanePid, expectedPaneSessionName);
   if (!beforeOwner.ok) return beforeOwner;
   try {
     const ownerResult = await runProcess(
@@ -148,7 +166,7 @@ export async function verifyExactPaneOwnerLive(exactPaneId: any, expectedPanePid
       },
     };
   }
-  return verifyExactPaneLive(exactPaneId, expectedPanePid);
+  return verifyExactPaneLive(exactPaneId, expectedPanePid, expectedPaneSessionName);
 }
 
 function exactPaneUnavailableResult(target: string, paneProof: any, extra: any = {}): any {
@@ -385,6 +403,7 @@ export async function sendPaneInput({
   exactPaneId = undefined,
   expectedPanePid = undefined,
   expectedPaneOwnerId = undefined,
+  expectedPaneSessionName = undefined,
   expectedHudPaneId = undefined,
 }: any): Promise<any> {
   const target = safeString(paneTarget).trim();
@@ -398,7 +417,7 @@ export async function sendPaneInput({
   let exactPaneProof: any = null;
   let pinnedPanePid = typeof expectedPanePid === 'number' ? expectedPanePid : undefined;
   const verifyExplicitPane = async () => {
-    const paneProof = await verifyExactPaneLive(exactPaneIdentity, pinnedPanePid);
+    const paneProof = await verifyExactPaneLive(exactPaneIdentity, pinnedPanePid, expectedPaneSessionName);
     exactPaneProof = paneProof.proof || null;
     if (paneProof.ok && typeof paneProof.proof?.pid === 'number') pinnedPanePid ??= paneProof.proof.pid;
     return paneProof;
@@ -410,7 +429,7 @@ export async function sendPaneInput({
   }
   const verifyForEffect = async () => {
     if (expectedOwner) {
-      const paneProof = await verifyExactPaneOwnerLive(exactPaneIdentity, pinnedPanePid, expectedOwner);
+      const paneProof = await verifyExactPaneOwnerLive(exactPaneIdentity, pinnedPanePid, expectedOwner, expectedPaneSessionName);
       exactPaneProof = paneProof.proof || null;
       return paneProof;
     }

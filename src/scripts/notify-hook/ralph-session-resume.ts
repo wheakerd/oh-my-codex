@@ -1,6 +1,17 @@
 import { existsSync } from 'fs';
-import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'fs/promises';
+import { mkdir, readdir, stat } from 'fs/promises';
 import { dirname, join } from 'path';
+import {
+  atomicWriteAuthorityFile,
+  captureRootFilesystemIdentity,
+  ensureAuthorityDirectory,
+  readAuthorityFileWithExpectedRoot,
+  removeAuthorityDirectory,
+  sameRootFilesystemIdentity,
+  type ResolvedStateAuthorityContext,
+  type RootFilesystemIdentity,
+  StateAuthorityError,
+} from '../../state/authority.js';
 import { captureTmuxPaneFromEnv } from '../../state/mode-state-context.js';
 import { resolveCodexPane } from '../tmux-hook-engine.js';
 import { safeString } from './utils.js';
@@ -19,10 +30,9 @@ interface RalphSessionResumeHooks {
 }
 
 interface RalphSessionResumeParams {
-  stateDir: string;
+  /** Already authenticated, committed state authority for every resume mutation. */
+  stateAuthority: Readonly<ResolvedStateAuthorityContext>;
   authorization?: PromptMutationAuthorization;
-  /** Worker-only legacy identity; leader resume requires authorization. */
-  payloadSessionId?: string;
   payloadThreadId?: string;
   env?: NodeJS.ProcessEnv;
   hooks?: RalphSessionResumeHooks;
@@ -59,13 +69,18 @@ async function sleep(ms: number): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function maybeRecoverStaleLock(lockDir: string): Promise<boolean> {
+async function maybeRecoverStaleLock(
+  lockDir: string,
+  stateDir: string,
+  rootIdentity: RootFilesystemIdentity,
+): Promise<boolean> {
   try {
     const info = await stat(lockDir);
-    if (Date.now() - info.mtimeMs <= RALPH_RESUME_LOCK_STALE_MS) {
-      return false;
-    }
-    await rm(lockDir, { recursive: true, force: true });
+    if (Date.now() - info.mtimeMs <= RALPH_RESUME_LOCK_STALE_MS) return false;
+    await removeAuthorityDirectory(lockDir, {
+      authority_root: stateDir,
+      expected_root_identity: rootIdentity,
+    });
     return true;
   } catch {
     return false;
@@ -74,28 +89,35 @@ async function maybeRecoverStaleLock(lockDir: string): Promise<boolean> {
 
 async function withRalphResumeLock<T>(
   stateDir: string,
+  rootIdentity: RootFilesystemIdentity,
   fn: () => Promise<T>,
 ): Promise<T | null> {
   const lockDir = join(stateDir, '.lock.ralph-session-resume');
   const ownerPath = join(lockDir, 'owner');
   const ownerToken = lockOwnerToken();
   const deadline = Date.now() + RALPH_RESUME_LOCK_TIMEOUT_MS;
-  await mkdir(dirname(lockDir), { recursive: true }).catch(() => {});
+  await ensureAuthorityDirectory(stateDir, dirname(lockDir), { expected_root_identity: rootIdentity });
 
   while (true) {
     try {
-      await mkdir(lockDir, { recursive: false });
+      await mkdir(lockDir, { recursive: false, mode: 0o700 });
       try {
-        await writeFile(ownerPath, ownerToken, 'utf8');
+        await atomicWriteAuthorityFile(ownerPath, ownerToken, {
+          authority_root: stateDir,
+          expected_root_identity: rootIdentity,
+        });
       } catch (error) {
-        await rm(lockDir, { recursive: true, force: true }).catch(() => {});
+        await removeAuthorityDirectory(lockDir, {
+          authority_root: stateDir,
+          expected_root_identity: rootIdentity,
+        }).catch(() => {});
         throw error;
       }
       break;
     } catch (error) {
       const err = error as NodeJS.ErrnoException;
       if (err.code !== 'EEXIST') throw error;
-      if (await maybeRecoverStaleLock(lockDir)) continue;
+      if (await maybeRecoverStaleLock(lockDir, stateDir, rootIdentity)) continue;
       if (Date.now() > deadline) return null;
       await sleep(RALPH_RESUME_LOCK_RETRY_MS);
     }
@@ -105,9 +127,15 @@ async function withRalphResumeLock<T>(
     return await fn();
   } finally {
     try {
-      const currentOwner = await readFile(ownerPath, 'utf8');
-      if (currentOwner.trim() === ownerToken) {
-        await rm(lockDir, { recursive: true, force: true });
+      const currentOwner = await readAuthorityFileWithExpectedRoot(ownerPath, {
+        authority_root: stateDir,
+        expected_root_identity: rootIdentity,
+      });
+      if (currentOwner?.trim() === ownerToken) {
+        await removeAuthorityDirectory(lockDir, {
+          authority_root: stateDir,
+          expected_root_identity: rootIdentity,
+        });
       }
     } catch {
       // Lock may already be gone after stale recovery or process interruption.
@@ -115,19 +143,34 @@ async function withRalphResumeLock<T>(
   }
 }
 
-async function readJson(path: string): Promise<Record<string, unknown> | null> {
+async function readJson(
+  path: string,
+  stateDir: string,
+  rootIdentity: RootFilesystemIdentity,
+): Promise<Record<string, unknown> | null> {
   try {
-    return JSON.parse(await readFile(path, 'utf-8')) as Record<string, unknown>;
-  } catch {
+    const content = await readAuthorityFileWithExpectedRoot(path, {
+      authority_root: stateDir,
+      expected_root_identity: rootIdentity,
+    });
+    return content ? JSON.parse(content) as Record<string, unknown> : null;
+  } catch (error) {
+    if (error instanceof StateAuthorityError) throw error;
     return null;
   }
 }
 
-async function writeJsonAtomic(path: string, value: unknown): Promise<void> {
-  await mkdir(dirname(path), { recursive: true }).catch(() => {});
-  const tempPath = `${path}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  await writeFile(tempPath, JSON.stringify(value, null, 2));
-  await rename(tempPath, path);
+async function writeJsonAtomic(
+  path: string,
+  value: unknown,
+  stateDir: string,
+  rootIdentity: RootFilesystemIdentity,
+): Promise<void> {
+  await ensureAuthorityDirectory(stateDir, dirname(path), { expected_root_identity: rootIdentity });
+  await atomicWriteAuthorityFile(path, JSON.stringify(value, null, 2), {
+    authority_root: stateDir,
+    expected_root_identity: rootIdentity,
+  });
 }
 
 function isTerminalRalphPhase(value: unknown): boolean {
@@ -198,6 +241,8 @@ async function markRalphStateAbandoned(
   path: string,
   state: Record<string, unknown>,
   freshness: RalphStateFreshness,
+  stateDir: string,
+  rootIdentity: RootFilesystemIdentity,
 ): Promise<void> {
   const nowIso = new Date(freshness.checkedAtMs).toISOString();
   await writeJsonAtomic(path, {
@@ -210,7 +255,7 @@ async function markRalphStateAbandoned(
     stale_resume_age_ms: freshness.ageMs,
     stale_resume_threshold_ms: freshness.staleThresholdMs,
     stale_resume_timestamp_source: freshness.timestampSource,
-  });
+  }, stateDir, rootIdentity);
 }
 
 function resolveResumePane(env: NodeJS.ProcessEnv = process.env): string {
@@ -232,6 +277,7 @@ function bindCurrentPane(state: Record<string, unknown>, nowIso: string, env: No
 
 async function scanMatchingRalphCandidates(
   stateDir: string,
+  rootIdentity: RootFilesystemIdentity,
   currentOmxSessionId: string,
   ownerCodexSessionId: string,
   payloadThreadId: string,
@@ -248,7 +294,7 @@ async function scanMatchingRalphCandidates(
     if (!entry.isDirectory() || !SESSION_ID_PATTERN.test(entry.name) || entry.name === currentOmxSessionId || !allowedStorageSessionIds.includes(entry.name)) continue;
     const path = join(sessionsRoot, entry.name, 'ralph-state.json');
     if (!existsSync(path)) continue;
-    const state = await readJson(path);
+    const state = await readJson(path, stateDir, rootIdentity);
     if (!isActiveRalphCandidate(state)) continue;
     const ownerSessionId = safeString(state.owner_codex_session_id).trim();
     const ownerThreadId = safeString(state.owner_codex_thread_id).trim();
@@ -256,21 +302,59 @@ async function scanMatchingRalphCandidates(
     if (ownerThreadId && payloadThreadId && ownerThreadId !== payloadThreadId) continue;
     const freshness = await readRalphStateFreshness(path, state, env);
     if (freshness.stale) {
-      await markRalphStateAbandoned(path, state, freshness);
+      await markRalphStateAbandoned(path, state, freshness, stateDir, rootIdentity);
       abandonedCount += 1;
       continue;
     }
-    matches.push({
-      sessionId: entry.name,
-      path,
-      state,
-    });
+    matches.push({ sessionId: entry.name, path, state });
   }
   return { candidates: matches, abandonedCount };
 }
 
+interface RalphTransferJournal {
+  schema_version: 1;
+  status: 'prepared' | 'committed';
+  transfer_id: string;
+  source_path: string;
+  target_path: string;
+  source_state: Record<string, unknown>;
+  previous_state: Record<string, unknown>;
+  next_state: Record<string, unknown>;
+}
+
+function transferJournalPath(stateDir: string): string {
+  return join(stateDir, 'ralph-session-resume-transfer.json');
+}
+
+async function recoverRalphTransfer(
+  stateDir: string,
+  rootIdentity: RootFilesystemIdentity,
+): Promise<void> {
+  const journal = await readJson(transferJournalPath(stateDir), stateDir, rootIdentity) as RalphTransferJournal | null;
+  if (!journal || journal.schema_version !== 1 || journal.status === 'committed'
+    || !journal.transfer_id || !journal.source_path || !journal.target_path) return;
+  const source = await readJson(journal.source_path, stateDir, rootIdentity);
+  const target = await readJson(journal.target_path, stateDir, rootIdentity);
+  const sourceTransferred = source?.ownership_transfer_id === journal.transfer_id && source.active === false;
+  if (sourceTransferred) {
+    if (target?.ownership_transfer_id !== journal.transfer_id || target.active !== true) {
+      await writeJsonAtomic(journal.target_path, journal.next_state, stateDir, rootIdentity);
+    }
+    await writeJsonAtomic(transferJournalPath(stateDir), { ...journal, status: 'committed' }, stateDir, rootIdentity);
+    return;
+  }
+  if (target?.ownership_transfer_id === journal.transfer_id) {
+    await atomicWriteAuthorityFile(journal.target_path, JSON.stringify({ ...target, active: false, current_phase: 'cancelled', stop_reason: 'ownership_transfer_rolled_back' }, null, 2), {
+      authority_root: stateDir,
+      expected_root_identity: rootIdentity,
+    });
+  }
+  await writeJsonAtomic(journal.source_path, journal.source_state, stateDir, rootIdentity);
+  await writeJsonAtomic(transferJournalPath(stateDir), { ...journal, status: 'committed' }, stateDir, rootIdentity);
+}
+
 export async function reconcileRalphSessionResume({
-  stateDir,
+  stateAuthority,
   authorization,
   payloadThreadId = '',
   env = process.env,
@@ -284,7 +368,14 @@ export async function reconcileRalphSessionResume({
       reason: 'authorization_missing',
     };
   }
-  const lockedResult = await withRalphResumeLock(stateDir, async () => {
+  const stateDir = stateAuthority.canonical_state_root;
+  const rootIdentity = stateAuthority.generation.root_identity;
+  const actualRootIdentity = await captureRootFilesystemIdentity(stateDir);
+  if (!sameRootFilesystemIdentity(rootIdentity, actualRootIdentity)) {
+    throw new StateAuthorityError('authority_root_fingerprint_mismatch', 'Ralph resume authority root does not match its committed filesystem identity');
+  }
+  const lockedResult = await withRalphResumeLock(stateDir, rootIdentity, async () => {
+    await recoverRalphTransfer(stateDir, rootIdentity);
     await hooks?.afterLockAcquired?.();
 
     const currentOmxSessionId = authorization.targetSessionId;
@@ -299,10 +390,8 @@ export async function reconcileRalphSessionResume({
 
     const currentSessionDir = join(stateDir, 'sessions', currentOmxSessionId);
     const currentRalphPath = join(currentSessionDir, 'ralph-state.json');
-    const currentRalphExists = existsSync(currentRalphPath);
-    const currentRalphState = currentRalphExists
-      ? await readJson(currentRalphPath)
-      : null;
+    const currentRalphState = await readJson(currentRalphPath, stateDir, rootIdentity);
+    const currentRalphExists = currentRalphState !== null || existsSync(currentRalphPath);
     const nowIso = new Date().toISOString();
 
     const currentOwnerCodexSessionId = safeString(currentRalphState?.owner_codex_session_id).trim();
@@ -318,7 +407,7 @@ export async function reconcileRalphSessionResume({
     if (currentRalphState && currentRalphState.active === true) {
       const freshness = await readRalphStateFreshness(currentRalphPath, currentRalphState, env);
       if (freshness.stale) {
-        await markRalphStateAbandoned(currentRalphPath, currentRalphState, freshness);
+        await markRalphStateAbandoned(currentRalphPath, currentRalphState, freshness, stateDir, rootIdentity);
         return {
           currentOmxSessionId,
           resumed: false,
@@ -361,7 +450,7 @@ export async function reconcileRalphSessionResume({
         changed = true;
       }
       if (changed) {
-        await writeJsonAtomic(currentRalphPath, updated);
+        await writeJsonAtomic(currentRalphPath, updated, stateDir, rootIdentity);
       }
       return {
         currentOmxSessionId,
@@ -395,6 +484,7 @@ export async function reconcileRalphSessionResume({
 
     const { candidates, abandonedCount } = await scanMatchingRalphCandidates(
       stateDir,
+      rootIdentity,
       currentOmxSessionId,
       normalizedPayloadSessionId,
       normalizedPayloadThreadId,
@@ -413,16 +503,16 @@ export async function reconcileRalphSessionResume({
     }
 
     const source = candidates[0];
-    await mkdir(currentSessionDir, { recursive: true });
+    await ensureAuthorityDirectory(stateDir, currentSessionDir, { expected_root_identity: rootIdentity });
 
+    const transferId = lockOwnerToken();
     const nextState = bindCurrentPane({
       ...source.state,
       owner_omx_session_id: currentOmxSessionId,
-      ...(normalizedPayloadSessionId ? { owner_codex_session_id: normalizedPayloadSessionId } : {}),
+      owner_codex_session_id: normalizedPayloadSessionId,
+      ownership_transfer_id: transferId,
     }, nowIso, env);
-    if (safeString(nextState.owner_codex_session_id).trim()) {
-      delete nextState.owner_codex_thread_id;
-    }
+    delete nextState.owner_codex_thread_id;
     delete nextState.completed_at;
     delete nextState.stop_reason;
 
@@ -432,14 +522,36 @@ export async function reconcileRalphSessionResume({
       current_phase: 'cancelled',
       completed_at: nowIso,
       stop_reason: 'ownership_transferred',
+      ownership_transfer_id: transferId,
     };
-
-    await writeJsonAtomic(currentRalphPath, nextState);
+    const journal: RalphTransferJournal = {
+      schema_version: 1,
+      status: 'prepared',
+      transfer_id: transferId,
+      source_path: source.path,
+      target_path: currentRalphPath,
+      source_state: source.state,
+      previous_state: previousState,
+      next_state: nextState,
+    };
+    await writeJsonAtomic(transferJournalPath(stateDir), journal, stateDir, rootIdentity);
     try {
+      // Deactivate first: an interrupted transfer may briefly have no owner, never two.
+      await writeJsonAtomic(source.path, previousState, stateDir, rootIdentity);
+      await writeJsonAtomic(currentRalphPath, nextState, stateDir, rootIdentity);
       await hooks?.afterTargetWrite?.();
-      await writeJsonAtomic(source.path, previousState);
+      await writeJsonAtomic(transferJournalPath(stateDir), { ...journal, status: 'committed' }, stateDir, rootIdentity);
     } catch (error) {
-      await rm(currentRalphPath, { force: true }).catch(() => {});
+      await writeJsonAtomic(source.path, source.state, stateDir, rootIdentity).catch(() => {});
+      const target = await readJson(currentRalphPath, stateDir, rootIdentity);
+      if (target?.ownership_transfer_id === transferId) {
+        await writeJsonAtomic(currentRalphPath, {
+          ...target,
+          active: false,
+          current_phase: 'cancelled',
+          stop_reason: 'ownership_transfer_rolled_back',
+        }, stateDir, rootIdentity).catch(() => {});
+      }
       throw error;
     }
 

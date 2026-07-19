@@ -696,6 +696,85 @@ describe('state authority foundation', () => {
       await rm(runRoot, { recursive: true, force: true });
     }
   });
+  it('denies a deep-imported child that presents the transported bearer, while the launcher can roll over', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'omx-authority-child-rollover-'));
+    const childRunRoot = await mkdtemp(join(tmpdir(), 'omx-authority-child-rollover-run-'));
+    const launcherRunRoot = await mkdtemp(join(tmpdir(), 'omx-authority-launcher-rollover-run-'));
+    try {
+      const initial = await initializeStateAuthority({
+        startup_cwd: workspace,
+        launch_id: 'child-rollover-source',
+        session_binding: { canonical_session_id: 'child-rollover-session' },
+      });
+      const transport = await mintStateAuthorityTransportCapability(initial);
+      const program = `
+        const authority = await import(process.env.OMX_AUTHORITY_MODULE_URL);
+        const context = await authority.resolveStateAuthorityForGuard({
+          startup_cwd: process.env.OMX_AUTHORITY_WORKSPACE,
+          observed_cwd: process.env.OMX_AUTHORITY_WORKSPACE,
+          session_id: 'child-rollover-session',
+        });
+        try {
+          await authority.rolloverStateAuthorityToAlternateRoot({
+            context,
+            transport_capability: process.env.OMX_STATE_AUTHORITY_CAPABILITY,
+            proposed_state_root: process.env.OMX_AUTHORITY_CHILD_TARGET,
+            creation_root: process.env.OMX_AUTHORITY_CHILD_RUN_ROOT,
+            launch_id: 'deep-import-child-rollover',
+            consumer_kind: 'madmax',
+            issuer: { kind: 'first-party-launcher', package_version: 'test', package_digest: '${'a'.repeat(64)}' },
+          });
+          process.stdout.write('unexpected-success');
+        } catch (error) {
+          process.stdout.write(error && typeof error === 'object' ? String(error.code ?? '') : '');
+        }
+      `;
+      const childResult = await new Promise<string>((resolvePromise, reject) => {
+        const child = spawn(process.execPath, ['--input-type=module', '--eval', program], {
+          env: {
+            ...process.env,
+            OMX_AUTHORITY_MODULE_URL: new URL('../authority.js', import.meta.url).href,
+            OMX_AUTHORITY_WORKSPACE: workspace,
+            OMX_AUTHORITY_CHILD_RUN_ROOT: childRunRoot,
+            OMX_AUTHORITY_CHILD_TARGET: join(childRunRoot, '.omx', 'state'),
+            OMX_STATE_AUTHORITY_CAPABILITY: transport.capability,
+          },
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+        let stdout = '';
+        let stderr = '';
+        child.stdout?.setEncoding('utf8');
+        child.stderr?.setEncoding('utf8');
+        child.stdout?.on('data', (chunk: string) => { stdout += chunk; });
+        child.stderr?.on('data', (chunk: string) => { stderr += chunk; });
+        child.on('error', reject);
+        child.on('close', (code) => {
+          if (code !== 0) {
+            reject(new Error(`deep-import child rollover failed (${code}): ${stderr}`));
+            return;
+          }
+          resolvePromise(stdout.trim());
+        });
+      });
+      assert.equal(childResult, AUTHORITY_DIAGNOSTIC_CODES.intentIssuerMismatch);
+      assert.equal(existsSync(join(childRunRoot, '.omx', 'state')), false);
+
+      const rolled = await rolloverStateAuthorityToAlternateRoot({
+        context: initial,
+        transport_capability: transport.capability,
+        proposed_state_root: join(launcherRunRoot, '.omx', 'state'),
+        creation_root: launcherRunRoot,
+        launch_id: 'launcher-rollover',
+        consumer_kind: 'madmax',
+        issuer,
+      });
+      assert.equal(rolled.canonical_state_root, canonicalizeExistingAuthorityPath(join(launcherRunRoot, '.omx', 'state')));
+    } finally {
+      await rm(workspace, { recursive: true, force: true });
+      await rm(childRunRoot, { recursive: true, force: true });
+      await rm(launcherRunRoot, { recursive: true, force: true });
+    }
+  });
   it('rolls a committed launch into one fenced alternate authority generation', async () => {
     const workspace = await mkdtemp(join(tmpdir(), 'omx-authority-alternate-rollover-'));
     const runRoot = await mkdtemp(join(tmpdir(), 'omx-authority-alternate-run-'));

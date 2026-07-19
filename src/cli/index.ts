@@ -200,6 +200,7 @@ import {
   atomicWriteAuthorityFile,
   captureRootFilesystemIdentity,
   ensureAuthorityDirectory,
+  assertStateAuthorityRolloverAuthorization,
   initializeStateAuthority,
   ensureStateAuthorityTransportCapability,
   isObservedCwdCompatibleWithStateAuthority,
@@ -3792,6 +3793,7 @@ async function activateMadmaxIsolationIfNeeded(
 ): Promise<ImmutableResolvedStateAuthorityContext> {
   if (!shouldAutoIsolateMadmaxLaunch(command, launchArgs, env, cwd))
     return authority;
+  assertStateAuthorityRolloverAuthorization(authority);
   const runDir = allocateMadmaxIsolatedRoot(env);
   const sourceCapability = await mintStateAuthorityTransportCapability(authority);
   const rolledAuthority = await rolloverStateAuthorityToAlternateRoot({

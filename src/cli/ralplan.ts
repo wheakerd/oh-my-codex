@@ -1,34 +1,18 @@
-import { randomUUID } from 'node:crypto';
-
-import { StateAuthorityError } from '../state/authority.js';
-import { resolveAuthorityRuntimeStateScope } from '../mcp/state-paths.js';
-import { ensureLeaderAndRecordIntent, type PendingRoleIntent, readSubagentTrackingStateStrict, recordNativeLeaderIntent } from '../subagents/tracker.js';
-import {
-  ROLE_INTENT_CORRELATION_TOKEN_PATTERN,
-  buildRoleIntentSpawnTaskName,
-  isAppCompatibleSpawnTaskName,
-  parseRoleIntentCorrelationToken,
-} from '../leader/contract.js';
+import { UNSUPPORTED_DOCUMENTED_LEADER_PROOF } from '../ralplan/documented-leader-preflight.js';
+import { executeStateOperation } from '../state/operations.js';
+import { resolveInstalledRoleName } from '../subagents/tracker.js';
 
 export const RALPLAN_HELP = `omx ralplan - RALPLAN consensus support commands
 
 Usage:
+  omx ralplan preflight [--json]
   omx ralplan role-intent write --role <role> --parent-thread <id> [--session <id>] [--ttl-ms <n>] [--json]
 
-role-intent write records the validated role required by the next adapted native spawn.
+preflight fails closed when adapted Ralplan lacks documented leader proof.
+role-intent write is unavailable on that adapted surface.
 `;
 
-type RoleIntentFailureReason = 'unknown_role' | 'invalid_correlation_token' | 'invalid_origin' | 'single_flight_conflict' | 'session_not_current' | 'parent_not_active_leader' | 'spawn_task_name_unsupported' | 'native_anchor_unavailable' | 'native_anchor_mismatch';
-
-// Shared validation for the App-compatible correlation token / spawn task name. Throws
-// (via buildRoleIntentSpawnTaskName) on structurally invalid tokens, matching the
-// pre-#3181 fail-before-persistence contract.
-function isSupportedCorrelationToken(token: string): boolean {
-  const spawnTaskName = buildRoleIntentSpawnTaskName(token);
-  return ROLE_INTENT_CORRELATION_TOKEN_PATTERN.test(token)
-    && isAppCompatibleSpawnTaskName(spawnTaskName)
-    && parseRoleIntentCorrelationToken(spawnTaskName) === token;
-}
+type RoleIntentFailureReason = 'unknown_role' | typeof UNSUPPORTED_DOCUMENTED_LEADER_PROOF;
 
 interface ParsedRoleIntentWriteArgs {
   role: string;
@@ -42,10 +26,7 @@ export interface RalplanCommandDependencies {
   cwd?: () => string;
   stdout?: (line: string) => void;
   stderr?: (line: string) => void;
-  resolveSessionScope?: typeof resolveAuthorityRuntimeStateScope;
-  recordNativeLeaderIntent?: typeof recordNativeLeaderIntent;
-  ensureLeaderAndRecordIntent?: typeof ensureLeaderAndRecordIntent;
-  generateCorrelationToken?: () => string;
+  clearRalplanState?: typeof executeStateOperation;
 }
 
 export async function ralplanCommand(
@@ -59,127 +40,50 @@ export async function ralplanCommand(
     return;
   }
 
+  if (args[0] === 'preflight') {
+    const json = parsePreflightArgs(args.slice(1));
+    await neutralizeRoutingOnlyRalplanState(
+      (deps.cwd ?? process.cwd)(),
+      deps.clearRalplanState ?? executeStateOperation,
+    );
+    emitRoleIntentFailure(UNSUPPORTED_DOCUMENTED_LEADER_PROOF, json, stdout, stderr);
+    return;
+  }
+
   if (args[0] !== 'role-intent' || args[1] !== 'write') {
     throw new Error(`Unknown ralplan command: ${args.join(' ')}\n${RALPLAN_HELP}`);
   }
 
   const parsed = parseRoleIntentWriteArgs(args.slice(2));
-  const cwd = (deps.cwd ?? process.cwd)();
-  const resolveSessionScope = deps.resolveSessionScope ?? resolveAuthorityRuntimeStateScope;
-  let currentScope: Awaited<ReturnType<typeof resolveAuthorityRuntimeStateScope>>;
+  if (!resolveInstalledRoleName(parsed.role)) {
+    emitRoleIntentFailure('unknown_role', parsed.json, stdout, stderr);
+    return;
+  }
+  emitRoleIntentFailure(UNSUPPORTED_DOCUMENTED_LEADER_PROOF, parsed.json, stdout, stderr);
+  return;
+}
+
+
+function parsePreflightArgs(args: string[]): boolean {
+  if (args.length === 0) return false;
+  if (args.length === 1 && args[0] === '--json') return true;
+  throw new Error(`Unknown ralplan preflight argument: ${args.join(' ')}`);
+}
+
+// Keyword selection can have created ordinary Ralplan mode state before the
+// native task schema is available. Clearing it also removes its canonical
+// skill state and current-session native Stop state. A missing authority is
+// already fail-closed and cannot turn this unsupported preflight into success.
+async function neutralizeRoutingOnlyRalplanState(
+  cwd: string,
+  clearRalplanState: typeof executeStateOperation,
+): Promise<void> {
   try {
-    currentScope = await resolveSessionScope(cwd);
-  } catch (error) {
-    if (!(error instanceof StateAuthorityError)) throw error;
-    emitRoleIntentFailure('native_anchor_unavailable', parsed.json, stdout, stderr);
-    return;
+    await clearRalplanState('state_clear', { workingDirectory: cwd, mode: 'ralplan' });
+  } catch {
+    // The denial below is deterministic even when there is no committed state
+    // authority to clear (and therefore no authoritative routing state).
   }
-  if (!currentScope.sessionId) {
-    // #3181: no authenticated canonical session pointer exists in this turn, so there
-    // is no verifiable native anchor to bootstrap from. Fail closed with a distinct
-    // machine reason instead of the opaque `missing_session`.
-    emitRoleIntentFailure('native_anchor_unavailable', parsed.json, stdout, stderr);
-    return;
-  }
-
-  let requestedScope = currentScope;
-  if (parsed.sessionId !== undefined) {
-    try {
-      requestedScope = await resolveSessionScope(cwd, parsed.sessionId);
-    } catch (error) {
-      if (!(error instanceof StateAuthorityError)) throw error;
-      emitRoleIntentFailure('native_anchor_unavailable', parsed.json, stdout, stderr);
-      return;
-    }
-  }
-  if (requestedScope.sessionId !== currentScope.sessionId) {
-    emitRoleIntentFailure('session_not_current', parsed.json, stdout, stderr);
-    return;
-  }
-
-  // #3181: a durable native-hook leader attestation (leader_thread_id + leader_attested_at)
-  // authorizes the in-turn atomic self-heal path, but ONLY when a usable current session
-  // The committed-authority resolver rejects ambient/cwd-selected roots and returns
-  // metadata only from the authenticated canonical session. A missing or foreign
-  // pointer therefore cannot bootstrap or retarget leader intent state.
-  const hasUsableCurrentPointer = Boolean(
-    currentScope.metadata && currentScope.metadata.sessionId === currentScope.sessionId,
-  );
-  // Strict read: an existing but unreadable/corrupt tracker must fail closed rather than
-  // being read as empty and then overwritten by the legacy recordPendingRoleIntent path,
-  // which would erase leader_attested_* and all subagent counter-evidence.
-  const trackingRead = await readSubagentTrackingStateStrict(currentScope.cwd);
-  if (!trackingRead.ok) {
-    emitRoleIntentFailure('native_anchor_unavailable', parsed.json, stdout, stderr);
-    return;
-  }
-  const trackingState = trackingRead.state;
-  const attestedSession = trackingState.sessions[currentScope.sessionId];
-  const attestedLeaderThreadId = hasUsableCurrentPointer && attestedSession?.leader_attested_at
-    ? attestedSession.leader_thread_id?.trim()
-    : undefined;
-  const useAttestedBootstrap = Boolean(attestedLeaderThreadId);
-
-  // Note: the non-attested legacy path's native-anchor validation + all-session subagent
-  // exclusion is performed atomically inside recordNativeLeaderIntent under the tracker
-  // lock (below), not as a separate pre-check, so a subagent record cannot race in between.
-
-  const correlationToken = (deps.generateCorrelationToken ?? (() => randomUUID().replace(/-/g, '')))();
-  if (!isSupportedCorrelationToken(correlationToken)) {
-    emitRoleIntentFailure('spawn_task_name_unsupported', parsed.json, stdout, stderr);
-    return;
-  }
-
-  let result: { ok: true; intent: PendingRoleIntent } | { ok: false; reason: RoleIntentFailureReason };
-  if (useAttestedBootstrap) {
-    const bootstrap = (deps.ensureLeaderAndRecordIntent ?? ensureLeaderAndRecordIntent)(currentScope.cwd, {
-      role: parsed.role,
-      sessionId: currentScope.sessionId,
-      parentThreadId: parsed.parentThreadId,
-      correlationToken,
-      ...(parsed.ttlMs === undefined ? {} : { ttlMs: parsed.ttlMs }),
-    });
-    result = bootstrap.ok ? { ok: true, intent: bootstrap.intent } : { ok: false, reason: bootstrap.reason };
-  } else {
-    const recordNativeIntent = deps.recordNativeLeaderIntent ?? recordNativeLeaderIntent;
-    const nativeResult = recordNativeIntent(currentScope.cwd, {
-      role: parsed.role,
-      sessionId: currentScope.sessionId,
-      parentThreadId: parsed.parentThreadId,
-      allowTrackerLeader: hasUsableCurrentPointer,
-      correlationToken,
-      ...(parsed.ttlMs === undefined ? {} : { ttlMs: parsed.ttlMs }),
-    });
-    result = nativeResult.ok ? { ok: true, intent: nativeResult.intent } : { ok: false, reason: nativeResult.reason };
-  }
-  if (!result.ok) {
-    emitRoleIntentFailure(result.reason, parsed.json, stdout, stderr);
-    return;
-  }
-
-  // Build the App-compatible spawn task name from the persisted correlation token so an
-  // idempotent reuse (same-identity intent) returns the original receipt's task name.
-  const spawnTaskName = buildRoleIntentSpawnTaskName(result.intent.correlation_token);
-  if (!isSupportedCorrelationToken(result.intent.correlation_token) || parseRoleIntentCorrelationToken(spawnTaskName) !== result.intent.correlation_token) {
-    emitRoleIntentFailure('spawn_task_name_unsupported', parsed.json, stdout, stderr);
-    return;
-  }
-  const receipt = {
-    ok: true,
-    intent: {
-      role: result.intent.role,
-      session_id: result.intent.session_id,
-      parent_thread_id: result.intent.parent_thread_id,
-      correlation_token: result.intent.correlation_token,
-      expires_at: result.intent.expires_at,
-    },
-    spawn_task_name: spawnTaskName,
-  };
-  if (parsed.json) {
-    stdout(JSON.stringify(receipt));
-    return;
-  }
-  stdout(`role-intent recorded: role=${receipt.intent.role} session=${receipt.intent.session_id} parent-thread=${receipt.intent.parent_thread_id} correlation-token=${receipt.intent.correlation_token} spawn-task-name=${receipt.spawn_task_name} expires-at=${receipt.intent.expires_at}`);
 }
 
 function parseRoleIntentWriteArgs(args: string[]): ParsedRoleIntentWriteArgs {
@@ -244,7 +148,7 @@ function parseTtlMs(value: string): number {
 }
 
 function emitRoleIntentFailure(
-  reason: RoleIntentFailureReason | 'missing_session',
+  reason: RoleIntentFailureReason,
   json: boolean,
   stdout: (line: string) => void,
   stderr: (line: string) => void,

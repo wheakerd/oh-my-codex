@@ -55,7 +55,7 @@ async function writeNodeCommandStub(
     );
     return;
   }
-  await writeFile(join(directory, name), `#!/usr/bin/env node\n${source}`, {
+  await writeFile(join(directory, name), `#!${process.execPath}\n${source}`, {
     mode: 0o755,
   });
 }
@@ -358,7 +358,7 @@ switch (args[0] || '') {
   case '-V': console.log('tmux 3.2a'); break;
   case 'split-window': console.log('%31'); break;
   case 'list-panes':
-    if (args.includes('-a')) console.log('%11\t0\t42424\tomx-team-low-role-scale\n%21\t0\t42424\tomx-team-low-role-scale\n%31\t0\t42424\tomx-team-low-role-scale');
+    if (args.includes('-a')) console.log('%11\\t0\\t42424\\tomx-team-low-role-scale\\n%21\\t0\\t42424\\tomx-team-low-role-scale\\n%31\\t0\\t42424\\tomx-team-low-role-scale');
     else console.log('42424');
     break;
   case 'show-option': console.log('team:low-role-scale'); break;
@@ -458,7 +458,7 @@ switch (args[0] || '') {
         cwd,
         { OMX_TEAM_SCALING_ENABLED: '1', OMX_TEAM_SKIP_READY_WAIT: '1' },
       );
-      assert.equal(result.ok, true);
+      assert.equal(result.ok, true, result.ok ? '' : result.error);
       if (!result.ok) return;
 
       const workerAgents = await readFile(
@@ -529,7 +529,7 @@ switch (args[0] || '') {
   case '-V': console.log('tmux 3.2a'); break;
   case 'split-window': console.log('%31'); break;
   case 'list-panes':
-    if (args.includes('-a')) console.log('%11\t0\t42424\tomx-team-exact-role-cli\n%21\t0\t42424\tomx-team-exact-role-cli\n%31\t0\t42424\tomx-team-exact-role-cli');
+    if (args.includes('-a')) console.log('%11\\t0\\t42424\\tomx-team-exact-role-cli\\n%21\\t0\\t42424\\tomx-team-exact-role-cli\\n%31\\t0\\t42424\\tomx-team-exact-role-cli');
     else console.log('42424');
     break;
   case 'show-option': console.log('team:exact-role-cli'); break;
@@ -615,7 +615,7 @@ switch (args[0] || '') {
 					OMX_TEAM_WORKER_INHERITED_MODEL: "claude-sonnet-4-6",
 				},
 			);
-			assert.equal(result.ok, true);
+			assert.equal(result.ok, true, result.ok ? "" : result.error);
 			if (!result.ok) return;
 
 			const workerIdentity = JSON.parse(
@@ -715,6 +715,7 @@ switch (args[0] || '') {
 const args = process.argv.slice(2);
 const { spawnSync } = require('child_process');
 const command = args[0] || '';
+const paneOwnerPath = ${JSON.stringify(join(fakeBinDir, 'pane-owner'))};
 if (command === '-V') { console.log('tmux 3.2a'); process.exit(0); }
 if (command === 'display-message') {
   console.log(args.join(' ').includes('#{window_width}') ? '120' : 'leader:0 %1');
@@ -722,16 +723,20 @@ if (command === 'display-message') {
 }
 if (command === 'list-panes') {
   if (args.includes('-a')) {
-    console.log('%1\t0\t42424\tleader\n%2\t0\t42424\tleader\n%3\t0\t42424\tleader');
+    console.log('%1\\t0\\t42424\\tleader:0\\n%2\\t0\\t42424\\tleader:0\\n%3\\t0\\t42424\\tleader:0');
   } else if (args.join(' ').includes('#{pane_pid}')) {
     console.log('42424');
   } else {
-    console.log('%1\tzsh\tzsh\n%2\tzsh\tzsh\n%3\tzsh\tzsh');
+    console.log('%1\\tzsh\\tzsh\\n%2\\tzsh\\tzsh\\n%3\\tzsh\\tzsh');
   }
   process.exit(0);
 }
+if (command === 'set-option') {
+  if (args.includes('@omx_team_pane_owner_id')) fs.writeFileSync(paneOwnerPath, args.at(-1) || '');
+  process.exit(0);
+}
 if (command === 'show-option') {
-  console.log('team:provider-env');
+  console.log(fs.existsSync(paneOwnerPath) ? fs.readFileSync(paneOwnerPath, 'utf8') : '');
   process.exit(0);
 }
 if (command === 'show-environment' || command === 'source-file' || command === 'set-environment') {

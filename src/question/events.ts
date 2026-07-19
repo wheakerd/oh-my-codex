@@ -95,15 +95,25 @@ async function maybeRecoverStaleQuestionEventLock(lockDir: string): Promise<bool
   return false;
 }
 
-async function withQuestionEventLock<T>(eventsPath: string, lockName: string, fn: () => Promise<T>): Promise<T> {
+async function withQuestionEventLock<T>(
+  eventsPath: string,
+  lockName: string,
+  fn: () => Promise<T>,
+  options: { stateDir: string; expectedRootIdentity: RootFilesystemIdentity },
+): Promise<T> {
   const lockDir = `${eventsPath}.${lockName}.lock`;
   const ownerPath = join(lockDir, 'owner');
   const ownerToken = questionEventLockOwnerToken();
   const deadline = Date.now() + QUESTION_EVENT_LOCK_TIMEOUT_MS;
-  await mkdir(dirname(lockDir), { recursive: true });
+  await ensureAuthorityDirectory(options.stateDir, dirname(lockDir), {
+    expected_root_identity: options.expectedRootIdentity,
+  });
   while (true) {
     try {
       await mkdir(lockDir);
+      await ensureAuthorityDirectory(options.stateDir, lockDir, {
+        expected_root_identity: options.expectedRootIdentity,
+      });
       try {
         await writeFile(ownerPath, ownerToken, 'utf8');
       } catch (error) {
@@ -217,7 +227,7 @@ export async function appendQuestionEvent(
   const event = buildQuestionEvent(type, record, options);
   await withQuestionEventLock(path, 'append', async () => {
     await writeQuestionEvent(path, storage.stateDir, storage.rootIdentity, event);
-  });
+  }, { stateDir: storage.stateDir, expectedRootIdentity: storage.rootIdentity });
   return event;
 }
 
@@ -235,7 +245,7 @@ export async function appendQuestionAnsweredEventOnce(
     const event = buildQuestionEvent('question-answered', record, options);
     await writeQuestionEvent(path, storage.stateDir, storage.rootIdentity, event);
     return { event, appended: true };
-  });
+  }, { stateDir: storage.stateDir, expectedRootIdentity: storage.rootIdentity });
 }
 
 export async function readQuestionEvents(
