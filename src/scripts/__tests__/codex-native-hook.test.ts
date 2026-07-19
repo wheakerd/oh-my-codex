@@ -4608,7 +4608,8 @@ PY`,
       await dispatchCodexNativeHook({
         hook_event_name: "SessionStart",
         cwd,
-        session_id: "worker-native",
+        session_id: "",
+        sessionId: "worker-native",
       }, { cwd, sessionOwnerPid: process.pid });
 
       assert.equal(await readFile(join(stateDir, "session.json"), "utf-8"), leaderPointerBefore);

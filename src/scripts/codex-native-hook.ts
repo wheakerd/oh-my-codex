@@ -2684,7 +2684,7 @@ async function resolveTeamWorkerStopDecision(
   const blockWorkerStop = (
     reasonCode: string,
     detail: string,
-    stateDirForDecision = getBaseStateDir(cwd),
+    stateDirForDecision = join(cwd, ".omx", "state"),
   ): TeamWorkerStopDecision => ({
     kind: "blocked",
     stateDir: stateDirForDecision,
@@ -19747,7 +19747,13 @@ export async function dispatchCodexNativeHook(
   let teamNoticeTargetKey: string | null = null;
   let promptClassification: KeywordInputClassification | null = null;
 
-  const nativeSessionId = safeString(payload.session_id ?? payload.sessionId).trim();
+  const declaredTeamWorker = hasRawTeamWorkerDeclaration();
+  const candidateWorkerPayloadSessionId = declaredTeamWorker
+    ? readUnambiguousNormalizedPayloadSessionId(payload)
+    : "";
+  const nativeSessionId = declaredTeamWorker
+    ? candidateWorkerPayloadSessionId
+    : safeString(payload.session_id ?? payload.sessionId).trim();
   const threadId = safeString(payload.thread_id ?? payload.threadId).trim();
   const turnId = safeString(payload.turn_id ?? payload.turnId).trim();
   const pointer = await readSessionPointer(pointerContext);
@@ -19791,11 +19797,7 @@ export async function dispatchCodexNativeHook(
   let resolvedNativeSessionId = nativeSessionId;
   let skipCanonicalSessionStartContext = false;
   let isSubagentSessionStart = false;
-  const declaredTeamWorker = hasRawTeamWorkerDeclaration();
   const authoritativeTeamWorker = declaredTeamWorker && await hasAuthoritativeTeamWorkerContext(cwd);
-  const candidateWorkerPayloadSessionId = declaredTeamWorker
-    ? readUnambiguousNormalizedPayloadSessionId(payload)
-    : "";
   const authoritativeWorkerPayloadSessionId = authoritativeTeamWorker
     && candidateWorkerPayloadSessionId
     && (!pointer.state || !payloadMatchesSessionPointer(candidateWorkerPayloadSessionId, pointer.state))
