@@ -19902,7 +19902,11 @@ export async function dispatchCodexNativeHook(
         )),
     )).some(Boolean)
     : false;
-  if (isSubagentStop && stopAuthorizationFailure?.stopReason === "session_scope_unmatched") {
+  if (
+    isSubagentStop
+    && stopAuthorizationFailure?.stopReason === "session_scope_unmatched"
+    && !(authoritativeTeamWorker && !authoritativeWorkerPayloadSessionId)
+  ) {
     canonicalSessionId = normalizeSessionId(readPayloadSessionId(payload)) ?? "";
     allowImplicitSessionSideEffects = true;
     stopAuthorizationFailure = null;

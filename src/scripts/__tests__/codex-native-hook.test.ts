@@ -4651,6 +4651,21 @@ PY`,
           await mkdir(dirname(pointerPath), { recursive: true });
           await writeFile(pointerPath, "{ malformed missing-identity evidence", "utf-8");
         }
+        if (pointerKind === "live") {
+          await writeJson(join(cwd, ".omx", "state", "subagent-tracking.json"), {
+            schemaVersion: 1,
+            sessions: {
+              "leader-session": {
+                session_id: "leader-session",
+                leader_thread_id: "invalid-test-leader-native",
+                threads: {
+                  "invalid-test-leader-native": { thread_id: "invalid-test-leader-native", kind: "leader" },
+                  "invalid-worker-thread": { thread_id: "invalid-worker-thread", kind: "subagent" },
+                },
+              },
+            },
+          });
+        }
         const pointerBefore = existsSync(pointerPath) ? await readFile(pointerPath, "utf-8") : null;
 
         for (const payload of [
