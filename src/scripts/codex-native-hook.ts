@@ -19773,14 +19773,21 @@ export async function dispatchCodexNativeHook(
           transcriptPath,
         );
       }
-    } else if (authoritativeWorkerPayloadSessionId && authoritativeWorkerPayloadSessionId === nativeSessionId) {
-      // Team workers share the leader's selected state root, but they do not own
-      // its compatibility pointer. Keep lifecycle state scoped to the explicit
-      // hook payload without reconciling or replacing the live leader pointer.
-      canonicalSessionId = authoritativeWorkerPayloadSessionId;
-      resolvedNativeSessionId = authoritativeWorkerPayloadSessionId;
-      allowImplicitSessionSideEffects = true;
-      stopAuthorizationFailure = null;
+    } else if (authoritativeTeamWorker) {
+      if (authoritativeWorkerPayloadSessionId && authoritativeWorkerPayloadSessionId === nativeSessionId) {
+        // Team workers share the leader's selected state root, but they do not own
+        // its compatibility pointer. Keep lifecycle state scoped to the explicit
+        // hook payload without reconciling or replacing the live leader pointer.
+        canonicalSessionId = authoritativeWorkerPayloadSessionId;
+        resolvedNativeSessionId = authoritativeWorkerPayloadSessionId;
+        allowImplicitSessionSideEffects = true;
+        stopAuthorizationFailure = null;
+      } else {
+        canonicalSessionId = "";
+        resolvedNativeSessionId = nativeSessionId;
+        skipCanonicalSessionStartContext = true;
+        allowImplicitSessionSideEffects = false;
+      }
     } else {
       const ownerOmxSessionId = await resolveVerifiedOwnerOmxSessionId();
       try {
@@ -19827,7 +19834,9 @@ export async function dispatchCodexNativeHook(
       authorizedWorkerStopSessionId || stopPayloadSessionId,
       undefined,
       currentSessionState,
-      pointer.status === "absent" || Boolean(authorizedWorkerStopSessionId),
+      authoritativeTeamWorker
+        ? Boolean(authorizedWorkerStopSessionId)
+        : pointer.status === "absent",
     );
     if (stopPayloadSessionId && !stopCanonicalSessionId) {
       canonicalSessionId = "";

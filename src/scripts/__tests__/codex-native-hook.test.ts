@@ -4629,6 +4629,56 @@ PY`,
     }
   });
 
+  it("fails closed for invalid Team worker lifecycle identity with absent or live pointers", async () => {
+    for (const pointerKind of ["absent", "live"] as const) {
+      const cwd = await mkdtemp(join(tmpdir(), `omx-native-hook-team-worker-invalid-${pointerKind}-`));
+      try {
+        delete process.env.OMX_TEAM_INTERNAL_WORKER;
+        delete process.env.OMX_TEAM_WORKER;
+        delete process.env.OMX_TEAM_STATE_ROOT;
+        delete process.env.OMX_TEAM_LEADER_CWD;
+        delete process.env.OMX_SESSION_ID;
+        delete process.env.TMUX;
+        delete process.env.TMUX_PANE;
+        const pointerPath = join(cwd, ".omx", "state", "session.json");
+        await configureAuthoritativeTeamWorker(cwd, "invalid-identity-team");
+        if (pointerKind === "live") {
+          await writeSessionStart(cwd, "leader-session", {
+            nativeSessionId: "invalid-test-leader-native",
+            pid: process.pid,
+          });
+        }
+        const pointerBefore = existsSync(pointerPath) ? await readFile(pointerPath, "utf-8") : null;
+
+        for (const payload of [
+          { session_id: "../escape" },
+          { session_id: "worker-one", sessionId: "worker-two" },
+        ]) {
+          await dispatchCodexNativeHook({
+            hook_event_name: "SessionStart",
+            cwd,
+            ...payload,
+          }, { cwd, sessionOwnerPid: process.pid });
+          assert.equal(existsSync(pointerPath), pointerBefore !== null);
+          if (pointerBefore !== null) assert.equal(await readFile(pointerPath, "utf-8"), pointerBefore);
+
+          const stop = await dispatchCodexNativeHook({
+            hook_event_name: "Stop",
+            cwd,
+            ...payload,
+            thread_id: "invalid-worker-thread",
+            turn_id: `invalid-worker-${pointerKind}-stop`,
+          }, { cwd });
+          assert.equal(stop.outputJson?.stopReason, "session_scope_unmatched");
+          assert.equal(existsSync(pointerPath), pointerBefore !== null);
+          if (pointerBefore !== null) assert.equal(await readFile(pointerPath, "utf-8"), pointerBefore);
+        }
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    }
+  });
+
   it("keeps authoritative worker payload scope independent of malformed selected-pointer evidence", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-team-worker-malformed-pointer-"));
     try {
