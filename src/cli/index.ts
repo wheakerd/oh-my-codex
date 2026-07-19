@@ -156,7 +156,6 @@ import {
   isMsysOrGitBash,
   isNativeWindows,
   isTmuxAvailable,
-  mitigateCopyModeUnderlineArtifacts,
 } from "../team/tmux-session.js";
 import { getPackageRoot } from "../utils/package.js";
 import { codexConfigPath, omxRoot, rememberOmxLaunchContext, resolveOmxCliEntryPath } from "../utils/paths.js";
@@ -1471,6 +1470,178 @@ function execTmuxFileSync(
     ...(options ?? {}),
     ...(process.platform === "win32" ? { windowsHide: true } : {}),
   }) as string;
+}
+
+type DetachedLeaderAuthority = {
+  paneId: string;
+  panePid: number;
+  sessionName: string;
+  sessionId: string;
+  sessionCreated: string;
+  windowId: string;
+  windowIndex: string;
+  ownerId: string;
+};
+
+type DetachedHudAuthority = {
+  paneId: string;
+  panePid: number;
+  sessionId: string;
+  windowId: string;
+  operationMarker: string;
+};
+
+function captureDetachedLeaderAuthority(leaderPaneId: string, expectedSessionName: string, ownerId: string): DetachedLeaderAuthority {
+  if (!/^%[0-9]+$/.test(leaderPaneId) || !ownerId) throw new Error("invalid detached leader authority target");
+  const output = execTmuxFileSync([
+    "display-message", "-p", "-t", leaderPaneId,
+    "#{session_name}\t#{session_id}\t#{session_created}\t#{window_index}\t#{window_id}\t#{pane_id}\t#{pane_pid}",
+  ], { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+  const fields = output.split("\t");
+  if (fields.length !== 7) throw new Error("malformed detached leader authority");
+  const [sessionName, sessionId, sessionCreated, windowIndex, windowId, paneId, panePid] = fields;
+  if (sessionName !== expectedSessionName || paneId !== leaderPaneId || !/^\$[0-9]+$/.test(sessionId)
+    || !/^[0-9]+$/.test(sessionCreated) || !/^[0-9]+$/.test(windowIndex)
+    || !/^@[0-9]+$/.test(windowId) || !/^[1-9][0-9]*$/.test(panePid)) {
+    throw new Error("malformed detached leader authority");
+  }
+  const parsedPid = Number(panePid);
+  if (!Number.isSafeInteger(parsedPid) || parsedPid <= 0) throw new Error("malformed detached leader authority");
+  return { paneId, panePid: parsedPid, sessionName, sessionId, sessionCreated, windowId, windowIndex, ownerId };
+}
+
+function detachedLeaderAuthorityCondition(authority: DetachedLeaderAuthority, requireOwner = true): string {
+  const conditions = [
+    "#{==:#{pane_dead},0}",
+    `#{==:#{pane_id},${authority.paneId}}`,
+    `#{==:#{pane_pid},${authority.panePid}}`,
+    `#{==:#{session_id},${authority.sessionId}}`,
+    `#{==:#{session_created},${authority.sessionCreated}}`,
+    `#{==:#{window_id},${authority.windowId}}`,
+    ...(requireOwner ? [`#{==:#{@omx_instance_id},${authority.ownerId}}`] : []),
+  ];
+  return conditions.reduce((combined, condition) => `#{&&:${combined},${condition}}`);
+}
+
+function detachedHudAuthorityCondition(authority: DetachedHudAuthority): string {
+  const conditions = [
+    "#{==:#{pane_dead},0}",
+    `#{==:#{pane_id},${authority.paneId}}`,
+    `#{==:#{pane_pid},${authority.panePid}}`,
+    `#{==:#{session_id},${authority.sessionId}}`,
+    `#{==:#{window_id},${authority.windowId}}`,
+    `#{m:*OMX_DETACHED_HUD_OPERATION=${authority.operationMarker}*,#{pane_start_command}}`,
+  ];
+  return conditions.reduce((combined, condition) => `#{&&:${combined},${condition}}`);
+}
+
+function detachedAuthorityReceipt(): string {
+  return `omx_detached_${randomUUID()}`;
+}
+
+function runDetachedLeaderMutation(authority: DetachedLeaderAuthority, args: string[], requireOwner = true): void {
+  const receipt = detachedAuthorityReceipt();
+  const success = `${args.map(quoteShellArg).join(" ")} \\; display-message -p ${quoteShellArg(receipt)}`;
+  const output = execTmuxFileSync([
+    "if-shell", "-F", "-t", authority.paneId, detachedLeaderAuthorityCondition(authority, requireOwner),
+    success, "display-message -p ''",
+  ], { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+  if (output !== receipt) throw new Error("detached leader authority changed before tmux mutation");
+}
+
+function runDetachedHudMutation(
+  leaderAuthority: DetachedLeaderAuthority,
+  hudAuthority: DetachedHudAuthority,
+  args: string[],
+): void {
+  const receipt = detachedAuthorityReceipt();
+  const success = `${args.map(quoteShellArg).join(" ")} \\; display-message -p ${quoteShellArg(receipt)}`;
+  const hudGuard = `if-shell -F -t ${quoteShellArg(hudAuthority.paneId)} ${quoteShellArg(detachedHudAuthorityCondition(hudAuthority))} ${quoteShellArg(success)} ${quoteShellArg("display-message -p ''")}`;
+  const output = execTmuxFileSync([
+    "if-shell", "-F", "-t", leaderAuthority.paneId, detachedLeaderAuthorityCondition(leaderAuthority),
+    hudGuard, "display-message -p ''",
+  ], { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+  if (output !== receipt) throw new Error("detached leader or HUD authority changed before tmux mutation");
+}
+
+function buildDeferredDetachedHudGuard(
+  leaderAuthority: DetachedLeaderAuthority,
+  hudAuthority: DetachedHudAuthority,
+  command: string,
+): string {
+  const deferredReceipt = detachedAuthorityReceipt();
+  const guardedResize = (match: string): string => {
+    const success = `${match} \\; display-message -p ${quoteShellArg(deferredReceipt)}`;
+    const hudGuard = `if-shell -F -t ${quoteShellArg(hudAuthority.paneId)} ${quoteShellArg(detachedHudAuthorityCondition(hudAuthority))} ${quoteShellArg(success)} ${quoteShellArg("")}`;
+    return `tmux if-shell -F -t ${quoteShellArg(leaderAuthority.paneId)} ${quoteShellArg(detachedLeaderAuthorityCondition(leaderAuthority))} ${quoteShellArg(hudGuard)} ${quoteShellArg("")}`;
+  };
+  const guardedCommand = command.replace(
+    /tmux resize-pane -t %[0-9]+ -y [1-9][0-9]*/g,
+    guardedResize,
+  );
+  if (guardedCommand === command) {
+    throw new Error("detached deferred HUD mutation lacks a recognized resize sink");
+  }
+  return guardedCommand;
+}
+
+function guardDetachedHudDeferredMutation(
+  leaderAuthority: DetachedLeaderAuthority,
+  hudAuthority: DetachedHudAuthority,
+  args: string[],
+): string[] {
+  if (args[0] === "set-hook" && typeof args.at(-1) === "string") {
+    const hookCommand = args.at(-1)!;
+    const runShellPrefix = "run-shell -b ";
+    if (!hookCommand.startsWith(runShellPrefix)) {
+      throw new Error("detached deferred HUD hook lacks a run-shell command");
+    }
+    const quotedPayload = hookCommand.slice(runShellPrefix.length);
+    if (!quotedPayload.startsWith("'") || !quotedPayload.endsWith("'")) {
+      throw new Error("detached deferred HUD hook has an invalid run-shell payload");
+    }
+    const payload = quotedPayload
+      .slice(1, -1)
+      .replaceAll(`'"'"'`, "'")
+      .replaceAll("'\\''", "'");
+    const guardedPayload = buildDeferredDetachedHudGuard(
+      leaderAuthority,
+      hudAuthority,
+      payload,
+    );
+    return [...args.slice(0, -1), `${runShellPrefix}${quoteShellArg(guardedPayload)}`];
+  }
+  if (args[0] === "run-shell") {
+    const commandIndex = args.length - 1;
+    return [...args.slice(0, commandIndex), buildDeferredDetachedHudGuard(leaderAuthority, hudAuthority, args[commandIndex]!)];
+  }
+  return args;
+}
+
+function runDetachedLeaderSplit(authority: DetachedLeaderAuthority, args: string[]): DetachedHudAuthority {
+  const receipt = detachedAuthorityReceipt();
+  const operationMarker = randomUUID();
+  const splitArgs = [...args];
+  const targetIndex = splitArgs.indexOf("-t");
+  if (targetIndex < 0 || splitArgs[targetIndex + 1] !== authority.sessionName) throw new Error("invalid detached HUD split target");
+  splitArgs[targetIndex + 1] = authority.paneId;
+  const formatIndex = splitArgs.indexOf("-F");
+  if (formatIndex < 0 || splitArgs[formatIndex + 1] !== "#{pane_id}") throw new Error("invalid detached HUD split receipt format");
+  const commandIndex = splitArgs.length - 1;
+  splitArgs[commandIndex] = `env OMX_DETACHED_HUD_OPERATION=${operationMarker} ${splitArgs[commandIndex]}`;
+  splitArgs[formatIndex + 1] = `#{pane_id}\t#{pane_pid}\t#{session_id}\t#{window_id}\t${receipt}`;
+  const output = execTmuxFileSync([
+    "if-shell", "-F", "-t", authority.paneId, detachedLeaderAuthorityCondition(authority),
+    splitArgs.map(quoteShellArg).join(" "), "display-message -p ''",
+  ], { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+  const [paneId, panePid, sessionId, windowId, observedReceipt, ...extra] = output.split("\t");
+  if (!/^%[0-9]+$/.test(paneId) || !/^[1-9][0-9]*$/.test(panePid) || !/^\$[0-9]+$/.test(sessionId)
+    || !/^@[0-9]+$/.test(windowId) || observedReceipt !== receipt || extra.length !== 0) {
+    throw new Error("detached leader authority changed before HUD split");
+  }
+  const parsedPid = Number(panePid);
+  if (!Number.isSafeInteger(parsedPid) || parsedPid <= 0) throw new Error("malformed detached HUD authority");
+  return { paneId, panePid: parsedPid, sessionId, windowId, operationMarker };
 }
 
 function readTmuxEnvValueForTarget(targetPaneId: string): string | undefined {
@@ -5872,6 +6043,7 @@ async function runCodex(
     );
     let detachedParentEnvFilePath: string | undefined;
     let detachedLeaderPaneId: string | null = null;
+    let detachedLeaderAuthority: DetachedLeaderAuthority | null = null;
     let detachedLeaderPid: number | null = null;
 
     let attachStep: DetachedSessionTmuxStep | null = null;
@@ -5893,28 +6065,45 @@ async function runCodex(
           },
         );
         for (const step of bootstrapSteps) {
-          let output: string;
           try {
-            output = execTmuxFileSync(step.args, { stdio: "pipe", encoding: "utf-8" });
+            if (step.name === "new-session") {
+              const output = execTmuxFileSync(step.args, { stdio: "pipe", encoding: "utf-8" });
+              createdSession = true;
+              const leaderPaneId = parsePaneIdFromTmuxOutput(output || "");
+              if (!leaderPaneId) throw new Error("detached session did not report a leader pane id");
+              detachedLeaderPaneId = leaderPaneId;
+              detachedLeaderAuthority = captureDetachedLeaderAuthority(leaderPaneId, sessionName, sessionId);
+              continue;
+            }
+            const authority = detachedLeaderAuthority;
+            if (!authority) throw new Error("detached leader authority missing before tmux mutation");
+            if (step.name === "tag-session") {
+              runDetachedLeaderMutation(authority, step.args, false);
+              runDetachedLeaderMutation(authority, ["set-option", "-q", "-t", authority.sessionName, "history-limit", String(DETACHED_TMUX_HISTORY_LIMIT)]);
+              runDetachedLeaderMutation(authority, ["set-option", "-pq", "-t", authority.paneId, "history-limit", String(DETACHED_TMUX_HISTORY_LIMIT)]);
+              continue;
+            }
+            if (step.name !== "split-and-capture-hud-pane") {
+              throw new Error(`unexpected detached bootstrap mutation: ${step.name}`);
+            }
+            const hudAuthority = runDetachedLeaderSplit(authority, step.args);
+            for (const finalizeStep of buildDetachedSessionFinalizeSteps(
+              authority.sessionName, hudAuthority.paneId, authority.windowIndex, process.env.OMX_MOUSE !== "0",
+              nativeWindows, detachedPreflight.shouldAttach, authority.paneId,
+            )) {
+              if (finalizeStep.name === "attach-session") { attachStep = finalizeStep; continue; }
+              if (finalizeStep.name === "sanitize-copy-mode-style") continue;
+              const targetsHudPane = new Set([
+                "register-resize-hook",
+                "register-client-attached-reconcile",
+                "schedule-delayed-resize",
+                "reconcile-hud-resize",
+              ]).has(finalizeStep.name);
+              if (targetsHudPane) runDetachedHudMutation(authority, hudAuthority, guardDetachedHudDeferredMutation(authority, hudAuthority, finalizeStep.args));
+              else runDetachedLeaderMutation(authority, finalizeStep.args);
+            }
           } catch (error) {
             throw new DetachedLaunchSafetyError(step.name === "new-session" ? "inert-session" : "pane-id", error, detachedPreflight.report);
-          }
-          if (step.name === "new-session") {
-            createdSession = true;
-            const leaderPaneId = parsePaneIdFromTmuxOutput(output || "");
-            if (!leaderPaneId) throw new DetachedLaunchSafetyError("pane-id", new Error("detached session did not report a leader pane id"), detachedPreflight.report);
-            detachedLeaderPaneId = leaderPaneId;
-            setDetachedTmuxSessionHistoryLimit(sessionName, leaderPaneId);
-          }
-          if (step.name === "split-and-capture-hud-pane") {
-            const hudPaneId = parsePaneIdFromTmuxOutput(output || "");
-            const hookWindowIndex = hudPaneId ? detectDetachedSessionWindowIndex(sessionName) : null;
-            for (const finalizeStep of buildDetachedSessionFinalizeSteps(sessionName, hudPaneId, hookWindowIndex, process.env.OMX_MOUSE !== "0", nativeWindows, detachedPreflight.shouldAttach, detachedLeaderPaneId)) {
-              if (finalizeStep.name === "attach-session") { attachStep = finalizeStep; continue; }
-              if (finalizeStep.name === "sanitize-copy-mode-style") { try { mitigateCopyModeUnderlineArtifacts(sessionName); } catch (error) { logCliOperationFailure(error); } continue; }
-              try { execTmuxFileSync(finalizeStep.args, { stdio: "ignore" }); } catch (error) { logCliOperationFailure(error); continue; }
-              if (finalizeStep.name === "reconcile-hud-resize") registerDetachedHudLayoutReconcileHook({ hudPaneId, detachedLeaderPaneId, cwd, sessionId, omxBin, omxRootOverride, baseEnv: runtimeHookEnv });
-            }
           }
         }
         return undefined;
@@ -6024,7 +6213,10 @@ async function runCodex(
             await attempt("rollback", () => { rmSync(releaseMarkerPath, { force: true }); rmSync(`${releaseMarkerPath}.release`, { force: true }); rmSync(`${releaseMarkerPath}.abort`, { force: true }); });
             if (createdSession) {
               for (const step of buildDetachedSessionRollbackSteps(sessionName, null, null, null)) {
-                await attempt(`session:${step.name}`, () => { execTmuxFileSync(step.args, { stdio: "ignore" }); });
+                await attempt(`session:${step.name}`, () => {
+                  if (!detachedLeaderAuthority) throw new Error("detached leader authority missing before rollback");
+                  runDetachedLeaderMutation(detachedLeaderAuthority, step.args);
+                });
               }
             }
           },

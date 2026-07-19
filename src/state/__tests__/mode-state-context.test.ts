@@ -47,16 +47,17 @@ describe('withModeRuntimeContext', () => {
       await writeFile(tmuxPath, `#!/bin/sh
 printf '%s\n' "$*" >> '${tmuxPath}.log'
 case "$1" in
-  list-panes) printf '%%7\\t0\\t4242\\n' ;;
+  list-panes) printf '%%7\t0\t4242\n' ;;
   set-option)
     [ "$5" = '@omx_ralph_pane_owner_id' ] || exit 2
     printf '%s' "$6" > '${tmuxPath}.ralph-owner'
     ;;
-  show-option)
-    [ "$6" = '@omx_ralph_pane_owner_id' ] || exit 3
-    cat '${tmuxPath}.ralph-owner'
+  display-message)
+    case "$*" in
+      *'#{session_id}'*) printf '%%7\\0374242\\037ralph-session\\037$7\\037@9\\037%s\\037codex\\037codex\n' "$(cat '${tmuxPath}.ralph-owner')" ;;
+      *) exit 4 ;;
+    esac
     ;;
-  display-message) printf 'ralph-session\\n' ;;
   *) exit 1 ;;
 esac
 `);
@@ -71,7 +72,11 @@ esac
       assert.equal(out.tmux_pane_id, '%7');
       assert.equal(out.tmux_pane_pid, 4242);
       assert.equal(out.tmux_session_name, 'ralph-session');
+      assert.equal(out.tmux_session_id, '$7');
+      assert.equal(out.tmux_window_id, '@9');
       assert.match(String(out.tmux_pane_owner_id), /^ralph:[0-9a-f-]+$/);
+      assert.equal(out.tmux_pane_current_command, 'codex');
+      assert.equal(out.tmux_pane_start_command, 'codex');
       assert.doesNotMatch(await readFile(`${tmuxPath}.log`, 'utf8'), /@omx_team_pane_owner_id/);
     } finally {
       if (originalPath === undefined) delete process.env.PATH;
@@ -88,6 +93,8 @@ esac
     assert.equal(out.tmux_pane_id, undefined);
     assert.equal(out.tmux_pane_pid, undefined);
     assert.equal(out.tmux_session_name, undefined);
+    assert.equal(out.tmux_session_id, undefined);
+    assert.equal(out.tmux_window_id, undefined);
     assert.equal(out.tmux_pane_owner_id, undefined);
   });
 });

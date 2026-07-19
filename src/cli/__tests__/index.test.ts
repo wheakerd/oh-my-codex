@@ -3787,21 +3787,23 @@ describe("tmux HUD pane helpers", () => {
     assert.deepEqual(buildHudPaneCleanupTargets(["%3"], "%4"), ["%3", "%4"]);
   });
 
-  it("listCurrentWindowHudPaneIds scopes tmux pane listing to the emitting pane", () => {
+  it("listCurrentWindowHudPaneIds excludes snapshots without complete current ownership", () => {
     const calls: string[][] = [];
-    const panes = listCurrentWindowHudPaneIds("%leader", (args) => {
+    const panes = listCurrentWindowHudPaneIds("%1", (args) => {
       calls.push(args);
+      if (args.at(-1) === "#{pane_id}") return "%1\n%2\n";
       return [
-        "%leader\tcodex\tcodex",
-        "%hud\tnode\tnode /tmp/bin/omx.js hud --watch",
+        "%1\x1fcodex\x1f0\x1f0\x1f100\x1f40\x1f39\x1f100\x1f40\x1fcodex\x1f/repo\x1f0\x1f101",
+        "%2\x1fnode\x1f0\x1f40\x1f100\x1f3\x1f42\x1f100\x1f43\x1fexec env OMX_TMUX_HUD_OWNER=1 OMX_TMUX_HUD_LEADER_PANE='%1' node /tmp/bin/dist/cli/omx.js hud --watch\x1f/repo\x1f0\x1f202",
       ].join("\n");
     });
 
-    assert.deepEqual(panes, ["%hud"]);
-    assert.deepEqual(calls[0], [
+    assert.deepEqual(panes, []);
+    assert.deepEqual(calls[0], ["list-panes", "-t", "%1", "-F", "#{pane_id}"]);
+    assert.deepEqual(calls[1], [
       "list-panes",
       "-t",
-      "%leader",
+      "%1",
       "-F",
       [
         "#{pane_id}",
@@ -3815,38 +3817,71 @@ describe("tmux HUD pane helpers", () => {
         "#{window_height}",
         "#{pane_start_command}",
         "#{pane_current_path}",
+        "#{pane_dead}",
+        "#{pane_pid}",
       ].join("\x1f"),
     ]);
   });
 
-  it("createHudWatchPane splits from the emitting pane target when provided", () => {
+  it("createHudWatchPane rejects an incomplete synthetic source incarnation", () => {
     const calls: string[][] = [];
+    const options = new Map<string, string>();
+    let splitCreated = false;
+    let splitMarker = "";
     const paneId = createSharedHudWatchPane(
       "/repo",
       "node /repo/dist/cli/omx.js hud --watch",
-      { heightLines: 3, targetPaneId: "%leader" },
+      { heightLines: 3, targetPaneId: "%1" },
       (args) => {
         calls.push(args);
-        return "%hud\n";
+        if (args[0] === "display-message") {
+          const format = args.at(-1);
+          if (format === "#{pane_id}\t#{pane_dead}\t#{pane_pid}\t#{session_id}\t#{window_id}") {
+            return "%1\t0\t101\t$7\t@1";
+          }
+          if (format === "#{session_id}\t#{window_id}") return "$7\t@1";
+        }
+        if (args[0] === "list-panes") {
+          const format = args.at(-1);
+          const panes = splitCreated ? ["%1", "%2"] : ["%1"];
+          if (format === "#{pane_id}") return `${panes.join("\n")}\n`;
+          if (format === "#{pane_id}\t#{pane_start_command}") {
+            return [
+              "%1\tcodex",
+              `%2\tOMX_TMUX_SPLIT_OPERATION_MARKER='${splitMarker}'; export OMX_TMUX_SPLIT_OPERATION_MARKER; exec env OMX_TMUX_HUD_OWNER=1 OMX_TMUX_HUD_LEADER_PANE='%1' node /repo/dist/cli/omx.js hud --watch`,
+            ].join("\n");
+          }
+          if (format === "#{pane_id}\t#{pane_dead}\t#{pane_pid}") {
+            return "%1\t0\t101\n%2\t0\t202\n";
+          }
+        }
+        if (args[0] === "set-option") {
+          options.set(args[2]!, args[3]!);
+          return "";
+        }
+        if (args[0] === "show-options") return `${options.get(args.at(-1)!) ?? ""}\n`;
+        if (args[0] === "if-shell") {
+          assert.equal(args[1], "-F");
+          assert.equal(args[2], "-t");
+          assert.equal(args[3], "%1");
+          assert.match(args[4]!, /#\{pane_id\},%1/);
+          assert.match(args[4]!, /#\{pane_pid\},101/);
+          assert.match(args[4]!, /#\{session_id\},\$1/);
+          assert.match(args[4]!, /#\{window_id\},@1/);
+          splitCreated = true;
+          const marker = /OMX_TMUX_SPLIT_OPERATION_MARKER='([\w-]+)'/.exec(args[5]!);
+          const receipt = /display-message -p (__omx_hud_split_[\w-]+)/.exec(args[5]!);
+          assert.ok(marker, "guarded split must bind an operation marker");
+          assert.ok(receipt, "guarded split must emit an exact receipt");
+          splitMarker = marker[1]!;
+          return `${receipt[1]}\n`;
+        }
+        throw new Error(`unexpected tmux command: ${args.join(" ")}`);
       },
     );
 
-    assert.equal(paneId, "%hud");
-    assert.deepEqual(calls[0], [
-      "split-window",
-      "-v",
-      "-l",
-      "3",
-      "-d",
-      "-t",
-      "%leader",
-      "-c",
-      "/repo",
-      "-P",
-      "-F",
-      "#{pane_id}",
-      "node /repo/dist/cli/omx.js hud --watch",
-    ]);
+    assert.equal(paneId, null);
+    assert.equal(calls.some((args) => args[0] === "if-shell"), false);
   });
 });
 

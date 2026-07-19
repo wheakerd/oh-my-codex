@@ -10,6 +10,7 @@
  * - 'draining' worker status for graceful transitions during scale_down
  */
 
+import { randomUUID } from 'crypto';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'path';
 import { mkdir, readFile, realpath, rm, writeFile } from 'fs/promises';
 import { existsSync } from 'fs';
@@ -18,16 +19,14 @@ import {
   isTmuxAvailable,
   waitForWorkerReady,
   dismissTrustPromptIfPresent,
-  sendToWorker,
   isWorkerAlive,
-  teardownWorkerPanes,
   buildWorkerStartupCommand,
   trustWorkerMiseConfigIfAvailable,
   writeWorkerStartupScriptCommand,
   resolveTeamWorkerCliForResolvedLaunchArgs,
   assertTeamWorkerCliPolicyCompatibility,
-  tagPaneTeamOwner,
   readPaneTeamOwnerTagResult,
+  teardownWorkerPanes,
   type TeamWorkerCli,
 } from './tmux-session.js';
 import { readExactPaneProofSync } from './exact-pane.js';
@@ -154,6 +153,125 @@ export function isScalingEnabled(env: NodeJS.ProcessEnv = process.env): boolean 
   const normalized = raw.trim().toLowerCase();
   return ['1', 'true', 'yes', 'on', 'enabled'].includes(normalized);
 }
+
+type ScalePaneInstance = {
+  paneId: string;
+  pid: number;
+  sessionName: string;
+  sessionId: string;
+  windowId: string;
+  teamOwnerId: string;
+};
+
+type ScaleUpWorkerInfo = WorkerInfo & {
+  session_id: string;
+  window_id: string;
+};
+
+const SCALE_PANE_INSTANCE_FORMAT = '#{pane_id}\t#{pane_pid}\t#{session_name}\t#{session_id}\t#{window_id}\t#{@omx_team_pane_owner_id}';
+const SCALE_SPLIT_RECEIPT_FORMAT = '#{pane_id}\t#{pane_pid}\t#{session_name}\t#{session_id}\t#{window_id}';
+
+type ScalePaneBirth = Omit<ScalePaneInstance, 'teamOwnerId'>;
+
+function scaleTransactionReceipt(): string {
+  return `omx-scale-${randomUUID()}`;
+}
+
+function hasExactScaleReceipt(stdout: string, receipt: string): boolean {
+  return stdout === `${receipt}\n` || stdout === `${receipt}\r\n`;
+}
+
+function runScalePaneTransaction(
+  pane: ScalePaneInstance,
+  effect: string,
+  receipt: string = scaleTransactionReceipt(),
+): boolean {
+  const result = spawnSync('tmux', [
+    'if-shell', '-F', '-t', pane.paneId, buildScalePaneAuthorityCondition(pane),
+    `${effect} \\; display-message -p ${quoteTmuxCommand(receipt)}`,
+    "display-message -p ''",
+  ], { encoding: 'utf-8' });
+  return result.status === 0 && hasExactScaleReceipt(result.stdout || '', receipt);
+}
+
+function tagScalePaneWithAuthority(pane: ScalePaneBirth, teamOwnerId: string): ScalePaneInstance | null {
+  const comparisons = [
+    ['pane_id', pane.paneId],
+    ['pane_pid', String(pane.pid)],
+    ['session_name', pane.sessionName],
+    ['session_id', pane.sessionId],
+    ['window_id', pane.windowId],
+  ].map(([field, expected]) => `#{==:#{${field}},${expected}}`);
+  const condition = comparisons.reduce((combined, comparison) => `#{&&:${combined},${comparison}}`);
+  const receipt = scaleTransactionReceipt();
+  const result = spawnSync('tmux', [
+    'if-shell', '-F', '-t', pane.paneId, condition,
+    `set-option -p -t ${pane.paneId} @omx_team_pane_owner_id ${quoteTmuxCommand(teamOwnerId)} \\; display-message -p ${quoteTmuxCommand(receipt)}`,
+    "display-message -p ''",
+  ], { encoding: 'utf-8' });
+  if (result.status !== 0 || !hasExactScaleReceipt(result.stdout || '', receipt)) return null;
+  return { ...pane, teamOwnerId };
+}
+
+function killScalePaneWithAuthority(pane: ScalePaneInstance): boolean {
+  return runScalePaneTransaction(pane, `kill-pane -t ${pane.paneId}`);
+}
+
+function parseScalePaneInstance(value: string): ScalePaneInstance | null {
+  const fields = value.trim().split('\t');
+  if (fields.length !== 6) return null;
+  const [paneId, pidText, sessionName, sessionId, windowId, teamOwnerId] = fields;
+  const pid = Number(pidText);
+  if (!/^%[0-9]+$/.test(paneId) || !Number.isSafeInteger(pid) || pid <= 0
+    || !sessionName || !/^\$[0-9]+$/.test(sessionId) || !/^@[0-9]+$/.test(windowId) || !teamOwnerId) return null;
+  return { paneId, pid, sessionName, sessionId, windowId, teamOwnerId };
+}
+
+function readScalePaneInstance(paneId: string): ScalePaneInstance | null {
+  const result = spawnSync('tmux', ['display-message', '-p', '-t', paneId, SCALE_PANE_INSTANCE_FORMAT], { encoding: 'utf-8' });
+  return result.status === 0 ? parseScalePaneInstance(result.stdout || '') : null;
+}
+
+function quoteTmuxCommand(value: string): string {
+  return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+function buildScalePaneAuthorityCondition(instance: ScalePaneInstance): string {
+  const comparisons = [
+    ['pane_id', instance.paneId],
+    ['pane_pid', String(instance.pid)],
+    ['session_name', instance.sessionName],
+    ['session_id', instance.sessionId],
+    ['window_id', instance.windowId],
+    ['@omx_team_pane_owner_id', instance.teamOwnerId],
+  ].map(([field, expected]) => `#{==:#{${field}},${expected}}`);
+  return comparisons.reduce((condition, comparison) => `#{&&:${condition},${comparison}}`);
+}
+
+function splitWorkerPaneWithScaleAuthority(
+  source: ScalePaneInstance,
+  splitDirection: string,
+  workerCwd: string,
+  command: string,
+): ScalePaneBirth | null {
+  const receipt = scaleTransactionReceipt();
+  const splitCommand = [
+    'split-window', splitDirection, '-t', source.paneId, '-d', '-P', '-F', `${SCALE_SPLIT_RECEIPT_FORMAT}\t${receipt}`,
+    '-c', workerCwd, command,
+  ].map(quoteTmuxCommand).join(' ');
+  const result = spawnSync('tmux', [
+    'if-shell', '-F', '-t', source.paneId, buildScalePaneAuthorityCondition(source), splitCommand, "display-message -p ''",
+  ], { encoding: 'utf-8' });
+  if (result.status !== 0) return null;
+  const fields = (result.stdout || '').replace(/\r?\n$/, '').split('\t');
+  if (fields.length !== 6 || fields[5] !== receipt) return null;
+  const [paneId, pidText, sessionName, sessionId, windowId] = fields;
+  const pid = Number(pidText);
+  if (!/^%[0-9]+$/.test(paneId) || !Number.isSafeInteger(pid) || pid <= 0
+    || !sessionName || !sessionId || !/^\$[0-9]+$/.test(sessionId) || !/^@[0-9]+$/.test(windowId)) return null;
+  return { paneId, pid, sessionName, sessionId, windowId };
+}
+
 
 function assertScalingEnabled(env: NodeJS.ProcessEnv = process.env): void {
   if (!isScalingEnabled(env)) {
@@ -416,16 +534,31 @@ function resolveScaleUpWorktreeMode(config: TeamConfig): WorktreeMode {
 
 async function notifyWorkerPaneOutcome(
   sessionName: string,
-  workerIndex: number,
   message: string,
   paneId?: string,
-  workerCli?: 'codex' | 'claude' | 'gemini',
   expectedPanePid?: number,
   expectedTeamOwnerId?: string,
-  hudPaneId?: string,
+  expectedSessionId?: string,
+  expectedWindowId?: string,
 ): Promise<DispatchOutcome> {
   try {
-    await sendToWorker(sessionName, workerIndex, message, paneId, workerCli, expectedPanePid, expectedTeamOwnerId, hudPaneId);
+    if (!paneId || !expectedPanePid || !expectedTeamOwnerId || !expectedSessionId || !expectedWindowId) {
+      throw new Error(`scale_up_final_send_authority_missing:${paneId ?? 'unknown'}`);
+    }
+    const pane: ScalePaneInstance = {
+      paneId,
+      pid: expectedPanePid,
+      sessionName,
+      sessionId: expectedSessionId,
+      windowId: expectedWindowId,
+      teamOwnerId: expectedTeamOwnerId,
+    };
+    if (!runScalePaneTransaction(
+      pane,
+      `send-keys -t ${paneId} -l ${quoteTmuxCommand(message)} \\; send-keys -t ${paneId} C-m`,
+    )) {
+      throw new Error(`scale_up_final_send_authority_lost:${paneId}`);
+    }
     return { ok: true, transport: 'tmux_send_keys', reason: 'tmux_send_keys_sent' };
   } catch (error) {
     return {
@@ -710,9 +843,9 @@ export async function scaleUp(
       ].filter((paneId): paneId is string => typeof paneId === 'string' && paneId.trim().startsWith('%')))];
       const resolvedPaneIds = new Set<string>();
       const unresolvedPaneIds = new Set<string>();
-      const expectedPanePids: Record<string, number> = {};
       const requiredTeamOwnerId = config.tmux_pane_owner_id?.trim();
       const authorizedRollbackPaneIds = new Set<string>();
+      const rollbackInstances = new Map<string, ScalePaneInstance>();
       for (const paneId of rollbackPaneIds) {
         const matchingWorkers = rollbackWorkers.filter((worker) => worker.pane_id === paneId);
         const worker = matchingWorkers.length === 1 ? matchingWorkers[0] : undefined;
@@ -727,43 +860,36 @@ export async function scaleUp(
           cleanupDebt.push(`pane_owner_unverified:${paneId}`);
           continue;
         }
-        expectedPanePids[paneId] = expectedPanePid;
+        const expectedWindowId = (worker as WorkerInfo & { window_id?: unknown }).window_id;
+        const expectedSessionId = (worker as WorkerInfo & { session_id?: unknown }).session_id;
+        if (typeof expectedWindowId !== 'string' || !/^@[0-9]+$/.test(expectedWindowId)
+          || typeof expectedSessionId !== 'string' || expectedSessionId.trim() === '') {
+          unresolvedPaneIds.add(paneId);
+          cleanupDebt.push(`pane_window_unpinned:${paneId}`);
+          continue;
+        }
+        const rollbackInstance = readScalePaneInstance(paneId);
+        if (!rollbackInstance
+          || rollbackInstance.pid !== expectedPanePid
+          || rollbackInstance.sessionName !== config.tmux_session
+          || rollbackInstance.sessionId !== expectedSessionId
+          || rollbackInstance.windowId !== expectedWindowId
+          || (requiredTeamOwnerId && rollbackInstance.teamOwnerId !== requiredTeamOwnerId)) {
+          unresolvedPaneIds.add(paneId);
+          cleanupDebt.push(`pane_window_authority_lost:${paneId}`);
+          continue;
+        }
+        rollbackInstances.set(paneId, rollbackInstance);
         authorizedRollbackPaneIds.add(paneId);
       }
-      try {
-        const paneTeardown = await teardownWorkerPanes([...authorizedRollbackPaneIds], {
-          leaderPaneId: config.leader_pane_id,
-          hudPaneId: config.hud_pane_id,
-          expectedPanePids,
-          authorizePaneKill: (paneId) => {
-            if (!requiredTeamOwnerId) return true;
-            const expectedOwnerId = rollbackTaggedPaneOwnerIds.get(paneId);
-            if (expectedOwnerId !== requiredTeamOwnerId) return false;
-            const currentOwner = readPaneTeamOwnerTagResult(paneId);
-            return currentOwner.status === 'value' && currentOwner.value === expectedOwnerId;
-          },
-        });
-        for (const paneId of [...paneTeardown.provenGonePaneIds, ...paneTeardown.killedPaneIds]) resolvedPaneIds.add(paneId);
-        for (const paneId of paneTeardown.kill.failedPaneIds) unresolvedPaneIds.add(paneId);
-        for (const proof of paneTeardown.proofUnavailable) unresolvedPaneIds.add(proof.paneId);
-        if (paneTeardown.kill.failedPaneIds.length > 0) cleanupDebt.push(`pane_teardown_failed:${paneTeardown.kill.failedPaneIds.join(',')}`);
-        if (paneTeardown.proofUnavailable.length > 0) {
-          cleanupDebt.push(`pane_proof_unavailable:${paneTeardown.proofUnavailable.map((proof) => `${proof.paneId}:${proof.reason}`).join(',')}`);
+      for (const paneId of authorizedRollbackPaneIds) {
+        const instance = rollbackInstances.get(paneId);
+        if (!instance || !killScalePaneWithAuthority(instance)) {
+          unresolvedPaneIds.add(paneId);
+          cleanupDebt.push(`pane_teardown_authority_lost:${paneId}`);
+          continue;
         }
-        if (paneTeardown.kill.failedPaneIds.length > 0 || paneTeardown.proofUnavailable.length > 0) {
-          for (const paneId of rollbackPaneIds) {
-            if (!resolvedPaneIds.has(paneId)) unresolvedPaneIds.add(paneId);
-          }
-          const unresolvedWithoutDirectFailure = [...unresolvedPaneIds].filter((paneId) =>
-            !paneTeardown.kill.failedPaneIds.includes(paneId)
-            && !paneTeardown.proofUnavailable.some((proof) => proof.paneId === paneId));
-          if (unresolvedWithoutDirectFailure.length > 0) {
-            cleanupDebt.push(`pane_teardown_unresolved:${unresolvedWithoutDirectFailure.join(',')}`);
-          }
-        }
-      } catch (cleanupError) {
-        for (const paneId of rollbackPaneIds) unresolvedPaneIds.add(paneId);
-        cleanupDebt.push(`pane_cleanup_exception:${String(cleanupError)}`);
+        resolvedPaneIds.add(paneId);
       }
 
       const unresolvedWorkerNames = new Set(rollbackWorkers
@@ -1084,74 +1210,57 @@ export async function scaleUp(
         );
       }
 
-      // The target and its expected PID were frozen before preparation. Prove
-      // the same identity immediately before the split-window side effect.
-
+      // Freeze and validate the full source-pane incarnation. The server owns
+      // the final comparison and split, so a recycled pane ID cannot become a
+      // split target between client-side proof and the topology mutation.
       const splitTargetProof = readExactPaneProofSync(splitTarget);
-      if (splitTargetProof.status !== 'live') {
+      const splitTargetInstance = splitTargetProof.status === 'live'
+        ? readScalePaneInstance(splitTargetProof.paneId)
+        : null;
+      if (!splitTargetInstance) {
         return await rollbackScaleUp(
-          `scale_up_split_target_proof_unavailable:${splitTarget}:${splitTargetProof.reason}`,
+          `scale_up_split_target_proof_unavailable:${splitTarget}`,
           { workerName, worktreePath: workerWorkspace?.worktreePath },
         );
       }
-      if (splitTargetProof.pid !== expectedSplitTargetPid) {
+      if (splitTargetInstance.pid !== expectedSplitTargetPid) {
         return await rollbackScaleUp(
-          `scale_up_split_target_pid_changed:${splitTarget}:${expectedSplitTargetPid}:${splitTargetProof.pid}`,
+          `scale_up_split_target_pid_changed:${splitTarget}:${expectedSplitTargetPid}:${splitTargetInstance.pid}`,
           { workerName, worktreePath: workerWorkspace?.worktreePath },
         );
       }
-      const currentSplitTargetOwner = readPaneTeamOwnerTagResult(splitTargetProof.paneId);
-      if (currentSplitTargetOwner.status !== 'value' || currentSplitTargetOwner.value !== expectedSplitTargetOwnerId) {
+      if (splitTargetInstance.sessionName !== sessionName
+        || (config.tmux_session_id && splitTargetInstance.sessionId !== config.tmux_session_id)
+        || splitTargetInstance.teamOwnerId !== expectedSplitTargetOwnerId) {
         return await rollbackScaleUp(
-          `scale_up_split_target_owner_changed:${splitTargetProof.paneId}`,
-          { workerName, worktreePath: workerWorkspace?.worktreePath },
-        );
-      }
-
-      // The owner read is untrusted and may race pane-ID reuse. Bind the split
-      // to the same persisted process again immediately before the effect.
-      const finalSplitTargetProof = readExactPaneProofSync(splitTargetProof.paneId);
-      if (finalSplitTargetProof.status !== 'live') {
-        return await rollbackScaleUp(
-          `scale_up_split_target_proof_unavailable:${splitTargetProof.paneId}:${finalSplitTargetProof.reason}`,
-          { workerName, worktreePath: workerWorkspace?.worktreePath },
-        );
-      }
-      if (finalSplitTargetProof.pid !== expectedSplitTargetPid) {
-        return await rollbackScaleUp(
-          `scale_up_split_target_pid_changed:${splitTargetProof.paneId}:${expectedSplitTargetPid}:${finalSplitTargetProof.pid}`,
+          `scale_up_split_target_authority_changed:${splitTargetInstance.paneId}`,
           { workerName, worktreePath: workerWorkspace?.worktreePath },
         );
       }
 
-      const result = spawnSync('tmux', [
-        'split-window', splitDirection, '-t', finalSplitTargetProof.paneId, '-d', '-P', '-F', '#{pane_id}', '-c', workerCwd, cmd,
-      ], { encoding: 'utf-8' });
-
-      if (result.status !== 0) {
+      const createdPane = splitWorkerPaneWithScaleAuthority(
+        splitTargetInstance,
+        splitDirection,
+        workerCwd,
+        cmd,
+      );
+      if (!createdPane) {
         return await rollbackScaleUp(
-          `Failed to create tmux pane for ${workerName}: ${(result.stderr || '').trim()}`,
+          `scale_up_split_target_authority_lost:${splitTargetInstance.paneId}`,
           { workerName, worktreePath: workerWorkspace?.worktreePath },
         );
       }
-
-      const paneId = (result.stdout || '').trim().split('\n')[0]?.trim();
-      if (!paneId || !paneId.startsWith('%')) {
-        return await rollbackScaleUp(`Failed to capture pane ID for ${workerName}`, {
-          paneId,
-          workerName,
-          worktreePath: workerWorkspace?.worktreePath,
-        });
-      }
-      const paneProof = readExactPaneProofSync(paneId);
-      const workerInfo: WorkerInfo = {
+      const paneId = createdPane.paneId;
+      const workerInfo: ScaleUpWorkerInfo = {
         name: workerName,
         index: workerIndex,
         role: runtimeRole,
         worker_cli: workerCli,
         assigned_tasks: [],
-        pid: paneProof.status === 'live' ? paneProof.pid : undefined,
+        pid: createdPane.pid,
         pane_id: paneId,
+        session_id: createdPane.sessionId,
+        window_id: createdPane.windowId,
         working_dir: workerCwd,
         worktree_repo_root: workerWorkspace ? workerWorkspace.repoRoot : undefined,
         worktree_path: workerWorkspace ? workerWorkspace.worktreePath : undefined,
@@ -1161,21 +1270,14 @@ export async function scaleUp(
         team_state_root: teamStateRoot,
       };
 
-      if (paneProof.status !== 'live') {
-        return await rollbackScaleUp(`Failed to prove tmux pane for ${workerName}`, { paneId, worker: workerInfo });
-      }
 
-      if (config.tmux_pane_owner_id) {
-        try {
-          tagPaneTeamOwner(paneProof.paneId, config.tmux_pane_owner_id, paneProof.pid);
-          rollbackTaggedPaneOwnerIds.set(paneProof.paneId, config.tmux_pane_owner_id.trim());
-        } catch (error) {
-          return await rollbackScaleUp(
-            `Failed to tag tmux pane for ${workerName}: ${error instanceof Error ? error.message : String(error)}`,
-            { paneId, worker: workerInfo },
-          );
-        }
+      const taggedPane = config.tmux_pane_owner_id
+        ? tagScalePaneWithAuthority(createdPane, config.tmux_pane_owner_id.trim())
+        : null;
+      if (!taggedPane) {
+        return await rollbackScaleUp(`scale_up_created_pane_owner_tag_authority_lost:${paneId}`, { paneId, worker: workerInfo });
       }
+      rollbackTaggedPaneOwnerIds.set(paneId, taggedPane.teamOwnerId);
 
       // Intentionally avoid forcing `select-layout tiled` here.
       // Tiled relayout reflows leader/HUD panes and breaks team window layout.
@@ -1233,7 +1335,7 @@ export async function scaleUp(
           if (dispatchPolicy.dispatch_mode === 'hook_preferred_with_fallback') {
             return { ok: true, transport: 'hook', reason: 'queued_for_hook_dispatch' };
           }
-          return await notifyWorkerPaneOutcome(sessionName, workerIndex, message, paneId, workerCli, workerInfo.pid, config.tmux_pane_owner_id ?? undefined, config.hud_pane_id ?? undefined);
+          return await notifyWorkerPaneOutcome(sessionName, message, paneId, workerInfo.pid, config.tmux_pane_owner_id ?? undefined, workerInfo.session_id, workerInfo.window_id);
         },
       });
       let outcome = queued;
@@ -1245,7 +1347,7 @@ export async function scaleUp(
         if (receipt && (receipt.status === 'notified' || receipt.status === 'delivered')) {
           outcome = { ok: true, transport: 'hook', reason: `hook_receipt_${receipt.status}`, request_id: queued.request_id };
         } else {
-          const fallback = await notifyWorkerPaneOutcome(sessionName, workerIndex, triggerDirective.text, paneId, workerCli, workerInfo.pid, config.tmux_pane_owner_id ?? undefined, config.hud_pane_id ?? undefined);
+          const fallback = await notifyWorkerPaneOutcome(sessionName, triggerDirective.text, paneId, workerInfo.pid, config.tmux_pane_owner_id ?? undefined, workerInfo.session_id, workerInfo.window_id);
           if (receipt?.status === 'failed') {
             if (fallback.ok) {
               await transitionDispatchRequest(
@@ -1325,7 +1427,7 @@ export async function scaleUp(
       // Retry dispatch once if a trust prompt is blocking the worker pane (fixes #393).
       if (!outcome.ok && dismissTrustPromptIfPresent(sessionName, workerIndex, paneId, workerInfo.pid, config.tmux_pane_owner_id ?? undefined, config.hud_pane_id ?? undefined)) {
         waitForWorkerReady(sessionName, workerIndex, readyTimeoutMs, paneId, workerInfo.pid, config.tmux_pane_owner_id ?? undefined, config.hud_pane_id ?? undefined);
-        const retry = await notifyWorkerPaneOutcome(sessionName, workerIndex, triggerDirective.text, paneId, workerCli, workerInfo.pid, config.tmux_pane_owner_id ?? undefined, config.hud_pane_id ?? undefined);
+        const retry = await notifyWorkerPaneOutcome(sessionName, triggerDirective.text, paneId, workerInfo.pid, config.tmux_pane_owner_id ?? undefined, workerInfo.session_id, workerInfo.window_id);
         if (retry.ok) {
           outcome = retry;
         }

@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, readFile } from 'fs/promises';
+import { chmod, mkdtemp, rm, readFile, writeFile } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import {
@@ -16,14 +16,115 @@ import {
 } from '../mcp-comm.js';
 
 const ORIGINAL_OMX_TEAM_STATE_ROOT = process.env.OMX_TEAM_STATE_ROOT;
+let tmuxFixtureDir = '';
+let originalPath: string | undefined;
 
-beforeEach(() => {
+const EXACT_TMUX_FIXTURE = `#!/usr/bin/env node
+const args = process.argv.slice(2);
+const command = args[0] || '';
+const format = args.at(-1) || '';
+const fs = require('fs');
+const statePath = require('path').join(__dirname, 'tmux-state.json');
+const initialPanes = Object.fromEntries(['%10', '%11', '%12', '%55', '%95'].map((pane) => [pane, {
+  pid: String(10000 + Number(pane.slice(1))), session: '$1', window: '@1', start: 'codex', owner: 'team:mcp-comm', dead: '0',
+}]));
+const state = (() => {
+  try { return JSON.parse(fs.readFileSync(statePath, 'utf8')); } catch { return { panes: initialPanes, nextPane: 96, global: {}, window: {}, pane: {} }; }
+})();
+state.panes ||= initialPanes;
+state.global ||= {};
+state.window ||= {};
+state.pane ||= {};
+state.nextPane ||= 96;
+const saveState = () => fs.writeFileSync(statePath, JSON.stringify(state));
+const target = () => {
+  const index = args.indexOf('-t');
+  return index >= 0 ? args[index + 1] || '%55' : '%55';
+};
+const paneRow = (pane, requestedFormat) => {
+  const details = state.panes[pane] || state.panes['%55'];
+  return requestedFormat
+    .replaceAll('#{pane_id}', pane)
+    .replaceAll('#{pane_pid}', details.pid)
+    .replaceAll('#{session_id}', details.session)
+    .replaceAll('#{window_id}', details.window)
+    .replaceAll('#{pane_dead}', details.dead)
+    .replaceAll('#{pane_current_command}', 'codex')
+    .replaceAll('#{pane_start_command}', details.start)
+    .replace(/#\{@omx_team_pane_owner_id\}/g, details.owner);
+};
+const paneList = (requestedFormat, panes = Object.keys(state.panes)) => process.stdout.write(panes.map((pane) => paneRow(pane, requestedFormat)).join('\n') + '\n');
+const optionKey = (scope, targetName, option) => scope + ':' + (targetName || '') + ':' + option;
+const readOption = () => {
+  const paneIndex = args.indexOf('-p');
+  const windowIndex = args.indexOf('-w');
+  const global = args.includes('-g');
+  const targetIndex = args.indexOf('-t');
+  const option = args.at(-1) || '';
+  const targetName = targetIndex >= 0 ? args[targetIndex + 1] : '';
+  const scope = paneIndex >= 0 ? 'pane' : windowIndex >= 0 ? 'window' : global ? 'global' : 'global';
+  process.stdout.write((state[scope][optionKey(scope, targetName, option)] || (scope === 'pane' ? state.panes[targetName]?.owner : 'team:mcp-comm') || '') + '\n');
+};
+const writeOption = () => {
+  const paneIndex = args.indexOf('-p');
+  const windowIndex = args.indexOf('-w');
+  const global = args.includes('-g');
+  const targetIndex = args.indexOf('-t');
+  const option = args.at(-2) || '';
+  const value = args.at(-1) || '';
+  const targetName = targetIndex >= 0 ? args[targetIndex + 1] : '';
+  const scope = paneIndex >= 0 ? 'pane' : windowIndex >= 0 ? 'window' : global ? 'global' : 'global';
+  state[scope][optionKey(scope, targetName, option)] = value;
+  if (scope === 'pane' && option === '@omx_team_pane_owner_id' && state.panes[targetName]) state.panes[targetName].owner = value;
+  saveState();
+};
+const split = (success) => {
+  const pane = '%' + state.nextPane++;
+  const source = state.panes[target()] || state.panes['%55'];
+  const marker = success.match(/OMX_TMUX_SPLIT_OPERATION_MARKER(?:='| = ')([^']+)/)?.[1] || '';
+  state.panes[pane] = { pid: String(20000 + Number(pane.slice(1))), session: source.session, window: source.window, start: marker ? "OMX_TMUX_SPLIT_OPERATION_MARKER='" + marker + "'; codex" : 'codex', owner: source.owner, dead: '0' };
+  saveState();
+  process.stdout.write(pane + '\n');
+};
+if (command === '-V') process.stdout.write('tmux 3.4\n');
+else if (command === 'list-panes') paneList(format, args.includes('-a') ? Object.keys(state.panes) : Object.keys(state.panes));
+else if (command === 'display-message') {
+  const pane = target();
+  if (format.includes('#{')) process.stdout.write(paneRow(pane, format) + '\n');
+}
+else if (command === 'split-window') process.exitCode = 1;
+else if (command === 'if-shell') {
+  const success = args.at(-2) || '';
+  if (success.includes('split-window')) split(success);
+  else {
+    const receipt = success.match(/__OMX_PANE_MUTATION_[a-f0-9]+__/);
+    if (receipt) process.stdout.write(receipt[0] + '\n');
+  }
+}
+else if (command === 'set-option') writeOption();
+else if (command === 'show-options') readOption();
+`;
+
+async function installExactTmuxFixture(): Promise<void> {
+  tmuxFixtureDir = await mkdtemp(join(tmpdir(), 'omx-mcp-comm-tmux-'));
+  const tmuxPath = join(tmuxFixtureDir, 'tmux');
+  await writeFile(tmuxPath, EXACT_TMUX_FIXTURE, 'utf8');
+  await chmod(tmuxPath, 0o755);
+  originalPath = process.env.PATH;
+  process.env.PATH = `${tmuxFixtureDir}:${originalPath || ''}`;
+}
+
+beforeEach(async () => {
   delete process.env.OMX_TEAM_STATE_ROOT;
+  await installExactTmuxFixture();
 });
 
-afterEach(() => {
+afterEach(async () => {
   if (typeof ORIGINAL_OMX_TEAM_STATE_ROOT === 'string') process.env.OMX_TEAM_STATE_ROOT = ORIGINAL_OMX_TEAM_STATE_ROOT;
   else delete process.env.OMX_TEAM_STATE_ROOT;
+  if (typeof originalPath === 'string') process.env.PATH = originalPath;
+  else delete process.env.PATH;
+  await rm(tmuxFixtureDir, { recursive: true, force: true });
 });
 
 describe('mcp-comm', () => {

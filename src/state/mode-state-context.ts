@@ -1,6 +1,7 @@
 import { randomUUID } from 'crypto';
 import { readExactPaneProofSync } from '../team/exact-pane.js';
 import { spawnPlatformCommandSync } from '../utils/platform-command.js';
+import { isPaneRunningShell } from '../scripts/tmux-hook-engine.js';
 
 import { execFileSync } from 'child_process';
 
@@ -10,8 +11,11 @@ export interface ModeStateContextLike {
   tmux_pane_id?: unknown;
   tmux_pane_pid?: unknown;
   tmux_pane_owner_id?: unknown;
+  tmux_pane_current_command?: unknown;
+  tmux_pane_start_command?: unknown;
   tmux_pane_set_at?: unknown;
   tmux_session_name?: unknown;
+  tmux_session_id?: unknown;
   tmux_window_id?: unknown;
   [key: string]: unknown;
 }
@@ -49,7 +53,11 @@ interface RalphPaneBinding {
   paneId: string;
   panePid: number;
   sessionName: string;
+  sessionId: string;
+  windowId: string;
   paneOwnerId: string;
+  paneCurrentCommand: string;
+  paneStartCommand: string;
 }
 
 function clearRalphPaneBinding(state: ModeStateContextLike): void {
@@ -57,10 +65,17 @@ function clearRalphPaneBinding(state: ModeStateContextLike): void {
   delete state.tmux_pane_pid;
   delete state.tmux_pane_owner_id;
   delete state.tmux_session_name;
+  delete state.tmux_session_id;
+  delete state.tmux_pane_current_command;
+  delete state.tmux_pane_start_command;
   delete state.tmux_pane_set_at;
   delete state.tmux_window_id;
 }
 
+function isSafeForegroundCommand(value: unknown): value is string {
+  return typeof value === 'string'
+    && /^[A-Za-z0-9_./:+@%=-]+(?: [A-Za-z0-9_./:+@%=-]+)*$/.test(value);
+}
 function captureRalphPaneBinding(paneId: string): RalphPaneBinding | null {
   const initialProof = readExactPaneProofSync(paneId);
   if (initialProof.status !== 'live') return null;
@@ -75,32 +90,29 @@ function captureRalphPaneBinding(paneId: string): RalphPaneBinding | null {
   ).result;
   if (tagged.error || tagged.status !== 0) return null;
 
-  const owner = spawnPlatformCommandSync(
+  const authority = spawnPlatformCommandSync(
     'tmux',
-    ['show-option', '-qv', '-p', '-t', initialProof.paneId, OMX_RALPH_PANE_OWNER_OPTION],
+    ['display-message', '-p', '-t', effectProof.paneId, `#{pane_id}\x1f#{pane_pid}\x1f#{session_name}\x1f#{session_id}\x1f#{window_id}\x1f#{${OMX_RALPH_PANE_OWNER_OPTION}}\x1f#{pane_current_command}\x1f#{pane_start_command}`],
     { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] },
   ).result;
-  if (owner.error || owner.status !== 0 || typeof owner.stdout !== 'string' || owner.stdout.trim() !== paneOwnerId) {
-    return null;
-  }
-
-  const finalProof = readExactPaneProofSync(initialProof.paneId);
-  if (finalProof.status !== 'live' || finalProof.pid !== initialProof.pid) return null;
-
-  const session = spawnPlatformCommandSync(
-    'tmux',
-    ['display-message', '-p', '-t', finalProof.paneId, '#{session_name}'],
-    { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] },
-  ).result;
-  if (session.error || session.status !== 0 || typeof session.stdout !== 'string') return null;
-  const sessionName = session.stdout.trim();
-  if (sessionName === '') return null;
+  if (authority.error || authority.status !== 0 || typeof authority.stdout !== 'string') return null;
+  const [capturedPaneId, capturedPid, sessionName, sessionId, windowId, capturedOwnerId, paneCurrentCommand, paneStartCommand, ...extra] = authority.stdout.trim().split('\x1f');
+  const panePid = Number(capturedPid);
+  if (extra.length > 0 || capturedPaneId !== effectProof.paneId || panePid !== effectProof.pid
+    || !/^%[0-9]+$/.test(capturedPaneId) || !Number.isSafeInteger(panePid) || panePid <= 0
+    || !isSafeForegroundCommand(sessionName) || !/^\$[0-9]+$/.test(sessionId) || !/^@[0-9]+$/.test(windowId)
+    || capturedOwnerId !== paneOwnerId || !isSafeForegroundCommand(paneCurrentCommand)
+    || !isSafeForegroundCommand(paneStartCommand) || isPaneRunningShell(paneCurrentCommand)) return null;
 
   return {
-    paneId: finalProof.paneId,
-    panePid: finalProof.pid,
+    paneId: capturedPaneId,
+    panePid,
     sessionName,
+    sessionId,
+    windowId,
     paneOwnerId,
+    paneCurrentCommand,
+    paneStartCommand,
   };
 }
 
@@ -137,7 +149,11 @@ export function withModeRuntimeContext<T extends ModeStateContextLike>(
       next.tmux_pane_id = binding.paneId;
       next.tmux_pane_pid = binding.panePid;
       next.tmux_session_name = binding.sessionName;
+      next.tmux_session_id = binding.sessionId;
+      next.tmux_window_id = binding.windowId;
       next.tmux_pane_owner_id = binding.paneOwnerId;
+      next.tmux_pane_current_command = binding.paneCurrentCommand;
+      next.tmux_pane_start_command = binding.paneStartCommand;
     } else {
       clearRalphPaneBinding(next);
     }
