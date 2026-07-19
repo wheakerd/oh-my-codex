@@ -3333,6 +3333,12 @@ function readPayloadSessionId(payload: CodexHookPayload): string {
   return payloadAliasValues(payload, ["session_id", "sessionId"])[0] ?? "";
 }
 
+function readUnambiguousNormalizedPayloadSessionId(payload: CodexHookPayload): string {
+  const aliases = payloadAliasValues(payload, ["session_id", "sessionId"]);
+  if (aliases.length !== 1) return "";
+  return normalizeSessionId(aliases[0]) ?? "";
+}
+
 function readPayloadThreadId(payload: CodexHookPayload): string {
   return payloadAliasValues(payload, ["thread_id", "threadId"])[0] ?? "";
 }
@@ -19709,10 +19715,9 @@ export async function dispatchCodexNativeHook(
   let skipCanonicalSessionStartContext = false;
   let isSubagentSessionStart = false;
   const authoritativeTeamWorker = await hasAuthoritativeTeamWorkerContext(cwd);
-  if (authoritativeTeamWorker) {
-    allowImplicitSessionSideEffects = true;
-    stopAuthorizationFailure = null;
-  }
+  const authoritativeWorkerPayloadSessionId = authoritativeTeamWorker
+    ? readUnambiguousNormalizedPayloadSessionId(payload)
+    : "";
 
   if (hookEventName === "SessionStart" && nativeSessionId) {
     const transcriptPath = safeString(payload.transcript_path ?? payload.transcriptPath).trim();
@@ -19768,12 +19773,14 @@ export async function dispatchCodexNativeHook(
           transcriptPath,
         );
       }
-    } else if (authoritativeTeamWorker) {
+    } else if (authoritativeWorkerPayloadSessionId && authoritativeWorkerPayloadSessionId === nativeSessionId) {
       // Team workers share the leader's selected state root, but they do not own
       // its compatibility pointer. Keep lifecycle state scoped to the explicit
       // hook payload without reconciling or replacing the live leader pointer.
-      canonicalSessionId = nativeSessionId;
-      resolvedNativeSessionId = nativeSessionId;
+      canonicalSessionId = authoritativeWorkerPayloadSessionId;
+      resolvedNativeSessionId = authoritativeWorkerPayloadSessionId;
+      allowImplicitSessionSideEffects = true;
+      stopAuthorizationFailure = null;
     } else {
       const ownerOmxSessionId = await resolveVerifiedOwnerOmxSessionId();
       try {
@@ -19814,12 +19821,13 @@ export async function dispatchCodexNativeHook(
 
   if (hookEventName === "Stop") {
     const stopPayloadSessionId = readPayloadSessionId(payload);
+    const authorizedWorkerStopSessionId = authoritativeWorkerPayloadSessionId;
     const stopCanonicalSessionId = await resolveInternalSessionIdForPayload(
       cwd,
-      stopPayloadSessionId,
+      authorizedWorkerStopSessionId || stopPayloadSessionId,
       undefined,
       currentSessionState,
-      pointer.status === "absent" || authoritativeTeamWorker,
+      pointer.status === "absent" || Boolean(authorizedWorkerStopSessionId),
     );
     if (stopPayloadSessionId && !stopCanonicalSessionId) {
       canonicalSessionId = "";
@@ -19832,6 +19840,10 @@ export async function dispatchCodexNativeHook(
       }
     } else if (stopCanonicalSessionId) {
       canonicalSessionId = stopCanonicalSessionId;
+    }
+    if (authorizedWorkerStopSessionId && stopCanonicalSessionId === authorizedWorkerStopSessionId) {
+      allowImplicitSessionSideEffects = true;
+      stopAuthorizationFailure = null;
     }
     if (canonicalSessionId && safeString(currentSessionState?.session_id).trim() === canonicalSessionId) {
       resolvedNativeSessionId =

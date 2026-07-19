@@ -4653,6 +4653,22 @@ PY`,
       assert.notEqual(stop.outputJson?.stopReason, "session_pointer_unusable");
       assert.notEqual(stop.outputJson?.stopReason, "session_scope_unmatched");
       assert.equal(await readFile(pointerPath, "utf-8"), "{ malformed leader evidence");
+
+      for (const payload of [
+        { session_id: "../escape" },
+        { session_id: "worker-one", sessionId: "worker-two" },
+      ]) {
+        const rejected = await dispatchCodexNativeHook({
+          hook_event_name: "SessionStart",
+          cwd,
+          ...payload,
+        }, { cwd, sessionOwnerPid: process.pid });
+        assert.equal(rejected.outputJson, null);
+        assert.equal(await readFile(pointerPath, "utf-8"), "{ malformed leader evidence");
+        assert.equal(existsSync(join(cwd, ".omx", "state", "sessions", "escape")), false);
+        assert.equal(existsSync(join(cwd, ".omx", "state", "sessions", "worker-one")), false);
+        assert.equal(existsSync(join(cwd, ".omx", "state", "sessions", "worker-two")), false);
+      }
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -4707,6 +4723,17 @@ PY`,
         session_id: "worker-after-stale-leader",
       }, { cwd, sessionOwnerPid: process.pid });
 
+      assert.equal(await readFile(pointerPath, "utf-8"), pointerBefore);
+
+      const stop = await dispatchCodexNativeHook({
+        hook_event_name: "Stop",
+        cwd,
+        session_id: "worker-after-stale-leader",
+        thread_id: "worker-after-stale-leader",
+        turn_id: "worker-after-stale-stop",
+      }, { cwd });
+      assert.notEqual(stop.outputJson?.stopReason, "session_pointer_unusable");
+      assert.notEqual(stop.outputJson?.stopReason, "session_scope_unmatched");
       assert.equal(await readFile(pointerPath, "utf-8"), pointerBefore);
     } finally {
       await rm(cwd, { recursive: true, force: true });
