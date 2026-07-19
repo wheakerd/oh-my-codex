@@ -4629,6 +4629,45 @@ PY`,
     }
   });
 
+  it("keeps declared Team workers fail closed before startup authority is materialized", async () => {
+    for (const pointerKind of ["absent", "live"] as const) {
+      const cwd = await mkdtemp(join(tmpdir(), `omx-native-hook-team-worker-race-${pointerKind}-`));
+      try {
+        const pointerPath = join(cwd, ".omx", "state", "session.json");
+        if (pointerKind === "live") {
+          await writeSessionStart(cwd, "race-leader-session", {
+            nativeSessionId: "race-leader-native",
+            pid: process.pid,
+          });
+        }
+        const pointerBefore = existsSync(pointerPath) ? await readFile(pointerPath, "utf-8") : null;
+        process.env.OMX_TEAM_WORKER = "race-team/worker-1";
+        process.env.OMX_TEAM_INTERNAL_WORKER = "race-team/worker-1";
+        process.env.TMUX = "1";
+        process.env.TMUX_PANE = "%10";
+
+        await dispatchCodexNativeHook({
+          hook_event_name: "SessionStart",
+          cwd,
+          session_id: "race-worker-native",
+        }, { cwd, sessionOwnerPid: process.pid });
+        assert.equal(existsSync(pointerPath), pointerBefore !== null);
+        if (pointerBefore !== null) assert.equal(await readFile(pointerPath, "utf-8"), pointerBefore);
+
+        const stop = await dispatchCodexNativeHook({
+          hook_event_name: "Stop",
+          cwd,
+          session_id: "race-worker-native",
+          thread_id: "race-worker-native",
+          turn_id: "race-worker-stop",
+        }, { cwd });
+        assert.equal(stop.outputJson?.stopReason, "session_scope_unmatched");
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    }
+  });
+
   it("fails closed for invalid Team worker lifecycle identity across pointer states", async () => {
     for (const pointerKind of ["absent", "live", "stale", "malformed"] as const) {
       const cwd = await mkdtemp(join(tmpdir(), `omx-native-hook-team-worker-invalid-${pointerKind}-`));
@@ -4668,12 +4707,16 @@ PY`,
         }
         const pointerBefore = existsSync(pointerPath) ? await readFile(pointerPath, "utf-8") : null;
 
-        for (const payload of [
+        const payloads: Array<Record<string, unknown>> = [
           {},
           { session_id: "" },
           { session_id: "../escape" },
           { session_id: "worker-one", sessionId: "worker-two" },
-        ]) {
+          ...(pointerKind === "live"
+            ? [{ session_id: "leader-session" }, { session_id: "invalid-test-leader-native" }]
+            : []),
+        ];
+        for (const payload of payloads) {
           await dispatchCodexNativeHook({
             hook_event_name: "SessionStart",
             cwd,

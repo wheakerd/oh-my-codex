@@ -19714,12 +19714,18 @@ export async function dispatchCodexNativeHook(
   let resolvedNativeSessionId = nativeSessionId;
   let skipCanonicalSessionStartContext = false;
   let isSubagentSessionStart = false;
-  const authoritativeTeamWorker = await hasAuthoritativeTeamWorkerContext(cwd);
-  const authoritativeWorkerPayloadSessionId = authoritativeTeamWorker
+  const declaredTeamWorker = readTeamWorkerEnvironment() !== null;
+  const authoritativeTeamWorker = declaredTeamWorker && await hasAuthoritativeTeamWorkerContext(cwd);
+  const candidateWorkerPayloadSessionId = declaredTeamWorker
     ? readUnambiguousNormalizedPayloadSessionId(payload)
     : "";
+  const authoritativeWorkerPayloadSessionId = authoritativeTeamWorker
+    && candidateWorkerPayloadSessionId
+    && (!currentSessionState || !payloadMatchesSessionPointer(candidateWorkerPayloadSessionId, currentSessionState))
+      ? candidateWorkerPayloadSessionId
+      : "";
 
-  if (hookEventName === "SessionStart" && authoritativeTeamWorker && !authoritativeWorkerPayloadSessionId) {
+  if (hookEventName === "SessionStart" && declaredTeamWorker && !authoritativeWorkerPayloadSessionId) {
     canonicalSessionId = "";
     resolvedNativeSessionId = nativeSessionId;
     skipCanonicalSessionStartContext = true;
@@ -19778,7 +19784,7 @@ export async function dispatchCodexNativeHook(
           transcriptPath,
         );
       }
-    } else if (authoritativeTeamWorker) {
+    } else if (declaredTeamWorker) {
       if (authoritativeWorkerPayloadSessionId && authoritativeWorkerPayloadSessionId === nativeSessionId) {
         // Team workers share the leader's selected state root, but they do not own
         // its compatibility pointer. Keep lifecycle state scoped to the explicit
@@ -19834,21 +19840,21 @@ export async function dispatchCodexNativeHook(
   if (hookEventName === "Stop") {
     const stopPayloadSessionId = readPayloadSessionId(payload);
     const authorizedWorkerStopSessionId = authoritativeWorkerPayloadSessionId;
-    const stopCanonicalSessionId = authoritativeTeamWorker && !authorizedWorkerStopSessionId
+    const stopCanonicalSessionId = declaredTeamWorker && !authorizedWorkerStopSessionId
       ? ""
       : await resolveInternalSessionIdForPayload(
         cwd,
         authorizedWorkerStopSessionId || stopPayloadSessionId,
         undefined,
         currentSessionState,
-        authoritativeTeamWorker
+        declaredTeamWorker
           ? Boolean(authorizedWorkerStopSessionId)
           : pointer.status === "absent",
       );
-    if ((authoritativeTeamWorker && !authorizedWorkerStopSessionId) || (stopPayloadSessionId && !stopCanonicalSessionId)) {
+    if ((declaredTeamWorker && !authorizedWorkerStopSessionId) || (stopPayloadSessionId && !stopCanonicalSessionId)) {
       canonicalSessionId = "";
       allowImplicitSessionSideEffects = false;
-      if (authoritativeTeamWorker && !authorizedWorkerStopSessionId) {
+      if (declaredTeamWorker && !authorizedWorkerStopSessionId) {
         stopAuthorizationFailure = {
           stopReason: "session_scope_unmatched",
           reason: "OMX cannot authorize Team worker Stop without exactly one valid explicit session id.",
@@ -19905,7 +19911,7 @@ export async function dispatchCodexNativeHook(
   if (
     isSubagentStop
     && stopAuthorizationFailure?.stopReason === "session_scope_unmatched"
-    && !(authoritativeTeamWorker && !authoritativeWorkerPayloadSessionId)
+    && !(declaredTeamWorker && !authoritativeWorkerPayloadSessionId)
   ) {
     canonicalSessionId = normalizeSessionId(readPayloadSessionId(payload)) ?? "";
     allowImplicitSessionSideEffects = true;
