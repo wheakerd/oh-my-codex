@@ -160,6 +160,33 @@ export async function onHookEvent(event, sdk) {
     }
   });
 
+  it('returns null HUD state through the runner when the default state root is absent', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-dispatch-missing-root-'));
+    try {
+      const dir = join(cwd, '.omx', 'hooks');
+      await mkdir(dir, { recursive: true });
+      await writeFile(
+        join(dir, 'missing-root-reader.mjs'),
+        `import { writeFile } from 'node:fs/promises';
+export async function onHookEvent(event, sdk) {
+  const hud = await sdk.omx.hud.read();
+  await writeFile(process.env.OMX_TEST_DISPATCH_OUTPUT, JSON.stringify(hud));
+}`,
+      );
+      const outputPath = join(cwd, 'dispatch-output.json');
+
+      const result = await dispatchHookEvent(buildHookEvent('session-start'), {
+        cwd,
+        env: { ...process.env, OMX_HOOK_PLUGINS: '1', OMX_TEST_DISPATCH_OUTPUT: outputPath },
+      });
+
+      assert.equal(result.results[0]?.ok, true);
+      assert.equal(JSON.parse(await readFile(outputPath, 'utf8')), null);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it('does not execute plugin top-level code in the parent process', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-dispatch-'));
     try {

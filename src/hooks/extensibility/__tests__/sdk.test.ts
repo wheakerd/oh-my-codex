@@ -474,6 +474,19 @@ exit 1
         await writeFile(join(stateRoot, 'session.json'), JSON.stringify({ session_id: 'sess-escaped' }));
         sdk = createHookPluginSdk({ cwd, stateRoot, pluginName: 'test', event: makeEvent() });
         assert.equal(await sdk.omx.hud.read(), null);
+
+        if (process.platform !== 'win32') {
+          const fileSessionDir = join(stateRoot, 'sessions', 'sess-file-escaped');
+          await mkdir(fileSessionDir, { recursive: true });
+          await symlink(
+            join(outside, 'hud-state.json'),
+            join(fileSessionDir, 'hud-state.json'),
+            'file',
+          );
+          await writeFile(join(stateRoot, 'session.json'), JSON.stringify({ session_id: 'sess-file-escaped' }));
+          sdk = createHookPluginSdk({ cwd, stateRoot, pluginName: 'test', event: makeEvent() });
+          assert.equal(await sdk.omx.hud.read(), null);
+        }
       } finally {
         await rm(cwd, { recursive: true, force: true });
         await rm(stateRoot, { recursive: true, force: true });

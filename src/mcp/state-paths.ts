@@ -262,13 +262,20 @@ function discoverSessionAuthorityBaseStateDir(workingDirectory?: string): string
     if (allowedRoots.length > 0 && !allowedRoots.some((root) => isWithinRoot(canonicalCurrent, root))) break;
 
     const candidate = join(current, '.omx', 'state');
-    const pointerPath = join(candidate, 'session.json');
+    const canonicalCandidate = canonicalizeExistingPath(candidate);
+    if (allowedRoots.length > 0 && !allowedRoots.some((root) => isWithinRoot(canonicalCandidate, root))) {
+      const parent = resolvePath(current, '..');
+      if (parent === current) break;
+      current = parent;
+      continue;
+    }
+    const pointerPath = join(canonicalCandidate, 'session.json');
     if (existsSync(pointerPath)) {
       try {
         const parsed = JSON.parse(readFileSync(pointerPath, 'utf8')) as unknown;
         if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)
           && sessionPointerMatchesId(parsed as Record<string, unknown>, sessionId)) {
-          matches.push(canonicalizeExistingPath(candidate));
+          matches.push(canonicalCandidate);
         }
       } catch {
         // Malformed pointers are classified by the normal state-scope resolver.
@@ -309,7 +316,15 @@ export function getBaseStateDirWithSource(workingDirectory?: string): { baseStat
     return { baseStateDir: sessionAuthority, rootSource: 'session-authority' };
   }
 
-  return { baseStateDir: join(resolveWorkingDirectoryForState(workingDirectory), '.omx', 'state'), rootSource: 'cwd-default' };
+  const baseStateDir = join(resolveWorkingDirectoryForState(workingDirectory), '.omx', 'state');
+  const allowedRoots = parseAllowedWorkingDirectoryRoots();
+  if (allowedRoots.length > 0) {
+    const canonicalBaseStateDir = canonicalizeExistingPath(baseStateDir);
+    if (!allowedRoots.some((root) => isWithinRoot(canonicalBaseStateDir, root))) {
+      throw new Error(`State root "${canonicalBaseStateDir}" is outside allowed roots (${WORKDIR_ALLOWLIST_ENV})`);
+    }
+  }
+  return { baseStateDir, rootSource: 'cwd-default' };
 }
 export function getBaseStateDir(workingDirectory?: string): string {
   return getBaseStateDirWithSource(workingDirectory).baseStateDir;

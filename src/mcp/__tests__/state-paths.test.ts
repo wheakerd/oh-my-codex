@@ -224,6 +224,27 @@ describe('state paths', () => {
     }
   });
 
+  it('does not select an in-allowlist state symlink that escapes the allowed root', async () => {
+    const parent = await mkRealTemp('omx-state-authority-symlink-');
+    const nested = join(parent, 'nested');
+    const outsideState = join(parent, 'outside-state');
+    try {
+      await mkdir(join(nested, '.omx'), { recursive: true });
+      await mkdir(outsideState, { recursive: true });
+      await writeFile(join(outsideState, 'session.json'), JSON.stringify({ session_id: 'sess-symlink', cwd: nested }));
+      await symlink(outsideState, join(nested, '.omx', 'state'), process.platform === 'win32' ? 'junction' : 'dir');
+      process.env.OMX_SESSION_ID = 'sess-symlink';
+      process.env.OMX_MCP_WORKDIR_ROOTS = nested;
+
+      assert.throws(
+        () => getBaseStateDirWithSource(nested),
+        /State root .* is outside allowed roots \(OMX_MCP_WORKDIR_ROOTS\)/,
+      );
+    } finally {
+      await rm(parent, { recursive: true, force: true });
+    }
+  });
+
   it('fails closed when an explicit state root is outside the allowlist', async () => {
     const allowedRoot = await mkRealTemp('omx-state-root-allowed-');
     const disallowedRoot = await mkRealTemp('omx-state-root-disallowed-');
