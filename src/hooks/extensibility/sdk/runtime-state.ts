@@ -1,6 +1,6 @@
-import { existsSync } from 'fs';
+import { existsSync, realpathSync } from 'fs';
 import { readFile } from 'fs/promises';
-import { join } from 'path';
+import { isAbsolute, join, relative } from 'path';
 import type {
   HookPluginOmxHudState,
   HookPluginOmxNotifyFallbackState,
@@ -9,7 +9,7 @@ import type {
   HookPluginSdk,
 } from '../types.js';
 import { omxRootStateFilePath } from './paths.js';
-import { getReadScopedStateFilePaths } from '../../../mcp/state-paths.js';
+import { getReadScopedStateFilePaths, normalizeSessionId } from '../../../mcp/state-paths.js';
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -30,21 +30,29 @@ async function readOmxStateFile<T extends Record<string, unknown>>(
 }
 
 function normalizeSessionState(value: Record<string, unknown>): HookPluginOmxSessionState | null {
-  return typeof value.session_id === 'string' && value.session_id.trim()
-    ? value as HookPluginOmxSessionState
-    : null;
+  const sessionId = normalizeSessionId(value.session_id);
+  return sessionId ? { ...value, session_id: sessionId } as HookPluginOmxSessionState : null;
+}
+
+function isContainedPath(path: string, root: string): boolean {
+  const rel = relative(root, path);
+  return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
 }
 
 async function readHudState(cwd: string, stateRoot?: string): Promise<HookPluginOmxHudState | null> {
   if (stateRoot) {
+    const canonicalStateRoot = realpathSync.native(stateRoot);
     const session = await readOmxStateFile<HookPluginOmxSessionState>(
-      join(stateRoot, 'session.json'),
+      join(canonicalStateRoot, 'session.json'),
       normalizeSessionState,
     );
     if (!session) return null;
-    return readOmxStateFile<HookPluginOmxHudState>(
-      join(stateRoot, 'sessions', session.session_id, 'hud-state.json'),
-    );
+    const sessionDir = join(canonicalStateRoot, 'sessions', session.session_id);
+    const hudStatePath = join(sessionDir, 'hud-state.json');
+    if (!existsSync(hudStatePath)) return null;
+    const canonicalSessionDir = realpathSync.native(sessionDir);
+    if (!isContainedPath(canonicalSessionDir, canonicalStateRoot)) return null;
+    return readOmxStateFile<HookPluginOmxHudState>(hudStatePath);
   }
   const [hudStatePath] = await getReadScopedStateFilePaths('hud-state.json', cwd, undefined, {
     rootFallback: false,

@@ -4,6 +4,7 @@ import { appendFile, mkdir } from "fs/promises";
 import { join } from "path";
 import { getPackageRoot } from "../../utils/package.js";
 import { omxRoot } from "../../utils/paths.js";
+import { getBaseStateDir } from "../../mcp/state-paths.js";
 import {
 	createLifecycleBroadcastFingerprint,
 	recordLifecycleHookBroadcastSent,
@@ -266,7 +267,7 @@ async function runPluginRunner(
 				pluginPath: plugin.path,
 				event,
 				sideEffectsEnabled,
-				stateRoot: options.stateRoot,
+				stateRoot: options.stateRoot ?? getBaseStateDir(options.cwd),
 			}),
 		);
 		child.stdin.end();
@@ -310,6 +311,7 @@ export async function dispatchHookEvent(
 	options: HookDispatchOptions = {},
 ): Promise<HookDispatchResult> {
 	const cwd = options.cwd || process.cwd();
+	const stateRoot = options.stateRoot ?? getBaseStateDir(cwd);
 	const env = options.env || process.env;
 	const runtimeHookDispatchEnabled =
 		shouldForceEnableRuntimeHookDispatch(event) || isHookPluginsEnabled(env);
@@ -374,7 +376,7 @@ export async function dispatchHookEvent(
 		const result = await runPluginRunner(
 			plugin,
 			event,
-			{ ...options, cwd, env },
+			{ ...options, cwd, env, stateRoot },
 			sideEffectsEnabled,
 		);
 		summary.results.push(result);

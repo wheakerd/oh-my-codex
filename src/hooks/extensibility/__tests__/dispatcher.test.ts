@@ -126,6 +126,40 @@ describe('dispatchHookEvent', () => {
     }
   });
 
+  it('forwards explicit stateRoot through the plugin runner to HUD reads', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-dispatch-root-source-'));
+    const stateRoot = await mkdtemp(join(tmpdir(), 'omx-dispatch-root-authority-'));
+    try {
+      const dir = join(cwd, '.omx', 'hooks');
+      const sessionDir = join(stateRoot, 'sessions', 'sess-dispatch');
+      await mkdir(dir, { recursive: true });
+      await mkdir(sessionDir, { recursive: true });
+      await writeFile(join(stateRoot, 'session.json'), JSON.stringify({ session_id: 'sess-dispatch' }));
+      await writeFile(join(sessionDir, 'hud-state.json'), JSON.stringify({ turn_count: 7 }));
+      await writeFile(
+        join(dir, 'root-reader.mjs'),
+        `import { writeFile } from 'node:fs/promises';
+export async function onHookEvent(event, sdk) {
+  const hud = await sdk.omx.hud.read();
+  await writeFile(process.env.OMX_TEST_DISPATCH_OUTPUT, JSON.stringify(hud));
+}`,
+      );
+      const outputPath = join(cwd, 'dispatch-output.json');
+
+      const result = await dispatchHookEvent(buildHookEvent('session-start'), {
+        cwd,
+        stateRoot,
+        env: { ...process.env, OMX_HOOK_PLUGINS: '1', OMX_TEST_DISPATCH_OUTPUT: outputPath },
+      });
+
+      assert.equal(result.results[0]?.ok, true);
+      assert.deepEqual(JSON.parse(await readFile(outputPath, 'utf8')), { turn_count: 7 });
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+      await rm(stateRoot, { recursive: true, force: true });
+    }
+  });
+
   it('does not execute plugin top-level code in the parent process', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-dispatch-'));
     try {

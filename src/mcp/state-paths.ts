@@ -255,8 +255,12 @@ function discoverSessionAuthorityBaseStateDir(workingDirectory?: string): string
   if (!sessionId) return undefined;
 
   let current = resolveWorkingDirectoryForState(workingDirectory);
+  const allowedRoots = parseAllowedWorkingDirectoryRoots();
   const matches: string[] = [];
   while (true) {
+    const canonicalCurrent = canonicalizeExistingPath(current);
+    if (allowedRoots.length > 0 && !allowedRoots.some((root) => isWithinRoot(canonicalCurrent, root))) break;
+
     const candidate = join(current, '.omx', 'state');
     const pointerPath = join(candidate, 'session.json');
     if (existsSync(pointerPath)) {
@@ -360,7 +364,18 @@ async function readUsableSessionStateFromBaseStateDir(
   try {
     const content = await readFile(sessionPath, 'utf-8');
     const state = JSON.parse(content) as SessionState;
-    return isSessionStateUsable(state, cwd) ? state : null;
+    const recordedCwd = typeof state.cwd === 'string' ? canonicalizeExistingPath(resolvePath(state.cwd)) : '';
+    const recordedStateRoot = typeof state.state_root === 'string'
+      ? canonicalizeExistingPath(resolvePath(state.state_root))
+      : '';
+    const canonicalBaseStateDir = canonicalizeExistingPath(baseStateDir);
+    const canonicalObservedCwd = canonicalizeExistingPath(resolvePath(cwd));
+    const authorityOwnsObservedCwd = Boolean(
+      recordedCwd
+      && recordedStateRoot === canonicalBaseStateDir
+      && isWithinRoot(canonicalObservedCwd, recordedCwd),
+    );
+    return isSessionStateUsable(state, authorityOwnsObservedCwd ? recordedCwd : cwd) ? state : null;
   } catch {
     return null;
   }

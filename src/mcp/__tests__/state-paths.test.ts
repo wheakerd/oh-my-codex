@@ -168,7 +168,7 @@ describe('state paths', () => {
     try {
       await mkdir(parentState, { recursive: true });
       await mkdir(nestedState, { recursive: true });
-      await writeFile(join(parentState, 'session.json'), JSON.stringify({ session_id: 'sess-parent', cwd: parent }));
+      await writeFile(join(parentState, 'session.json'), JSON.stringify({ session_id: 'sess-parent', cwd: parent, state_root: parentState }));
       await writeFile(join(nestedState, 'session.json'), JSON.stringify({ session_id: 'sess-nested', cwd: nested }));
       process.env.OMX_SESSION_ID = 'sess-parent';
 
@@ -176,6 +176,8 @@ describe('state paths', () => {
         baseStateDir: parentState,
         rootSource: 'session-authority',
       });
+      const writable = await resolveWritableStateScope(nested);
+      assert.equal(writable.stateDir, join(parentState, 'sessions', 'sess-parent'));
     } finally {
       await rm(parent, { recursive: true, force: true });
     }
@@ -197,6 +199,26 @@ describe('state paths', () => {
         () => getBaseStateDirWithSource(nested),
         new RegExp(`Conflicting authoritative state roots.*${parentState}.*${nestedState}|Conflicting authoritative state roots.*${nestedState}.*${parentState}`),
       );
+    } finally {
+      await rm(parent, { recursive: true, force: true });
+    }
+  });
+
+  it('does not discover ancestor authority outside OMX_MCP_WORKDIR_ROOTS', async () => {
+    const parent = await mkRealTemp('omx-state-authority-allowlist-');
+    const nested = join(parent, 'nested');
+    const parentState = join(parent, '.omx', 'state');
+    try {
+      await mkdir(parentState, { recursive: true });
+      await mkdir(nested, { recursive: true });
+      await writeFile(join(parentState, 'session.json'), JSON.stringify({ session_id: 'sess-outside', cwd: parent }));
+      process.env.OMX_SESSION_ID = 'sess-outside';
+      process.env.OMX_MCP_WORKDIR_ROOTS = nested;
+
+      assert.deepEqual(getBaseStateDirWithSource(nested), {
+        baseStateDir: join(nested, '.omx', 'state'),
+        rootSource: 'cwd-default',
+      });
     } finally {
       await rm(parent, { recursive: true, force: true });
     }

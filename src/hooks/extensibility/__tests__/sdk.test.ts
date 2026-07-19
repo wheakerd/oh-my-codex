@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { describe, it } from 'node:test';
@@ -456,6 +456,28 @@ exit 1
       } finally {
         await rm(cwd, { recursive: true, force: true });
         await rm(stateRoot, { recursive: true, force: true });
+      }
+    });
+
+    it('rejects invalid and symlink-escaped sessions under explicit stateRoot', async () => {
+      const cwd = await mkdtemp(join(tmpdir(), 'omx-sdk-hud-containment-source-'));
+      const stateRoot = await mkdtemp(join(tmpdir(), 'omx-sdk-hud-containment-root-'));
+      const outside = await mkdtemp(join(tmpdir(), 'omx-sdk-hud-containment-outside-'));
+      try {
+        await writeFile(join(stateRoot, 'session.json'), JSON.stringify({ session_id: '../outside' }));
+        let sdk = createHookPluginSdk({ cwd, stateRoot, pluginName: 'test', event: makeEvent() });
+        assert.equal(await sdk.omx.hud.read(), null);
+
+        await mkdir(join(stateRoot, 'sessions'), { recursive: true });
+        await writeFile(join(outside, 'hud-state.json'), JSON.stringify({ turn_count: 99 }));
+        await symlink(outside, join(stateRoot, 'sessions', 'sess-escaped'), process.platform === 'win32' ? 'junction' : 'dir');
+        await writeFile(join(stateRoot, 'session.json'), JSON.stringify({ session_id: 'sess-escaped' }));
+        sdk = createHookPluginSdk({ cwd, stateRoot, pluginName: 'test', event: makeEvent() });
+        assert.equal(await sdk.omx.hud.read(), null);
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+        await rm(stateRoot, { recursive: true, force: true });
+        await rm(outside, { recursive: true, force: true });
       }
     });
 
