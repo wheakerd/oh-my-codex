@@ -255,6 +255,7 @@ function discoverSessionAuthorityBaseStateDir(workingDirectory?: string): string
   if (!sessionId) return undefined;
 
   let current = resolveWorkingDirectoryForState(workingDirectory);
+  const observedCwd = canonicalizeExistingPath(current);
   const allowedRoots = parseAllowedWorkingDirectoryRoots();
   const matches: string[] = [];
   while (true) {
@@ -273,9 +274,21 @@ function discoverSessionAuthorityBaseStateDir(workingDirectory?: string): string
     if (existsSync(pointerPath)) {
       try {
         const parsed = JSON.parse(readFileSync(pointerPath, 'utf8')) as unknown;
-        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-          && sessionPointerMatchesId(parsed as Record<string, unknown>, sessionId)) {
-          matches.push(canonicalCandidate);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          const state = parsed as SessionState;
+          const recordedCwd = typeof state.cwd === 'string'
+            ? canonicalizeExistingPath(resolvePath(state.cwd))
+            : '';
+          const recordedStateRoot = typeof state.state_root === 'string'
+            ? canonicalizeExistingPath(resolvePath(state.state_root))
+            : '';
+          if (sessionPointerMatchesId(state as unknown as Record<string, unknown>, sessionId)
+            && recordedCwd
+            && recordedStateRoot === canonicalCandidate
+            && isWithinRoot(observedCwd, recordedCwd)
+            && isSessionStateUsable(state, recordedCwd)) {
+            matches.push(canonicalCandidate);
+          }
         }
       } catch {
         // Malformed pointers are classified by the normal state-scope resolver.

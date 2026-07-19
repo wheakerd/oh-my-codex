@@ -191,14 +191,38 @@ describe('state paths', () => {
     try {
       await mkdir(parentState, { recursive: true });
       await mkdir(nestedState, { recursive: true });
-      await writeFile(join(parentState, 'session.json'), JSON.stringify({ session_id: 'sess-conflict', cwd: parent }));
-      await writeFile(join(nestedState, 'session.json'), JSON.stringify({ session_id: 'sess-conflict', cwd: nested }));
+      await writeFile(join(parentState, 'session.json'), JSON.stringify({ session_id: 'sess-conflict', cwd: parent, state_root: parentState }));
+      await writeFile(join(nestedState, 'session.json'), JSON.stringify({ session_id: 'sess-conflict', cwd: nested, state_root: nestedState }));
       process.env.OMX_SESSION_ID = 'sess-conflict';
 
       assert.throws(
         () => getBaseStateDirWithSource(nested),
         new RegExp(`Conflicting authoritative state roots.*${parentState}.*${nestedState}|Conflicting authoritative state roots.*${nestedState}.*${parentState}`),
       );
+    } finally {
+      await rm(parent, { recursive: true, force: true });
+    }
+  });
+
+  it('ignores a dead matching ancestor session pointer', async () => {
+    const parent = await mkRealTemp('omx-state-authority-dead-');
+    const nested = join(parent, 'nested');
+    const parentState = join(parent, '.omx', 'state');
+    try {
+      await mkdir(parentState, { recursive: true });
+      await mkdir(nested, { recursive: true });
+      await writeFile(join(parentState, 'session.json'), JSON.stringify({
+        session_id: 'sess-dead',
+        cwd: parent,
+        state_root: parentState,
+        pid: 2_147_483_647,
+      }));
+      process.env.OMX_SESSION_ID = 'sess-dead';
+
+      assert.deepEqual(getBaseStateDirWithSource(nested), {
+        baseStateDir: join(nested, '.omx', 'state'),
+        rootSource: 'cwd-default',
+      });
     } finally {
       await rm(parent, { recursive: true, force: true });
     }
