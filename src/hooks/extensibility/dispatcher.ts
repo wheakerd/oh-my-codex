@@ -343,7 +343,7 @@ export async function dispatchHookEvent(
 	if (
 		dedupeFingerprint
 		&& !shouldSendLifecycleHookBroadcast(
-			join(omxRoot(cwd), "state"),
+			stateRoot,
 			event.session_id,
 			event.event,
 			dedupeFingerprint,
@@ -397,7 +397,7 @@ export async function dispatchHookEvent(
 
 	if (dedupeFingerprint && summary.results.some((result) => result.ok)) {
 		recordLifecycleHookBroadcastSent(
-			join(omxRoot(cwd), "state"),
+			stateRoot,
 			event.session_id,
 			event.event,
 			dedupeFingerprint,

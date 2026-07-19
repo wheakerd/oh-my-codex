@@ -486,6 +486,16 @@ exit 1
           await writeFile(join(stateRoot, 'session.json'), JSON.stringify({ session_id: 'sess-file-escaped' }));
           sdk = createHookPluginSdk({ cwd, stateRoot, pluginName: 'test', event: makeEvent() });
           assert.equal(await sdk.omx.hud.read(), null);
+
+          const siblingDir = join(stateRoot, 'sessions', 'sess-sibling');
+          const siblingTargetDir = join(stateRoot, 'sessions', 'sess-sibling-target');
+          await mkdir(siblingDir, { recursive: true });
+          await mkdir(siblingTargetDir, { recursive: true });
+          await writeFile(join(siblingTargetDir, 'hud-state.json'), JSON.stringify({ turn_count: 55 }));
+          await symlink(join(siblingTargetDir, 'hud-state.json'), join(siblingDir, 'hud-state.json'), 'file');
+          await writeFile(join(stateRoot, 'session.json'), JSON.stringify({ session_id: 'sess-sibling' }));
+          sdk = createHookPluginSdk({ cwd, stateRoot, pluginName: 'test', event: makeEvent() });
+          assert.equal(await sdk.omx.hud.read(), null);
         }
       } finally {
         await rm(cwd, { recursive: true, force: true });

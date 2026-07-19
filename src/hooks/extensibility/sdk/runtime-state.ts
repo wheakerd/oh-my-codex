@@ -54,7 +54,7 @@ async function readHudState(cwd: string, stateRoot?: string): Promise<HookPlugin
       const canonicalSessionDir = realpathSync.native(sessionDir);
       const canonicalHudStatePath = realpathSync.native(hudStatePath);
       if (!isContainedPath(canonicalSessionDir, canonicalStateRoot)
-        || !isContainedPath(canonicalHudStatePath, canonicalStateRoot)) return null;
+        || !isContainedPath(canonicalHudStatePath, canonicalSessionDir)) return null;
       return readOmxStateFile<HookPluginOmxHudState>(canonicalHudStatePath);
     } catch {
       return null;

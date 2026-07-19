@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { existsSync } from 'node:fs';
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -323,6 +324,7 @@ export async function onHookEvent() {}
 
   it('dedupes repeated native lifecycle hook dispatches for the same session/turn fingerprint', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-dispatch-dedupe-'));
+    const stateRoot = await mkdtemp(join(tmpdir(), 'omx-dispatch-dedupe-root-'));
     try {
       const dir = join(cwd, '.omx', 'hooks');
       await mkdir(dir, { recursive: true });
@@ -341,10 +343,12 @@ export async function onHookEvent() {}
 
       const first = await dispatchHookEvent(event, {
         cwd,
+        stateRoot,
         env: { ...process.env, OMX_HOOK_PLUGINS: '1' },
       });
       const second = await dispatchHookEvent(event, {
         cwd,
+        stateRoot,
         env: { ...process.env, OMX_HOOK_PLUGINS: '1' },
       });
 
@@ -355,8 +359,11 @@ export async function onHookEvent() {}
       assert.equal(second.enabled, true);
       assert.equal(second.reason, 'deduped');
       assert.equal(second.results.length, 0);
+      assert.equal(existsSync(join(stateRoot, 'sessions', 'sess-1', 'lifecycle-notif-state.json')), true);
+      assert.equal(existsSync(join(cwd, '.omx', 'state', 'sessions', 'sess-1', 'lifecycle-notif-state.json')), false);
     } finally {
       await rm(cwd, { recursive: true, force: true });
+      await rm(stateRoot, { recursive: true, force: true });
     }
   });
 });
