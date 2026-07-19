@@ -198,8 +198,8 @@ function canonicalizeExistingPath(path: string): string {
   return path;
 }
 
-function parseAllowedWorkingDirectoryRoots(): string[] {
-  const raw = process.env[WORKDIR_ALLOWLIST_ENV];
+function parseAllowedWorkingDirectoryRoots(env: NodeJS.ProcessEnv = process.env): string[] {
+  const raw = env[WORKDIR_ALLOWLIST_ENV];
   if (typeof raw !== 'string' || raw.trim() === '') return [];
 
   const roots = raw
@@ -250,13 +250,13 @@ function sessionPointerMatchesId(pointer: Record<string, unknown>, sessionId: st
   ].some((value) => normalizeSessionId(value) === sessionId);
 }
 
-function discoverSessionAuthorityBaseStateDir(workingDirectory?: string): string | undefined {
-  const sessionId = normalizeSessionId(process.env[OMX_SESSION_ID_ENV]);
+function discoverSessionAuthorityBaseStateDir(workingDirectory?: string, env: NodeJS.ProcessEnv = process.env): string | undefined {
+  const sessionId = normalizeSessionId(env[OMX_SESSION_ID_ENV]);
   if (!sessionId) return undefined;
 
   let current = resolveWorkingDirectoryForState(workingDirectory);
   const observedCwd = canonicalizeExistingPath(current);
-  const allowedRoots = parseAllowedWorkingDirectoryRoots();
+  const allowedRoots = parseAllowedWorkingDirectoryRoots(env);
   const matches: string[] = [];
   while (true) {
     const canonicalCurrent = canonicalizeExistingPath(current);
@@ -310,39 +310,53 @@ function discoverSessionAuthorityBaseStateDir(workingDirectory?: string): string
   return uniqueMatches[0];
 }
 
-export function getBaseStateDirWithSource(workingDirectory?: string): { baseStateDir: string; rootSource: StateRootSource } {
-  const teamStateRootOverride = process.env[OMX_TEAM_STATE_ROOT_ENV]?.trim();
-  if (typeof teamStateRootOverride === 'string' && teamStateRootOverride !== '') {
-    return { baseStateDir: resolveWorkingDirectoryForState(teamStateRootOverride), rootSource: 'team-env' };
-  }
-
-  const omxRootOverride = process.env[OMX_ROOT_ENV]?.trim();
-  if (typeof omxRootOverride === 'string' && omxRootOverride !== '') {
-    return { baseStateDir: join(resolveWorkingDirectoryForState(omxRootOverride), '.omx', 'state'), rootSource: 'omx-root-env' };
-  }
-
-  const omxStateRootOverride = process.env[OMX_STATE_ROOT_ENV]?.trim();
-  if (typeof omxStateRootOverride === 'string' && omxStateRootOverride !== '') {
-    return { baseStateDir: join(resolveWorkingDirectoryForState(omxStateRootOverride), '.omx', 'state'), rootSource: 'omx-state-root-env' };
-  }
-
-  const sessionAuthority = discoverSessionAuthorityBaseStateDir(workingDirectory);
-  if (sessionAuthority) {
-    return { baseStateDir: sessionAuthority, rootSource: 'session-authority' };
-  }
-
-  const baseStateDir = join(resolveWorkingDirectoryForState(workingDirectory), '.omx', 'state');
-  const allowedRoots = parseAllowedWorkingDirectoryRoots();
+function validateResolvedBaseStateDir(
+  baseStateDir: string,
+  rootSource: StateRootSource,
+  env: NodeJS.ProcessEnv,
+): { baseStateDir: string; rootSource: StateRootSource } {
+  const allowedRoots = parseAllowedWorkingDirectoryRoots(env);
   if (allowedRoots.length > 0) {
     const canonicalBaseStateDir = canonicalizeExistingPath(baseStateDir);
     if (!allowedRoots.some((root) => isWithinRoot(canonicalBaseStateDir, root))) {
       throw new Error(`State root "${canonicalBaseStateDir}" is outside allowed roots (${WORKDIR_ALLOWLIST_ENV})`);
     }
   }
-  return { baseStateDir, rootSource: 'cwd-default' };
+  return { baseStateDir, rootSource };
 }
-export function getBaseStateDir(workingDirectory?: string): string {
-  return getBaseStateDirWithSource(workingDirectory).baseStateDir;
+
+export function getBaseStateDirWithSource(
+  workingDirectory?: string,
+  env: NodeJS.ProcessEnv = process.env,
+): { baseStateDir: string; rootSource: StateRootSource } {
+  const teamStateRootOverride = env[OMX_TEAM_STATE_ROOT_ENV]?.trim();
+  if (typeof teamStateRootOverride === 'string' && teamStateRootOverride !== '') {
+    return validateResolvedBaseStateDir(resolveWorkingDirectoryForState(teamStateRootOverride), 'team-env', env);
+  }
+
+  const omxRootOverride = env[OMX_ROOT_ENV]?.trim();
+  if (typeof omxRootOverride === 'string' && omxRootOverride !== '') {
+    return validateResolvedBaseStateDir(join(resolveWorkingDirectoryForState(omxRootOverride), '.omx', 'state'), 'omx-root-env', env);
+  }
+
+  const omxStateRootOverride = env[OMX_STATE_ROOT_ENV]?.trim();
+  if (typeof omxStateRootOverride === 'string' && omxStateRootOverride !== '') {
+    return validateResolvedBaseStateDir(join(resolveWorkingDirectoryForState(omxStateRootOverride), '.omx', 'state'), 'omx-state-root-env', env);
+  }
+
+  const sessionAuthority = discoverSessionAuthorityBaseStateDir(workingDirectory, env);
+  if (sessionAuthority) {
+    return validateResolvedBaseStateDir(sessionAuthority, 'session-authority', env);
+  }
+
+  return validateResolvedBaseStateDir(
+    join(resolveWorkingDirectoryForState(workingDirectory), '.omx', 'state'),
+    'cwd-default',
+    env,
+  );
+}
+export function getBaseStateDir(workingDirectory?: string, env: NodeJS.ProcessEnv = process.env): string {
+  return getBaseStateDirWithSource(workingDirectory, env).baseStateDir;
 }
 
 export function getStateDir(workingDirectory?: string, sessionId?: string): string {
@@ -407,7 +421,8 @@ async function readUsableSessionStateFromBaseStateDir(
       && recordedStateRoot === canonicalBaseStateDir
       && isWithinRoot(canonicalObservedCwd, recordedCwd),
     );
-    return isSessionStateUsable(state, authorityOwnsObservedCwd ? recordedCwd : cwd) ? state : null;
+    if (!authorityOwnsObservedCwd) return null;
+    return isSessionStateUsable(state, recordedCwd) ? state : null;
   } catch {
     return null;
   }

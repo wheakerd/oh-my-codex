@@ -311,8 +311,8 @@ export async function dispatchHookEvent(
 	options: HookDispatchOptions = {},
 ): Promise<HookDispatchResult> {
 	const cwd = options.cwd || process.cwd();
-	const stateRoot = options.stateRoot ?? getBaseStateDir(cwd);
 	const env = options.env || process.env;
+	const stateRoot = options.stateRoot ?? getBaseStateDir(cwd, env);
 	const runtimeHookDispatchEnabled =
 		shouldForceEnableRuntimeHookDispatch(event) || isHookPluginsEnabled(env);
 	const enabled = options.enabled ?? runtimeHookDispatchEnabled;

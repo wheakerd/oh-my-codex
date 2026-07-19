@@ -14,6 +14,7 @@ import {
   getAllSessionScopedStatePaths,
   getReadScopedStateFilePaths,
   readCurrentSessionId,
+  readSessionMetadataFromBaseStateDir,
   resolveRuntimeStateScope,
   resolveStateScope,
   resolveWritableStateScope,
@@ -202,6 +203,26 @@ describe('state paths', () => {
     }
   });
 
+  it('rejects pointers whose persisted or inferred root does not own the selected base', async () => {
+    const cwd = await mkRealTemp('omx-state-pointer-root-owner-');
+    const selectedState = join(cwd, 'selected-state');
+    const claimedState = join(cwd, 'claimed-state');
+    try {
+      await mkdir(selectedState, { recursive: true });
+      await writeFile(join(selectedState, 'session.json'), JSON.stringify({
+        session_id: 'sess-mismatch',
+        cwd,
+        state_root: claimedState,
+      }));
+      assert.equal(await readSessionMetadataFromBaseStateDir(cwd, selectedState), undefined);
+
+      await writeFile(join(selectedState, 'session.json'), JSON.stringify({ session_id: 'sess-legacy-explicit', cwd }));
+      assert.equal(await readSessionMetadataFromBaseStateDir(cwd, selectedState), undefined);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it('fails explicitly when multiple ancestor pointers claim the same session authority', async () => {
     const parent = await mkRealTemp('omx-state-authority-conflict-');
     const nested = join(parent, 'nested');
@@ -282,6 +303,26 @@ describe('state paths', () => {
         () => getBaseStateDirWithSource(nested),
         /State root .* is outside allowed roots \(OMX_MCP_WORKDIR_ROOTS\)/,
       );
+    } finally {
+      await rm(parent, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects OMX_ROOT and OMX_STATE_ROOT whose appended state directory escapes the allowlist', async () => {
+    const parent = await mkRealTemp('omx-state-override-symlink-');
+    const allowed = join(parent, 'allowed');
+    const outsideState = join(parent, 'outside-state');
+    try {
+      await mkdir(join(allowed, '.omx'), { recursive: true });
+      await mkdir(outsideState, { recursive: true });
+      await symlink(outsideState, join(allowed, '.omx', 'state'), process.platform === 'win32' ? 'junction' : 'dir');
+      process.env.OMX_MCP_WORKDIR_ROOTS = allowed;
+      process.env.OMX_ROOT = allowed;
+      assert.throws(() => getBaseStateDirWithSource(allowed), /State root .* is outside allowed roots/);
+
+      delete process.env.OMX_ROOT;
+      process.env.OMX_STATE_ROOT = allowed;
+      assert.throws(() => getBaseStateDirWithSource(allowed), /State root .* is outside allowed roots/);
     } finally {
       await rm(parent, { recursive: true, force: true });
     }
@@ -690,6 +731,7 @@ describe('state paths', () => {
       await writeFile(join(teamStateRoot, 'session.json'), JSON.stringify({
         session_id: 'sess-team-current',
         cwd: wd,
+        state_root: teamStateRoot,
       }));
       await mkdir(join(wd, '.omx', 'state'), { recursive: true });
       await writeFile(join(wd, '.omx', 'state', 'session.json'), JSON.stringify({

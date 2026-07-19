@@ -161,6 +161,48 @@ export async function onHookEvent(event, sdk) {
     }
   });
 
+  it('resolves plugin authority from options.env instead of ambient process.env', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-dispatch-env-source-'));
+    const stateRoot = await mkdtemp(join(tmpdir(), 'omx-dispatch-env-authority-'));
+    const ambientRoot = await mkdtemp(join(tmpdir(), 'omx-dispatch-env-ambient-'));
+    const previousTeamRoot = process.env.OMX_TEAM_STATE_ROOT;
+    try {
+      process.env.OMX_TEAM_STATE_ROOT = ambientRoot;
+      const dir = join(cwd, '.omx', 'hooks');
+      const sessionDir = join(stateRoot, 'sessions', 'sess-env');
+      await mkdir(dir, { recursive: true });
+      await mkdir(sessionDir, { recursive: true });
+      await writeFile(join(stateRoot, 'session.json'), JSON.stringify({ session_id: 'sess-env', cwd, state_root: stateRoot }));
+      await writeFile(join(sessionDir, 'hud-state.json'), JSON.stringify({ turn_count: 8 }));
+      await writeFile(
+        join(dir, 'env-root-reader.mjs'),
+        `import { writeFile } from 'node:fs/promises';
+export async function onHookEvent(event, sdk) {
+  await writeFile(process.env.OMX_TEST_DISPATCH_OUTPUT, JSON.stringify(await sdk.omx.hud.read()));
+}`,
+      );
+      const outputPath = join(cwd, 'dispatch-output.json');
+      const result = await dispatchHookEvent(buildHookEvent('session-start', { session_id: 'sess-env' }), {
+        cwd,
+        env: {
+          ...process.env,
+          OMX_TEAM_STATE_ROOT: stateRoot,
+          OMX_HOOK_PLUGINS: '1',
+          OMX_TEST_DISPATCH_OUTPUT: outputPath,
+        },
+      });
+
+      assert.equal(result.results[0]?.ok, true);
+      assert.deepEqual(JSON.parse(await readFile(outputPath, 'utf8')), { turn_count: 8 });
+    } finally {
+      if (previousTeamRoot === undefined) delete process.env.OMX_TEAM_STATE_ROOT;
+      else process.env.OMX_TEAM_STATE_ROOT = previousTeamRoot;
+      await rm(cwd, { recursive: true, force: true });
+      await rm(stateRoot, { recursive: true, force: true });
+      await rm(ambientRoot, { recursive: true, force: true });
+    }
+  });
+
   it('returns null HUD state through the runner when the default state root is absent', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-dispatch-missing-root-'));
     try {
