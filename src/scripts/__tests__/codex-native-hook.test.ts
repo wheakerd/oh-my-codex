@@ -4602,6 +4602,8 @@ PY`,
         owner_codex_session_id: "leader-native",
       });
       const leaderRalphBeforeWorkerStop = await readFile(leaderRalphPath, "utf-8");
+      const rootNativeStopPath = join(stateDir, "native-stop-state.json");
+      assert.equal(existsSync(rootNativeStopPath), false);
 
       await dispatchCodexNativeHook({
         hook_event_name: "SessionStart",
@@ -4621,6 +4623,7 @@ PY`,
       assert.notEqual(workerStop.outputJson?.stopReason, "session_scope_unmatched");
       assert.notEqual(workerStop.outputJson?.stopReason, "session_pointer_unusable");
       assert.equal(await readFile(leaderRalphPath, "utf-8"), leaderRalphBeforeWorkerStop);
+      assert.equal(existsSync(rootNativeStopPath), false);
 
       delete process.env.OMX_TEAM_INTERNAL_WORKER;
       delete process.env.OMX_TEAM_WORKER;
@@ -4634,6 +4637,34 @@ PY`,
       }, { cwd });
       assert.notEqual(leaderStop.outputJson?.stopReason, "session_scope_unmatched");
       assert.equal(await readFile(join(stateDir, "session.json"), "utf-8"), leaderPointerBefore);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects leader aliases from foreign-cwd pointer evidence in a worker worktree", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-team-worker-foreign-alias-"));
+    try {
+      await writeSessionStart(cwd, "foreign-alias-leader", {
+        nativeSessionId: "foreign-alias-leader-native",
+        pid: process.pid,
+      });
+      await configureAuthoritativeTeamWorker(cwd, "foreign-alias-team");
+      const pointerPath = join(cwd, ".omx", "state", "session.json");
+      const pointer = JSON.parse(await readFile(pointerPath, "utf-8")) as Record<string, unknown>;
+      pointer.cwd = join(cwd, "leader-worktree");
+      await writeJson(pointerPath, pointer);
+      const pointerBefore = await readFile(pointerPath, "utf-8");
+
+      for (const sessionId of ["foreign-alias-leader", "foreign-alias-leader-native"]) {
+        await dispatchCodexNativeHook({
+          hook_event_name: "SessionStart",
+          cwd,
+          session_id: sessionId,
+        }, { cwd, sessionOwnerPid: process.pid });
+        assert.equal(await readFile(pointerPath, "utf-8"), pointerBefore);
+        assert.equal(existsSync(join(cwd, ".omx", "state", "sessions", sessionId)), false);
+      }
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

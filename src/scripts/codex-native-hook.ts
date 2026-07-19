@@ -2555,6 +2555,11 @@ function readTeamWorkerEnvironment(): { teamName: string; workerName: string } |
   return internalWorker ?? externalWorker;
 }
 
+function hasRawTeamWorkerDeclaration(): boolean {
+  return safeString(process.env.OMX_TEAM_INTERNAL_WORKER).trim() !== ""
+    || safeString(process.env.OMX_TEAM_WORKER).trim() !== "";
+}
+
 async function hasAuthoritativeTeamWorkerContext(cwd: string): Promise<boolean> {
   const workerContext = readTeamWorkerEnvironment();
   if (!workerContext) return false;
@@ -2799,6 +2804,37 @@ function isStopExempt(payload: CodexHookPayload): boolean {
     || value.includes("compact")
     || value.includes("limit"),
   );
+}
+
+async function buildDeclaredTeamWorkerStopOutput(
+  payload: CodexHookPayload,
+  cwd: string,
+): Promise<Record<string, unknown> | null> {
+  const decision = await resolveTeamWorkerStopDecision(cwd);
+  if (decision.kind === "blocked") {
+    if (payload.stop_hook_active === true && !decision.allowRepeatDuringStopHook) return null;
+    return decision.output;
+  }
+  if (decision.kind === "allowed") {
+    try {
+      await maybeNudgeLeaderForAllowedWorkerStop({
+        stateDir: decision.stateDir,
+        logsDir: join(cwd, ".omx", "logs"),
+        workerContext: decision.workerContext,
+      });
+    } catch (err) {
+      void err;
+    }
+    return null;
+  }
+  const workerName = readTeamWorkerEnvironment()?.workerName ?? "unknown";
+  const reason = "OMX cannot resolve authoritative Team worker state for Stop.";
+  return {
+    decision: "block",
+    stopReason: `team_worker_${workerName}_missing_worker_state`,
+    reason,
+    systemMessage: reason,
+  };
 }
 
 async function readModeStateWithStopSource(
@@ -19687,6 +19723,14 @@ export async function dispatchCodexNativeHook(
       outputJson: null,
     };
   }
+  if (hookEventName === "Stop" && hasRawTeamWorkerDeclaration()) {
+    return {
+      hookEventName,
+      omxEventName: mapCodexHookEventToOmxEvent(hookEventName),
+      skillState: null,
+      outputJson: await buildDeclaredTeamWorkerStopOutput(payload, cwd),
+    };
+  }
   // Native hooks must use the exact pointer root selected for this dispatch.
   const pointerContext = resolveSessionPointerContext(cwd);
   const stateDir = pointerContext.baseStateDir;
@@ -19746,15 +19790,14 @@ export async function dispatchCodexNativeHook(
   let resolvedNativeSessionId = nativeSessionId;
   let skipCanonicalSessionStartContext = false;
   let isSubagentSessionStart = false;
-  const declaredTeamWorker = safeString(process.env.OMX_TEAM_INTERNAL_WORKER).trim() !== ""
-    || safeString(process.env.OMX_TEAM_WORKER).trim() !== "";
+  const declaredTeamWorker = hasRawTeamWorkerDeclaration();
   const authoritativeTeamWorker = declaredTeamWorker && await hasAuthoritativeTeamWorkerContext(cwd);
   const candidateWorkerPayloadSessionId = declaredTeamWorker
     ? readUnambiguousNormalizedPayloadSessionId(payload)
     : "";
   const authoritativeWorkerPayloadSessionId = authoritativeTeamWorker
     && candidateWorkerPayloadSessionId
-    && (!currentSessionState || !payloadMatchesSessionPointer(candidateWorkerPayloadSessionId, currentSessionState))
+    && (!pointer.state || !payloadMatchesSessionPointer(candidateWorkerPayloadSessionId, pointer.state))
       ? candidateWorkerPayloadSessionId
       : "";
   const declaredTeamWorkerStopOnly = hookEventName === "Stop" && declaredTeamWorker;
