@@ -1566,7 +1566,7 @@ describe('readAllState canonical skill precedence', () => {
       const sessionId = 'sess-team-root-session-json';
       const sessionDir = join(teamStateRoot, 'sessions', sessionId);
       await mkdir(sessionDir, { recursive: true });
-      await writeFile(join(teamStateRoot, 'session.json'), JSON.stringify({ session_id: sessionId, cwd }));
+      await writeFile(join(teamStateRoot, 'session.json'), JSON.stringify({ session_id: sessionId, cwd, state_root: teamStateRoot }));
       await writeFile(join(sessionDir, 'skill-active-state.json'), JSON.stringify({
         active: true,
         skill: 'ralplan',
