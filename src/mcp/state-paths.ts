@@ -141,14 +141,17 @@ function convertWslToWindowsPath(raw: string): string {
   return rest ? `${drive}:\\${rest}` : `${drive}:\\`;
 }
 
-export function resolveWorkingDirectoryForState(workingDirectory?: string): string {
+export function resolveWorkingDirectoryForState(
+  workingDirectory?: string,
+  env: NodeJS.ProcessEnv = process.env,
+): string {
   const raw = typeof workingDirectory === 'string' ? workingDirectory.trim() : '';
   if (raw.includes('\0')) {
     throw new Error('workingDirectory contains a NUL byte');
   }
   if (!raw) {
     const cwd = resolvePath(process.cwd());
-    return enforceWorkingDirectoryPolicy(cwd);
+    return enforceWorkingDirectoryPolicy(cwd, env);
   }
 
   let normalized = raw;
@@ -170,7 +173,7 @@ export function resolveWorkingDirectoryForState(workingDirectory?: string): stri
   }
 
   const resolved = resolvePath(normalized);
-  return enforceWorkingDirectoryPolicy(resolved);
+  return enforceWorkingDirectoryPolicy(resolved, env);
 }
 
 function canonicalizeExistingPath(path: string): string {
@@ -226,8 +229,11 @@ function isWithinRoot(path: string, root: string): boolean {
   return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
 }
 
-function enforceWorkingDirectoryPolicy(resolvedWorkingDirectory: string): string {
-  const roots = parseAllowedWorkingDirectoryRoots();
+function enforceWorkingDirectoryPolicy(
+  resolvedWorkingDirectory: string,
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  const roots = parseAllowedWorkingDirectoryRoots(env);
   if (roots.length === 0) return resolvedWorkingDirectory;
 
   const canonicalWorkingDirectory = canonicalizeExistingPath(resolvedWorkingDirectory);
@@ -254,7 +260,7 @@ function discoverSessionAuthorityBaseStateDir(workingDirectory?: string, env: No
   const sessionId = normalizeSessionId(env[OMX_SESSION_ID_ENV]);
   if (!sessionId) return undefined;
 
-  let current = resolveWorkingDirectoryForState(workingDirectory);
+  let current = resolveWorkingDirectoryForState(workingDirectory, env);
   const observedCwd = canonicalizeExistingPath(current);
   const allowedRoots = parseAllowedWorkingDirectoryRoots(env);
   const matches: string[] = [];
@@ -331,17 +337,17 @@ export function getBaseStateDirWithSource(
 ): { baseStateDir: string; rootSource: StateRootSource } {
   const teamStateRootOverride = env[OMX_TEAM_STATE_ROOT_ENV]?.trim();
   if (typeof teamStateRootOverride === 'string' && teamStateRootOverride !== '') {
-    return validateResolvedBaseStateDir(resolveWorkingDirectoryForState(teamStateRootOverride), 'team-env', env);
+    return validateResolvedBaseStateDir(resolveWorkingDirectoryForState(teamStateRootOverride, env), 'team-env', env);
   }
 
   const omxRootOverride = env[OMX_ROOT_ENV]?.trim();
   if (typeof omxRootOverride === 'string' && omxRootOverride !== '') {
-    return validateResolvedBaseStateDir(join(resolveWorkingDirectoryForState(omxRootOverride), '.omx', 'state'), 'omx-root-env', env);
+    return validateResolvedBaseStateDir(join(resolveWorkingDirectoryForState(omxRootOverride, env), '.omx', 'state'), 'omx-root-env', env);
   }
 
   const omxStateRootOverride = env[OMX_STATE_ROOT_ENV]?.trim();
   if (typeof omxStateRootOverride === 'string' && omxStateRootOverride !== '') {
-    return validateResolvedBaseStateDir(join(resolveWorkingDirectoryForState(omxStateRootOverride), '.omx', 'state'), 'omx-state-root-env', env);
+    return validateResolvedBaseStateDir(join(resolveWorkingDirectoryForState(omxStateRootOverride, env), '.omx', 'state'), 'omx-state-root-env', env);
   }
 
   const sessionAuthority = discoverSessionAuthorityBaseStateDir(workingDirectory, env);
@@ -350,7 +356,7 @@ export function getBaseStateDirWithSource(
   }
 
   return validateResolvedBaseStateDir(
-    join(resolveWorkingDirectoryForState(workingDirectory), '.omx', 'state'),
+    join(resolveWorkingDirectoryForState(workingDirectory, env), '.omx', 'state'),
     'cwd-default',
     env,
   );

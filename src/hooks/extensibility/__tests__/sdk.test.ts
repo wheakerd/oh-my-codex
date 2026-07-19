@@ -470,6 +470,7 @@ exit 1
         await writeFile(join(stateRoot, 'session.json'), JSON.stringify({
           session_id: 'sess-canonical',
           native_session_id: 'sess-native',
+          owner_codex_session_id: 'sess-owner-codex',
           cwd,
           state_root: stateRoot,
         }));
@@ -481,6 +482,22 @@ exit 1
           event: { ...makeEvent(), session_id: 'sess-native' },
         });
         assert.deepEqual(await sdk.omx.hud.read(), { turn_count: 4 });
+
+        sdk = createHookPluginSdk({
+          cwd,
+          stateRoot,
+          pluginName: 'test',
+          event: { ...makeEvent(), session_id: 'sess-owner-codex' },
+        });
+        assert.deepEqual(await sdk.omx.hud.read(), { turn_count: 4 });
+
+        sdk = createHookPluginSdk({
+          cwd,
+          stateRoot,
+          pluginName: 'test',
+          event: { ...makeEvent(), session_id: '../invalid' },
+        });
+        assert.equal(await sdk.omx.hud.read(), null);
 
         sdk = createHookPluginSdk({
           cwd,

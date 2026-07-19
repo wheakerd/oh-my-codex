@@ -45,11 +45,14 @@ async function readHudState(cwd: string, stateRoot?: string, requestedSessionId?
       const canonicalStateRoot = realpathSync.native(stateRoot);
       const metadata = await readSessionMetadataFromBaseStateDir(cwd, canonicalStateRoot);
       if (!metadata) return null;
-      const normalizedRequestedSessionId = normalizeSessionId(requestedSessionId);
+      const requestedSessionText = typeof requestedSessionId === 'string' ? requestedSessionId.trim() : '';
+      const normalizedRequestedSessionId = normalizeSessionId(requestedSessionText);
+      if (requestedSessionText && !normalizedRequestedSessionId) return null;
       const requestedIsBound = !normalizedRequestedSessionId
         || normalizedRequestedSessionId === metadata.sessionId
         || metadata.nativeSessionAliases.includes(normalizedRequestedSessionId)
-        || normalizedRequestedSessionId === metadata.ownerOmxSessionId;
+        || normalizedRequestedSessionId === metadata.ownerOmxSessionId
+        || normalizedRequestedSessionId === metadata.ownerCodexSessionId;
       if (!requestedIsBound) return null;
       const sessionDir = join(canonicalStateRoot, 'sessions', metadata.sessionId);
       const hudStatePath = join(sessionDir, 'hud-state.json');

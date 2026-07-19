@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { delimiter, join } from 'node:path';
 import { describe, it } from 'node:test';
 import { isHookPluginFeatureEnabled, dispatchHookEvent } from '../dispatcher.js';
 import { buildHookEvent } from '../events.js';
@@ -166,8 +166,10 @@ export async function onHookEvent(event, sdk) {
     const stateRoot = await mkdtemp(join(tmpdir(), 'omx-dispatch-env-authority-'));
     const ambientRoot = await mkdtemp(join(tmpdir(), 'omx-dispatch-env-ambient-'));
     const previousTeamRoot = process.env.OMX_TEAM_STATE_ROOT;
+    const previousAllowlist = process.env.OMX_MCP_WORKDIR_ROOTS;
     try {
       process.env.OMX_TEAM_STATE_ROOT = ambientRoot;
+      process.env.OMX_MCP_WORKDIR_ROOTS = ambientRoot;
       const dir = join(cwd, '.omx', 'hooks');
       const sessionDir = join(stateRoot, 'sessions', 'sess-env');
       await mkdir(dir, { recursive: true });
@@ -187,6 +189,7 @@ export async function onHookEvent(event, sdk) {
         env: {
           ...process.env,
           OMX_TEAM_STATE_ROOT: stateRoot,
+          OMX_MCP_WORKDIR_ROOTS: [cwd, stateRoot].join(delimiter),
           OMX_HOOK_PLUGINS: '1',
           OMX_TEST_DISPATCH_OUTPUT: outputPath,
         },
@@ -197,6 +200,8 @@ export async function onHookEvent(event, sdk) {
     } finally {
       if (previousTeamRoot === undefined) delete process.env.OMX_TEAM_STATE_ROOT;
       else process.env.OMX_TEAM_STATE_ROOT = previousTeamRoot;
+      if (previousAllowlist === undefined) delete process.env.OMX_MCP_WORKDIR_ROOTS;
+      else process.env.OMX_MCP_WORKDIR_ROOTS = previousAllowlist;
       await rm(cwd, { recursive: true, force: true });
       await rm(stateRoot, { recursive: true, force: true });
       await rm(ambientRoot, { recursive: true, force: true });
