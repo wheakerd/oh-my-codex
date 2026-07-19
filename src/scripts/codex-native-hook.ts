@@ -19281,7 +19281,17 @@ async function buildStopHookOutput(
 
   if (options.teamWorkerOnly === true) {
     const teamWorkerDecision = await resolveTeamWorkerStopDecision(cwd);
-    if (teamWorkerDecision.kind === "blocked") return teamWorkerDecision.output;
+    if (teamWorkerDecision.kind === "blocked") {
+      return await returnPersistentStopBlock(
+        payload,
+        stateDir,
+        "team-worker-stop",
+        safeString(teamWorkerDecision.output.stopReason),
+        teamWorkerDecision.output,
+        undefined,
+        { allowRepeatDuringStopHook: teamWorkerDecision.allowRepeatDuringStopHook },
+      );
+    }
     if (teamWorkerDecision.kind === "allowed") {
       try {
         await maybeNudgeLeaderForAllowedWorkerStop({
@@ -19736,7 +19746,8 @@ export async function dispatchCodexNativeHook(
   let resolvedNativeSessionId = nativeSessionId;
   let skipCanonicalSessionStartContext = false;
   let isSubagentSessionStart = false;
-  const declaredTeamWorker = readTeamWorkerEnvironment() !== null;
+  const declaredTeamWorker = safeString(process.env.OMX_TEAM_INTERNAL_WORKER).trim() !== ""
+    || safeString(process.env.OMX_TEAM_WORKER).trim() !== "";
   const authoritativeTeamWorker = declaredTeamWorker && await hasAuthoritativeTeamWorkerContext(cwd);
   const candidateWorkerPayloadSessionId = declaredTeamWorker
     ? readUnambiguousNormalizedPayloadSessionId(payload)
@@ -19746,9 +19757,7 @@ export async function dispatchCodexNativeHook(
     && (!currentSessionState || !payloadMatchesSessionPointer(candidateWorkerPayloadSessionId, currentSessionState))
       ? candidateWorkerPayloadSessionId
       : "";
-  const declaredTeamWorkerStopOnly = hookEventName === "Stop"
-    && declaredTeamWorker
-    && !authoritativeWorkerPayloadSessionId;
+  const declaredTeamWorkerStopOnly = hookEventName === "Stop" && declaredTeamWorker;
 
   if (hookEventName === "SessionStart" && declaredTeamWorker && !authoritativeWorkerPayloadSessionId) {
     canonicalSessionId = "";

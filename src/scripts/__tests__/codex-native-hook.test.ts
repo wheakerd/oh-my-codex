@@ -4593,6 +4593,15 @@ PY`,
       });
       await configureAuthoritativeTeamWorker(cwd, "pointer-team");
       const leaderPointerBefore = await readFile(join(stateDir, "session.json"), "utf-8");
+      const leaderRalphPath = join(stateDir, "sessions", "leader-session", "ralph-state.json");
+      await writeJson(leaderRalphPath, {
+        active: true,
+        mode: "ralph",
+        current_phase: "executing",
+        session_id: "leader-session",
+        owner_codex_session_id: "leader-native",
+      });
+      const leaderRalphBeforeWorkerStop = await readFile(leaderRalphPath, "utf-8");
 
       await dispatchCodexNativeHook({
         hook_event_name: "SessionStart",
@@ -4611,6 +4620,7 @@ PY`,
       }, { cwd });
       assert.notEqual(workerStop.outputJson?.stopReason, "session_scope_unmatched");
       assert.notEqual(workerStop.outputJson?.stopReason, "session_pointer_unusable");
+      assert.equal(await readFile(leaderRalphPath, "utf-8"), leaderRalphBeforeWorkerStop);
 
       delete process.env.OMX_TEAM_INTERNAL_WORKER;
       delete process.env.OMX_TEAM_WORKER;
@@ -4653,6 +4663,21 @@ PY`,
         }, { cwd, sessionOwnerPid: process.pid });
         assert.equal(existsSync(pointerPath), pointerBefore !== null);
         if (pointerBefore !== null) assert.equal(await readFile(pointerPath, "utf-8"), pointerBefore);
+
+        for (const declaration of [
+          { internal: "malformed", external: "" },
+          { internal: "race-team/worker-1", external: "other-team/worker-1" },
+        ]) {
+          process.env.OMX_TEAM_INTERNAL_WORKER = declaration.internal;
+          process.env.OMX_TEAM_WORKER = declaration.external;
+          await dispatchCodexNativeHook({
+            hook_event_name: "SessionStart",
+            cwd,
+            session_id: "race-worker-malformed-native",
+          }, { cwd, sessionOwnerPid: process.pid });
+          assert.equal(existsSync(pointerPath), pointerBefore !== null);
+          if (pointerBefore !== null) assert.equal(await readFile(pointerPath, "utf-8"), pointerBefore);
+        }
 
         const stop = await dispatchCodexNativeHook({
           hook_event_name: "Stop",
