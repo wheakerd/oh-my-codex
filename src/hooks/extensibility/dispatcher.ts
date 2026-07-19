@@ -266,6 +266,7 @@ async function runPluginRunner(
 				pluginPath: plugin.path,
 				event,
 				sideEffectsEnabled,
+				stateRoot: options.stateRoot,
 			}),
 		);
 		child.stdin.end();

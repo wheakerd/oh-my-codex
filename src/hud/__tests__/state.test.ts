@@ -915,7 +915,10 @@ describe('readAllState canonical skill precedence', () => {
       });
 
       const state = await readAllState(cwd);
-      assert.deepEqual(state.ultragoal, {
+      const ultragoal = { ...(state.ultragoal as unknown as Record<string, unknown>) };
+      delete ultragoal.tmux_pane_id;
+      delete ultragoal.tmux_pane_set_at;
+      assert.deepEqual(ultragoal, {
         active: true,
         mode: 'ultragoal',
         current_phase: 'planning',

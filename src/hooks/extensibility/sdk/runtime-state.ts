@@ -1,5 +1,6 @@
 import { existsSync } from 'fs';
 import { readFile } from 'fs/promises';
+import { join } from 'path';
 import type {
   HookPluginOmxHudState,
   HookPluginOmxNotifyFallbackState,
@@ -34,30 +35,42 @@ function normalizeSessionState(value: Record<string, unknown>): HookPluginOmxSes
     : null;
 }
 
-export function createHookPluginOmxApi(cwd: string): HookPluginSdk['omx'] {
+async function readHudState(cwd: string, stateRoot?: string): Promise<HookPluginOmxHudState | null> {
+  if (stateRoot) {
+    const session = await readOmxStateFile<HookPluginOmxSessionState>(
+      join(stateRoot, 'session.json'),
+      normalizeSessionState,
+    );
+    if (!session) return null;
+    return readOmxStateFile<HookPluginOmxHudState>(
+      join(stateRoot, 'sessions', session.session_id, 'hud-state.json'),
+    );
+  }
+  const [hudStatePath] = await getReadScopedStateFilePaths('hud-state.json', cwd, undefined, {
+    rootFallback: false,
+  });
+  return readOmxStateFile<HookPluginOmxHudState>(hudStatePath);
+}
+
+export function createHookPluginOmxApi(cwd: string, stateRoot?: string): HookPluginSdk['omx'] {
   return {
     session: {
       read: () => readOmxStateFile<HookPluginOmxSessionState>(
-        omxRootStateFilePath(cwd, 'session.json'),
+        omxRootStateFilePath(cwd, 'session.json', stateRoot),
         normalizeSessionState,
       ),
     },
     hud: {
-      read: async () => {
-        const [hudStatePath] = await getReadScopedStateFilePaths('hud-state.json', cwd, undefined, {
-          rootFallback: false,
-        });
-        return readOmxStateFile<HookPluginOmxHudState>(hudStatePath);
-      },
+      read: () => readHudState(cwd, stateRoot),
     },
     notifyFallback: {
       read: () => readOmxStateFile<HookPluginOmxNotifyFallbackState>(
-        omxRootStateFilePath(cwd, 'notify-fallback-state.json'),
+        omxRootStateFilePath(cwd, 'notify-fallback-state.json', stateRoot),
       ),
     },
     updateCheck: {
       read: () => readOmxStateFile<HookPluginOmxUpdateCheckState>(
-        omxRootStateFilePath(cwd, 'update-check.json'),
+        omxRootStateFilePath(cwd, 'update-check.json', stateRoot),
       ),
     },
   };

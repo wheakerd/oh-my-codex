@@ -160,6 +160,48 @@ describe('state paths', () => {
     }
   });
 
+  it('uses the ancestor session pointer matching OMX_SESSION_ID as the authoritative root', async () => {
+    const parent = await mkRealTemp('omx-state-authority-parent-');
+    const nested = join(parent, 'nested', 'project');
+    const parentState = join(parent, '.omx', 'state');
+    const nestedState = join(nested, '.omx', 'state');
+    try {
+      await mkdir(parentState, { recursive: true });
+      await mkdir(nestedState, { recursive: true });
+      await writeFile(join(parentState, 'session.json'), JSON.stringify({ session_id: 'sess-parent', cwd: parent }));
+      await writeFile(join(nestedState, 'session.json'), JSON.stringify({ session_id: 'sess-nested', cwd: nested }));
+      process.env.OMX_SESSION_ID = 'sess-parent';
+
+      assert.deepEqual(getBaseStateDirWithSource(nested), {
+        baseStateDir: parentState,
+        rootSource: 'session-authority',
+      });
+    } finally {
+      await rm(parent, { recursive: true, force: true });
+    }
+  });
+
+  it('fails explicitly when multiple ancestor pointers claim the same session authority', async () => {
+    const parent = await mkRealTemp('omx-state-authority-conflict-');
+    const nested = join(parent, 'nested');
+    const parentState = join(parent, '.omx', 'state');
+    const nestedState = join(nested, '.omx', 'state');
+    try {
+      await mkdir(parentState, { recursive: true });
+      await mkdir(nestedState, { recursive: true });
+      await writeFile(join(parentState, 'session.json'), JSON.stringify({ session_id: 'sess-conflict', cwd: parent }));
+      await writeFile(join(nestedState, 'session.json'), JSON.stringify({ session_id: 'sess-conflict', cwd: nested }));
+      process.env.OMX_SESSION_ID = 'sess-conflict';
+
+      assert.throws(
+        () => getBaseStateDirWithSource(nested),
+        new RegExp(`Conflicting authoritative state roots.*${parentState}.*${nestedState}|Conflicting authoritative state roots.*${nestedState}.*${parentState}`),
+      );
+    } finally {
+      await rm(parent, { recursive: true, force: true });
+    }
+  });
+
   it('fails closed when an explicit state root is outside the allowlist', async () => {
     const allowedRoot = await mkRealTemp('omx-state-root-allowed-');
     const disallowedRoot = await mkRealTemp('omx-state-root-disallowed-');

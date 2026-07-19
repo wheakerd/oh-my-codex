@@ -424,6 +424,41 @@ exit 1
       }
     });
 
+    it('honors explicit stateRoot when reading session-scoped HUD state', async () => {
+      const cwd = await mkdtemp(join(tmpdir(), 'omx-sdk-hud-source-'));
+      const stateRoot = await mkdtemp(join(tmpdir(), 'omx-sdk-hud-authority-'));
+      try {
+        await writeOmxStateFile(cwd, 'session.json', { session_id: 'stale-source', cwd });
+        await writeOmxStateFile(cwd, join('sessions', 'stale-source', 'hud-state.json'), {
+          last_turn_at: 'stale-source',
+          turn_count: 99,
+        });
+        await mkdir(join(stateRoot, 'sessions', 'sess-authority'), { recursive: true });
+        await writeFile(join(stateRoot, 'session.json'), JSON.stringify({
+          session_id: 'sess-authority',
+          cwd,
+        }));
+        await writeFile(join(stateRoot, 'sessions', 'sess-authority', 'hud-state.json'), JSON.stringify({
+          last_turn_at: 'authoritative',
+          turn_count: 3,
+        }));
+
+        const sdk = createHookPluginSdk({
+          cwd,
+          stateRoot,
+          pluginName: 'test',
+          event: makeEvent(),
+        });
+        assert.deepEqual(await sdk.omx.hud.read(), {
+          last_turn_at: 'authoritative',
+          turn_count: 3,
+        });
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+        await rm(stateRoot, { recursive: true, force: true });
+      }
+    });
+
     it('returns null for missing omx reader files', async () => {
       const cwd = await mkdtemp(join(tmpdir(), 'omx-sdk-'));
       try {

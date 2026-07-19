@@ -1,5 +1,5 @@
 import { delimiter, isAbsolute, join, relative, resolve as resolvePath } from 'path';
-import { existsSync, realpathSync } from 'fs';
+import { existsSync, realpathSync, readFileSync } from 'fs';
 import { readFile, readdir } from 'fs/promises';
 import {
   isSessionStateUsable,
@@ -23,7 +23,7 @@ export const WRITABLE_STATE_SCOPE_ERRORS = {
 } as const;
 
 
-export type StateRootSource = 'team-env' | 'omx-root-env' | 'omx-state-root-env' | 'cwd-default';
+export type StateRootSource = 'team-env' | 'omx-root-env' | 'omx-state-root-env' | 'session-authority' | 'cwd-default';
 export type SessionScopeSource = 'explicit' | 'env' | 'session-json' | 'native-alias' | 'root';
 
 export interface ResolvedSessionMetadata {
@@ -240,6 +240,50 @@ function enforceWorkingDirectoryPolicy(resolvedWorkingDirectory: string): string
   return canonicalWorkingDirectory;
 }
 
+function sessionPointerMatchesId(pointer: Record<string, unknown>, sessionId: string): boolean {
+  return [
+    pointer.session_id,
+    pointer.native_session_id,
+    pointer.owner_omx_session_id,
+    pointer.owner_codex_session_id,
+    pointer.codex_session_id,
+  ].some((value) => normalizeSessionId(value) === sessionId);
+}
+
+function discoverSessionAuthorityBaseStateDir(workingDirectory?: string): string | undefined {
+  const sessionId = normalizeSessionId(process.env[OMX_SESSION_ID_ENV]);
+  if (!sessionId) return undefined;
+
+  let current = resolveWorkingDirectoryForState(workingDirectory);
+  const matches: string[] = [];
+  while (true) {
+    const candidate = join(current, '.omx', 'state');
+    const pointerPath = join(candidate, 'session.json');
+    if (existsSync(pointerPath)) {
+      try {
+        const parsed = JSON.parse(readFileSync(pointerPath, 'utf8')) as unknown;
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+          && sessionPointerMatchesId(parsed as Record<string, unknown>, sessionId)) {
+          matches.push(canonicalizeExistingPath(candidate));
+        }
+      } catch {
+        // Malformed pointers are classified by the normal state-scope resolver.
+      }
+    }
+    const parent = resolvePath(current, '..');
+    if (parent === current) break;
+    current = parent;
+  }
+
+  const uniqueMatches = [...new Set(matches)];
+  if (uniqueMatches.length > 1) {
+    throw new Error(
+      `Conflicting authoritative state roots for OMX_SESSION_ID ${sessionId}: ${uniqueMatches.join(', ')}`,
+    );
+  }
+  return uniqueMatches[0];
+}
+
 export function getBaseStateDirWithSource(workingDirectory?: string): { baseStateDir: string; rootSource: StateRootSource } {
   const teamStateRootOverride = process.env[OMX_TEAM_STATE_ROOT_ENV]?.trim();
   if (typeof teamStateRootOverride === 'string' && teamStateRootOverride !== '') {
@@ -254,6 +298,11 @@ export function getBaseStateDirWithSource(workingDirectory?: string): { baseStat
   const omxStateRootOverride = process.env[OMX_STATE_ROOT_ENV]?.trim();
   if (typeof omxStateRootOverride === 'string' && omxStateRootOverride !== '') {
     return { baseStateDir: join(resolveWorkingDirectoryForState(omxStateRootOverride), '.omx', 'state'), rootSource: 'omx-state-root-env' };
+  }
+
+  const sessionAuthority = discoverSessionAuthorityBaseStateDir(workingDirectory);
+  if (sessionAuthority) {
+    return { baseStateDir: sessionAuthority, rootSource: 'session-authority' };
   }
 
   return { baseStateDir: join(resolveWorkingDirectoryForState(workingDirectory), '.omx', 'state'), rootSource: 'cwd-default' };
