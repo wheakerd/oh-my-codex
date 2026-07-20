@@ -2,6 +2,8 @@ import { spawnSync, execFile } from 'child_process';
 import { promisify } from 'util';
 import { closeSync, chmodSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'fs';
 import { homedir } from 'os';
+import { randomBytes } from 'crypto';
+
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'path';
 import {
   CODEX_BYPASS_FLAG,
@@ -78,6 +80,10 @@ export interface TeamSession {
   leaderPaneId: string;
   /** Frozen leader pane process identity for startup and recovery authority. */
   leaderPanePid?: number;
+  /** Frozen leader tmux session/window incarnations for same-server sink authorization. */
+  leaderSessionId?: string;
+  leaderSessionCreated?: string;
+  leaderWindowId?: string;
   /** HUD pane spawned below the leader column, or null if creation failed. */
   hudPaneId: string | null;
   /** Frozen HUD pane process identity for startup and recovery authority. */
@@ -241,6 +247,104 @@ function runTmuxStructured(args: string[]): { ok: true; stdout: string } | { ok:
     return { ok: false, stderr: (result.stderr || '').trim() || `tmux exited ${result.status}` };
   }
   return { ok: true, stdout: (result.stdout || '').replace(/\r?\n$/, '') };
+
+}
+
+type SourcePaneAuthority = {
+  paneId: string;
+  panePid: number;
+  sessionName: string;
+  sessionId: string;
+  sessionCreated: string;
+  windowId: string;
+  windowIndex: string;
+  /** Present only after the Team owner bootstrap tag has been committed. */
+  teamPaneOwnerId: string | null;
+};
+
+function captureSourcePaneAuthority(paneId: string, expectedTeamPaneOwnerId?: string): SourcePaneAuthority {
+  const target = paneId.trim();
+  if (!/^%[0-9]+$/.test(target)) throw new Error(`invalid tmux source pane: ${paneId}`);
+  const result = runTmuxStructured([
+    'display-message', '-p', '-t', target,
+    '#{session_name}\t#{session_id}\t#{session_created}\t#{window_index}\t#{window_id}\t#{pane_id}\t#{pane_pid}',
+  ]);
+  if (!result.ok) throw new Error(`failed to capture tmux source authority: ${result.stderr}`);
+  const fields = result.stdout.split('\t');
+  if (fields.length !== 7) throw new Error('malformed tmux source authority');
+  const [sessionName, sessionId, sessionCreated, windowIndex, windowId, capturedPaneId, panePid] = fields;
+  if (!sessionName || !/^\$[0-9]+$/.test(sessionId) || !/^[0-9]+$/.test(sessionCreated)
+    || !/^[0-9]+$/.test(windowIndex) || !/^@[0-9]+$/.test(windowId)
+    || capturedPaneId !== target || !/^[1-9][0-9]*$/.test(panePid)) {
+    throw new Error('malformed tmux source authority');
+  }
+  const parsedPid = Number(panePid);
+  if (!Number.isSafeInteger(parsedPid) || parsedPid <= 0) throw new Error('malformed tmux source authority');
+  const proof = readExactPaneProofSync(target);
+  if (proof.status === 'unavailable') throw new ExactPaneProofUnavailableError(proof);
+  if (proof.status !== 'live' || proof.pid !== parsedPid) throw new Error(`tmux pane identity changed: ${target}`);
+  const ownerResult = runTmuxStructured(['show-option', '-qv', '-p', '-t', target, OMX_TEAM_PANE_OWNER_OPTION]);
+  if (!ownerResult.ok) throw new Error(`failed to capture tmux pane owner: ${ownerResult.stderr}`);
+  const teamPaneOwnerId = ownerResult.stdout.trim() || null;
+  if (teamPaneOwnerId && !/^[A-Za-z0-9._:-]+$/.test(teamPaneOwnerId)) {
+    throw new Error('malformed tmux pane owner');
+  }
+  if (expectedTeamPaneOwnerId !== undefined && teamPaneOwnerId !== expectedTeamPaneOwnerId) {
+    throw new Error(`tmux pane team owner changed: ${target}`);
+  }
+  return {
+    paneId: target,
+    panePid: parsedPid,
+    sessionName,
+    sessionId,
+    sessionCreated,
+    windowId,
+    windowIndex,
+    teamPaneOwnerId,
+  };
+}
+
+function sourceAuthorityPredicate(source: SourcePaneAuthority): string {
+  return [
+    '#{==:#{pane_dead},0}',
+    `#{==:#{pane_id},${source.paneId}}`,
+    `#{==:#{pane_pid},${source.panePid}}`,
+    `#{==:#{session_id},${source.sessionId}}`,
+    `#{==:#{session_created},${source.sessionCreated}}`,
+    `#{==:#{window_id},${source.windowId}}`,
+    ...(source.teamPaneOwnerId ? [`#{==:#{${OMX_TEAM_PANE_OWNER_OPTION}},${source.teamPaneOwnerId}}`] : []),
+  ].reduce((combined, condition) => `#{&&:${combined},${condition}}`);
+}
+
+function sourceTransactionReceipt(): string {
+  return `omx_source_${process.pid}_${Date.now()}_${randomBytes(16).toString('hex')}`;
+}
+
+/** Queue an effect in the source pane's tmux server only when its exact pane/session/window incarnation still matches. */
+function runSourceAuthorizedTmux(source: SourcePaneAuthority, effect: string, receipt: string = sourceTransactionReceipt()): string {
+  const result = runTmux([
+    'if-shell', '-F', '-t', source.paneId, sourceAuthorityPredicate(source),
+    `${effect} \\; display-message -p ${shellQuoteSingle(receipt)}`,
+    "display-message -p ''",
+  ]);
+  if (!result.ok) throw new Error(`tmux source authority transaction failed: ${result.stderr}`);
+  if (result.stdout !== receipt) throw new Error('tmux source authority changed before effect');
+  return receipt;
+}
+
+function runSourceAuthorizedSplit(source: SourcePaneAuthority, effect: string): string {
+  const receipt = sourceTransactionReceipt();
+  const result = runTmux([
+    'if-shell', '-F', '-t', source.paneId, sourceAuthorityPredicate(source),
+    effect.replace("-F '#{pane_id}'", `-F '#{pane_id}\\t${receipt}'`),
+    "display-message -p ''",
+  ]);
+  if (!result.ok) throw new Error(`tmux source authority transaction failed: ${result.stderr}`);
+  const [paneId, observedReceipt, ...extra] = result.stdout.split('\t');
+  if (!paneId || !/^%[0-9]+$/.test(paneId) || observedReceipt !== receipt || extra.length !== 0) {
+    throw new Error('tmux source authority changed before split effect');
+  }
+  return paneId;
 }
 
 type RestoredHudCleanupDebt = {
@@ -480,16 +584,6 @@ function sanitizeTmuxStyleOption(
   return result.ok;
 }
 
-function tagPaneInstance(paneTarget: string, instanceId: string, expectedPanePid?: number): void {
-  const target = paneTarget.trim();
-  const sanitized = instanceId.trim();
-  if (!target || !sanitized) return;
-  const provenTarget = requireLiveExactPaneSync(target, expectedPanePid);
-  const result = runTmux(['set-option', '-p', '-t', provenTarget, OMX_PANE_INSTANCE_OPTION, sanitized]);
-  if (!result.ok) {
-    throw new Error(`failed to tag tmux pane ${provenTarget}: ${result.stderr}`);
-  }
-}
 
 export function tagPaneTeamOwner(paneTarget: string, teamOwnerId: string, expectedPanePid?: number): void {
   const target = paneTarget.trim();
@@ -1359,14 +1453,12 @@ export function buildReconcileHudResizeArgs(
 }
 
 function redrawLeaderPaneAfterTeamLayout(
-  leaderPaneId: string,
-  expectedPanePid: number,
+  source: SourcePaneAuthority,
   expectedTeamOwnerId: string,
 ): void {
-  const target = leaderPaneId.trim();
-  if (!target.startsWith('%')) return;
-  const provenTarget = requireLiveTeamOwnedPaneSync(target, expectedPanePid, expectedTeamOwnerId);
-  runTmux(['send-keys', '-t', provenTarget, 'C-l']);
+  const provenTarget = requireLiveTeamOwnedPaneSync(source.paneId, source.panePid, expectedTeamOwnerId);
+  if (provenTarget !== source.paneId) throw new Error(`tmux pane identity changed: ${source.paneId}`);
+  runSourceAuthorizedTmux(source, `send-keys -t ${source.paneId} C-l`);
 }
 
 const ZSH_CANDIDATE_PATHS = ['/bin/zsh', '/usr/bin/zsh', '/usr/local/bin/zsh', '/opt/local/bin/zsh', '/opt/homebrew/bin/zsh'];
@@ -2283,9 +2375,14 @@ export function createTeamSession(
     const leaderProof = readExactPaneProofSync(leaderPaneId);
     if (leaderProof.status === 'unavailable') throw new ExactPaneProofUnavailableError(leaderProof);
     if (leaderProof.status === 'gone') throw new Error(`tmux pane is not proven live: ${leaderPaneId}`);
-    const leaderPanePid = leaderProof.pid;
+    let leaderSource = captureSourcePaneAuthority(leaderPaneId);
+    if (leaderSource.sessionName !== sessionName || leaderSource.windowIndex !== windowIndex || leaderSource.panePid !== leaderProof.pid) {
+      throw new Error('tmux source authority changed during team startup');
+    }
+    const leaderPanePid = leaderSource.panePid;
     partialLeaderPaneId = leaderPaneId;
     partialLeaderPanePid = leaderPanePid;
+
     const initialHudPaneIds = findHudWatchPaneIds(paneListResult.panes, leaderPaneId, { leaderPaneId });
     const initialWindowPanePids = new Map<string, number>([[leaderPaneId, leaderPanePid]]);
 
@@ -2304,13 +2401,25 @@ export function createTeamSession(
     // instead of making it disappear on team startup failures or broken installs.
     requireFrozenWindowTopologySync(teamTarget, initialWindowPanePids);
     if (ownerSessionId) {
-      const tagResult = runTmux(['set-option', '-t', sessionName, OMX_INSTANCE_OPTION, ownerSessionId]);
-      if (!tagResult.ok) {
-        throw new Error(`failed to tag tmux session ${sessionName}: ${tagResult.stderr}`);
-      }
+      runSourceAuthorizedTmux(
+        leaderSource,
+        `set-option -t ${leaderSource.sessionId} ${OMX_INSTANCE_OPTION} ${shellQuoteSingle(ownerSessionId)}`,
+      );
     }
-    tagPaneInstance(leaderPaneId, ownerSessionId, leaderPanePid);
-    tagPaneTeamOwner(leaderPaneId, teamPaneOwnerId, leaderPanePid);
+    if (ownerSessionId) {
+      runSourceAuthorizedTmux(
+        leaderSource,
+        `set-option -p -t ${leaderPaneId} ${OMX_PANE_INSTANCE_OPTION} ${shellQuoteSingle(ownerSessionId)}`,
+      );
+    }
+    runSourceAuthorizedTmux(
+      leaderSource,
+      `set-option -p -t ${leaderPaneId} ${OMX_TEAM_PANE_OWNER_OPTION} ${shellQuoteSingle(teamPaneOwnerId)}`,
+    );
+    // All subsequent Team mutations must bind the frozen leader owner in the
+    // same tmux-server transaction as their effect. The initial tag itself is
+    // deliberately the sole bootstrap mutation before an owner exists.
+    leaderSource = captureSourcePaneAuthority(leaderPaneId, teamPaneOwnerId);
     if (canRecreateTeamHud) {
       for (const [hudPaneId, hudPanePid] of initialWindowPanePids) {
         if (hudPaneId !== leaderPaneId) killExactPaneSync(hudPaneId, hudPanePid);
@@ -2352,26 +2461,12 @@ export function createTeamSession(
         teamPaneOwnerId,
       );
 
-      const split = runTmux([
-        'split-window',
-        splitDirection,
-        '-t',
-        splitTarget,
-        '-d',
-        '-P',
-        '-F',
-        '#{pane_id}',
-        '-c',
-        tmuxWorkerCwd,
-        cmd,
-      ]);
-      if (!split.ok) {
-        throw new Error(`failed to create worker pane ${i}: ${split.stderr}`);
-      }
-      const paneId = split.stdout.split('\n')[0]?.trim();
-      if (!paneId || !paneId.startsWith('%')) {
-        throw new Error(`failed to capture worker pane id for worker ${i}`);
-      }
+      const splitSource = captureSourcePaneAuthority(splitTarget, teamPaneOwnerId);
+      const paneId = runSourceAuthorizedSplit(
+        splitSource,
+        `split-window ${splitDirection} -t ${splitTarget} -d -P -F '#{pane_id}' -c ${shellQuoteSingle(tmuxWorkerCwd)} ${shellQuoteSingle(cmd)}`,
+      );
+
       // The pane exists once split-window returns its concrete ID. Persist it in
       // rollback/partial state before its first proof: a malformed or unavailable
       // topology must retain cleanup debt, but cannot authorize an effect.
@@ -2389,9 +2484,20 @@ export function createTeamSession(
       if (isNativeWindows() && !waitForPaneToRemainPresent(teamTarget, paneId)) {
         throw new Error(`worker pane ${i} did not remain present after tmux split-window returned ${paneId}`);
       }
-      tagPaneInstance(paneId, ownerSessionId, panePid);
+      const paneSource = captureSourcePaneAuthority(paneId);
+      if (paneSource.panePid !== panePid) throw new Error(`tmux pane identity changed: ${paneId}`);
+      if (ownerSessionId) {
+        runSourceAuthorizedTmux(
+          paneSource,
+          `set-option -p -t ${paneId} ${OMX_PANE_INSTANCE_OPTION} ${shellQuoteSingle(ownerSessionId)}`,
+        );
+      }
       rollbackTaggedPaneOwnerIds.set(paneId, teamPaneOwnerId);
-      tagPaneTeamOwner(paneId, teamPaneOwnerId, panePid);
+      runSourceAuthorizedTmux(
+        paneSource,
+        `set-option -p -t ${paneId} ${OMX_TEAM_PANE_OWNER_OPTION} ${shellQuoteSingle(teamPaneOwnerId)}`,
+      );
+
       frozenWindowPaneOwners.set(paneId, teamPaneOwnerId);
       workerPaneIds.push(paneId);
       if (i === 1) {
@@ -2403,7 +2509,8 @@ export function createTeamSession(
 
     // Keep leader as full left/main pane; workers stay stacked on the right.
     requireFrozenWindowTopologySync(teamTarget, frozenWindowPanePids, frozenWindowPaneOwners);
-    runTmux(['select-layout', '-t', teamTarget, 'main-vertical']);
+    runSourceAuthorizedTmux(leaderSource, `select-layout -t ${leaderSource.windowId} main-vertical`);
+
 
     // Force leader pane to use half the window width.
     const windowWidthResult = runTmux(['display-message', '-p', '-t', teamTarget, '#{window_width}']);
@@ -2412,9 +2519,9 @@ export function createTeamSession(
       if (Number.isFinite(width) && width >= 40) {
         const half = String(Math.floor(width / 2));
         requireFrozenWindowTopologySync(teamTarget, frozenWindowPanePids, frozenWindowPaneOwners);
-        runTmux(['set-window-option', '-t', teamTarget, 'main-pane-width', half]);
+        runSourceAuthorizedTmux(leaderSource, `set-window-option -t ${leaderSource.windowId} main-pane-width ${half}`);
         requireFrozenWindowTopologySync(teamTarget, frozenWindowPanePids, frozenWindowPaneOwners);
-        runTmux(['select-layout', '-t', teamTarget, 'main-vertical']);
+        runSourceAuthorizedTmux(leaderSource, `select-layout -t ${leaderSource.windowId} main-vertical`);
       }
     }
 
@@ -2431,12 +2538,13 @@ export function createTeamSession(
       requireFrozenWindowTopologySync(teamTarget, frozenWindowPanePids, frozenWindowPaneOwners);
       const hudSplitTarget = leaderPaneId;
 
-      const hudResult = runTmux([
-        'split-window', '-v', '-f', '-l', String(HUD_TMUX_TEAM_HEIGHT_LINES), '-t', hudSplitTarget, '-d', '-P', '-F', '#{pane_id}', '-c', hudCwd, hudCmd,
-      ]);
-      if (hudResult.ok) {
-        const id = hudResult.stdout.split('\n')[0]?.trim() ?? '';
-        if (id.startsWith('%')) {
+      const hudSource = captureSourcePaneAuthority(hudSplitTarget, teamPaneOwnerId);
+      const id = runSourceAuthorizedSplit(
+        hudSource,
+        `split-window -v -f -l ${HUD_TMUX_TEAM_HEIGHT_LINES} -t ${hudSplitTarget} -d -P -F '#{pane_id}' -c ${shellQuoteSingle(hudCwd)} ${shellQuoteSingle(hudCmd)}`,
+      );
+      {
+
           // split-window has created a concrete pane even though no proof has
           // authorized an effect yet. Retain PID-less cleanup debt first.
           rollbackPanes.set(id, null);
@@ -2452,9 +2560,19 @@ export function createTeamSession(
           if (isNativeWindows() && !waitForPaneToRemainPresent(teamTarget, id)) {
             throw new Error(`HUD pane did not remain present after tmux split-window returned ${id}`);
           }
-          tagPaneInstance(id, ownerSessionId, hudPanePid);
+          const hudSource = captureSourcePaneAuthority(id);
+          if (hudSource.panePid !== hudPanePid) throw new Error(`tmux pane identity changed: ${id}`);
+          if (ownerSessionId) {
+            runSourceAuthorizedTmux(
+              hudSource,
+              `set-option -p -t ${id} ${OMX_PANE_INSTANCE_OPTION} ${shellQuoteSingle(ownerSessionId)}`,
+            );
+          }
           rollbackTaggedPaneOwnerIds.set(id, teamPaneOwnerId);
-          tagPaneTeamOwner(id, teamPaneOwnerId, hudPanePid);
+          runSourceAuthorizedTmux(
+            hudSource,
+            `set-option -p -t ${id} ${OMX_TEAM_PANE_OWNER_OPTION} ${shellQuoteSingle(teamPaneOwnerId)}`,
+          );
           frozenWindowPaneOwners.set(id, teamPaneOwnerId);
           hudPaneId = id;
 
@@ -2557,10 +2675,11 @@ export function createTeamSession(
           }
         }
       }
-    }
 
-    runTmux(['select-pane', '-t', requireLiveTeamOwnedPaneSync(leaderPaneId, leaderPanePid, teamPaneOwnerId)]);
-    redrawLeaderPaneAfterTeamLayout(leaderPaneId, leaderPanePid, teamPaneOwnerId);
+    const focusedLeader = requireLiveTeamOwnedPaneSync(leaderPaneId, leaderPanePid, teamPaneOwnerId);
+    if (focusedLeader !== leaderSource.paneId) throw new Error(`tmux pane identity changed: ${leaderPaneId}`);
+    runSourceAuthorizedTmux(leaderSource, `select-pane -t ${leaderPaneId}`);
+    redrawLeaderPaneAfterTeamLayout(leaderSource, teamPaneOwnerId);
 
     sleepSeconds(0.5);
 
@@ -2575,14 +2694,11 @@ export function createTeamSession(
       );
     }
 
-    const sessionIncarnation = teamTarget.includes(':') ? null : queryDetachedTeamSession(sessionName);
-    if (sessionIncarnation && sessionIncarnation.status !== 'exact') {
-      throw new Error(`tmux_session_incarnation_unavailable:${sessionName}`);
-    }
     return {
       name: teamTarget,
-      tmuxSessionId: sessionIncarnation?.incarnation.sessionId,
-      tmuxSessionCreated: sessionIncarnation?.incarnation.sessionCreated,
+      tmuxSessionId: leaderSource.sessionId,
+      tmuxSessionCreated: leaderSource.sessionCreated,
+
       workerCount,
       cwd,
       workerPaneIds,
@@ -2590,6 +2706,9 @@ export function createTeamSession(
       workerPanePidsByIndex,
       leaderPanePid,
       workerStartupArgs: Object.freeze(workerStartupArgs),
+      leaderSessionId: leaderSource.sessionId,
+      leaderSessionCreated: leaderSource.sessionCreated,
+      leaderWindowId: leaderSource.windowId,
       hudPanePid: partialHudPanePid,
 
       leaderPaneId,

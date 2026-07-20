@@ -97,10 +97,54 @@ async function wrapFakeTmuxWithDetachedLeader(fakeTmuxPath: string): Promise<voi
   const implementationPath = `${fakeTmuxPath}.impl`;
   await rename(fakeTmuxPath, implementationPath);
   await writeExecutable(fakeTmuxPath, `#!/bin/sh
+if [ "$1" = "display-message" ] && [ "$2" = "-p" ] && [ "$3" = "-t" ] && case "$5" in *'#{session_created}'*'#{window_id}'*'#{pane_pid}'*) true;; *) false;; esac; then
+  session=$(cat /tmp/omx-test-detached-session-name 2>/dev/null || printf omx-test)
+  printf '%s\t$1\t1\t0\t@1\t%s\t123\n' "$session" "$4"
+  exit 0
+fi
+if [ "$1" = "set-option" ] && [ "$2" = "-t" ] && [ "$4" = "@omx_instance_id" ]; then
+  printf '%s' "$5" > /tmp/omx-test-detached-owner-id
+fi
+if [ "$1" = "list-panes" ] && case "$*" in *'#{session_created}'*'#{@omx_instance_id}'*) true;; *) false;; esac; then
+  ${JSON.stringify(implementationPath)} "$@" >/dev/null 2>&1 || true
+  session=$(cat /tmp/omx-test-detached-session-name 2>/dev/null || printf omx-test)
+  owner=$(cat /tmp/omx-test-detached-owner-id 2>/dev/null || printf '')
+  printf '%%12\t0\t123\t%s\t$1\t1\t%s\n' "$session" "$owner"
+  exit 0
+fi
+if [ "$1" = "if-shell" ] && [ "$2" = "-F" ] && [ "$3" = "-t" ]; then
+  if [ -f "$0.detached-recycled" ] && [ "$4" = "%99" ]; then ${JSON.stringify(implementationPath)} __nested_hud_guard_denied__ %99 999 '$2' @2; exit 0; fi
+  ${JSON.stringify(implementationPath)} "$@" >/dev/null 2>&1 || true
+  success="$6"
+  receipt=$(printf '%s' "$success" | sed -n 's/.*\\(omx_detached_[A-Za-z0-9-]*\\).*/\\1/p')
+  case "\${OMX_TEST_DETACHED_RECYCLE:-}" in
+    split) case "$success" in *split-window*) exit 0;; esac ;;
+    finalization) case "$*" in
+      *split-window*) : > "$0.detached-split-seen" ;;
+      *"if-shell -F -t '%99'"*) if [ -f "$0.detached-split-seen" ]; then
+        ${JSON.stringify(implementationPath)} __recycled__ %99 999 '$2' @2
+        : > "$0.detached-recycled"
+        eval "set -- $success"
+        "$0" "$@" >/dev/null
+      fi ;;
+    esac ;;
+  esac
+  [ -n "$receipt" ] || exit 1
+  case "$success" in
+    *split-window*) printf '%%99\t456\t$1\t@1\t%s\n' "$receipt" ;;
+    *) printf '%s\n' "$receipt" ;;
+  esac
+  exit 0
+fi
 output=$(${JSON.stringify(implementationPath)} "$@")
 status=$?
 printf '%s' "$output"
 if [ "$status" -eq 0 ] && [ "$1" = "new-session" ]; then
+  previous=''
+  for arg in "$@"; do
+    if [ "$previous" = '-s' ]; then printf '%s' "$arg" > /tmp/omx-test-detached-session-name; break; fi
+    previous="$arg"
+  done
   for last_arg do :; done
   pane=$(printf '%s' "$output" | sed -n '1p')
   TMUX=/tmp/omx-test-tmux,1,0 TMUX_PANE="$pane" nohup /bin/sh -c "$last_arg" </dev/null >/tmp/omx-test-detached-leader.log 2>&1 &
@@ -130,10 +174,54 @@ async function createLaunchFixture(
   const tmuxImpl = join(fakeBin, 'tmux-impl');
   await writeExecutable(tmuxImpl, tmuxScript(tmuxLogPath));
   await writeExecutable(join(fakeBin, 'tmux'), `#!/bin/sh
+if [ "$1" = "display-message" ] && [ "$2" = "-p" ] && [ "$3" = "-t" ] && case "$5" in *'#{session_created}'*'#{window_id}'*'#{pane_pid}'*) true;; *) false;; esac; then
+  session=$(cat /tmp/omx-test-detached-session-name 2>/dev/null || printf omx-test)
+  printf '%s\t$1\t1\t0\t@1\t%s\t123\n' "$session" "$4"
+  exit 0
+fi
+if [ "$1" = "set-option" ] && [ "$2" = "-t" ] && [ "$4" = "@omx_instance_id" ]; then
+  printf '%s' "$5" > /tmp/omx-test-detached-owner-id
+fi
+if [ "$1" = "list-panes" ] && case "$*" in *'#{session_created}'*'#{@omx_instance_id}'*) true;; *) false;; esac; then
+  ${JSON.stringify(tmuxImpl)} "$@" >/dev/null 2>&1 || true
+  session=$(cat /tmp/omx-test-detached-session-name 2>/dev/null || printf omx-test)
+  owner=$(cat /tmp/omx-test-detached-owner-id 2>/dev/null || printf '')
+  printf '%%12\t0\t123\t%s\t$1\t1\t%s\n' "$session" "$owner"
+  exit 0
+fi
+if [ "$1" = "if-shell" ] && [ "$2" = "-F" ] && [ "$3" = "-t" ]; then
+  if [ -f "$0.detached-recycled" ] && [ "$4" = "%99" ]; then ${JSON.stringify(tmuxImpl)} __nested_hud_guard_denied__ %99 999 '$2' @2; exit 0; fi
+  ${JSON.stringify(tmuxImpl)} "$@" >/dev/null 2>&1 || true
+  success="$6"
+  receipt=$(printf '%s' "$success" | sed -n 's/.*\\(omx_detached_[A-Za-z0-9-]*\\).*/\\1/p')
+  case "\${OMX_TEST_DETACHED_RECYCLE:-}" in
+    split) case "$success" in *split-window*) exit 0;; esac ;;
+    finalization) case "$*" in
+      *split-window*) : > "$0.detached-split-seen" ;;
+      *"if-shell -F -t '%99'"*) if [ -f "$0.detached-split-seen" ]; then
+        ${JSON.stringify(tmuxImpl)} __recycled__ %99 999 '$2' @2
+        : > "$0.detached-recycled"
+        eval "set -- $success"
+        "$0" "$@" >/dev/null
+      fi ;;
+    esac ;;
+  esac
+  [ -n "$receipt" ] || exit 1
+  case "$success" in
+    *split-window*) printf '%%99\t456\t$1\t@1\t%s\n' "$receipt" ;;
+    *) printf '%s\n' "$receipt" ;;
+  esac
+  exit 0
+fi
 output=$(${JSON.stringify(tmuxImpl)} "$@")
 status=$?
 printf '%s' "$output"
 if [ "$status" -eq 0 ] && [ "$1" = "new-session" ]; then
+  previous=''
+  for arg in "$@"; do
+    if [ "$previous" = '-s' ]; then printf '%s' "$arg" > /tmp/omx-test-detached-session-name; break; fi
+    previous="$arg"
+  done
   for last_arg do :; done
   pane=$(printf '%s' "$output" | sed -n '1p')
   TMUX=/tmp/omx-test-tmux,1,0 TMUX_PANE="$pane" nohup /bin/sh -c "$last_arg" </dev/null >/tmp/omx-test-detached-leader.log 2>&1 &
@@ -815,7 +903,7 @@ exit 0
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
       assert.equal(result.status, 0, result.error || result.stderr || result.stdout);
       assert.match(tmuxLog, /tmux:new-session /);
-      assert.match(tmuxLog, /tmux:split-window /);
+      assert.match(tmuxLog, /tmux:if-shell -F -t %12 .*split-window/);
       assert.doesNotMatch(tmuxLog, /tmux:attach-session/);
       assert.doesNotMatch(result.stderr, /failed to attach detached tmux session/);
     } finally {
@@ -1172,7 +1260,9 @@ exit 0
         registryEntries[1]!.detached_launch_context,
         'independent launches must get distinct active-detached lock identities',
       );
-      assert.equal((await readdir(join(runs, 'active-detached'))).length, 2);
+      const activeDetachedEntries = await readdir(join(runs, 'active-detached'));
+      assert.equal(activeDetachedEntries.filter((entry) => entry.endsWith('.json')).length, 2);
+      assert.equal(activeDetachedEntries.filter((entry) => entry.endsWith('.lock')).length, 0);
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
       assert.equal((tmuxLog.match(/tmux:new-session/g) || []).length, 2);
@@ -1215,6 +1305,46 @@ exit 0
       assert.equal(second.status, 0, second.error || second.stderr || second.stdout);
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
       assert.equal((tmuxLog.match(/tmux:new-session/g) || []).length, 2);
+    } finally {
+      await rm(wd, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+    }
+  });
+
+  it('denies detached HUD finalization when the receipted pane id is recycled', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-launch-detached-hud-recycle-'));
+    try {
+      const { env, tmuxLogPath } = await createLaunchFixture(
+        wd,
+        (logPath) => `#!/bin/sh
+printf 'tmux:%s\n' "$*" >> "${logPath}"
+case "$1" in
+  -V) printf 'tmux 3.4\n'; exit 0 ;;
+  has-session) exit 1 ;;
+  new-session) printf '%%12\n'; exit 0 ;;
+  split-window) printf '%%99\n'; exit 0 ;;
+  display-message) printf '0\n'; exit 0 ;;
+  show-options) printf 'off\n'; exit 0 ;;
+  set-option|set-hook|attach-session|kill-session|run-shell|resize-pane) exit 0 ;;
+esac
+exit 0
+`,
+      );
+      const result = runOmx(wd, ['--madmax', '--tmux'], {
+        ...env,
+        OMX_LAUNCH_POLICY: 'direct',
+        OMX_TEST_DETACHED_RECYCLE: 'finalization',
+        TMUX: '',
+        TMUX_PANE: '',
+      });
+      if (shouldSkipForSpawnPermissions(result.error)) return;
+
+      assert.equal(result.status, 0, result.error || result.stderr || result.stdout);
+      const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
+      assert.match(tmuxLog, /tmux:if-shell -F -t %12 .*OMX_DETACHED_HUD_OPERATION=/);
+      assert.match(tmuxLog, /if-shell -F -t '%99' .*456.*\$1.*@1.*OMX_DETACHED_HUD_OPERATION=/);
+      assert.match(tmuxLog, /^tmux:__nested_hud_guard_denied__ %99 999 \$2 @2$/m);
+      assert.doesNotMatch(tmuxLog, /run-shell -b ['"]run-shell -b /);
+      assert.doesNotMatch(tmuxLog, /^tmux:resize-pane .*%99/m);
     } finally {
       await rm(wd, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
@@ -1299,13 +1429,13 @@ exit 0
       assert.doesNotMatch(tmuxLog, /tmux:show-options -gv history-limit/);
       assert.doesNotMatch(tmuxLog, /tmux:set-option -g[q ]+history-limit/);
       assert.match(tmuxLog, /tmux:new-session .* -s /);
-      assert.match(tmuxLog, new RegExp(`tmux:set-option -q -t .* history-limit ${DETACHED_TMUX_HISTORY_LIMIT}`));
-      assert.match(tmuxLog, new RegExp(`tmux:set-option -pq -t %12 history-limit ${DETACHED_TMUX_HISTORY_LIMIT}`));
+      assert.match(tmuxLog, new RegExp(`tmux:if-shell -F -t %12 .*set-option.*history-limit.*${DETACHED_TMUX_HISTORY_LIMIT}`));
+      assert.match(tmuxLog, new RegExp(`tmux:if-shell -F -t %12 .*set-option.*-pq.*%12.*history-limit.*${DETACHED_TMUX_HISTORY_LIMIT}`));
       assert.match(
         tmuxLog,
-        /tmux:set-hook -t .* client-detached\[[0-9]+\] if-shell -F '#\{==:#\{session_attached\},0\}' 'run-shell -b "tmux clear-history -t %12 >\/dev\/null 2>&1 \|\| true"'/,
+        /tmux:if-shell -F -t %12 .*set-hook.*client-detached\[[0-9]+\].*clear-history -t %12/,
       );
-      assert.match(tmuxLog, new RegExp(`tmux:split-window -v -l ${HUD_TMUX_HEIGHT_LINES} .* -t `));
+      assert.match(tmuxLog, new RegExp(`tmux:if-shell -F -t %12 .*split-window.*-v.*-l.*${HUD_TMUX_HEIGHT_LINES}.*-t.*%12`));
       assert.equal(result.status, 0, result.error || result.stderr || result.stdout);
       await waitForPath(`${fakeTmuxPath}.leader-done`);
     } finally {
@@ -1395,6 +1525,7 @@ esac
 exit 0
 `,
       );
+      await wrapFakeTmuxWithDetachedLeader(join(fakeBin, 'tmux'));
 
       const result = runOmx(
         wd,
@@ -1534,34 +1665,67 @@ exit 0
     }
   });
 
-  it('preserves HUD split behavior inside tmux when no direct override is present', async () => {
+  it('fails closed on an incomplete synthetic HUD split source inside tmux', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-launch-inside-tmux-managed-'));
     try {
       const { env, tmuxLogPath } = await createLaunchFixture(
         wd,
         (tmuxLogPath) => `#!/bin/sh
+state="${tmuxLogPath}.hud-created"
+proof="${tmuxLogPath}.hud-proof"
+marker="${tmuxLogPath}.hud-marker"
 printf 'tmux:%s\n' "$*" >> "${tmuxLogPath}"
 case "$1" in
   list-panes)
+    case "$*" in
+      *'#{pane_id}'*'#{pane_start_command}'*)
+        if [ -f "$state" ]; then printf '%%1\tcodex\n%%2\tOMX_TMUX_SPLIT_OPERATION_MARKER='\''%s'\''; export OMX_TMUX_SPLIT_OPERATION_MARKER; exec env OMX_TMUX_HUD_OWNER=1 OMX_TMUX_HUD_LEADER_PANE='\''%%1'\'' node hud\n' "$(cat "$marker")"; else printf '%%1\tcodex\n'; fi
+        ;;
+      *'#{pane_id}\t#{pane_dead}\t#{pane_pid}'*)
+        printf '%%1\t0\t101\n%%2\t0\t202\n'
+        ;;
+      *'#{pane_id}'*)
+        if [ -f "$state" ]; then printf '%%1\n%%2\n'; else printf '%%1\n'; fi
+        ;;
+    esac
     exit 0
     ;;
   split-window)
-    printf '%s\n' '%hud'
+    printf '%%2\n'
+    exit 0
+    ;;
+  if-shell)
+    [ "$2" = '-F' ] && [ "$3" = '-t' ] && [ "$4" = '%1' ] || exit 1
+    case "$5" in *'#{pane_pid},101'*'#{session_id},$7'*'#{window_id},@1'*) ;; *) exit 1 ;; esac
+    success="$6"
+    receipt=\${success##*display-message -p }
+    receipt=\${receipt%% *}
+    split_marker=$(printf '%s' "$success" | sed -n "s/.*OMX_TMUX_SPLIT_OPERATION_MARKER='\\([^']*\\)'.*/\\1/p")
+    [ -n "$split_marker" ] || exit 1
+    printf '%s' "$split_marker" > "$marker"
+    : > "$state"
+    printf '%s\n' "$receipt"
     exit 0
     ;;
   display-message)
     case "$*" in
       *'#{socket_path}'*) printf '/tmp/tmux-test.sock\n' ;;
+      *'#{pane_id}'*'#{pane_dead}'*'#{pane_pid}'*'#{session_id}'*'#{window_id}'*) printf '%%1\t0\t101\t$7\t@1\n' ;;
+      *'#{session_id}'*'#{window_id}'*) printf '$7\t@1\n' ;;
       *'#S'*) printf 'managed-session\n' ;;
       *) printf '0\n' ;;
     esac
     exit 0
     ;;
   show-options)
-    printf 'off\n'
+    if [ "$2" = '-g' ] && [ "$3" = '-v' ]; then cat "$proof" 2>/dev/null || true; else printf 'off\n'; fi
     exit 0
     ;;
-  set-option|kill-pane)
+  set-option)
+    if [ "$2" = '-g' ]; then printf '%s\n' "$4" > "$proof"; fi
+    exit 0
+    ;;
+  kill-pane)
     exit 0
     ;;
 esac
@@ -1584,7 +1748,7 @@ exit 0
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
       assert.equal(result.status, 0, result.error || result.stderr || result.stdout);
       assert.match(result.stdout, /fake-codex:.*--dangerously-bypass-approvals-and-sandbox/);
-      assert.match(tmuxLog, new RegExp(`tmux:split-window -v -l ${HUD_TMUX_HEIGHT_LINES}`));
+      assert.doesNotMatch(tmuxLog, /tmux:if-shell -F -t %1 .*split-window/);
       assert.match(tmuxLog, /tmux:set-option -t managed-session mouse on/);
       assert.match(tmuxLog, /tmux:set-option -sq extended-keys always/);
     } finally {

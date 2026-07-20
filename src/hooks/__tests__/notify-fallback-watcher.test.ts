@@ -238,7 +238,7 @@ function defaultAutoNudgePattern(targetPane: string): RegExp {
 
 function buildFakeTmux(
   tmuxLogPath: string,
-  options: { failSendKeys?: boolean; failSendKeysMatch?: string; paneOwner?: string; panePid?: number; paneSession?: string; ralphPane?: { paneId: string; panePid: number; paneOwner: string } } = {},
+  options: { failSendKeys?: boolean; failSendKeysMatch?: string; paneOwner?: string; panePid?: number; paneSession?: string; paneSessionId?: string; paneWindowId?: string; paneCurrentCommand?: string; paneStartCommand?: string; ralphPane?: { paneId: string; panePid: number; paneOwner: string } } = {},
 ): string {
   return `#!/usr/bin/env bash
 set -eu
@@ -304,8 +304,12 @@ if [[ "$cmd" == "display-message" ]]; then
     dirname "${tmuxLogPath}"
     exit 0
   fi
+  if [[ "$fmt" == *"#{pane_id}"* && "$fmt" == *"#{session_id}"* && "$fmt" == *"#{window_id}"* ]]; then
+    printf '%s\\037%s\\037%s\\037%s\\037%s\\037%s\\037%s\\037%s\n' '${options.ralphPane?.paneId ?? '%42'}' '${options.ralphPane?.panePid ?? options.panePid ?? 4242}' '${options.paneSession ?? 'session-test'}' '${options.paneSessionId ?? '$7'}' '${options.paneWindowId ?? '@9'}' '${options.ralphPane?.paneOwner ?? options.paneOwner ?? 'ralph:owner'}' '${options.paneCurrentCommand ?? 'codex'}' '${options.paneStartCommand ?? 'codex'}'
+    exit 0
+  fi
   if [[ "$fmt" == "#{pane_current_command}" ]]; then
-    echo "codex"
+    echo "${options.paneCurrentCommand ?? 'codex'}"
     exit 0
   fi
   if [[ "$fmt" == "#S" ]]; then
@@ -337,6 +341,66 @@ if [[ "$cmd" == "paste-buffer" ]]; then
 fi
 if [[ "$cmd" == "delete-buffer" ]]; then
   rm -f "${tmuxLogPath}.buffer"
+  exit 0
+fi
+if [[ "$cmd" == "if-shell" ]]; then
+  forceFormat=0
+  target=""
+  while [[ "\$#" -gt 0 ]]; do
+    case "\$1" in
+      -F)
+        forceFormat=1
+        shift
+        ;;
+      -t)
+        target="\$2"
+        shift 2
+        ;;
+      *)
+        break
+        ;;
+    esac
+  done
+  condition="\${1:-}"
+  success="\${2:-}"
+  denied="\${3:-}"
+  currentCommand="${options.paneCurrentCommand ?? 'codex'}"
+  startCommand="${options.paneStartCommand ?? 'codex'}"
+  sessionName="${options.paneSession ?? 'session-test'}"
+  sessionId='${options.paneSessionId ?? '$7'}'
+  windowId='${options.paneWindowId ?? '@9'}'
+  paneId="${options.ralphPane?.paneId ?? '%42'}"
+  panePid="${options.ralphPane?.panePid ?? options.panePid ?? 4242}"
+  paneOwner="${options.ralphPane?.paneOwner ?? options.paneOwner ?? 'ralph:owner'}"
+  if [[ "$forceFormat" != "1" || "$target" != "$paneId" || "$condition" != *"#{pane_id},$paneId"* || "$condition" != *"#{pane_dead},0"* || "$condition" != *"#{pane_pid},$panePid"* || "$condition" != *"#{session_name},$sessionName"* || "$condition" != *"#{session_id},$sessionId"* || "$condition" != *"#{window_id},$windowId"* || "$condition" != *"#{@omx_ralph_pane_owner_id},$paneOwner"* || "$condition" != *"#{pane_current_command},$currentCommand"* || "$condition" != *"#{pane_start_command},$startCommand"* ]]; then
+    if [[ "\$denied" == "display-message -p __omx_ralph_input_denied__" ]]; then
+      printf '__omx_ralph_input_denied__\n'
+    fi
+    exit 0
+  fi
+  receiptSeparator=' \\; display-message -p '
+  if [[ "\$success" != *"\$receiptSeparator"* ]]; then
+    printf '__omx_ralph_input_denied__\n'
+    exit 0
+  fi
+  sendCommand="\${success%%"\$receiptSeparator"*}"
+  receipt="\${success#*"\$receiptSeparator"}"
+  if [[ -z "\$sendCommand" || ! "\$receipt" =~ ^__omx_ralph_input_[a-z0-9]+__$ ]]; then
+    printf '__omx_ralph_input_denied__\n'
+    exit 0
+  fi
+  eval "set -- \$sendCommand"
+  if [[ "\$#" -lt 4 || "\$1" != "send-keys" || "\$2" != "-t" || "\$3" != "\$paneId" || ( "\$4" != "-l" && "\$4" != "C-m" ) || ( "\$4" == "-l" && "\$#" -ne 5 ) || ( "\$4" == "C-m" && "\$#" -ne 4 ) ]]; then
+    printf '__omx_ralph_input_denied__\n'
+    exit 0
+  fi
+  sendKeysArgs="\${*:2}"
+  if [[ "${options.failSendKeys === true ? '1' : '0'}" == "1" || ( -n "${options.failSendKeysMatch ?? ''}" && "\$sendKeysArgs" == *"${options.failSendKeysMatch ?? ''}"* ) ]]; then
+    echo 'send failed' >&2
+    exit 1
+  fi
+  echo "send-keys \$sendKeysArgs" >> "${tmuxLogPath}"
+  printf '%s\n' "\$receipt"
   exit 0
 fi
 if [[ "$cmd" == "send-keys" ]]; then
@@ -1095,7 +1159,11 @@ describe('notify-fallback watcher', () => {
         tmux_pane_id: '%42',
         tmux_pane_pid: 4242,
         tmux_session_name: 'session-test',
+        tmux_session_id: '$7',
+        tmux_window_id: '@9',
         tmux_pane_owner_id: 'ralph:owner',
+        tmux_pane_current_command: 'codex',
+        tmux_pane_start_command: 'codex',
       }, null, 2));
       await writeFile(join(wd, '.omx', 'state', 'team-state.json'), JSON.stringify({
         active: true,
@@ -1169,7 +1237,11 @@ describe('notify-fallback watcher', () => {
         tmux_pane_id: '%42',
         tmux_pane_pid: 4242,
         tmux_session_name: 'session-test',
+        tmux_session_id: '$7',
+        tmux_window_id: '@9',
         tmux_pane_owner_id: 'ralph:owner',
+        tmux_pane_current_command: 'codex',
+        tmux_pane_start_command: 'codex',
       }, null, 2));
       await writeFile(join(wd, '.omx', 'state', 'team-state.json'), JSON.stringify({
         active: true,
@@ -2165,7 +2237,11 @@ exit 0
         tmux_pane_id: '%42',
         tmux_pane_pid: 4242,
         tmux_session_name: 'session-test',
+        tmux_session_id: '$7',
+        tmux_window_id: '@9',
         tmux_pane_owner_id: 'ralph:owner',
+        tmux_pane_current_command: 'codex',
+        tmux_pane_start_command: 'codex',
       }, null, 2));
       await writeFile(join(stateDir, 'hud-state.json'), JSON.stringify({
         last_progress_at: new Date(Date.now() - 61_000).toISOString(),
@@ -2235,16 +2311,19 @@ exit 0
     }
   });
 
-  it('fails closed for recycled, incomplete, HUD, and taken-over Ralph pane bindings', async () => {
+  it('fails closed for recycled, incomplete, HUD, taken-over, and command-drift Ralph pane bindings', async () => {
     const cases = [
-      [{ tmux_pane_pid: 4242, tmux_session_name: 'session-test', tmux_pane_owner_id: 'ralph:owner' }, { paneOwner: 'ralph:owner', panePid: 4243 }],
+      [{ tmux_pane_pid: 4242, tmux_session_name: 'session-test', tmux_session_id: '$7', tmux_window_id: '@9', tmux_pane_owner_id: 'ralph:owner' }, { paneOwner: 'ralph:owner', panePid: 4243 }],
       [{}, { paneOwner: 'ralph:owner' }],
-      [{ tmux_pane_pid: 4242, tmux_session_name: 'session-test', tmux_pane_owner_id: 'team:dispatch-team' }, { paneOwner: 'team:dispatch-team' }],
-      [{ tmux_pane_pid: 4242, tmux_session_name: 'session-test', tmux_pane_owner_id: 'ralph:owner' }, { paneOwner: 'ralph:owner', paneSession: 'other-session' }],
-      [{ tmux_pane_pid: 4242, tmux_session_name: 'session-test', tmux_pane_owner_id: 'ralph:owner' }, { paneOwner: 'ralph:other' }],
-      [{ tmux_pane_pid: 4242.9, tmux_session_name: 'session-test', tmux_pane_owner_id: 'ralph:owner' }, { paneOwner: 'ralph:owner' }],
-      [{ tmux_pane_pid: '4.242e3', tmux_session_name: 'session-test', tmux_pane_owner_id: 'ralph:owner' }, { paneOwner: 'ralph:owner' }],
-      [{ tmux_pane_pid: '9007199254740992', tmux_session_name: 'session-test', tmux_pane_owner_id: 'ralph:owner' }, { paneOwner: 'ralph:owner' }],
+      [{ tmux_pane_pid: 4242, tmux_session_name: 'session-test', tmux_session_id: '$7', tmux_window_id: '@9', tmux_pane_owner_id: 'team:dispatch-team' }, { paneOwner: 'team:dispatch-team' }],
+      [{ tmux_pane_pid: 4242, tmux_session_name: 'session-test', tmux_session_id: '$7', tmux_window_id: '@9', tmux_pane_owner_id: 'ralph:owner' }, { paneOwner: 'ralph:owner', paneSession: 'other-session' }],
+      [{ tmux_pane_pid: 4242, tmux_session_name: 'session-test', tmux_session_id: '$7', tmux_window_id: '@9', tmux_pane_owner_id: 'ralph:owner' }, { paneOwner: 'ralph:owner', paneSessionId: '$8' }],
+      [{ tmux_pane_pid: 4242, tmux_session_name: 'session-test', tmux_session_id: '$7', tmux_window_id: '@9', tmux_pane_owner_id: 'ralph:owner' }, { paneOwner: 'ralph:owner', paneWindowId: '@10' }],
+      [{ tmux_pane_pid: 4242, tmux_session_name: 'session-test', tmux_session_id: '$7', tmux_window_id: '@9', tmux_pane_owner_id: 'ralph:owner' }, { paneOwner: 'ralph:other' }],
+      [{ tmux_pane_pid: 4242.9, tmux_session_name: 'session-test', tmux_session_id: '$7', tmux_window_id: '@9', tmux_pane_owner_id: 'ralph:owner' }, { paneOwner: 'ralph:owner' }],
+      [{ tmux_pane_pid: '4.242e3', tmux_session_name: 'session-test', tmux_session_id: '$7', tmux_window_id: '@9', tmux_pane_owner_id: 'ralph:owner' }, { paneOwner: 'ralph:owner' }],
+      [{ tmux_pane_pid: '9007199254740992', tmux_session_name: 'session-test', tmux_session_id: '$7', tmux_window_id: '@9', tmux_pane_owner_id: 'ralph:owner' }, { paneOwner: 'ralph:owner' }],
+      [{ tmux_pane_pid: 4242, tmux_session_name: 'session-test', tmux_session_id: '$7', tmux_window_id: '@9', tmux_pane_owner_id: 'ralph:owner', tmux_pane_current_command: 'codex', tmux_pane_start_command: 'codex' }, { paneOwner: 'ralph:owner', paneCurrentCommand: 'node' }],
     ] as const;
     const watcherScript = new URL('../../../dist/scripts/notify-fallback-watcher.js', import.meta.url).pathname;
     const notifyHook = new URL('../../../dist/scripts/notify-hook.js', import.meta.url).pathname;
@@ -2262,6 +2341,7 @@ exit 0
         const result = spawnSync(process.execPath, [watcherScript, '--once', '--cwd', wd, '--notify-script', notifyHook], { encoding: 'utf-8', env: { ...buildCleanNotifyEnv(), PATH: `${fakeBinDir}:${process.env.PATH || ''}` } });
         assert.equal(result.status, 0, result.stderr || result.stdout);
         assert.doesNotMatch(await readFile(tmuxLogPath, 'utf-8').catch(() => ''), /send-keys -t %42/);
+        if ('paneCurrentCommand' in tmux) assert.match(await readFile(tmuxLogPath, 'utf-8'), /if-shell -F -t %42/);
       } finally { await rm(wd, { recursive: true, force: true }); }
     }
   });
@@ -2283,7 +2363,11 @@ exit 0
         tmux_pane_id: '%42',
         tmux_pane_pid: 4242,
         tmux_session_name: 'session-test',
+        tmux_session_id: '$7',
+        tmux_window_id: '@9',
         tmux_pane_owner_id: 'ralph:owner',
+        tmux_pane_current_command: 'codex',
+        tmux_pane_start_command: 'codex',
       }, null, 2));
       await writeFile(join(stateDir, 'hud-state.json'), JSON.stringify({
         last_progress_at: new Date(Date.now() - 5_000).toISOString(),
@@ -2336,7 +2420,11 @@ exit 0
         tmux_pane_id: '%42',
         tmux_pane_pid: 4242,
         tmux_session_name: 'session-test',
+        tmux_session_id: '$7',
+        tmux_window_id: '@9',
         tmux_pane_owner_id: 'ralph:owner',
+        tmux_pane_current_command: 'codex',
+        tmux_pane_start_command: 'codex',
       }, null, 2));
       await writeFile(join(stateDir, 'hud-state.json'), JSON.stringify({
         last_progress_at: new Date(Date.now() - 61_000).toISOString(),
@@ -2393,7 +2481,11 @@ exit 0
         tmux_pane_id: '%42',
         tmux_pane_pid: 4242,
         tmux_session_name: 'session-test',
+        tmux_session_id: '$7',
+        tmux_window_id: '@9',
         tmux_pane_owner_id: 'ralph:owner',
+        tmux_pane_current_command: 'codex',
+        tmux_pane_start_command: 'codex',
       }, null, 2));
       await writeFile(join(sessionStateDir, 'hud-state.json'), JSON.stringify({
         last_progress_at: new Date(Date.now() - 180_000).toISOString(),
@@ -2449,7 +2541,11 @@ exit 0
         tmux_pane_id: '%42',
         tmux_pane_pid: 4242,
         tmux_session_name: 'session-test',
+        tmux_session_id: '$7',
+        tmux_window_id: '@9',
         tmux_pane_owner_id: 'ralph:owner',
+        tmux_pane_current_command: 'codex',
+        tmux_pane_start_command: 'codex',
         owner_omx_session_id: omxSessionId,
         owner_codex_session_id: codexSessionId,
       }, null, 2));
@@ -2534,7 +2630,11 @@ exit 0
         tmux_pane_id: '%42',
         tmux_pane_pid: 4242,
         tmux_session_name: 'session-test',
+        tmux_session_id: '$7',
+        tmux_window_id: '@9',
         tmux_pane_owner_id: 'ralph:owner',
+        tmux_pane_current_command: 'codex',
+        tmux_pane_start_command: 'codex',
       }, null, 2));
       await writeFile(statePath, JSON.stringify({
         ralph_continue_steer: {
@@ -2652,7 +2752,11 @@ exit 0
           tmux_pane_id: '%99',
           tmux_pane_pid: 4242,
           tmux_session_name: 'session-test',
+          tmux_session_id: '$7',
+          tmux_window_id: '@9',
           tmux_pane_owner_id: 'ralph:owner',
+          tmux_pane_current_command: 'codex',
+          tmux_pane_start_command: 'codex',
           scenario,
         }, null, 2));
         await writeFile(join(stateDir, 'hud-state.json'), JSON.stringify({ last_progress_at: new Date(Date.now() - 61_000).toISOString() }));
@@ -2667,7 +2771,7 @@ exit 0
         const persistedRalph = JSON.parse(await readFile(ralphStatePath, 'utf-8'));
         assert.equal(persistedRalph.tmux_pane_id, '%99', `${scenario} must retain its stored pane identity`);
         const watcherState = JSON.parse(await readFile(join(stateDir, 'notify-fallback-state.json'), 'utf-8'));
-        assert.equal(watcherState.ralph_continue_steer?.last_reason, 'pane_binding_changed');
+        assert.equal(watcherState.ralph_continue_steer?.last_reason, 'send_failed');
         const tmuxLog = await readFile(tmuxLogPath, 'utf8');
         assert.doesNotMatch(tmuxLog, /send-keys -t %(42|99) -l Ralph loop active continue/);
         assert.doesNotMatch(tmuxLog, /list-panes -s -t/, 'watcher must not discover a replacement pane');
@@ -2694,7 +2798,11 @@ exit 0
         tmux_pane_id: '%42',
         tmux_pane_pid: 4242,
         tmux_session_name: 'session-test',
+        tmux_session_id: '$7',
+        tmux_window_id: '@9',
         tmux_pane_owner_id: 'ralph:owner',
+        tmux_pane_current_command: 'codex',
+        tmux_pane_start_command: 'codex',
       }, null, 2));
       await writeFile(join(stateDir, 'hud-state.json'), JSON.stringify({
         last_progress_at: new Date(Date.now() - 61_000).toISOString(),
@@ -2757,7 +2865,11 @@ exit 0
         tmux_pane_id: '%42',
         tmux_pane_pid: 4242,
         tmux_session_name: 'session-test',
+        tmux_session_id: '$7',
+        tmux_window_id: '@9',
         tmux_pane_owner_id: 'ralph:owner',
+        tmux_pane_current_command: 'codex',
+        tmux_pane_start_command: 'codex',
       }, null, 2));
       await writeFile(join(stateDir, 'hud-state.json'), JSON.stringify({
         last_progress_at: new Date(Date.now() - 61_000).toISOString(),
@@ -2821,7 +2933,11 @@ exit 0
         tmux_pane_id: '%42',
         tmux_pane_pid: 4242,
         tmux_session_name: 'session-test',
+        tmux_session_id: '$7',
+        tmux_window_id: '@9',
         tmux_pane_owner_id: 'ralph:owner',
+        tmux_pane_current_command: 'codex',
+        tmux_pane_start_command: 'codex',
       }, null, 2));
       await writeFile(join(stateDir, 'hud-state.json'), JSON.stringify({
         last_progress_at: new Date(Date.now() - 61_000).toISOString(),
@@ -2876,7 +2992,11 @@ exit 0
         tmux_pane_id: '%42',
         tmux_pane_pid: 4242,
         tmux_session_name: 'session-test',
+        tmux_session_id: '$7',
+        tmux_window_id: '@9',
         tmux_pane_owner_id: 'ralph:owner',
+        tmux_pane_current_command: 'codex',
+        tmux_pane_start_command: 'codex',
       }, null, 2));
       await writeFile(join(stateDir, 'hud-state.json'), JSON.stringify({
         last_progress_at: new Date(Date.now() - 61_000).toISOString(),
@@ -2914,7 +3034,11 @@ exit 0
         tmux_pane_id: '%42',
         tmux_pane_pid: 4242,
         tmux_session_name: 'session-test',
+        tmux_session_id: '$7',
+        tmux_window_id: '@9',
         tmux_pane_owner_id: 'ralph:owner',
+        tmux_pane_current_command: 'codex',
+        tmux_pane_start_command: 'codex',
       }, null, 2));
 
       const terminalRun = spawnSync(
@@ -2959,7 +3083,11 @@ exit 0
         tmux_pane_id: '%42',
         tmux_pane_pid: 4242,
         tmux_session_name: 'session-test',
+        tmux_session_id: '$7',
+        tmux_window_id: '@9',
         tmux_pane_owner_id: 'ralph:owner',
+        tmux_pane_current_command: 'codex',
+        tmux_pane_start_command: 'codex',
       }, null, 2));
       await writeFile(join(stateDir, 'hud-state.json'), JSON.stringify({
         last_progress_at: new Date(Date.now() - 5 * 60_000).toISOString(),
@@ -3014,7 +3142,11 @@ exit 0
         tmux_pane_id: '%42',
         tmux_pane_pid: 4242,
         tmux_session_name: 'session-test',
+        tmux_session_id: '$7',
+        tmux_window_id: '@9',
         tmux_pane_owner_id: 'ralph:owner',
+        tmux_pane_current_command: 'codex',
+        tmux_pane_start_command: 'codex',
       }, null, 2));
       await writeFile(join(stateDir, 'hud-state.json'), JSON.stringify({
         last_progress_at: new Date(Date.now() - 5 * 60_000).toISOString(),
@@ -3068,7 +3200,11 @@ exit 0
         tmux_pane_id: '%42',
         tmux_pane_pid: 4242,
         tmux_session_name: 'session-test',
+        tmux_session_id: '$7',
+        tmux_window_id: '@9',
         tmux_pane_owner_id: 'ralph:owner',
+        tmux_pane_current_command: 'codex',
+        tmux_pane_start_command: 'codex',
       }, null, 2));
       await writeFile(join(stateDir, 'hud-state.json'), JSON.stringify({
         last_progress_at: new Date(Date.now() - 61_000).toISOString(),
@@ -3150,7 +3286,11 @@ exit 0
         tmux_pane_id: '%43',
         tmux_pane_pid: 4343,
         tmux_session_name: 'session-test',
+        tmux_session_id: '$7',
+        tmux_window_id: '@9',
         tmux_pane_owner_id: 'ralph:owner',
+        tmux_pane_current_command: 'codex',
+        tmux_pane_start_command: 'codex',
       }, null, 2));
       await writeFile(join(wd, '.omx', 'state', 'hud-state.json'), JSON.stringify({
         last_progress_at: new Date(Date.now() - 61_000).toISOString(),
@@ -3421,7 +3561,11 @@ exit 0
         tmux_pane_id: '%42',
         tmux_pane_pid: 4242,
         tmux_session_name: 'session-test',
+        tmux_session_id: '$7',
+        tmux_window_id: '@9',
         tmux_pane_owner_id: 'ralph:owner',
+        tmux_pane_current_command: 'codex',
+        tmux_pane_start_command: 'codex',
       }, null, 2));
       await writeFile(watcherStatePath, JSON.stringify({
         ralph_continue_steer: {
@@ -3474,7 +3618,11 @@ exit 0
         tmux_pane_id: '%42',
         tmux_pane_pid: 4242,
         tmux_session_name: 'session-test',
+        tmux_session_id: '$7',
+        tmux_window_id: '@9',
         tmux_pane_owner_id: 'ralph:owner',
+        tmux_pane_current_command: 'codex',
+        tmux_pane_start_command: 'codex',
       }, null, 2));
       await writeFile(watcherStatePath, JSON.stringify({
         ralph_continue_steer: {
@@ -3532,7 +3680,11 @@ exit 0
         tmux_pane_id: '%42',
         tmux_pane_pid: 4242,
         tmux_session_name: 'session-test',
+        tmux_session_id: '$7',
+        tmux_window_id: '@9',
         tmux_pane_owner_id: 'ralph:owner',
+        tmux_pane_current_command: 'codex',
+        tmux_pane_start_command: 'codex',
       }, null, 2));
       await writeFile(join(sessionStateDir, 'hud-state.json'), JSON.stringify({
         last_progress_at: new Date(Date.now() - 61_000).toISOString(),
@@ -3588,7 +3740,11 @@ exit 0
         tmux_pane_id: '%42',
         tmux_pane_pid: 4242,
         tmux_session_name: 'session-test',
+        tmux_session_id: '$7',
+        tmux_window_id: '@9',
         tmux_pane_owner_id: 'ralph:owner',
+        tmux_pane_current_command: 'codex',
+        tmux_pane_start_command: 'codex',
       }, null, 2));
 
       await waitForExit(child, 4000);

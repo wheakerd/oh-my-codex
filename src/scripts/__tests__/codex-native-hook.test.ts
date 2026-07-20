@@ -11184,25 +11184,77 @@ export async function onHookEvent(event) {
 			const tmuxLog = join(cwd, "tmux.log");
 			await writeFile(
 				join(binDir, "tmux"),
-				`#!/usr/bin/env bash
+`#!/usr/bin/env bash
 set -euo pipefail
-printf '%s\\n' "$*" >> ${JSON.stringify(tmuxLog)}
+printf '%s\n' "$*" >> ${JSON.stringify(tmuxLog)}
+options_file=${JSON.stringify(join(cwd, "tmux-options"))}
+state_file=${JSON.stringify(join(cwd, "tmux-state"))}
+if [[ -f "$state_file" ]]; then
+  IFS=$'\t' read -r panes marker < "$state_file"
+else
+  panes='%1'
+  marker=''
+fi
 case "$1" in
   list-panes)
-    printf '%%1\\tcodex\\tcodex\\n'
+    if [[ "$*" == *'#{pane_id} #{pane_dead} #{pane_pid}'* ]]; then
+      printf '%%1 0 200\n'
+      [[ "$panes" == *'%9'* ]] && printf '%%9 0 201\n'
+    elif [[ "$*" == *'pane_start_command'* ]]; then
+      printf '%%1\t/bin/codex\n'
+      [[ "$panes" == *'%9'* ]] && printf '%%9\tOMX_TMUX_SPLIT_OPERATION_MARKER='"'"'"$marker'"'"'; export OMX_TMUX_SPLIT_OPERATION_MARKER; node dist/cli/omx.js hud --watch\n'
+    elif [[ "$panes" == *'%9'* ]]; then
+      printf '%%1\n%%9\n'
+    else
+      printf '%%1\n'
+    fi
     ;;
   display-message)
-    printf '200\\t60\\n'
+    if [[ "$*" == *'#{pane_id}'*'#{pane_dead}'*'#{pane_pid}'*'#{session_id}'*'#{window_id}'* ]]; then
+      printf '%%1\t0\t200\t$1\t@1\n'
+    elif [[ "$*" == *'#{session_id}'*'#{window_id}'* ]]; then
+      printf '$1\t@1\n'
+    else
+      printf '200\t60\n'
+    fi
     ;;
-  split-window)
-    printf '%%9\\n'
+  set-option)
+    printf '%s\t%s\n' "$3" "$4" >> "$options_file"
+    ;;
+  show-options)
+    value=''
+    if [[ -f "$options_file" ]]; then
+      while IFS=$'\t' read -r key stored; do
+        [[ "$key" == "$4" ]] && value="$stored"
+      done < "$options_file"
+    fi
+    printf '%s\n' "$value"
+    ;;
+  if-shell)
+    success="$6"
+    if [[ "$success" == *'split-window'* ]]; then
+      if [[ "$success" =~ OMX_TMUX_SPLIT_OPERATION_MARKER=\\'([^\\']+)\\' ]]; then
+        marker="\${BASH_REMATCH[1]}"
+      fi
+panes='%1 %9'
+printf '%s\t%s\n' "$panes" "$marker" > "$state_file"
+    fi
+    receipt="\${success#*display-message -p }"
+    if [[ "$receipt" != "$success" ]]; then
+      receipt="\${receipt%%[[:space:]]*}"
+      printf '%s\n' "$receipt"
+    fi
     ;;
   resize-pane)
     ;;
 esac
-`,
+`
 			);
 			await chmod(join(binDir, "tmux"), 0o755);
+			const tmuxSyntax = spawnSync("bash", ["-n", join(binDir, "tmux")], {
+				encoding: "utf-8",
+			});
+			assert.equal(tmuxSyntax.status, 0, tmuxSyntax.stderr);
 			process.env.PATH = `${binDir}:${originalPath}`;
 			process.argv = [originalArgv[0] || "node", "/tmp/codex-host-binary"];
 
@@ -11221,15 +11273,11 @@ esac
 			assert.match(tmuxCalls, /list-panes -t %1 -F/);
 			assert.match(
 				tmuxCalls,
-				new RegExp(`split-window -v -l ${HUD_TMUX_HEIGHT_LINES} -d -t %1 -c`),
+				new RegExp(`if-shell -F -t %1 [^\\n]*#\\{pane_pid\\},200[^\\n]*#\\{session_id\\},\\$1[^\\n]*#\\{window_id\\},@1[^\\n]*split-window -v -l ${HUD_TMUX_HEIGHT_LINES} -d -t %1 [^\\n]*display-message -p __omx_hud_split_`),
 			);
 			assert.match(
 				tmuxCalls,
-				new RegExp(`resize-pane -t %9 -y ${HUD_TMUX_HEIGHT_LINES}`),
-			);
-			assert.match(
-				tmuxCalls,
-				/dist\/cli\/omx\.js' hud --watch --preset=focused/,
+				/dist\/cli\/omx\.js' hud --watch '--preset=focused'/,
 			);
 			assert.doesNotMatch(tmuxCalls, /\/tmp\/codex-host-binary' hud --watch/);
 		} finally {
@@ -11328,26 +11376,78 @@ esac
 			const tmuxLog = join(cwd, "tmux.log");
 			await writeFile(
 				join(binDir, "tmux"),
-				`#!/usr/bin/env bash
+`#!/usr/bin/env bash
 set -euo pipefail
 printf '%s\n' "$*" >> ${JSON.stringify(tmuxLog)}
+options_file=${JSON.stringify(join(cwd, "tmux-options"))}
+state_file=${JSON.stringify(join(cwd, "tmux-state"))}
+if [[ -f "$state_file" ]]; then
+  IFS=$'\t' read -r panes marker < "$state_file"
+else
+  panes='%1 %2'
+  marker=''
+fi
 case "$1" in
   list-panes)
-    printf '%%1\tcodex\tcodex\n'
-    printf '%%2\tnode\texec env OMX_TMUX_HUD_OWNER='"'"'1'"'"' ${OMX_TMUX_HUD_LEADER_PANE_ENV}='"'"'%%1'"'"' /node /omx.js hud --watch\n'
+    if [[ "$*" == *'#{pane_id} #{pane_dead} #{pane_pid}'* ]]; then
+      printf '%%1 0 200\n%%2 0 201\n'
+      [[ "$panes" == *'%9'* ]] && printf '%%9 0 202\n'
+    elif [[ "$*" == *'pane_start_command'* ]]; then
+      printf '%%1\t/bin/codex\n'
+      printf '%%2\texec env OMX_TMUX_HUD_OWNER='"'"'"1'"'"' ${OMX_TMUX_HUD_LEADER_PANE_ENV}='"'"'"%%1'"'"' /node /omx.js hud --watch\n'
+      [[ "$panes" == *'%9'* ]] && printf '%%9\tOMX_TMUX_SPLIT_OPERATION_MARKER='"'"'"$marker'"'"'; export OMX_TMUX_SPLIT_OPERATION_MARKER; node dist/cli/omx.js hud --watch\n'
+    elif [[ "$panes" == *'%9'* ]]; then
+      printf '%%1\n%%2\n%%9\n'
+    else
+      printf '%%1\n%%2\n'
+    fi
     ;;
   display-message)
-    printf '200\t60\n'
+    if [[ "$*" == *'#{pane_id}'*'#{pane_dead}'*'#{pane_pid}'*'#{session_id}'*'#{window_id}'* ]]; then
+      printf '%%1\t0\t200\t$1\t@1\n'
+    elif [[ "$*" == *'#{session_id}'*'#{window_id}'* ]]; then
+      printf '$1\t@1\n'
+    else
+      printf '200\t60\n'
+    fi
+    ;;
+  set-option)
+    printf '%s\t%s\n' "$3" "$4" >> "$options_file"
+    ;;
+  show-options)
+    value=''
+    if [[ -f "$options_file" ]]; then
+      while IFS=$'\t' read -r key stored; do
+        [[ "$key" == "$4" ]] && value="$stored"
+      done < "$options_file"
+    fi
+    printf '%s\n' "$value"
+    ;;
+  if-shell)
+    success="$6"
+    if [[ "$success" == *'split-window'* ]]; then
+      if [[ "$success" =~ OMX_TMUX_SPLIT_OPERATION_MARKER=\\'([^\\']+)\\' ]]; then
+        marker="\${BASH_REMATCH[1]}"
+      fi
+panes='%1 %2 %9'
+printf '%s\t%s\n' "$panes" "$marker" > "$state_file"
+    fi
+    receipt="\${success#*display-message -p }"
+    if [[ "$receipt" != "$success" ]]; then
+      receipt="\${receipt%%[[:space:]]*}"
+      printf '%s\n' "$receipt"
+    fi
     ;;
   resize-pane)
     ;;
-  split-window)
-    printf '%%9\n'
-    ;;
 esac
-`,
+`
 			);
 			await chmod(join(binDir, "tmux"), 0o755);
+			const tmuxSyntax = spawnSync("bash", ["-n", join(binDir, "tmux")], {
+				encoding: "utf-8",
+			});
+			assert.equal(tmuxSyntax.status, 0, tmuxSyntax.stderr);
 			process.env.PATH = `${binDir}:${originalPath}`;
 
 			const result = await dispatchCodexNativeHook(
@@ -11365,10 +11465,9 @@ esac
 			assert.equal(result.omxEventName, "keyword-detector");
 			const tmuxCalls = await readFile(tmuxLog, "utf-8");
 			assert.match(tmuxCalls, /list-panes -t %1 -F/);
-			assert.match(tmuxCalls, /split-window/);
 			assert.match(
 				tmuxCalls,
-				new RegExp(`resize-pane -t %9 -y ${HUD_TMUX_HEIGHT_LINES}`),
+				/if-shell -F -t %1 [^\n]*#\{pane_pid\},200[^\n]*#\{session_id\},\$1[^\n]*#\{window_id\},@1[^\n]*split-window [^\n]*display-message -p __omx_hud_split_/,
 			);
 			assert.equal(
 				existsSync(

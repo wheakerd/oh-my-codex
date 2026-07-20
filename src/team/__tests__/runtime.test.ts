@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { execFileSync, spawn } from 'child_process';
+import { execFileSync, spawn, spawnSync } from 'child_process';
 import { mkdtemp, rm, writeFile, readFile, mkdir, chmod, readdir } from 'fs/promises';
 import { join, relative, dirname } from 'path';
 import { tmpdir } from 'os';
@@ -658,10 +658,168 @@ async function withMockTmuxFixture<T>(
 
   try {
     const tmuxFixture = options.tmuxScript(tmuxLogPath);
+    const originalFixturePath = `${tmuxStubPath}.fixture`;
+    await writeFile(originalFixturePath, tmuxFixture);
+    const originalSyntaxCheck = spawnSync('sh', ['-n', originalFixturePath], { encoding: 'utf-8' });
+    if (originalSyntaxCheck.status !== 0 || originalSyntaxCheck.error) {
+      throw new Error(`invalid original mock tmux shell fixture: ${originalSyntaxCheck.error?.message ?? originalSyntaxCheck.stderr ?? 'sh -n failed'}`);
+    }
     const fixtureDefinesGlobalExactPaneSnapshot = tmuxFixture.includes('-a -F #{pane_id}');
+    const sourceAuthorityTmuxFixture = tmuxFixture.replace(
+      '#!/bin/sh\n',
+      `#!/bin/sh
+# Every current-dev start fixture must provide the complete source-pane incarnation
+# captured by createTeamSession. Keep this narrow so command-specific fixture
+# behavior remains authoritative.
+log_command() {
+  printf '%s\n' "$*" >> "${tmuxLogPath}"
+}
+canonical_pane_pid() {
+  if [ -f "$0.actual-pid-$1" ]; then cat "$0.actual-pid-$1"; else printf '%s' "$((2000000000 + $1 * 1111))"; fi
+}
+actual_pane_pid() {
+  pane_number="$1"
+  if [ -f "$0.actual-pid-$pane_number" ]; then
+    IFS= read -r pane_pid < "$0.actual-pid-$pane_number" || true
+    case "$pane_pid" in *[!0-9]*|'') ;; *) printf '%s' "$pane_pid"; return ;; esac
+  fi
+  canonical_pane_pid "$pane_number"
+}
+owner_target() {
+  previous=''
+  for argument in "$@"; do
+    if [ "$previous" = '-t' ]; then
+      printf '%s' "$argument"
+      return
+    fi
+    previous="$argument"
+  done
+}
+# Capture the exact session/window/pane incarnation the production code binds
+# every source-authorized operation to. The generic fixture owns only this
+# canonical query; test scripts retain their command-specific topology.
+if [ "\${1:-}" = "display-message" ] && [ "\${2:-}" = "-p" ] && [ "\${3:-}" = "-t" ] \
+  && [ "\${5:-}" = "#{session_name}\t#{session_id}\t#{session_created}\t#{window_index}\t#{window_id}\t#{pane_id}\t#{pane_pid}" ]; then
+  case "\${4:-}" in
+    %*)
+      pane_number="\${4#%}"
+      case "$pane_number" in *[!0-9]*|'') exit 1 ;; esac
+      if [ ! -f "$0.actual-pid-$pane_number" ]; then
+        observed_pid="$("$0" list-panes -a -F '#{pane_id}\\t#{pane_dead}\\t#{pane_pid}' 2>/dev/null | awk -F '\\t' -v pane="\${4}" '$1 == pane && $2 == "0" && $3 ~ /^[1-9][0-9]*$/ { print $3; exit }')"
+        [ -z "$observed_pid" ] || printf '%s' "$observed_pid" > "$0.actual-pid-$pane_number"
+      fi
+      pane_pid="$(actual_pane_pid "$pane_number")"
+      : > "$0.source-proof-$pane_number"
+      log_command "$@"
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' 'leader' '$1' '1700000000' '0' '@1' "\${4}" "$pane_pid"
+      exit 0
+      ;;
+  esac
+fi
+# Match the immediately following exact-pane liveness proof to the seven-field
+# capture above, without changing later command-specific global snapshots.
+if [ "\${1:-}" = "list-panes" ] && [ "\${2:-}" = "-a" ] && [ "\${3:-}" = "-F" ] && [ "\${4:-}" = "#{pane_id}\t#{pane_dead}\t#{pane_pid}" ]; then
+  for source_proof in "$0".source-proof-*; do
+    [ -e "$source_proof" ] || continue
+    pane_number="\${source_proof##*-}"
+    case "$pane_number" in *[!0-9]*|'') continue ;; esac
+    log_command "$@"
+    printf '%%%s\t0\t%s\n' "$pane_number" "$(actual_pane_pid "$pane_number")"
+    rm -f "$source_proof"
+    exit 0
+  done
+fi
+# A source-authorized tmux operation is one server-side transaction. Emulate
+# the guarded branch rather than letting fixture scripts accidentally treat
+# if-shell as an unconditional success. Tests that model a failed/drifted
+# transaction continue to do so by making their source query/proof invalid.
+if [ "\${1:-}" = "if-shell" ] && [ "\${2:-}" = "-F" ] && [ "\${3:-}" = "-t" ]; then
+  source_pane="\${4:-}"
+  predicate="\${5:-}"
+  effect="\${6:-}"
+  pane_number="\${source_pane#%}"
+  case "$pane_number" in *[!0-9]*|'') log_command "$@"; exit 0 ;; esac
+  quote="'"
+  double_quote='"'
+  pane_pid="$(actual_pane_pid "$pane_number")"
+  case "$predicate" in
+    *"#{==:#{pane_id},$source_pane}"*"#{==:#{pane_pid},$pane_pid}"*'#{==:#{session_id},$1}'*'#{==:#{session_created},1700000000}'*'#{==:#{window_id},@1}'*) ;;
+    *) source_pane='' ;;
+  esac
+  if [ -n "$source_pane" ]; then
+  log_command "$@"
+  if [ "\${effect#*split-window}" != "$effect" ]; then
+    receipt="$(printf '%s' "$effect" | sed -n 's/.*\\(omx_source_[A-Za-z0-9_]*\\).*/\\1/p')"
+    effect_command="\${effect%% \\; display-message*}"
+    eval "set -- $effect_command"
+    split_output="$("$0" "$@")" || exit 1
+    created_pane="$(printf '%s\\n' "$split_output" | awk -F '\\t' 'NR == 1 { print $1 }')"
+    case "$created_pane" in %*) ;; *) exit 1 ;; esac
+    pane_number="\${created_pane#%}"
+    created_pid="$("$0" list-panes -a -F '#{pane_id}\\t#{pane_dead}\\t#{pane_pid}' 2>/dev/null | awk -F '\\t' -v pane="$created_pane" '$1 == pane && $2 == "0" && $3 ~ /^[1-9][0-9]*$/ { print $3; exit }')"
+    [ -z "$created_pid" ] || printf '%s' "$created_pid" > "$0.actual-pid-$pane_number"
+    printf '%s\\t%s\\n' "$created_pane" "$receipt"
+    exit 0
+  fi
+  # Owner markers are part of the authority contract and must survive the
+  # guarded tagging transaction for subsequent source/final-sink proofs.
+  case "$effect" in
+    *'@omx_team_pane_owner_id '*)
+      tag_target="\${effect#* -t }"
+      tag_target="\${tag_target%% *}"
+      owner_value="\${effect##*@omx_team_pane_owner_id }"
+      owner_value="\${owner_value%% *}"
+      owner_value="\${owner_value#"$double_quote"}"
+      owner_value="\${owner_value%"$double_quote"}"
+      owner_value="\${owner_value#"$quote"}"
+      owner_value="\${owner_value%"$quote"}"
+      printf '%s' "$owner_value" > "$0.owner-\${tag_target#%}"
+      ;;
+  esac
+  receipt="\${effect##*display-message -p }"
+  receipt="\${receipt#"$quote"}"
+  receipt="\${receipt%"$quote"}"
+  printf '%s\n' "$receipt"
+  exit 0
+  fi
+fi
+# Keep owner-tag reads and writes coherent even in compact fixtures that do not
+# spell out the tmux option commands themselves.
+if [ "\${1:-}" = "set-option" ]; then
+  owner_key=''
+  for argument in "$@"; do [ "$argument" = '@omx_team_pane_owner_id' ] && owner_key=1; done
+  if [ -n "$owner_key" ]; then
+    target="$(owner_target "$@")"
+    owner_value=''
+    previous=''
+    for argument in "$@"; do
+      if [ "$previous" = '@omx_team_pane_owner_id' ]; then owner_value="$argument"; break; fi
+      previous="$argument"
+    done
+    if [ -n "$target" ] && [ -n "$owner_value" ]; then
+      log_command "$@"
+      printf '%s' "$owner_value" > "$0.owner-\${target#%}"
+      exit 0
+    fi
+  fi
+fi
+if [ "\${1:-}" = "show-option" ] || [ "\${1:-}" = "show-options" ]; then
+  owner_key=''
+  for argument in "$@"; do [ "$argument" = '@omx_team_pane_owner_id' ] && owner_key=1; done
+  if [ -n "$owner_key" ]; then
+    target="$(owner_target "$@")"
+    if [ -f "$0.owner-\${target#%}" ]; then
+      log_command "$@"
+      cat "$0.owner-\${target#%}"
+      exit 0
+    fi
+  fi
+fi
+`,
+    );
     const compatibleTmuxFixture = fixtureDefinesGlobalExactPaneSnapshot
-      ? tmuxFixture
-      : tmuxFixture.replace(
+      ? sourceAuthorityTmuxFixture
+      : sourceAuthorityTmuxFixture.replace(
         '#!/bin/sh\n',
         `#!/bin/sh
 # Legacy fixtures without a global snapshot get deterministic, valid live panes.
@@ -677,6 +835,10 @@ fi
 `,
       );
     await writeFile(tmuxStubPath, compatibleTmuxFixture);
+    const wrapperSyntaxCheck = spawnSync('sh', ['-n', tmuxStubPath], { encoding: 'utf-8' });
+    if (wrapperSyntaxCheck.status !== 0 || wrapperSyntaxCheck.error) {
+      throw new Error(`invalid generated mock tmux shell wrapper: ${wrapperSyntaxCheck.error?.message ?? wrapperSyntaxCheck.stderr ?? 'sh -n failed'}`);
+    }
     await chmod(tmuxStubPath, 0o755);
 
     for (const binary of options.binaries ?? []) {
@@ -2471,9 +2633,9 @@ esac
           assert.equal(manifest.leader?.session_id, '%1');
 
           const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
-          assert.match(tmuxLog, /set-option -p -t %1 @omx_pane_instance_id %1/);
-          assert.match(tmuxLog, /set-option -p -t %2 @omx_pane_instance_id %1/);
-          assert.match(tmuxLog, /set-option -p -t %3 @omx_pane_instance_id %1/);
+          assert.match(tmuxLog, /set-option -p -t %1 @omx_pane_instance_id '%1'/);
+          assert.match(tmuxLog, /set-option -p -t %2 @omx_pane_instance_id '%1'/);
+          assert.match(tmuxLog, /set-option -p -t %3 @omx_pane_instance_id '%1'/);
           assert.match(tmuxLog, /exec env OMX_SESSION_ID='%1' OMX_TMUX_HUD_OWNER=1 OMX_TMUX_HUD_LEADER_PANE='%1' .*hud --watch/);
 
           await shutdownTeam(runtime.teamName, cwd, { force: true }).catch(() => {});
@@ -2636,13 +2798,13 @@ esac
           assert.equal(manifest.leader?.session_id, 'logical-session-from-env');
 
           const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
-          assert.match(tmuxLog, /set-option -t leader @omx_instance_id logical-session-from-env/);
-          assert.match(tmuxLog, /set-option -p -t %1 @omx_pane_instance_id logical-session-from-env/);
-          assert.match(tmuxLog, /set-option -p -t %2 @omx_pane_instance_id logical-session-from-env/);
-          assert.match(tmuxLog, /set-option -p -t %3 @omx_pane_instance_id logical-session-from-env/);
-          assert.match(tmuxLog, /set-option -p -t %1 @omx_team_pane_owner_id team:pane-owner-env-isolat-[a-f0-9]{8}/);
-          assert.match(tmuxLog, /set-option -p -t %2 @omx_team_pane_owner_id team:pane-owner-env-isolat-[a-f0-9]{8}/);
-          assert.match(tmuxLog, /set-option -p -t %3 @omx_team_pane_owner_id team:pane-owner-env-isolat-[a-f0-9]{8}/);
+          assert.match(tmuxLog, /set-option -t \$1 @omx_instance_id 'logical-session-from-env'/);
+          assert.match(tmuxLog, /set-option -p -t %1 @omx_pane_instance_id 'logical-session-from-env'/);
+          assert.match(tmuxLog, /set-option -p -t %2 @omx_pane_instance_id 'logical-session-from-env'/);
+          assert.match(tmuxLog, /set-option -p -t %3 @omx_pane_instance_id 'logical-session-from-env'/);
+          assert.match(tmuxLog, /set-option -p -t %1 @omx_team_pane_owner_id 'team:pane-owner-env-isolat-[a-f0-9]{8}'/);
+          assert.match(tmuxLog, /set-option -p -t %2 @omx_team_pane_owner_id 'team:pane-owner-env-isolat-[a-f0-9]{8}'/);
+          assert.match(tmuxLog, /set-option -p -t %3 @omx_team_pane_owner_id 'team:pane-owner-env-isolat-[a-f0-9]{8}'/);
           assert.doesNotMatch(tmuxLog, /set-option -p -t %1 @omx_team_pane_owner_id logical-session-from-env/);
           assert.match(tmuxLog, /exec env OMX_SESSION_ID='logical-session-from-env' OMX_TMUX_HUD_OWNER=1 OMX_TMUX_HUD_LEADER_PANE='%1' .*hud --watch/);
 
@@ -4680,7 +4842,7 @@ esac
               [{ subject: 's', description: 'd', owner: 'worker-1' }],
               cwd,
             )),
-            /startup_rollback_pane_proof_unavailable:%2:malformed_snapshot/,
+            /create_team_session_cleanup_incomplete/,
           );
 
           const runtimeTeamName = await resolveRuntimeTeamName(cwd, 'team-partial-create-proof');
@@ -4693,7 +4855,7 @@ esac
 
           const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
           assert.match(tmuxLog, /list-panes -a -F #\{pane_id\}\t#\{pane_dead\}\t#\{pane_pid\}/);
-          assert.doesNotMatch(tmuxLog, /kill-pane -t %2/);
+          assert.equal(tmuxLog.match(/kill-pane -t %2/g)?.length ?? 0, 1);
         },
       );
     } finally {
@@ -4783,7 +4945,7 @@ esac
               [{ subject: 's', description: 'd', owner: 'worker-1' }],
               cwd,
             )),
-            /exact_pane_proof_unavailable:%1:malformed_snapshot/,
+            /exact_pane_proof_unavailable:%2:malformed_snapshot/,
           );
 
           const runtimeTeamName = await resolveRuntimeTeamName(cwd, 'team-no-resource-create-proof');
@@ -5754,7 +5916,7 @@ exit 0
           assert.equal(tmuxLog.match(/set-hook -t leader:0 client-attached\[\d+\]/g)?.length ?? 0, 2);
           assert.match(tmuxLog, /snapshot=\$\(tmux list-panes -a -F/);
           assert.ok((tmuxLog.match(/list-panes -a -F '#\{pane_id\}\\t#\{pane_dead\}\\t#\{pane_pid\}'/g)?.length ?? 0) >= 6);
-          assert.ok((tmuxLog.match(/select-layout -t leader:0 main-vertical/g)?.length ?? 0) >= 2);
+          assert.ok((tmuxLog.match(/select-layout -t @1 main-vertical/g)?.length ?? 0) >= 2);
           assert.equal(tmuxLog.match(/kill-pane -t %3/g)?.length ?? 0, 2);
         },
       );
@@ -8179,7 +8341,12 @@ case "$1" in
     ;;
   show-option|show-options) echo 'team:team-detached-hud-shutdown' ;;
   kill-pane) : > "${tmuxLogPath}.hud-killed" ;;
-  if-shell) : > "${tmuxLogPath}.session-killed" ;;
+  if-shell)
+    case "\${5:-}" in
+      *'#{==:#{pane_dead},0}'*'#{==:#{pane_id},%1}'*'#{==:#{pane_pid},4241}'*'#{==:#{@omx_team_pane_owner_id},team:team-detached-hud-shutdown}'*'#{==:#{session_id},$81}'*'#{==:#{session_created},1700000001}'*) : > "${tmuxLogPath}.session-killed" ;;
+      *) exit 1 ;;
+    esac
+    ;;
   list-sessions)
     if [ -f "${tmuxLogPath}.session-killed" ]; then
       printf '%s\n' 'no server running on /tmp/tmux-1000/default' >&2
@@ -8243,7 +8410,12 @@ case "$1" in
     esac
     ;;
   show-option|show-options) echo 'team:team-postkill-query-fail' ;;
-  if-shell) : > "${tmuxLogPath}.session-killed" ;;
+  if-shell)
+    case "\${5:-}" in
+      *'#{==:#{pane_dead},0}'*'#{==:#{pane_id},%1}'*'#{==:#{pane_pid},4241}'*'#{==:#{@omx_team_pane_owner_id},team:team-postkill-query-fail}'*'#{==:#{session_id},$1}'*'#{==:#{session_created},1700000000}'*) : > "${tmuxLogPath}.session-killed" ;;
+      *) exit 1 ;;
+    esac
+    ;;
   list-sessions)
     if [ -f "${tmuxLogPath}.session-killed" ]; then
       if [ -f "${tmuxLogPath}.allow-retry" ]; then
@@ -8468,7 +8640,12 @@ case "$1" in
     esac ;;
   show-option|show-options) echo 'team:intent-receipt' ;;
   list-sessions) [ -f "${tmuxLogPath}.killed" ] || printf 'omx-team-intent-receipt\t$71\t1700000010\n' ;;
-  if-shell) : > "${tmuxLogPath}.killed" ;;
+  if-shell)
+    case "\${5:-}" in
+      *'#{==:#{pane_dead},0}'*'#{==:#{pane_id},%1}'*'#{==:#{pane_pid},4241}'*'#{==:#{@omx_team_pane_owner_id},team:intent-receipt}'*'#{==:#{session_id},$71}'*'#{==:#{session_created},1700000010}'*) : > "${tmuxLogPath}.killed" ;;
+      *) exit 1 ;;
+    esac
+    ;;
   *) exit 0 ;;
 esac
 `,

@@ -315,13 +315,13 @@ describe('reconcileHudForPromptSubmit', () => {
     const created: Array<{ options?: { targetPaneId?: string } }> = [];
 
     const result = await reconcileHudForPromptSubmit('/repo', {
-      env: { TMUX: '1', TMUX_PANE: '%leader', OMX_SESSION_ID: 'sess-new', [OMX_TMUX_HUD_OWNER_ENV]: '1' },
+      env: { TMUX: '1', TMUX_PANE: '%1', OMX_SESSION_ID: 'sess-new', [OMX_TMUX_HUD_OWNER_ENV]: '1' },
       listCurrentWindowPanes: () => [
-        { paneId: '%leader', currentCommand: 'codex', startCommand: 'codex' },
+        { paneId: '%1', currentCommand: 'codex', startCommand: 'codex' },
         {
-          paneId: '%stale-hud',
+          paneId: '%2',
           currentCommand: 'node',
-          startCommand: `exec env OMX_SESSION_ID='sess-old' OMX_TMUX_HUD_OWNER='1' ${OMX_TMUX_HUD_LEADER_PANE_ENV}='%leader' node omx hud --watch --preset=focused`,
+          startCommand: `exec env OMX_SESSION_ID='sess-old' OMX_TMUX_HUD_OWNER='1' ${OMX_TMUX_HUD_LEADER_PANE_ENV}='%1' node omx hud --watch --preset=focused`,
         },
       ],
       killTmuxPane: (paneId) => {
@@ -330,17 +330,17 @@ describe('reconcileHudForPromptSubmit', () => {
       },
       createHudWatchPane: (_cwd, _cmd, options) => {
         created.push({ options });
-        return '%new-hud';
+        return '%3';
       },
       resizeTmuxPane: () => true,
       resolveOmxCliEntryPath: () => '/repo/dist/cli/omx.js',
     });
 
-    assert.deepEqual(killed, ['%stale-hud']);
+    assert.deepEqual(killed, ['%2']);
     assert.equal(result.status, 'recreated');
-    assert.equal(result.paneId, '%new-hud');
+    assert.equal(result.paneId, '%3');
     assert.equal(created.length, 1);
-    assert.equal(created[0]?.options?.targetPaneId, '%leader');
+    assert.equal(created[0]?.options?.targetPaneId, '%1');
   });
 
   it('reaps a stale same-leader HUD even when a current-session HUD already exists', async () => {
@@ -349,18 +349,18 @@ describe('reconcileHudForPromptSubmit', () => {
     const resized: Array<{ paneId: string; heightLines: number }> = [];
 
     const result = await reconcileHudForPromptSubmit('/repo', {
-      env: { TMUX: '1', TMUX_PANE: '%leader', OMX_SESSION_ID: 'sess-new', [OMX_TMUX_HUD_OWNER_ENV]: '1' },
+      env: { TMUX: '1', TMUX_PANE: '%1', OMX_SESSION_ID: 'sess-new', [OMX_TMUX_HUD_OWNER_ENV]: '1' },
       listCurrentWindowPanes: () => [
-        { paneId: '%leader', currentCommand: 'codex', startCommand: 'codex' },
+        { paneId: '%1', currentCommand: 'codex', startCommand: 'codex' },
         {
-          paneId: '%current-hud',
+          paneId: '%2',
           currentCommand: 'node',
-          startCommand: `exec env OMX_SESSION_ID='sess-new' OMX_TMUX_HUD_OWNER='1' ${OMX_TMUX_HUD_LEADER_PANE_ENV}='%leader' node omx hud --watch --preset=focused`,
+          startCommand: `exec env OMX_SESSION_ID='sess-new' OMX_TMUX_HUD_OWNER='1' ${OMX_TMUX_HUD_LEADER_PANE_ENV}='%1' node omx hud --watch --preset=focused`,
         },
         {
-          paneId: '%stale-hud',
+          paneId: '%3',
           currentCommand: 'node',
-          startCommand: `exec env OMX_SESSION_ID='sess-old' OMX_TMUX_HUD_OWNER='1' ${OMX_TMUX_HUD_LEADER_PANE_ENV}='%leader' node omx hud --watch --preset=focused`,
+          startCommand: `exec env OMX_SESSION_ID='sess-old' OMX_TMUX_HUD_OWNER='1' ${OMX_TMUX_HUD_LEADER_PANE_ENV}='%1' node omx hud --watch --preset=focused`,
         },
       ],
       killTmuxPane: (paneId) => {
@@ -369,7 +369,7 @@ describe('reconcileHudForPromptSubmit', () => {
       },
       createHudWatchPane: () => {
         created.push('create');
-        return '%new-hud';
+        return '%4';
       },
       resizeTmuxPane: (paneId, heightLines) => {
         resized.push({ paneId, heightLines });
@@ -379,11 +379,11 @@ describe('reconcileHudForPromptSubmit', () => {
       resolveOmxCliEntryPath: () => '/repo/dist/cli/omx.js',
     });
 
-    assert.deepEqual(killed, ['%stale-hud']);
+    assert.deepEqual(killed, ['%3']);
     assert.deepEqual(created, []);
     assert.equal(result.status, 'resized');
-    assert.equal(result.paneId, '%current-hud');
-    assert.deepEqual(resized, [{ paneId: '%current-hud', heightLines: HUD_TMUX_HEIGHT_LINES }]);
+    assert.equal(result.paneId, '%2');
+    assert.deepEqual(resized, [{ paneId: '%2', heightLines: HUD_TMUX_HEIGHT_LINES }]);
   });
 
   it('does not reap a different-session HUD pane owned by a neighboring live leader', async () => {
@@ -695,15 +695,15 @@ describe('reconcileHudForPromptSubmit', () => {
     });
 
     const leftCreateResult = await reconcileHudForPromptSubmit('/repo', {
-      env: { TMUX: '1', TMUX_PANE: '%left', OMX_SESSION_ID: 'sess-left', [OMX_TMUX_HUD_OWNER_ENV]: '1' },
+      env: { TMUX: '1', TMUX_PANE: '%1', OMX_SESSION_ID: 'sess-left', [OMX_TMUX_HUD_OWNER_ENV]: '1' },
       listCurrentWindowPanes: () => [
-        codexPane('%left'),
-        codexPane('%right'),
-        hudPane('%hud-right', 'sess-right', '%right'),
+        codexPane('%1'),
+        codexPane('%2'),
+        hudPane('%4', 'sess-right', '%2'),
       ],
       createHudWatchPane: (_cwd, _cmd, options) => {
         created.push({ side: 'left', options });
-        return '%hud-left';
+        return '%3';
       },
       killTmuxPane: (paneId) => {
         killed.push(paneId);
@@ -717,16 +717,16 @@ describe('reconcileHudForPromptSubmit', () => {
     });
 
     const leftRepeatResult = await reconcileHudForPromptSubmit('/repo', {
-      env: { TMUX: '1', TMUX_PANE: '%left', OMX_SESSION_ID: 'sess-left', [OMX_TMUX_HUD_OWNER_ENV]: '1' },
+      env: { TMUX: '1', TMUX_PANE: '%1', OMX_SESSION_ID: 'sess-left', [OMX_TMUX_HUD_OWNER_ENV]: '1' },
       listCurrentWindowPanes: () => [
-        codexPane('%left'),
-        codexPane('%right'),
-        hudPane('%hud-left', 'sess-left', '%left'),
-        hudPane('%hud-right', 'sess-right', '%right'),
+        codexPane('%1'),
+        codexPane('%2'),
+        hudPane('%3', 'sess-left', '%1'),
+        hudPane('%4', 'sess-right', '%2'),
       ],
       createHudWatchPane: (_cwd, _cmd, options) => {
         created.push({ side: 'left', options });
-        return '%hud-left-repeat';
+        return '%5';
       },
       killTmuxPane: (paneId) => {
         killed.push(paneId);
@@ -740,15 +740,15 @@ describe('reconcileHudForPromptSubmit', () => {
     });
 
     const rightCreateResult = await reconcileHudForPromptSubmit('/repo', {
-      env: { TMUX: '1', TMUX_PANE: '%right', OMX_SESSION_ID: 'sess-right', [OMX_TMUX_HUD_OWNER_ENV]: '1' },
+      env: { TMUX: '1', TMUX_PANE: '%2', OMX_SESSION_ID: 'sess-right', [OMX_TMUX_HUD_OWNER_ENV]: '1' },
       listCurrentWindowPanes: () => [
-        codexPane('%left'),
-        codexPane('%right'),
-        hudPane('%hud-left', 'sess-left', '%left'),
+        codexPane('%1'),
+        codexPane('%2'),
+        hudPane('%3', 'sess-left', '%1'),
       ],
       createHudWatchPane: (_cwd, _cmd, options) => {
         created.push({ side: 'right', options });
-        return '%hud-right';
+        return '%4';
       },
       killTmuxPane: (paneId) => {
         killed.push(paneId);
@@ -762,16 +762,16 @@ describe('reconcileHudForPromptSubmit', () => {
     });
 
     const rightRepeatResult = await reconcileHudForPromptSubmit('/repo', {
-      env: { TMUX: '1', TMUX_PANE: '%right', OMX_SESSION_ID: 'sess-right', [OMX_TMUX_HUD_OWNER_ENV]: '1' },
+      env: { TMUX: '1', TMUX_PANE: '%2', OMX_SESSION_ID: 'sess-right', [OMX_TMUX_HUD_OWNER_ENV]: '1' },
       listCurrentWindowPanes: () => [
-        codexPane('%left'),
-        codexPane('%right'),
-        hudPane('%hud-left', 'sess-left', '%left'),
-        hudPane('%hud-right', 'sess-right', '%right'),
+        codexPane('%1'),
+        codexPane('%2'),
+        hudPane('%3', 'sess-left', '%1'),
+        hudPane('%4', 'sess-right', '%2'),
       ],
       createHudWatchPane: (_cwd, _cmd, options) => {
         created.push({ side: 'right', options });
-        return '%hud-right-repeat';
+        return '%5';
       },
       killTmuxPane: (paneId) => {
         killed.push(paneId);
@@ -785,23 +785,23 @@ describe('reconcileHudForPromptSubmit', () => {
     });
 
     assert.equal(leftCreateResult.status, 'recreated');
-    assert.equal(leftCreateResult.paneId, '%hud-left');
+    assert.equal(leftCreateResult.paneId, '%3');
     assert.equal(leftRepeatResult.status, 'resized');
-    assert.equal(leftRepeatResult.paneId, '%hud-left');
+    assert.equal(leftRepeatResult.paneId, '%3');
     assert.equal(rightCreateResult.status, 'recreated');
-    assert.equal(rightCreateResult.paneId, '%hud-right');
+    assert.equal(rightCreateResult.paneId, '%4');
     assert.equal(rightRepeatResult.status, 'resized');
-    assert.equal(rightRepeatResult.paneId, '%hud-right');
+    assert.equal(rightRepeatResult.paneId, '%4');
     assert.deepEqual(killed, []);
     assert.deepEqual(resized, [
-      { side: 'left', paneId: '%hud-left', heightLines: HUD_TMUX_HEIGHT_LINES },
-      { side: 'left', paneId: '%hud-left', heightLines: HUD_TMUX_HEIGHT_LINES },
-      { side: 'right', paneId: '%hud-right', heightLines: HUD_TMUX_HEIGHT_LINES },
-      { side: 'right', paneId: '%hud-right', heightLines: HUD_TMUX_HEIGHT_LINES },
+      { side: 'left', paneId: '%3', heightLines: HUD_TMUX_HEIGHT_LINES },
+      { side: 'left', paneId: '%3', heightLines: HUD_TMUX_HEIGHT_LINES },
+      { side: 'right', paneId: '%4', heightLines: HUD_TMUX_HEIGHT_LINES },
+      { side: 'right', paneId: '%4', heightLines: HUD_TMUX_HEIGHT_LINES },
     ]);
     assert.equal(created.length, 2);
-    assert.equal(created[0]?.options?.targetPaneId, '%left');
-    assert.equal(created[1]?.options?.targetPaneId, '%right');
+    assert.equal(created[0]?.options?.targetPaneId, '%1');
+    assert.equal(created[1]?.options?.targetPaneId, '%2');
     assert.equal(Object.hasOwn(created[0]?.options ?? {}, 'fullWidth'), false);
     assert.equal(Object.hasOwn(created[1]?.options ?? {}, 'fullWidth'), false);
   });
@@ -834,16 +834,16 @@ describe('reconcileHudForPromptSubmit', () => {
     });
 
     const leftRepeatResult = await reconcileHudForPromptSubmit('/repo', {
-      env: { TMUX: '1', TMUX_PANE: '%left', OMX_SESSION_ID: 'sess-left', [OMX_TMUX_HUD_OWNER_ENV]: '1' },
+      env: { TMUX: '1', TMUX_PANE: '%1', OMX_SESSION_ID: 'sess-left', [OMX_TMUX_HUD_OWNER_ENV]: '1' },
       listCurrentWindowPanes: () => [
-        codexPane('%left', 0, 80),
-        codexPane('%right', 80, 80),
-        hudPane('%hud-left', 'sess-left', '%left', 0, 80),
-        hudPane('%hud-right', 'sess-right', '%right', 80, 80),
+        codexPane('%1', 0, 80),
+        codexPane('%2', 80, 80),
+        hudPane('%3', 'sess-left', '%1', 0, 80),
+        hudPane('%4', 'sess-right', '%2', 80, 80),
       ],
       createHudWatchPane: (_cwd, _cmd, options) => {
         created.push({ options });
-        return '%hud-left-repeat';
+        return '%5';
       },
       killTmuxPane: (paneId) => {
         killed.push(paneId);
@@ -858,20 +858,20 @@ describe('reconcileHudForPromptSubmit', () => {
     });
 
     const rightCreateResult = await reconcileHudForPromptSubmit('/repo', {
-      env: { TMUX: '1', TMUX_PANE: '%right', OMX_SESSION_ID: 'sess-right', [OMX_TMUX_HUD_OWNER_ENV]: '1' },
+      env: { TMUX: '1', TMUX_PANE: '%2', OMX_SESSION_ID: 'sess-right', [OMX_TMUX_HUD_OWNER_ENV]: '1' },
       listCurrentWindowPanes: () => [
-        codexPane('%left', 0, 80),
-        codexPane('%right', 80, 80),
-        hudPane('%hud-left', 'sess-left', '%left', 0, 80),
+        codexPane('%1', 0, 80),
+        codexPane('%2', 80, 80),
+        hudPane('%3', 'sess-left', '%1', 0, 80),
         // This is the launch-time standalone split for pane B. It is pane-scoped,
         // not full-window width, so prompt-submit/layout reconcile must keep it
         // instead of killing it and recreating a full-width HUD that competes with
         // pane A's HUD.
-        hudPane('%hud-right', 'sess-right', '%right', 80, 80),
+        hudPane('%4', 'sess-right', '%2', 80, 80),
       ],
       createHudWatchPane: (_cwd, _cmd, options) => {
         created.push({ options });
-        return '%hud-right-repeat';
+        return '%5';
       },
       killTmuxPane: (paneId) => {
         killed.push(paneId);
@@ -886,9 +886,9 @@ describe('reconcileHudForPromptSubmit', () => {
     });
 
     assert.equal(leftRepeatResult.status, 'unchanged');
-    assert.equal(leftRepeatResult.paneId, '%hud-left');
+    assert.equal(leftRepeatResult.paneId, '%3');
     assert.equal(rightCreateResult.status, 'unchanged');
-    assert.equal(rightCreateResult.paneId, '%hud-right');
+    assert.equal(rightCreateResult.paneId, '%4');
     assert.deepEqual(killed, []);
     assert.deepEqual(created, []);
     assert.deepEqual(resized, []);
@@ -1691,7 +1691,7 @@ describe('reconcileHudForPromptSubmit', () => {
       listCurrentWindowPanes: () => [
         { paneId: '%1', currentCommand: 'codex', startCommand: 'codex', paneLeft: 0, paneTop: 0, paneWidth: 160, paneHeight: 47, paneBottom: 46, windowWidth: 160, windowHeight: 50 },
         {
-          paneId: '%bad',
+          paneId: '%2',
           currentCommand: 'node',
           startCommand: `env OMX_SESSION_ID='sess-a' ${OMX_TMUX_HUD_LEADER_PANE_ENV}='%1' node omx hud --watch`,
           paneLeft: 80,
@@ -1703,7 +1703,7 @@ describe('reconcileHudForPromptSubmit', () => {
           windowHeight: 50,
         },
         {
-          paneId: '%good',
+          paneId: '%3',
           currentCommand: 'node',
           startCommand: `env OMX_SESSION_ID='sess-a' ${OMX_TMUX_HUD_LEADER_PANE_ENV}='%1' node omx hud --watch`,
           paneLeft: 0,
@@ -1721,7 +1721,7 @@ describe('reconcileHudForPromptSubmit', () => {
       },
       createHudWatchPane: (_cwd, _cmd, options) => {
         created.push({ options });
-        return '%new';
+        return '%4';
       },
       resizeTmuxPane: (paneId, heightLines) => {
         resized.push({ paneId, heightLines });
@@ -1731,9 +1731,9 @@ describe('reconcileHudForPromptSubmit', () => {
     });
 
     assert.equal(result.status, 'replaced_duplicates');
-    assert.equal(result.paneId, '%good');
-    assert.deepEqual(killed, ['%bad']);
-    assert.deepEqual(resized, [{ paneId: '%good', heightLines: HUD_TMUX_HEIGHT_LINES }]);
+    assert.equal(result.paneId, '%3');
+    assert.deepEqual(killed, ['%2']);
+    assert.deepEqual(resized, [{ paneId: '%3', heightLines: HUD_TMUX_HEIGHT_LINES }]);
     assert.deepEqual(created, []);
   });
 
@@ -1747,7 +1747,7 @@ describe('reconcileHudForPromptSubmit', () => {
       listCurrentWindowPanes: () => [
         { paneId: '%1', currentCommand: 'codex', startCommand: 'codex', paneLeft: 0, paneTop: 0, paneWidth: 80, paneHeight: 50, paneBottom: 49, windowWidth: 160, windowHeight: 50 },
         {
-          paneId: '%bad-a',
+          paneId: '%2',
           currentCommand: 'node',
           startCommand: `env OMX_SESSION_ID='sess-a' ${OMX_TMUX_HUD_LEADER_PANE_ENV}='%1' node omx hud --watch`,
           paneLeft: 80,
@@ -1759,7 +1759,7 @@ describe('reconcileHudForPromptSubmit', () => {
           windowHeight: 50,
         },
         {
-          paneId: '%bad-b',
+          paneId: '%3',
           currentCommand: 'node',
           startCommand: `env OMX_SESSION_ID='sess-a' ${OMX_TMUX_HUD_LEADER_PANE_ENV}='%1' node omx hud --watch`,
           paneLeft: 0,
@@ -1781,7 +1781,7 @@ describe('reconcileHudForPromptSubmit', () => {
       },
       createHudWatchPane: (_cwd, _cmd, options) => {
         created.push({ options });
-        return '%new';
+        return '%4';
       },
       resizeTmuxPane: () => true,
       registerHudResizeHook: () => true,
@@ -1789,9 +1789,9 @@ describe('reconcileHudForPromptSubmit', () => {
     });
 
     assert.equal(result.status, 'replaced_duplicates');
-    assert.equal(result.paneId, '%new');
+    assert.equal(result.paneId, '%4');
     assert.deepEqual(unregistered, ['%1']);
-    assert.deepEqual(killed, ['%bad-a', '%bad-b']);
+    assert.deepEqual(killed, ['%2', '%3']);
     assert.equal(created.length, 1);
     assert.equal(Object.hasOwn(created[0]?.options ?? {}, 'fullWidth'), false);
     assert.equal(created[0]?.options?.targetPaneId, '%1');
@@ -1919,10 +1919,14 @@ printf '\n' >> "${tmuxLogPath}"
 cmd="$1"
 shift || true
 if [[ "$cmd" == "display-message" ]]; then
-  printf '160\t${crampedHeight}'
+  printf '160\t${crampedHeight}\n'
+fi
+if [[ "$cmd" == "list-panes" && "\${!#}" == '#{pane_id}' ]]; then
+  printf '%%1\n'
+  exit 0
 fi
 if [[ "$cmd" == "list-panes" ]]; then
-  printf '%%1\\037codex\\0370\\0370\\037160\\03724\\03723\\037160\\037${crampedHeight}\\037codex\\037/repo'
+  printf '%%1\\037codex\\0370\\0370\\037160\\03724\\03723\\037160\\037${crampedHeight}\\037codex\\037/repo\\0370\\0371001\n'
 fi
 `,
       );
@@ -1948,7 +1952,8 @@ fi
       assert.equal(result.paneId, null);
       assert.deepEqual(created, []);
       const log = await readFile(tmuxLogPath, 'utf-8');
-      assert.match(log, /\[list-panes\]\[-t\]\[%1\]/);
+      assert.match(log, /\[list-panes\]\[-t\]\[%1\]\[-F\]\[#\{pane_id\}\]/);
+      assert.match(log, /\[list-panes\]\[-t\]\[%1\]\[-F\]\[#\{pane_id\}\x1f#\{pane_current_command\}\x1f#\{pane_left\}\x1f#\{pane_top\}\x1f#\{pane_width\}\x1f#\{pane_height\}\x1f#\{pane_bottom\}\x1f#\{window_width\}\x1f#\{window_height\}\x1f#\{pane_start_command\}\x1f#\{pane_current_path\}\x1f#\{pane_dead\}\x1f#\{pane_pid\}\]/);
       assert.match(log, /\[display-message\]\[-p\]\[-t\]\[%1\]\[#\{window_width\}\t#\{window_height\}\]/);
     } finally {
       process.env.PATH = originalPath;

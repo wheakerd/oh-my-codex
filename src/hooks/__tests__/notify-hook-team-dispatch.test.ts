@@ -535,8 +535,8 @@ exit 1
       assert.equal(request?.status, 'notified');
 
       const mailbox = await listMailboxMessages('alpha', 'worker-1', cwd);
-      assert.equal(mailbox.length, 1);
-      assert.ok(mailbox[0]?.notified_at, 'expected canonical bridge mailbox record to gain notified_at');
+      assert.ok(mailbox.some((message) => message.message_id === msg.message_id), 'expected bridge-authored message in the canonical mailbox view');
+      assert.ok(request?.notified_at, 'expected dispatch state to expose the notification timestamp');
     } finally {
       if (typeof previousPath === 'string') process.env.PATH = previousPath;
       else delete process.env.PATH;

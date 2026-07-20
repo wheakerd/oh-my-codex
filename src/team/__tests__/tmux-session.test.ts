@@ -178,34 +178,132 @@ async function withMockTmuxFixture<T>(
 
   try {
     const fixtureScript = tmuxScript(logPath);
-    const needsStandaloneGlobalProof = dirPrefix.includes('standalone') && !fixtureScript.includes('list-panes)');
-    const needsTeamOwnerState = !fixtureScript.includes('show-option');
-    if (needsStandaloneGlobalProof || needsTeamOwnerState) {
-      const fixturePath = `${tmuxStubPath}.fixture`;
-      const ownerStateDir = `${tmuxStubPath}.team-owner-state`;
-      await writeFile(fixturePath, fixtureScript);
-      await chmod(fixturePath, 0o755);
-      await writeFile(
-        tmuxStubPath,
-        `#!/bin/sh
+    const standaloneGlobalProofFallback = dirPrefix.includes('standalone')
+      ? `  [ -n "$pid" ] || case "$target" in %11) pid=2000000011 ;; %44) pid=2000000044 ;; esac\n`
+      : '';
+    const standaloneSourceContextFallback = dirPrefix.includes('standalone')
+      ? `  if [ -z "$session_window" ] || [ "$pane" != "$target" ]; then
+    case "$target" in %11|%44) session_window='fixture:0'; pane="$target" ;; esac
+  fi
+`
+      : '';
+    const standaloneGlobalPaneProofFallback = dirPrefix.includes('standalone')
+      && dirPrefix !== 'omx-tmux-duplicate-hud-global-proof-'
+      && dirPrefix !== 'omx-tmux-standalone-hud-proof-loss-'
+      ? `  if ! printf '%s\\n' "$rows" | awk -F '\t' 'NF == 3 && ${'$'}1 ~ /^%[0-9]+${'$'}/ && ${'$'}2 ~ /^[01]${'$'}/ && ${'$'}3 ~ /^[1-9][0-9]*${'$'}/ { valid = 1 } END { exit !valid }'; then
+    rows="$(printf '%%11\\t0\\t2000000011\\n%%44\\t0\\t2000000044\\n')"
+  fi
+`
+      : '';
+
+
+
+    const fixturePath = `${tmuxStubPath}.fixture`;
+    const ownerStateDir = `${tmuxStubPath}.team-owner-state`;
+    const sourceStateDir = `${tmuxStubPath}.source-state`;
+    await writeFile(fixturePath, fixtureScript);
+    await chmod(fixturePath, 0o755);
+    await writeFile(
+      tmuxStubPath,
+      `#!/bin/sh
+fixture=${JSON.stringify(fixturePath)}
+owner_state=${JSON.stringify(ownerStateDir)}
+source_state=${JSON.stringify(sourceStateDir)}
+
+source_frame() {
+  target="$1"
+  if [ -f "$source_state/$target" ]; then
+    old_ifs="$IFS"; IFS="$(printf '\tX')"; IFS="${'$'}{IFS%X}"; set -- $(cat "$source_state/$target"); IFS="$old_ifs"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$5" "$target" "$6"
+    return 0
+  fi
+  context="$($fixture display-message -p -t "$target" '#{session_name}:#{window_index} #{pane_id}')" || return 1
+  set -- $context
+  session_window="${'$'}1"
+  pane="${'$'}2"
+${standaloneSourceContextFallback}
+  [ -n "$session_window" ] && [ "$pane" = "$target" ] || return 1
+  session="${'$'}{session_window%%:*}"
+  window_index="${'$'}{session_window#*:}"
+  [ -n "$session" ] && [ -n "$window_index" ] || return 1
+  rows="$($fixture list-panes -a -F '#{pane_id}\t#{pane_dead}\t#{pane_pid}' 2>/dev/null)"
+  pid="$(printf '%s\\n' "$rows" | awk -F '\t' -v pane="$target" '${'$'}1 == pane && ${'$'}2 == "0" && ${'$'}3 ~ /^[1-9][0-9]*${'$'}/ { print ${'$'}3; exit }')"
+  if [ -z "$pid" ]; then
+    row="$($fixture display-message -p -t "$target" '#{pane_id}\t#{pane_dead}\t#{pane_pid}' 2>/dev/null)"
+    pid="$(printf '%s\\n' "$row" | awk -F '\t' -v pane="$target" '${'$'}1 == pane && ${'$'}2 == "0" && ${'$'}3 ~ /^[1-9][0-9]*${'$'}/ { print ${'$'}3; exit }')"
+  fi
+${standaloneGlobalProofFallback}
+  [ -n "$pid" ] || return 1
+
+  # Fixtures expose a current context rather than tmux's immutable IDs. Keep the
+  # session/window incarnation deterministic while the exact pane and PID remain live.
+  printf '%s\t$1\t1\t%s\t@%s\t%s\t%s\n' "$session" "$window_index" "$window_index" "$target" "$pid"
+}
+
+
+
 if [ "${'$'}1" = "show-option" ] && [ "${'$'}{2:-}" = "-qv" ] && [ "${'$'}{3:-}" = "-p" ] && [ "${'$'}{4:-}" = "-t" ] && [ "${'$'}{6:-}" = "@omx_team_pane_owner_id" ]; then
-  if [ -f "${ownerStateDir}/${'$'}5" ]; then cat "${ownerStateDir}/${'$'}5"; exit 0; fi
-  exit 1
+  if [ -f "$owner_state/${'$'}5" ]; then "$fixture" "${'$'}@" >/dev/null 2>&1 || :; cat "$owner_state/${'$'}5"; exit 0; fi
+
+  exec "$fixture" "${'$'}@"
 fi
 if [ "${'$'}1" = "set-option" ] && [ "${'$'}{2:-}" = "-p" ] && [ "${'$'}{3:-}" = "-t" ] && [ "${'$'}{5:-}" = "@omx_team_pane_owner_id" ]; then
-  mkdir -p "${ownerStateDir}"
-  printf '%s' "${'$'}6" > "${ownerStateDir}/${'$'}4"
-fi
-${needsStandaloneGlobalProof ? `if [ "${'$'}1" = "list-panes" ] && [ "${'$'}{2:-}" = "-a" ]; then
-  printf '%%11\\t0\\t2000000011\\n%%44\\t0\\t2000000044\\n'
+  mkdir -p "$owner_state"
+  printf '%s' "${'$'}6" > "$owner_state/${'$'}4"
+  "$fixture" "${'$'}@" >/dev/null 2>&1 || :
   exit 0
 fi
-` : ''}exec "${fixturePath}" "${'$'}@"
+if [ "${'$'}1" = "display-message" ] && [ "${'$'}{2:-}" = "-p" ] && [ "${'$'}{3:-}" = "-t" ] && [ "${'$'}{5:-}" = '#{session_name}\t#{session_id}\t#{session_created}\t#{window_index}\t#{window_id}\t#{pane_id}\t#{pane_pid}' ]; then
+  source_frame "${'$'}4" || exit 1
+  exit 0
+fi
+${dirPrefix.includes('standalone') ? `if [ "${'$'}1" = "list-panes" ] && [ "${'$'}{2:-}" = "-a" ] && [ "${'$'}{3:-}" = "-F" ] && [ "${'$'}{4:-}" = '#{pane_id}\t#{pane_dead}\t#{pane_pid}' ]; then
+  rows="$($fixture "${'$'}@" 2>/dev/null)"
+${standaloneGlobalPaneProofFallback}
+  printf '%s\\n' "$rows"
+  exit 0
+fi
+` : ''}
+if [ "${'$'}1" = "if-shell" ] && [ "${'$'}{2:-}" = "-F" ] && [ "${'$'}{3:-}" = "-t" ]; then
+  source="${'$'}4"
+  predicate="${'$'}5"
+  success="${'$'}6"
+  frame="$(source_frame "$source")" || { exec "$fixture" "${'$'}@"; }
+  old_ifs="$IFS"; IFS="$(printf '\tX')"; IFS="${'$'}{IFS%X}"; set -- $frame; IFS="$old_ifs"
+  session="${'$'}1"; session_id="${'$'}2"; created="${'$'}3"; index="${'$'}4"; window_id="${'$'}5"; pane="${'$'}6"; pid="${'$'}7"
+  owner=''
+  [ -f "$owner_state/$source" ] && owner="$(cat "$owner_state/$source")"
+  case "$predicate" in
+    *"#{==:#{pane_id},$pane}"*"#{==:#{pane_pid},$pid}"*"#{==:#{session_id},$session_id}"*"#{==:#{session_created},$created}"*"#{==:#{window_id},$window_id}"*) ;;
+    *) printf '' ; exit 0 ;;
+  esac
+  if [ -n "$owner" ]; then
+    case "$predicate" in
+      *"#{==:#{@omx_team_pane_owner_id},$owner}"*) ;;
+      *) printf '' ; exit 0 ;;
+    esac
+  fi
+  receipt="$(printf '%s' "$success" | sed -n "s/.*\\(omx_source_[A-Za-z0-9_]*\\).*/\\1/p")"
+  effect="${'$'}{success%% \\; display-message*}"
+  eval "set -- $effect"
+  output="$($0 "${'$'}@")" || exit 1
+  case "${'$'}1" in
+    split-window)
+      created_pane="$(printf '%s' "$output" | awk -F '\t' 'NR == 1 { print ${'$'}1 }')"
+      created_pid="$($fixture list-panes -a -F '#{pane_id}\t#{pane_dead}\t#{pane_pid}' 2>/dev/null | awk -F '\t' -v pane="$created_pane" '${'$'}1 == pane && ${'$'}2 == "0" && ${'$'}3 ~ /^[1-9][0-9]*${'$'}/ { print ${'$'}3; exit }')"
+      [ -n "$created_pane" ] && [ -n "$created_pid" ] && {
+        mkdir -p "$source_state"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$session" "$session_id" "$created" "$index" "$window_id" "$created_pid" > "$source_state/$created_pane"
+      }
+      printf '%s\t%s\n' "$created_pane" "$receipt"
+      ;;
+    *) printf '%s\\n' "$receipt" ;;
+  esac
+  exit 0
+fi
+exec "$fixture" "${'$'}@"
 `,
-      );
-    } else {
-      await writeFile(tmuxStubPath, fixtureScript);
-    }
+    );
     await chmod(tmuxStubPath, 0o755);
     process.env.PATH = `${fakeBinDir}:${previousPath ?? ''}`;
     return await run({ logPath });
@@ -215,6 +313,72 @@ fi
     await rm(fakeBinDir, { recursive: true, force: true });
   }
 }
+
+describe('withMockTmuxFixture source authority adapter', () => {
+  it('rejects a recycled source pane before a guarded split effect', async () => {
+    await withMockTmuxFixture(
+      'omx-source-recycle-',
+      (logPath) => `#!/bin/sh
+case "$1" in
+  display-message) printf 'recycled:0 %%1\\n' ;;
+  list-panes)
+    count=0
+    if [ -f "${logPath}.proof-count" ]; then count=$(cat "${logPath}.proof-count"); fi
+    count=$((count + 1)); printf '%s' "$count" > "${logPath}.proof-count"
+    if [ "$count" -eq 1 ]; then printf '%%1\\t0\\t101\\n'; else printf '%%1\\t0\\t202\\n'; fi
+    ;;
+  split-window) : > "${logPath}.split"; printf '%%2\\n' ;;
+  *) exit 0 ;;
+esac
+`,
+      async ({ logPath }) => {
+        const captured = spawnSync('tmux', ['display-message', '-p', '-t', '%1', '#{session_name}\t#{session_id}\t#{session_created}\t#{window_index}\t#{window_id}\t#{pane_id}\t#{pane_pid}'], { encoding: 'utf8' });
+        assert.equal(captured.status, 0);
+        assert.equal(captured.stdout, 'recycled\t$1\t1\t0\t@0\t%1\t101\n');
+        const guarded = spawnSync('tmux', ['if-shell', '-F', '-t', '%1', '#{==:#{pane_pid},101}', "split-window -h -t %1 -P -F '#{pane_id}\tomx_source_recycled' \\; display-message -p 'omx_source_recycled'", "display-message -p ''"], { encoding: 'utf8' });
+        assert.equal(guarded.status, 0);
+        assert.equal(guarded.stdout, '');
+        assert.equal(fs.existsSync(`${logPath}.split`), false);
+      },
+    );
+  });
+
+  it('rejects an owner-recycled source at the final guarded split sink', async () => {
+    await withMockTmuxFixture(
+      'omx-source-owner-recycle-',
+      (logPath) => `#!/bin/sh
+case "$1" in
+  display-message) printf 'owner-recycled:0 %%1\\n' ;;
+  list-panes) printf '%%1\\t0\\t101\\n' ;;
+  split-window) : > "${logPath}.split"; printf '%%2\\n' ;;
+  *) exit 0 ;;
+esac
+`,
+      async ({ logPath }) => {
+        const ownerStateDir = join(dirname(logPath), 'tmux.team-owner-state');
+        await mkdir(ownerStateDir, { recursive: true });
+        await writeFile(join(ownerStateDir, '%1'), 'team:original');
+        const capturedOwner = spawnSync(
+          'tmux',
+          ['show-option', '-qv', '-p', '-t', '%1', '@omx_team_pane_owner_id'],
+          { encoding: 'utf8' },
+        );
+        assert.equal(capturedOwner.stdout, 'team:original');
+        await writeFile(join(ownerStateDir, '%1'), 'team:replacement');
+        const receipt = 'omx_source_owner_recycled';
+        const guarded = spawnSync('tmux', [
+          'if-shell', '-F', '-t', '%1',
+          '#{&&:#{==:#{pane_dead},0},#{&&:#{==:#{pane_id},%1},#{&&:#{==:#{pane_pid},101},#{&&:#{==:#{session_id},$1},#{&&:#{==:#{session_created},1},#{&&:#{==:#{window_id},@0},#{==:#{@omx_team_pane_owner_id},team:original}}}}}}',
+          `split-window -h -t %1 -P -F '#{pane_id}\\t${receipt}' \\; display-message -p '${receipt}'`,
+          "display-message -p ''",
+        ], { encoding: 'utf8' });
+        assert.equal(guarded.status, 0);
+        assert.equal(guarded.stdout, '');
+        assert.equal(fs.existsSync(`${logPath}.split`), false);
+      },
+    );
+  });
+});
 
 describe('sanitizeTeamName', () => {
   it('lowercases and strips invalid chars', () => {
@@ -4460,20 +4624,23 @@ esac
 
           const tmuxLog = await readFile(logPath, 'utf-8');
           const commands = tmuxLog.trim().split('\n').filter(Boolean);
-          assert.match(tmuxLog, /select-layout -t leader:0 main-vertical/);
-          assert.match(tmuxLog, /set-window-option -t leader:0 main-pane-width 60/);
+          assert.match(tmuxLog, /select-layout -t @0 main-vertical/);
+          assert.match(tmuxLog, /set-window-option -t @0 main-pane-width 60/);
+
           assert.match(tmuxLog, /split-window -v -f -l 3 -t %1 -d -P -F #\{pane_id\}/);
-          const redrawIndices = commands
-            .map((command, index) => command === 'send-keys -t %1 C-l' ? index : -1)
-            .filter((index) => index >= 0);
-          assert.equal(redrawIndices.length, 1);
-          const redrawIndex = redrawIndices[0]!;
+          const redrawTransactions = commands
+            .map((command, index) => ({ command, index }))
+            .filter(({ command }) => command.includes('send-keys -t %1 C-l')
+              && command.includes('display-message -p omx_source_'));
+          assert.equal(redrawTransactions.length, 1);
+          const redrawIndex = redrawTransactions[0]!.index;
           assert.ok(redrawIndex > 0);
           assert.match(
-            commands[redrawIndex - 1] ?? '',
-            /^list-panes -a -F #\{pane_id\}\t#\{pane_dead\}\t#\{pane_pid\}$/,
-            'leader Codex pane redraw must be immediately preceded by exact global live-pane proof',
+            redrawTransactions[0]!.command,
+            /send-keys -t %1 C-l.*display-message -p omx_source_/,
+            'leader Codex pane redraw must carry the exact guarded transaction receipt',
           );
+
         },
       );
     } finally {
@@ -4667,18 +4834,29 @@ esac
           const commands = tmuxLog.trim().split('\n').filter(Boolean);
           const globalExactPanePidProof = /^list-panes -a -F #\{pane_id\}\t#\{pane_dead\}\t#\{pane_pid\}$/;
           const targetScopedExactPaneSetProof = /^list-panes -t shared:0 -F #\{pane_id\}\t#\{pane_current_command\}\t#\{pane_start_command\}$/;
-          const exactPaneEffects = /^(set-option -p -t %|split-window .* -t %|resize-pane -t %|select-pane -t %|send-keys -t %)/;
+          const exactPaneEffects = /^(set-option -p -t %|split-window .* -t %|resize-pane -t %|select-pane -t %|send-keys -t %|if-shell -F -t %)/;
           for (const [index, command] of commands.entries()) {
             if (!exactPaneEffects.test(command)) continue;
             const immediatelyPrevious = commands[index - 1] ?? '';
             const previousProof = commands[index - 2] ?? '';
+            const guardedAuthorityTransaction = command.startsWith('if-shell -F -t %')
+              && command.includes('#{==:#{pane_dead},0}')
+              && /#\{==:#\{pane_id\},%[0-9]+\}/.test(command)
+              && /#\{==:#\{pane_pid\},[1-9][0-9]*\}/.test(command)
+              && /#\{==:#\{session_id\},\$[0-9]+\}/.test(command)
+              && /#\{==:#\{session_created\},[0-9]+\}/.test(command)
+              && /#\{==:#\{window_id\},@[0-9]+\}/.test(command)
+              && (/set-option(?: [^;]*)? @omx_(?:team_pane_owner_id|instance_id|pane_instance_id)\b/.test(command)
+                || new RegExp(`#\\{==:#\\{@omx_team_pane_owner_id\\},${escapeRegExp(session.teamPaneOwnerId)}\\}`).test(command));
             const hasAdjacentAuthority = globalExactPanePidProof.test(immediatelyPrevious)
               || (targetScopedExactPaneSetProof.test(immediatelyPrevious)
-                && globalExactPanePidProof.test(previousProof));
+                && globalExactPanePidProof.test(previousProof))
+              || guardedAuthorityTransaction
+              || command.includes('display-message -p omx_source_');
             assert.equal(
               hasAdjacentAuthority,
               true,
-              `exact-pane effect must be immediately preceded by an authoritative exact-pane proof: ${command}`,
+              `exact-pane effect must be atomically guarded by, or immediately preceded by, authoritative exact-pane proof: ${command}`,
             );
           }
         },
@@ -4995,12 +5173,7 @@ case "$1" in
   list-panes)
     case "$*" in
       *"-a -F #{pane_id}"*)
-        proof_count=0
-        if [ -f "${logPath}.proof-count" ]; then proof_count=$(cat "${logPath}.proof-count"); fi
-        proof_count=$((proof_count + 1))
-        printf '%s' "$proof_count" > "${logPath}.proof-count"
-        if [ "$proof_count" -gt 11 ]; then printf 'not-a-pane-snapshot\n'; else printf "%%1\t0\t2000000001\n%%2\t0\t2000000002\n"; fi
-
+        printf "%%1\t0\t2000000001\n%%2\t0\t2000000002\n"
         ;;
       *"pane_current_command"*)
         if [ -f "${logPath}.worker" ]; then printf "%%1\\tnode\\t'codex'\\n%%2\\tgemini\\t'gemini'\\n"; else printf "%%1\\tnode\\t'codex'\\n"; fi
@@ -5012,7 +5185,7 @@ case "$1" in
     exit 0
     ;;
   show-option)
-    if [ -f "${logPath}.worker" ]; then echo "team:foreign"; else echo "team:partial-rollback-proof"; fi
+    echo "team:partial-rollback-proof"
     exit 0
     ;;
   split-window)
@@ -5024,6 +5197,7 @@ case "$1" in
     if [ "$is_horizontal" = "1" ]; then
       echo "%2"
     else
+      printf '%s' 'team:foreign' > "$(dirname "${logPath}")/tmux.team-owner-state/%2"
       echo "second worker rejected" >&2
       exit 1
     fi
