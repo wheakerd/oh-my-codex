@@ -24,6 +24,7 @@ import {
   recordSubagentTurnForSession,
   resolveInstalledRoleName,
 } from "../subagents/tracker.js";
+
 import { readRoleRoutingMarker, writeRoleRoutingMarker } from "../subagents/role-routing-marker.js";
 import { evaluateCodex01445PreToolUse } from "../ralplan/documented-leader-preflight.js";
 import {
@@ -133,7 +134,6 @@ import {
   isNativeSubagentSpawnToolName,
   isRoleRoutingUnavailableEvidence,
   isUnsupportedNativeSubagentEvidence,
-  parseRoleIntentCorrelationToken,
   parseNativeSubagentResultDisposition,
   resolveNativeSubagentSupportStatus,
   type NativeSubagentUnsupportedReason,
@@ -377,8 +377,8 @@ interface NativeSubagentSessionStartMetadata {
   parentThreadId: string;
   agentNickname?: string;
   agentRole?: string;
-  correlationToken?: string;
 }
+
 
 
 function readBoundedFirstLineSync(path: string): string {
@@ -409,18 +409,7 @@ function readBoundedFirstLineSync(path: string): string {
   }
 }
 
-function selectAuthoritativeTaskName(
-  threadSpawn: unknown,
-  subagent: unknown,
-  payload: unknown,
-): { present: boolean; value: unknown } {
-  for (const obj of [threadSpawn, subagent, payload]) {
-    if (obj && typeof obj === "object" && "task_name" in obj) {
-      return { present: true, value: (obj as Record<string, unknown>).task_name };
-    }
-  }
-  return { present: false, value: undefined };
-}
+
 
 
 function readNativeSubagentSessionStartMetadata(transcriptPath: string): NativeSubagentSessionStartMetadata | null {
@@ -446,10 +435,7 @@ function readNativeSubagentSessionStartMetadata(transcriptPath: string): NativeS
       payload.agent_nickname ?? payload.agentNickname,
     ];
     const agentNickname = safeString(agentNicknameCarrierValues[0]).trim();
-    const authoritativeTaskName = selectAuthoritativeTaskName(threadSpawn, subagent, payload);
-    const correlationToken = authoritativeTaskName.present
-      ? parseRoleIntentCorrelationToken(authoritativeTaskName.value)
-      : undefined;
+
     const agentRole = safeString(
       threadSpawn.agent_role
         ?? threadSpawn.agentRole
@@ -464,13 +450,14 @@ function readNativeSubagentSessionStartMetadata(transcriptPath: string): NativeS
       parentThreadId,
       ...(agentNickname ? { agentNickname } : {}),
       ...(agentRole ? { agentRole } : {}),
-      ...(correlationToken ? { correlationToken } : {}),
     };
+
 
   } catch {
     return null;
   }
 }
+
 
 async function recordNativeSubagentSessionStart(
   cwd: string,
@@ -486,7 +473,6 @@ async function recordNativeSubagentSessionStart(
     canonicalSessionId.trim(),
     parentThreadId,
   ].filter(Boolean))];
-
   for (const sessionId of trackingSessionIds) {
     if (parentThreadId && parentThreadId !== childThreadId) {
       await recordSubagentTurnForSession(cwd, {
@@ -500,6 +486,7 @@ async function recordNativeSubagentSessionStart(
       threadId: childThreadId,
       kind: "subagent",
       ...(parentThreadId && parentThreadId !== childThreadId ? { leaderThreadId: parentThreadId } : {}),
+      // agent_type is lifecycle/routing metadata, never authority.
       mode: metadata.agentRole,
     }).catch(() => {});
   }
@@ -2034,7 +2021,7 @@ async function buildSessionStartContext(
 
   const modeSummaries: string[] = [];
   for (const mode of ["ralph", "autopilot", "ultrawork", "ultraqa", "ralplan", "deep-interview", "team"] as const) {
-    const state = await readJsonIfExists(getStatePath(mode, cwd, sessionId));
+    const state = await readModeStateForSession(mode, sessionId, cwd);
     if (state?.active !== true || !isNonTerminalPhase(state.current_phase)) continue;
     if (mode === "team") {
       const teamName = safeString(state.team_name).trim();
@@ -19695,18 +19682,12 @@ export async function dispatchCodexNativeHook(
 ): Promise<NativeHookDispatchResult> {
   const hookEventName = readHookEventName(payload);
   const cwd = options.cwd ?? (safeString(payload.cwd).trim() || process.cwd());
+  const omxEventName = mapCodexHookEventToOmxEvent(hookEventName);
   if (hookEventName === "PreToolUse" && safeString(payload.tool_name).trim() === "Bash") {
     const denial = evaluateCodex01445PreToolUse(payload, {
-      resolveInstalledRoleName: (role) => resolveInstalledRoleName(role, undefined, cwd),
+      resolveInstalledRoleName: (role: string) => resolveInstalledRoleName(role, undefined, cwd),
     });
-    if (denial) {
-      return {
-        hookEventName,
-        omxEventName: mapCodexHookEventToOmxEvent(hookEventName),
-        skillState: null,
-        outputJson: denial,
-      };
-    }
+    if (denial) return { hookEventName, omxEventName, skillState: null, outputJson: denial };
   }
   if (hookEventName === "PostCompact" && process.env.OMX_NATIVE_HOOK_DOCTOR_SMOKE === "1") {
     return {
@@ -19738,7 +19719,6 @@ export async function dispatchCodexNativeHook(
   const policyRoot = resolveConductorPolicyRoot(stateDir, cwd);
   const policyCwd = policyRoot.cwd;
 
-  const omxEventName = mapCodexHookEventToOmxEvent(hookEventName);
   let skillState: SkillActiveState | null = null;
   let triageAdditionalContext: string | null = null;
   let goalWorkflowAdditionalContext: string | null = null;
@@ -19916,6 +19896,7 @@ export async function dispatchCodexNativeHook(
   } else if (!canonicalSessionId) {
     canonicalSessionId = safeString(currentSessionState?.session_id).trim();
   }
+
 
   if (hookEventName === "Stop") {
     const stopPayloadSessionId = readPayloadSessionId(payload);

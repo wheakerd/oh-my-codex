@@ -1,16 +1,18 @@
 #!/usr/bin/env node
 import { spawn } from 'node:child_process';
 import { extname } from 'node:path';
-import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
+import { closeSync, constants as fsConstants, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const hookDir = dirname(fileURLToPath(import.meta.url));
 // sync-plugin-mirror verifies this stable marker; runtime behavior is tested separately.
 const OMX_PLUGIN_HOOK_LAUNCHER_CONTRACT_MARKER = 'omx-plugin-hook-launcher:v1';
+const OMX_PLUGIN_HOOK_ROUTING_ONLY_MARKER = 'omx-plugin-hook-routing-only:v1';
 const MAX_WRAPPER_STDIN_BYTES = 1024 * 1024;
 const RAW_EVENT_SCAN_BYTES = 64 * 1024;
 const MAX_STOP_STDOUT_BYTES = 1024 * 1024;
+const MAX_ROUTING_RECORD_BYTES = 4 * 1024;
 const CODEX_HOOK_EVENT_NAMES = new Set([
   'SessionStart',
   'PreToolUse',
@@ -144,35 +146,97 @@ function sanitizeLaunchId(value) {
   return String(value ?? '').trim().replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 128);
 }
 
-function resolveLaunchClaimPath(payload, launchId) {
+function resolveLaunchRoutingPath(payload, launchId) {
   const cwd = typeof payload.cwd === 'string' && payload.cwd.trim() ? payload.cwd : process.cwd();
   const stateRoot = typeof process.env.OMX_ROOT === 'string' && process.env.OMX_ROOT.trim()
     ? process.env.OMX_ROOT.trim()
     : join(cwd, '.omx');
-  return join(stateRoot, 'state', 'plugin-hook-launches', `${sanitizeLaunchId(launchId)}.json`);
+  return join(stateRoot, 'state', 'plugin-hook-routing', `${sanitizeLaunchId(launchId)}.json`);
 }
 
 function hookPayloadSessionId(input, payload) {
-  const parsedSessionId = typeof payload.session_id === 'string' ? payload.session_id.trim() : '';
+  const candidate = payload?.session_id ?? payload?.sessionId;
+  const parsedSessionId = typeof candidate === 'string' ? candidate.trim() : '';
   if (parsedSessionId) return parsedSessionId;
-  return extractTopLevelStringField(input.toString('utf8'), ['session_id', 'sessionId'])?.trim() ?? '';
+  return input && typeof input.toString === 'function'
+    ? extractTopLevelStringField(input.toString('utf8'), ['session_id', 'sessionId'])?.trim() ?? ''
+    : '';
 }
 
-function isOmxLauncherSession(input, payload) {
-  const launchId = process.env.OMX_CODEX_LAUNCH_ID?.trim();
+function isSafeRoutingSessionId(value) {
+  return typeof value === 'string' && value.length > 0 && value.length <= 256;
+}
+
+function isChildRoutingSessionStart(payload, ownerSessionId) {
+  if ((payload?.hook_event_name ?? payload?.hookEventName) !== 'SessionStart' || !ownerSessionId) return false;
+  const childSessionId = hookPayloadSessionId(null, payload);
+  const transcriptCandidate = payload?.transcript_path ?? payload?.transcriptPath;
+  const transcriptPath = typeof transcriptCandidate === 'string' ? transcriptCandidate.trim() : '';
+  if (!childSessionId || !transcriptPath) return false;
+  let fd;
+  try {
+    fd = openSync(transcriptPath, 'r');
+    const buffer = Buffer.alloc(64 * 1024);
+    const bytes = readSync(fd, buffer, 0, buffer.length, 0);
+    const newline = buffer.subarray(0, bytes).indexOf(0x0a);
+    const firstLine = buffer.subarray(0, newline >= 0 ? newline : bytes).toString('utf8').trim();
+    const record = JSON.parse(firstLine);
+    const metadata = record?.type === 'session_meta' && record?.payload && typeof record.payload === 'object' ? record.payload : null;
+    const spawn = metadata?.source?.subagent?.thread_spawn;
+    const metadataIds = [metadata?.id, metadata?.session_id].filter((value) => value !== undefined);
+    return metadataIds.length > 0
+      && metadataIds.every((value) => value === childSessionId)
+      && spawn && typeof spawn === 'object'
+      && spawn.parent_thread_id === ownerSessionId;
+  } catch {
+    return false;
+  } finally {
+    if (fd !== undefined) try { closeSync(fd); } catch {}
+  }
+}
+
+function readPinnedRoutingRecord(routingPath) {
+  let fd;
+  try {
+    const initial = lstatSync(routingPath);
+    if (!initial.isFile() || initial.isSymbolicLink() || initial.nlink !== 1 || initial.size <= 0 || initial.size > MAX_ROUTING_RECORD_BYTES) return null;
+    fd = openSync(routingPath, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+    const opened = fstatSync(fd);
+    if (!opened.isFile() || opened.nlink !== 1 || opened.size !== initial.size || opened.dev !== initial.dev || opened.ino !== initial.ino) return null;
+    const buffer = Buffer.alloc(opened.size);
+    if (readSync(fd, buffer, 0, buffer.length, 0) !== buffer.length) return null;
+    const current = lstatSync(routingPath);
+    const final = fstatSync(fd);
+    if (!current.isFile() || current.isSymbolicLink() || current.nlink !== 1 || current.size !== opened.size || current.dev !== opened.dev || current.ino !== opened.ino || final.nlink !== 1 || final.size !== opened.size) return null;
+    const routing = JSON.parse(buffer.toString('utf8'));
+    return routing && typeof routing === 'object' && !Array.isArray(routing) ? routing : null;
+  } catch {
+    return null;
+  } finally {
+    if (fd !== undefined) try { closeSync(fd); } catch {}
+  }
+}
+
+// This is routing correlation only. It is intentionally unauthenticated and must
+// never be used as authorization or proof that a session is OMX-owned.
+function isPluginHookRoutingSession(input, payload) {
+  const launchId = sanitizeLaunchId(process.env.OMX_CODEX_LAUNCH_ID);
   const entryPath = process.env.OMX_ENTRY_PATH?.trim();
   const sessionId = hookPayloadSessionId(input, payload);
-  if (!launchId || !entryPath || !sessionId) return false;
+  if (!launchId || !entryPath || !isSafeRoutingSessionId(sessionId)) return false;
 
-  const claimPath = resolveLaunchClaimPath(payload, launchId);
-
+  const routingPath = resolveLaunchRoutingPath(payload, launchId);
   try {
-    if (existsSync(claimPath)) {
-      const claimed = JSON.parse(readFileSync(claimPath, 'utf8'));
-      return claimed?.sessionId === sessionId;
+    if (existsSync(routingPath)) {
+      const routing = readPinnedRoutingRecord(routingPath);
+      if (!routing) return false;
+      const ownerSessionId = routing.routing === OMX_PLUGIN_HOOK_ROUTING_ONLY_MARKER && isSafeRoutingSessionId(routing.ownerSessionId)
+        ? routing.ownerSessionId
+        : '';
+      return ownerSessionId === sessionId || isChildRoutingSessionStart(payload, ownerSessionId);
     }
-    mkdirSync(dirname(claimPath), { recursive: true });
-    writeFileSync(claimPath, `${JSON.stringify({ sessionId })}\n`, { encoding: 'utf8', mode: 0o600 });
+    mkdirSync(dirname(routingPath), { recursive: true });
+    writeFileSync(routingPath, `${JSON.stringify({ routing: OMX_PLUGIN_HOOK_ROUTING_ONLY_MARKER, ownerSessionId: sessionId })}\n`, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
     return true;
   } catch {
     return false;
@@ -439,11 +503,11 @@ function parseSingleJsonObjectOutput(raw) {
 async function main() {
   const { input, oversized, totalBytes } = await readBoundedStdin({ drainOversized: true });
   const payload = parseHookPayload(input);
-  const launchedByOmx = isOmxLauncherSession(input, payload);
+  const routedByLaunchCorrelation = isPluginHookRoutingSession(input, payload);
   const isStop = detectStopHookInput(input);
   const isCompact = detectCompactHookInput(input);
 
-  if (!launchedByOmx) {
+  if (!routedByLaunchCorrelation) {
     writePlainCodexNoop(isStop);
     return;
   }

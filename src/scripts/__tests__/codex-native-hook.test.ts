@@ -41,6 +41,7 @@ import {
 	updateDetachedSessionMetadata,
 	writeSessionStart,
 } from "../../hooks/session.js";
+import { neutralizeOwnedRoutingRalplan } from '../../ralplan/documented-leader-preflight.js';
 import { resetTriageConfigCache } from "../../hooks/triage-config.js";
 import { executeStateOperation } from "../../state/operations.js";
 import { HUD_TMUX_HEIGHT_LINES } from "../../hud/constants.js";
@@ -61,14 +62,7 @@ import {
 import { getBaseStateDir } from "../../state/paths.js";
 import { maybeNudgeLeaderForAllowedWorkerStop } from "../notify-hook/team-worker-stop.js";
 import { MAX_NATIVE_STDIN_JSON_BYTES } from "../hook-payload-guard.js";
-import { readSubagentTrackingState, recordPendingRoleIntent } from "../../subagents/tracker.js";
-import { buildRoleIntentSpawnTaskName } from "../../leader/contract.js";
 
-import {
-	NATIVE_SUBAGENT_ROLE_ROUTING_MARKER_FILE,
-	readRoleRoutingMarker,
-	writeRoleRoutingMarker,
-} from "../../subagents/role-routing-marker.js";
 
 const ARGUMENT_PRODUCING_RUNTIME_DENIAL_COMMANDS = [
   ["node-xargs-wrapper-read", `printf x | xargs node -e "require('fs').readFileSync('src/victim.ts','utf8')"`],
@@ -3991,6 +3985,26 @@ PY`,
     }
   });
 
+  it('does not advertise a neutralized Ralplan seed in SessionStart context', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-native-hook-neutralized-ralplan-'));
+    const previousSessionId = process.env.OMX_SESSION_ID;
+    try {
+      const sessionId = 'neutralized-session';
+      await writeSessionStart(cwd, sessionId);
+      const directory = join(cwd, '.omx', 'state', 'sessions', sessionId);
+      await mkdir(directory, { recursive: true });
+      await writeFile(join(directory, 'ralplan-state.json'), JSON.stringify({ active: true, mode: 'ralplan', current_phase: 'planning', started_at: '2026-01-01T00:00:00.000Z', updated_at: '2026-01-01T00:00:00.000Z', session_id: sessionId }));
+      await writeFile(join(directory, 'skill-active-state.json'), JSON.stringify({ version: 1, active: true, skill: 'ralplan', keyword: '$RALPLAN', phase: 'planning', activated_at: '2026-01-01T00:00:00.000Z', updated_at: '2026-01-01T00:00:00.000Z', source: 'keyword-detector', session_id: sessionId, initialized_mode: 'ralplan', initialized_state_path: `.omx/state/sessions/${sessionId}/ralplan-state.json`, active_skills: [{ skill: 'ralplan', active: true, phase: 'planning', activated_at: '2026-01-01T00:00:00.000Z', updated_at: '2026-01-01T00:00:00.000Z', session_id: sessionId }] }));
+      process.env.OMX_SESSION_ID = sessionId;
+      assert.equal(await neutralizeOwnedRoutingRalplan(cwd), true);
+      const result = await dispatchCodexNativeHook({ hook_event_name: 'SessionStart', cwd, session_id: sessionId }, { cwd });
+      const context = String((result.outputJson as { hookSpecificOutput?: { additionalContext?: string } }).hookSpecificOutput?.additionalContext ?? '');
+      assert.doesNotMatch(context, /- ralplan phase:/);
+    } finally {
+      previousSessionId === undefined ? delete process.env.OMX_SESSION_ID : process.env.OMX_SESSION_ID = previousSessionId;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
   it("reconciles native SessionStart on Windows EPERM with one degraded-durability warning", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-session-start-windows-eperm-"));
     const originalWrite = process.stderr.write;
@@ -24974,7 +24988,7 @@ PY`,
     }
   });
 
-  it("does not block Stop after owner-session ralplan CLI completion writes to native canonical state", async () => {
+  it("blocks Stop release after owner-session ralplan CLI completion when only local lifecycle evidence is available", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-stop-ralplan-owner-alias-complete-"));
     const previousSessionId = process.env.OMX_SESSION_ID;
     try {
@@ -25056,8 +25070,16 @@ PY`,
         workingDirectory: cwd,
       });
 
-      assert.notEqual(writeResult.isError, true);
-      assert.equal(existsSync(join(stateDir, "sessions", ownerSessionId, "ralplan-state.json")), false);
+      assert.equal(writeResult.isError, true);
+      assert.match(
+        String((writeResult.payload as { error?: unknown }).error ?? ""),
+        /documented_host_consensus_receipt_unavailable/,
+      );
+      const preservedRalplan = JSON.parse(
+        await readFile(join(stateDir, "sessions", nativeSessionId, "ralplan-state.json"), "utf-8"),
+      ) as Record<string, unknown>;
+      assert.equal(preservedRalplan.active, true);
+      assert.equal(preservedRalplan.current_phase, "planning");
       const result = await dispatchCodexNativeHook(
         {
           hook_event_name: "Stop",
@@ -25068,7 +25090,15 @@ PY`,
       );
 
       assert.equal(result.omxEventName, "stop");
-      assert.equal(result.outputJson, null);
+      assert.equal(result.outputJson?.decision, "block");
+      assert.equal(
+        result.outputJson?.stopReason,
+        "skill_ralplan_planning_continue_artifact",
+      );
+      assert.match(
+        String(result.outputJson?.reason ?? ""),
+        /ralplan|planning/i,
+      );
     } finally {
       if (typeof previousSessionId === "string") process.env.OMX_SESSION_ID = previousSessionId;
       else delete process.env.OMX_SESSION_ID;
@@ -27805,7 +27835,6 @@ PY`,
             },
           },
         },
-        pending_role_intents: [],
       });
 
       const result = await dispatchCodexNativeHook(
@@ -33860,85 +33889,7 @@ describe("#3118 native role contract", () => {
 		}
 	}
 
-	type TaskNameCarrier = "thread_spawn" | "subagent" | "payload";
 
-	async function startUntypedNativeChild(
-		cwd: string,
-		input: {
-			childSessionId: string;
-			parentThreadId: string;
-			agentNickname?: string;
-			taskName?: string;
-			taskNameCarrier?: TaskNameCarrier;
-			taskNames?: Partial<Record<TaskNameCarrier, unknown>>;
-			camelTaskNames?: Partial<Record<TaskNameCarrier, unknown>>;
-		},
-	): Promise<void> {
-		const taskNameCarrier = input.taskNameCarrier ?? "payload";
-		const taskNameField = (carrier: TaskNameCarrier): Record<string, unknown> => {
-			if (input.taskNames && Object.prototype.hasOwnProperty.call(input.taskNames, carrier)) {
-				return { task_name: input.taskNames[carrier] };
-			}
-			return input.taskName && taskNameCarrier === carrier ? { task_name: input.taskName } : {};
-		};
-		const camelTaskNameField = (carrier: TaskNameCarrier): Record<string, unknown> => (
-			input.camelTaskNames && Object.prototype.hasOwnProperty.call(input.camelTaskNames, carrier)
-				? { taskName: input.camelTaskNames[carrier] }
-				: {}
-		);
-		const transcriptPath = join(cwd, `${input.childSessionId}-rollout.jsonl`);
-		await writeFile(
-			transcriptPath,
-			`${JSON.stringify({
-				type: "session_meta",
-				payload: {
-					id: input.childSessionId,
-					...taskNameField("payload"),
-					...camelTaskNameField("payload"),
-					source: {
-						subagent: {
-							...taskNameField("subagent"),
-							...camelTaskNameField("subagent"),
-							thread_spawn: {
-								parent_thread_id: input.parentThreadId,
-								depth: 1,
-								...taskNameField("thread_spawn"),
-								...camelTaskNameField("thread_spawn"),
-								...(input.agentNickname
-									? { agent_nickname: input.agentNickname }
-									: {}),
-							},
-						},
-					},
-				},
-			})}\n`,
-		);
-		await dispatchCodexNativeHook(
-			{
-				hook_event_name: "SessionStart",
-				cwd,
-				session_id: input.childSessionId,
-				transcript_path: transcriptPath,
-			},
-			{ cwd, sessionOwnerPid: process.pid },
-		);
-	}
-
-	async function readNativeRoleChild(
-		stateDir: string,
-		canonicalSessionId: string,
-		childSessionId: string,
-	): Promise<{ mode?: string; role?: string; provenance_kind?: string } | undefined> {
-		const tracking = JSON.parse(
-			await readFile(join(stateDir, "subagent-tracking.json"), "utf-8"),
-		) as {
-			sessions?: Record<
-				string,
-				{ threads?: Record<string, { mode?: string; role?: string; provenance_kind?: string }> }
-			>;
-		};
-		return tracking.sessions?.[canonicalSessionId]?.threads?.[childSessionId];
-	}
 
 
 	it("denies an unknown agent_type on collaboration.spawn_agent before dispatch (#3118)", async () => {
@@ -33996,182 +33947,6 @@ describe("#3118 native role contract", () => {
 		});
 	});
 
-	it("does not revive adapted roles from App task_name carriers or pending intents (#3118, #3194)", async () => {
-		for (const taskNameCarrier of ["thread_spawn", "subagent", "payload"] as const) {
-			await withIsolatedNativeRoleState(`adapted-disabled-${taskNameCarrier}`, async (cwd, stateDir) => {
-				const canonicalSessionId = `sess-3194-adapted-disabled-${taskNameCarrier}`;
-				const parentThreadId = `thread-3194-adapted-parent-${taskNameCarrier}`;
-				const childSessionId = `thread-3194-adapted-child-${taskNameCarrier}`;
-				const correlationToken = "11111111111111111111111100003194";
-				await mkdir(join(stateDir, "sessions", canonicalSessionId), { recursive: true });
-				await writeSessionStart(cwd, canonicalSessionId, { nativeSessionId: parentThreadId });
-				assert.equal(recordPendingRoleIntent(cwd, {
-					role: "architect",
-					sessionId: canonicalSessionId,
-					parentThreadId,
-					correlationToken,
-				}).ok, true);
-
-				await startUntypedNativeChild(cwd, {
-					childSessionId,
-					parentThreadId,
-					taskName: buildRoleIntentSpawnTaskName(correlationToken),
-					taskNameCarrier,
-				});
-
-				const child = await readNativeRoleChild(stateDir, canonicalSessionId, childSessionId);
-				assert.equal(child?.role, undefined, taskNameCarrier);
-				assert.equal(child?.provenance_kind, undefined, taskNameCarrier);
-				assert.equal((await readSubagentTrackingState(cwd)).pending_role_intents.length, 1, taskNameCarrier);
-				assert.equal(existsSync(join(stateDir, NATIVE_SUBAGENT_ROLE_ROUTING_MARKER_FILE)), false, taskNameCarrier);
-			});
-		}
-	});
-
-	it("fails closed on a present non-marker task_name without falling back to agent_nickname (#3118)", async () => {
-		await withIsolatedNativeRoleState("unbound-task-name-mismatch", async (cwd, stateDir) => {
-			const canonicalSessionId = "sess-3118-unbound-task-name-mismatch";
-			const parentThreadId = "thread-3118-unbound-task-name-mismatch-parent";
-			const childSessionId = "thread-3118-unbound-task-name-mismatch-child";
-			const correlationToken = "55555555555555555555555500003118";
-			await mkdir(join(stateDir, "sessions", canonicalSessionId), { recursive: true });
-			await writeSessionStart(cwd, canonicalSessionId, { nativeSessionId: parentThreadId });
-			assert.equal(
-				recordPendingRoleIntent(cwd, {
-					role: "architect",
-					sessionId: canonicalSessionId,
-					parentThreadId,
-					correlationToken,
-				}).ok,
-				true,
-			);
-
-			await startUntypedNativeChild(cwd, {
-				childSessionId,
-				parentThreadId,
-				taskName: "not_a_marker",
-				agentNickname: buildRoleIntentSpawnTaskName(correlationToken),
-			});
-
-			const child = await readNativeRoleChild(stateDir, canonicalSessionId, childSessionId);
-			assert.equal(child?.mode, undefined);
-			assert.equal(child?.role, undefined);
-			assert.equal(child?.provenance_kind, undefined);
-			assert.equal(existsSync(join(stateDir, NATIVE_SUBAGENT_ROLE_ROUTING_MARKER_FILE)), false);
-			assert.equal(
-				readRoleRoutingMarker(stateDir, { cwd, sessionId: canonicalSessionId, parentThreadId }),
-				null,
-			);
-			assert.equal(
-				(await readSubagentTrackingState(cwd)).pending_role_intents[0]?.correlation_token,
-				correlationToken,
-			);
-		});
-	});
-
-	it("leaves an unmarked App child untyped and unconsumed without first-arrival binding (#3118)", async () => {
-		await withIsolatedNativeRoleState("unbound-no-app-marker", async (cwd, stateDir) => {
-			const canonicalSessionId = "sess-3118-unbound-no-app-marker";
-			const parentThreadId = "thread-3118-unbound-no-app-marker-parent";
-			const childSessionId = "thread-3118-unbound-no-app-marker-child";
-			const correlationToken = "66666666666666666666666600003118";
-			await mkdir(join(stateDir, "sessions", canonicalSessionId), { recursive: true });
-			await writeSessionStart(cwd, canonicalSessionId, { nativeSessionId: parentThreadId });
-			assert.equal(
-				recordPendingRoleIntent(cwd, {
-					role: "architect",
-					sessionId: canonicalSessionId,
-					parentThreadId,
-					correlationToken,
-				}).ok,
-				true,
-			);
-
-			await startUntypedNativeChild(cwd, { childSessionId, parentThreadId });
-
-			const child = await readNativeRoleChild(stateDir, canonicalSessionId, childSessionId);
-			assert.equal(child?.mode, undefined);
-			assert.equal(child?.role, undefined);
-			assert.equal(child?.provenance_kind, undefined);
-			assert.equal(existsSync(join(stateDir, NATIVE_SUBAGENT_ROLE_ROUTING_MARKER_FILE)), false);
-			assert.equal(
-				readRoleRoutingMarker(stateDir, { cwd, sessionId: canonicalSessionId, parentThreadId }),
-				null,
-			);
-			assert.equal(
-				(await readSubagentTrackingState(cwd)).pending_role_intents[0]?.correlation_token,
-				correlationToken,
-			);
-		});
-	});
-
-	it("does not authenticate an agent_nickname role-intent marker without task_name (#3118)", async () => {
-		await withIsolatedNativeRoleState("adapted-agent-nickname-fallback", async (cwd, stateDir) => {
-			const canonicalSessionId = "sess-3118-adapted-agent-nickname-fallback";
-			const parentThreadId = "thread-3118-adapted-agent-nickname-fallback-parent";
-			const childSessionId = "thread-3118-adapted-agent-nickname-fallback-child";
-			const correlationToken = "77777777777777777777777700003118";
-			await mkdir(join(stateDir, "sessions", canonicalSessionId), { recursive: true });
-			await writeSessionStart(cwd, canonicalSessionId, { nativeSessionId: parentThreadId });
-			assert.equal(
-				recordPendingRoleIntent(cwd, {
-					role: "architect",
-					sessionId: canonicalSessionId,
-					parentThreadId,
-					correlationToken,
-				}).ok,
-				true,
-			);
-
-			await startUntypedNativeChild(cwd, {
-				childSessionId,
-				parentThreadId,
-				agentNickname: buildRoleIntentSpawnTaskName(correlationToken),
-			});
-
-			const child = await readNativeRoleChild(stateDir, canonicalSessionId, childSessionId);
-			assert.equal(child?.mode, undefined);
-			assert.equal(child?.role, undefined);
-			assert.equal(child?.provenance_kind, undefined);
-			assert.equal(existsSync(join(stateDir, NATIVE_SUBAGENT_ROLE_ROUTING_MARKER_FILE)), false);
-			assert.equal(readRoleRoutingMarker(stateDir, { cwd, sessionId: canonicalSessionId, parentThreadId }), null);
-			assert.equal(
-				(await readSubagentTrackingState(cwd)).pending_role_intents[0]?.correlation_token,
-				correlationToken,
-			);
-		});
-	});
-
-	it("does not authenticate a camelCase taskName role-intent marker without task_name (#3118)", async () => {
-		await withIsolatedNativeRoleState("adapted-camel-task-name", async (cwd, stateDir) => {
-			const canonicalSessionId = "sess-3118-adapted-camel-task-name";
-			const parentThreadId = "thread-3118-adapted-camel-task-name-parent";
-			const childSessionId = "thread-3118-adapted-camel-task-name-child";
-			const correlationToken = "88888888888888888888888800003118";
-			await mkdir(join(stateDir, "sessions", canonicalSessionId), { recursive: true });
-			await writeSessionStart(cwd, canonicalSessionId, { nativeSessionId: parentThreadId });
-			assert.equal(recordPendingRoleIntent(cwd, {
-				role: "architect",
-				sessionId: canonicalSessionId,
-				parentThreadId,
-				correlationToken,
-			}).ok, true);
-
-			await startUntypedNativeChild(cwd, {
-				childSessionId,
-				parentThreadId,
-				camelTaskNames: { thread_spawn: buildRoleIntentSpawnTaskName(correlationToken) },
-			});
-
-			const child = await readNativeRoleChild(stateDir, canonicalSessionId, childSessionId);
-			assert.equal(child?.mode, undefined);
-			assert.equal(child?.role, undefined);
-			assert.equal(child?.provenance_kind, undefined);
-			assert.equal(existsSync(join(stateDir, NATIVE_SUBAGENT_ROLE_ROUTING_MARKER_FILE)), false);
-			assert.equal(readRoleRoutingMarker(stateDir, { cwd, sessionId: canonicalSessionId, parentThreadId }), null);
-			assert.equal((await readSubagentTrackingState(cwd)).pending_role_intents[0]?.correlation_token, correlationToken);
-		});
-	});
 });
 
 // ---------------------------------------------------------------------------
@@ -35798,6 +35573,54 @@ describe('native UserPromptSubmit payload provenance', () => {
       await rm(cwd, { recursive: true, force: true });
     }
   });
+
+	it("denies canonical adapted role intent before hostile pointer states for raw and compiled hooks", async () => {
+		const expected = {
+			hookSpecificOutput: {
+				hookEventName: "PreToolUse",
+				permissionDecision: "deny",
+				permissionDecisionReason: "unsupported_documented_leader_proof: Codex 0.144.5 hooks do not expose documented root identity required for adapted Ralplan.",
+			},
+		};
+		const payload = {
+			hook_event_name: "PreToolUse",
+			tool_name: "Bash",
+			tool_use_id: "hostile-pointer-role-intent",
+			tool_input: { command: 'omx ralplan role-intent write --role architect --parent-thread "$CODEX_THREAD_ID" --json' },
+		};
+		const cases: Array<[string, (stateDir: string, pointerPath: string, cwd: string) => Promise<void>]> = [
+			["malformed", async (_stateDir, pointerPath) => { await writeFile(pointerPath, "{", "utf8"); }],
+			["oversized", async (_stateDir, pointerPath) => { await writeFile(pointerPath, "x".repeat(2 * 1024 * 1024), "utf8"); }],
+			["unreadable", async (_stateDir, pointerPath) => { await mkdir(pointerPath); }],
+			["symlink", async (_stateDir, pointerPath, cwd) => {
+				const targetPath = join(cwd, "forged-session.json");
+				await writeFile(targetPath, '{"session_id":"forged"}', "utf8");
+				await symlink(targetPath, pointerPath);
+			}],
+			["replaced", async (_stateDir, pointerPath) => {
+				await writeFile(pointerPath, '{"session_id":"first"}', "utf8");
+				await rm(pointerPath);
+				await writeFile(pointerPath, '{"session_id":"replacement"}', "utf8");
+			}],
+		];
+		for (const [name, setup] of cases) {
+			const cwd = await mkdtemp(join(tmpdir(), `omx-native-hook-role-intent-${name}-`));
+			try {
+				const stateDir = join(cwd, ".omx", "state");
+				const pointerPath = join(stateDir, "session.json");
+				await mkdir(stateDir, { recursive: true });
+				await setup(stateDir, pointerPath, cwd);
+				const raw = await dispatchCodexNativeHook({ ...payload, cwd }, { cwd });
+				assert.deepEqual(raw.outputJson, expected, `${name} raw`);
+				assert.deepEqual((await readdir(stateDir)).sort(), ["session.json"], `${name} raw writes`);
+				const compiled = parseSingleJsonStdout(runNativeHookCli({ ...payload, cwd }, { cwd }));
+				assert.deepEqual(compiled, expected, `${name} compiled`);
+				assert.deepEqual((await readdir(stateDir)).sort(), ["session.json"], `${name} compiled writes`);
+			} finally {
+				await rm(cwd, { recursive: true, force: true });
+			}
+		}
+	});
 });
 
 describe("native Team notice ledger reconciliation", () => {

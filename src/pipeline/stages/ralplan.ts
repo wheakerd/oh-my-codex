@@ -17,6 +17,7 @@ import {
   buildRalplanConsensusGateForCwd,
   buildRalplanConsensusGateFromSources,
   hasDurableRalplanConsensusEvidenceForCwd,
+  type RalplanConsensusBlockedReason,
   type RalplanConsensusGateEvidence,
 } from '../../ralplan/consensus-gate.js';
 
@@ -74,6 +75,7 @@ export function createRalplanStage(options: CreateRalplanStageOptions = {}): Pip
           return {
             status: runtimeResult.status === 'completed' && consensusComplete ? 'completed' : 'failed',
             artifacts: {
+              ...runtimeResult.artifacts,
               plansDir: planningArtifacts.plansDir,
               specsDir: planningArtifacts.specsDir,
               task: ctx.task,
@@ -89,10 +91,9 @@ export function createRalplanStage(options: CreateRalplanStageOptions = {}): Pip
               architectReviews: runtimeResult.architectReviews,
               criticReviews: runtimeResult.criticReviews,
               ralplanConsensusGate: consensusGate,
-              ...runtimeResult.artifacts,
             },
             duration_ms: Date.now() - startTime,
-            error: runtimeResult.error ?? (consensusComplete ? undefined : 'ralplan_consensus_evidence_missing'),
+            error: runtimeResult.error ?? (consensusComplete ? undefined : consensusGate.blockedReason ?? 'ralplan_consensus_evidence_missing'),
           };
         }
 
@@ -108,11 +109,12 @@ export function createRalplanStage(options: CreateRalplanStageOptions = {}): Pip
         const completed = planningComplete && consensusComplete;
         const error = completed
           ? undefined
-          : consensusComplete && !planningComplete
-            ? 'ralplan_planning_artifacts_missing_after_consensus'
-            : planningComplete && !consensusComplete
-              ? 'ralplan_consensus_evidence_missing'
-              : 'ralplan_planning_artifacts_missing';
+          : consensusGate.blockedReason
+            ?? (consensusComplete && !planningComplete
+              ? 'ralplan_planning_artifacts_missing_after_consensus'
+              : planningComplete && !consensusComplete
+                ? 'ralplan_consensus_evidence_missing'
+                : 'ralplan_planning_artifacts_missing');
 
         return {
           status: completed ? 'completed' : 'failed',
@@ -128,7 +130,7 @@ export function createRalplanStage(options: CreateRalplanStageOptions = {}): Pip
             ralplanConsensusGate: consensusGate,
             instruction: consensusComplete
               ? `Run RALPLAN consensus planning for: ${ctx.task}`
-              : `Remain in RALPLAN for: ${ctx.task}. Do not hand off to execution until durable Architect approval followed by Critic approval is recorded in ralplan state or handoff artifacts.`,
+              : `Remain in RALPLAN for: ${ctx.task}. Architect and Critic reviews are lifecycle evidence only; do not hand off to execution until an official host-issued receipt is verified through the documented non-user-mintable host surface. Until then record documented_host_consensus_receipt_unavailable.`,
           },
           duration_ms: Date.now() - startTime,
           error,
@@ -152,6 +154,9 @@ function buildRalplanConsensusGate(runtimeResult: {
   architectReviews: unknown[];
   criticReviews: unknown[];
 }, ctx: StageContext, requireNativeSubagents?: boolean): RalplanConsensusGateEvidence {
+  const runtimeGate = runtimeConsensusGateDiagnostic(runtimeResult.ralplanConsensusGate);
+  if (runtimeGate) return runtimeGate;
+
   return buildRalplanConsensusGateFromSources([{
     source: 'runtime-result',
     value: runtimeResult,
@@ -160,6 +165,32 @@ function buildRalplanConsensusGate(runtimeResult: {
     sessionId: ctx.sessionId,
     requireNativeSubagents,
   });
+}
+
+function runtimeConsensusGateDiagnostic(value: unknown): RalplanConsensusGateEvidence | null {
+  if (!value || typeof value !== 'object') return null;
+
+  const gate = value as Record<string, unknown>;
+  const blockedReason = gate.blocked_reason ?? gate.blockedReason;
+  if (typeof blockedReason !== 'string') return null;
+
+  const blockedDetailsValue = gate.blocked_details ?? gate.blockedDetails;
+  const blockedDetails = Array.isArray(blockedDetailsValue)
+    ? blockedDetailsValue.filter((detail): detail is string => typeof detail === 'string')
+    : [];
+  return {
+    complete: false,
+    sequence: ['architect-review', 'critic-review'],
+    ralplan_architect_review: asRecord(gate.ralplan_architect_review ?? gate.architect_review),
+    ralplan_critic_review: asRecord(gate.ralplan_critic_review ?? gate.critic_review),
+    source: 'runtime-result',
+    blockedReason: blockedReason as RalplanConsensusBlockedReason,
+    ...(blockedDetails.length > 0 ? { blockedDetails } : {}),
+  };
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' ? value as Record<string, unknown> : null;
 }
 
 function hasDurableRalplanConsensusEvidence(

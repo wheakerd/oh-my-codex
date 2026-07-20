@@ -10,7 +10,7 @@
  * - Non-clean review artifacts can drive a return to ralplan
  */
 
-import { startMode, readModeState, updateModeState, cancelMode } from '../modes/base.js';
+import { startMode, readModeState, updateAutopilotPipelineState, cancelMode } from '../modes/base.js';
 import { createDeepInterviewStage } from './stages/deep-interview.js';
 import { createRalplanStage } from './stages/ralplan.js';
 import { createUltragoalStage } from './stages/ultragoal.js';
@@ -27,6 +27,7 @@ import type {
 } from './types.js';
 
 const MODE_NAME = 'autopilot' as const;
+const DOCUMENTED_HOST_CONSENSUS_RECEIPT_UNAVAILABLE = 'documented_host_consensus_receipt_unavailable';
 
 // ---------------------------------------------------------------------------
 // Pipeline orchestrator
@@ -75,7 +76,7 @@ export async function runPipeline(config: PipelineConfig): Promise<PipelineResul
     },
   };
 
-  await updateModeState(MODE_NAME, {
+  await updateAutopilotPipelineState({
     ...modeState,
     ...pipelineExtension,
     current_phase: config.stages[0].name,
@@ -109,14 +110,19 @@ export async function runPipeline(config: PipelineConfig): Promise<PipelineResul
     // Check if stage should be skipped
     if (stage.canSkip?.(ctx)) {
       let skippedArtifacts: Record<string, unknown> = {};
+      let skippedError: string | undefined;
       if (stage.name === 'ralplan') {
-        const materialized = await stage.run(ctx);
+        const materialized = enforceRalplanHostReceiptBlocker(await stage.run(ctx), stage.name);
         skippedArtifacts = materialized.artifacts;
+        if (isRalplanHostReceiptBlocked(stage.name, skippedArtifacts)) {
+          skippedError = materialized.error;
+        }
       }
       const skippedResult: StageResult = {
-        status: 'skipped',
+        status: skippedError ? 'failed' : 'skipped',
         artifacts: skippedArtifacts,
         duration_ms: 0,
+        ...(skippedError ? { error: skippedError } : {}),
       };
       stageResults[stage.name] = skippedResult;
       if (Object.keys(skippedArtifacts).length > 0) {
@@ -124,12 +130,30 @@ export async function runPipeline(config: PipelineConfig): Promise<PipelineResul
         Object.assign(handoffArtifactsByStage, { [stage.name]: skippedArtifacts });
       }
 
-      await updateModeState(MODE_NAME, {
+      await updateAutopilotPipelineState({
         current_phase: `${stage.name}:skipped`,
         pipeline_stage_index: i,
         pipeline_stage_results: { ...stageResults },
         handoff_artifacts: normalizeHandoffArtifactKeys(handoffArtifactsByStage),
-      } as Partial<PipelineModeStateExtension>, cwd, undefined, { trustedPipelineProgress: true });
+      } as Partial<PipelineModeStateExtension>, cwd);
+
+      if (skippedError) {
+        const duration_ms = Date.now() - startTime;
+        await updateAutopilotPipelineState({
+          active: false,
+          current_phase: 'failed',
+          completed_at: new Date().toISOString(),
+          error: skippedError,
+        }, cwd);
+        return {
+          status: 'failed',
+          stageResults,
+          duration_ms,
+          artifacts,
+          error: skippedError,
+          failedStage: stage.name,
+        };
+      }
 
       lastStageName = stage.name;
       previousResult = skippedResult;
@@ -137,11 +161,11 @@ export async function runPipeline(config: PipelineConfig): Promise<PipelineResul
     }
 
     // Update state to running
-    await updateModeState(MODE_NAME, {
+    await updateAutopilotPipelineState({
       current_phase: stage.name,
       pipeline_stage_index: i,
       iteration: i + 1,
-    } as Partial<PipelineModeStateExtension>, cwd, undefined, { trustedPipelineProgress: true });
+    } as Partial<PipelineModeStateExtension>, cwd);
 
     // Execute the stage
     let result: StageResult;
@@ -156,6 +180,8 @@ export async function runPipeline(config: PipelineConfig): Promise<PipelineResul
         error: `Stage ${stage.name} threw: ${errorMsg}`,
       };
     }
+
+    result = enforceRalplanHostReceiptBlocker(result, stage.name);
 
     stageResults[stage.name] = result;
 
@@ -197,7 +223,7 @@ export async function runPipeline(config: PipelineConfig): Promise<PipelineResul
     const handoffArtifacts = normalizeHandoffArtifactKeys(handoffArtifactsByStage);
 
     // Persist stage result
-    await updateModeState(MODE_NAME, {
+    await updateAutopilotPipelineState({
       current_phase: shouldReturnToRalplan ? 'ralplan' : (result.status === 'completed' ? stage.name : `${stage.name}:${result.status}`),
       handoff_artifacts: handoffArtifacts,
       ...(stage.name === 'code-review' ? {
@@ -212,13 +238,13 @@ export async function runPipeline(config: PipelineConfig): Promise<PipelineResul
       } : {}),
       pipeline_stage_index: shouldReturnToRalplan ? findStageIndex(config.stages, 'ralplan') : i,
       pipeline_stage_results: { ...stageResults },
-    } as Partial<PipelineModeStateExtension>, cwd, undefined, { trustedPipelineProgress: true });
+    } as Partial<PipelineModeStateExtension>, cwd);
 
     // Bail on failure
     if (result.status === 'failed') {
       const duration_ms = Date.now() - startTime;
 
-      await updateModeState(MODE_NAME, {
+      await updateAutopilotPipelineState({
         active: false,
         current_phase: 'failed',
         completed_at: new Date().toISOString(),
@@ -242,7 +268,7 @@ export async function runPipeline(config: PipelineConfig): Promise<PipelineResul
           : `Autopilot quality gates were not clean after ${reviewCycle} cycle(s).`;
         const duration_ms = Date.now() - startTime;
 
-        await updateModeState(MODE_NAME, {
+        await updateAutopilotPipelineState({
           active: false,
           current_phase: 'failed',
           completed_at: new Date().toISOString(),
@@ -275,7 +301,7 @@ export async function runPipeline(config: PipelineConfig): Promise<PipelineResul
   // All stages completed
   const duration_ms = Date.now() - startTime;
 
-  await updateModeState(MODE_NAME, {
+  await updateAutopilotPipelineState({
     active: false,
     current_phase: 'complete',
     completed_at: new Date().toISOString(),
@@ -284,7 +310,7 @@ export async function runPipeline(config: PipelineConfig): Promise<PipelineResul
     return_to_ralplan_reason: null,
     handoff_artifacts: normalizeHandoffArtifactKeys(handoffArtifactsByStage),
     pipeline_stage_results: { ...stageResults },
-  } as Partial<PipelineModeStateExtension>, cwd, undefined, { trustedPipelineProgress: true });
+  } as Partial<PipelineModeStateExtension>, cwd);
 
   return {
     status: 'completed',
@@ -360,6 +386,32 @@ function normalizeHandoffArtifactKeys(artifacts: Record<string, unknown>): Recor
     }
   }
   return normalized;
+}
+
+function isRalplanHostReceiptBlocked(stageName: string, artifacts: Record<string, unknown>): boolean {
+  if (stageName !== 'ralplan') return false;
+  const gate = artifacts.ralplanConsensusGate ?? artifacts.ralplan_consensus_gate;
+  if (!gate || typeof gate !== 'object') return false;
+
+  const gateRecord = gate as Record<string, unknown>;
+  return gateRecord.blockedReason === 'documented_host_consensus_receipt_unavailable'
+    || gateRecord.blocked_reason === 'documented_host_consensus_receipt_unavailable';
+}
+function enforceRalplanHostReceiptBlocker(result: StageResult, stageName: string): StageResult {
+  if (!isRalplanHostReceiptBlocked(stageName, result.artifacts)) return result;
+  const previousError = result.error;
+  const artifacts = previousError && previousError !== DOCUMENTED_HOST_CONSENSUS_RECEIPT_UNAVAILABLE
+    ? {
+      ...result.artifacts,
+      documented_host_consensus_receipt_diagnostic: { prior_error: previousError },
+    }
+    : result.artifacts;
+  return {
+    ...result,
+    status: 'failed',
+    artifacts,
+    error: DOCUMENTED_HOST_CONSENSUS_RECEIPT_UNAVAILABLE,
+  };
 }
 
 function toHandoffArtifactKey(stageName: string): string {

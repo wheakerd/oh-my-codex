@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { chmod, cp, mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, cp, link, mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { delimiter, dirname, join, relative, sep } from 'node:path';
 import { buildMergedConfig } from '../../config/generator.js';
@@ -176,7 +176,9 @@ async function assertSyncPluginCheckRejectsLauncherWithoutContract(): Promise<vo
     const launcher = await readFile(fixtureHookLauncherPath, 'utf-8');
     await writeFile(
       fixtureHookLauncherPath,
-      launcher.replace('omx-plugin-hook-launcher:v1', 'omx-plugin-hook-launcher:missing'),
+      launcher
+        .replace('omx-plugin-hook-launcher:v1', 'omx-plugin-hook-launcher:missing')
+        .replace("import { spawn } from 'node:child_process';", "import { createHmac } from 'node:crypto';\nimport { spawn } from 'node:child_process';"),
       'utf-8',
     );
 
@@ -192,6 +194,7 @@ async function assertSyncPluginCheckRejectsLauncherWithoutContract(): Promise<vo
     assert.notEqual(result.status, 0, 'sync-plugin-mirror --check should reject launcher contract drift');
     assert.match(result.stderr, /plugin_bundle_metadata_out_of_sync/);
     assert.match(result.stderr, /kind=hook-launcher/);
+    assert.match(result.stderr, /prohibitedMarkers/);
   } finally {
     await rm(fixtureRoot, { recursive: true, force: true });
   }
@@ -599,6 +602,7 @@ describe('official Codex plugin layout', () => {
         OMX_ENTRY_PATH: omxBin,
         OMX_CODEX_LAUNCH_ID: 'inherited-launch-token',
         OMX_NATIVE_HOOK_COMMAND: commandPath,
+        CODEX_HOME: join(cacheRoot, 'codex-home'),
       };
       const owner = runPluginNativeHook(
         cachePluginRoot,
@@ -613,6 +617,12 @@ describe('official Codex plugin layout', () => {
 
       assert.equal(owner.status, 0, owner.stderr || owner.stdout);
       assert.equal((await readFile(calledPath, 'utf-8')).trim(), 'codex-native-hook');
+      const routingPath = join(cacheRoot, '.omx-root', 'state', 'plugin-hook-routing', 'inherited-launch-token.json');
+      assert.deepEqual(JSON.parse(await readFile(routingPath, 'utf-8')), {
+        routing: 'omx-plugin-hook-routing-only:v1',
+        ownerSessionId: 'owner-codex-session',
+      });
+      await assert.rejects(readFile(join(cacheRoot, 'codex-home', '.omx', 'native-anchor-auth.key'), 'utf-8'), { code: 'ENOENT' });
       await rm(calledPath, { force: true });
 
       const nestedPlainCodex = runPluginNativeHook(
@@ -629,6 +639,27 @@ describe('official Codex plugin layout', () => {
       assert.equal(nestedPlainCodex.status, 0, nestedPlainCodex.stderr || nestedPlainCodex.stdout);
       assert.equal(nestedPlainCodex.stdout, '');
       await assert.rejects(readFile(calledPath, 'utf-8'), { code: 'ENOENT' });
+      const childTranscriptPath = join(cacheRoot, 'child-transcript.jsonl');
+      await writeFile(childTranscriptPath, `${JSON.stringify({
+        type: 'session_meta',
+        payload: {
+          id: 'child-codex-session',
+          session_id: 'child-codex-session',
+          source: { subagent: { thread_spawn: { parent_thread_id: 'owner-codex-session' } } },
+        },
+      })}\n`, 'utf-8');
+      const child = runPluginNativeHook(
+        cachePluginRoot,
+        JSON.stringify({
+          hook_event_name: 'SessionStart',
+          session_id: 'child-codex-session',
+          transcript_path: childTranscriptPath,
+        }),
+        inheritedEnv,
+      );
+      assert.equal(child.status, 0, child.stderr || child.stdout);
+      assert.equal((await readFile(calledPath, 'utf-8')).trim(), 'codex-native-hook');
+      await rm(calledPath, { force: true });
       for (const eventName of ['PreToolUse', 'PostToolUse'] as const) {
         const result = runPluginNativeHook(
           cachePluginRoot,
@@ -639,6 +670,50 @@ describe('official Codex plugin layout', () => {
         assert.equal(result.stdout, '');
         await assert.rejects(readFile(calledPath, 'utf-8'), { code: 'ENOENT' });
       }
+    });
+  });
+
+  it('rejects unsafe plugin routing records without delegating and keeps Stop schema-safe', async () => {
+    await withPluginCacheCopy(async (cachePluginRoot, cacheRoot) => {
+      const calledPath = join(cacheRoot, 'called.txt');
+      const commandPath = join(cacheRoot, 'record-called.sh');
+      await writeFile(commandPath, `#!/bin/sh\necho called > ${JSON.stringify(calledPath)}\nprintf '{}\\n'\n`, 'utf-8');
+      await chmod(commandPath, 0o755);
+      const routingDir = join(cacheRoot, '.omx-root', 'state', 'plugin-hook-routing');
+      const routingPath = join(routingDir, 'unsafe-routing.json');
+      const targetPath = join(cacheRoot, 'routing-target.json');
+      const environment = {
+        OMX_ROOT: join(cacheRoot, '.omx-root'),
+        OMX_ENTRY_PATH: omxBin,
+        OMX_CODEX_LAUNCH_ID: 'unsafe-routing',
+        OMX_NATIVE_HOOK_COMMAND: commandPath,
+      };
+      const validRecord = JSON.stringify({ routing: 'omx-plugin-hook-routing-only:v1', ownerSessionId: 'owner-session' });
+      await mkdir(routingDir, { recursive: true });
+      await writeFile(targetPath, validRecord, 'utf-8');
+
+      const cases: Array<[string, () => Promise<void>]> = [
+        ['malformed', async () => { await writeFile(routingPath, '{', 'utf-8'); }],
+        ['oversized', async () => { await writeFile(routingPath, 'x'.repeat(4097), 'utf-8'); }],
+        ['symlink', async () => { await symlink(targetPath, routingPath); }],
+        ['hardlink', async () => { await link(targetPath, routingPath); }],
+        ['replacement', async () => { await writeFile(routingPath, JSON.stringify({ routing: 'omx-plugin-hook-routing-only:v1', ownerSessionId: 'replacement-session' }), 'utf-8'); }],
+      ];
+      for (const [name, setup] of cases) {
+        await rm(routingPath, { force: true });
+        await setup();
+        const result = runPluginNativeHook(cachePluginRoot, JSON.stringify({ hook_event_name: 'UserPromptSubmit', session_id: 'owner-session' }), environment);
+        assert.equal(result.status, 0, `${name}: ${result.stderr || result.stdout}`);
+        assert.equal(result.stdout, '', name);
+        await assert.rejects(readFile(calledPath, 'utf-8'), { code: 'ENOENT' }, name);
+      }
+
+      await rm(routingPath, { force: true });
+      await writeFile(routingPath, '{', 'utf-8');
+      const stop = runPluginNativeHook(cachePluginRoot, JSON.stringify({ hook_event_name: 'Stop', session_id: 'owner-session' }), environment);
+      assert.equal(stop.status, 0, stop.stderr || stop.stdout);
+      assert.deepEqual(parseSingleJsonStdout(stop.stdout), {});
+      await assert.rejects(readFile(calledPath, 'utf-8'), { code: 'ENOENT' });
     });
   });
 

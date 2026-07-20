@@ -29,6 +29,7 @@ import {
   resolveWritableStateScope,
 } from '../mcp/state-paths.js';
 import { completeRalplanSession, validateRalplanTerminalConsensus } from '../state/operations.js';
+import { readNeutralizedRoutingOverlay } from '../ralplan/documented-leader-preflight.js';
 
 
 export interface ModeState {
@@ -50,10 +51,6 @@ export type ModeName = 'autopilot' | 'autoresearch' | 'deep-interview' | 'ralph'
 
 /** @deprecated These mode names were removed in v4.6. Use the canonical modes instead. */
 export type DeprecatedModeName = 'ultrapilot' | 'pipeline' | 'ecomode';
-
-export interface UpdateModeStateOptions {
-  trustedPipelineProgress?: boolean;
-}
 
 const DEPRECATED_MODES: Record<DeprecatedModeName, string> = {
   ultrapilot: 'Use "team" instead. ultrapilot has been merged into team mode.',
@@ -92,6 +89,16 @@ function isNextAutopilotPhase(
   const currentOrder = autopilotPhaseOrder(currentPhase);
   const nextOrder = autopilotPhaseOrder(nextPhase);
   return currentOrder >= 0 && nextOrder === currentOrder + 1;
+}
+
+function assertAutopilotRalplanUltragoalGate(
+  currentState: Record<string, unknown>,
+  nextState: Record<string, unknown>,
+  cwd: string,
+  sessionId: string | undefined,
+): void {
+  const gate = canAdvanceAutopilotRalplanToUltragoal({ cwd, sessionId, currentState, nextState });
+  if (!gate.allowed) throw new Error(buildAutopilotRalplanUltragoalGateError(gate));
 }
 
 /**
@@ -219,7 +226,12 @@ async function readModeStateFromPaths(paths: string[]): Promise<ModeState | null
   for (const path of paths) {
     if (!existsSync(path)) continue;
     try {
-      return JSON.parse(await readFile(path, 'utf-8'));
+      const canonical = JSON.parse(await readFile(path, 'utf-8')) as ModeState;
+      if (canonical.mode === 'ralplan') {
+        const overlay = await readNeutralizedRoutingOverlay(path, 'ralplan');
+        if (overlay) return overlay as ModeState;
+      }
+      return canonical;
     } catch {
       return null;
     }
@@ -280,7 +292,25 @@ export async function updateModeState(
   updates: Partial<ModeState>,
   projectRoot?: string,
   explicitSessionId?: string,
-  options: UpdateModeStateOptions = {},
+): Promise<ModeState> {
+  return updateModeStateInternal(mode, updates, projectRoot, explicitSessionId, false);
+}
+
+/** Persists Autopilot pipeline bookkeeping while enforcing the ralplan-to-ultragoal gate. */
+export async function updateAutopilotPipelineState(
+  updates: Partial<ModeState>,
+  projectRoot?: string,
+  explicitSessionId?: string,
+): Promise<ModeState> {
+  return updateModeStateInternal('autopilot', updates, projectRoot, explicitSessionId, true);
+}
+
+async function updateModeStateInternal(
+  mode: string,
+  updates: Partial<ModeState>,
+  projectRoot: string | undefined,
+  explicitSessionId: string | undefined,
+  pipelineProgressWrite: boolean,
 ): Promise<ModeState> {
   const scope = await resolveWritableStateScope(projectRoot, explicitSessionId);
   const baseStateDir = getBaseStateDir(projectRoot);
@@ -314,16 +344,27 @@ export async function updateModeState(
     if (validationError) throw new Error(validationError);
   }
   if (mode === 'autopilot') {
-    const isPipelineOrchestratorProgressWrite = options.trustedPipelineProgress === true;
     const currentAutopilotChildPhase = deriveAutopilotChildPhase({ ...current, mode: 'autopilot' });
     const nextAutopilotChildPhase = deriveAutopilotChildPhase({ ...normalizedBase, mode: 'autopilot' });
     const completionTransitionError = validateAutopilotCompletionTransition(
       current as Record<string, unknown>,
       normalizedBase as Record<string, unknown>,
-      { allowUnknownActivePhaseCompletion: options.trustedPipelineProgress === true },
+      { allowUnknownActivePhaseCompletion: pipelineProgressWrite },
     );
     if (completionTransitionError) throw new Error(completionTransitionError);
-    if (!isPipelineOrchestratorProgressWrite) {
+    if (pipelineProgressWrite) {
+      if (
+        currentAutopilotChildPhase === 'ralplan'
+        && nextAutopilotChildPhase === 'ultragoal'
+      ) {
+        assertAutopilotRalplanUltragoalGate(
+          current as Record<string, unknown>,
+          normalizedBase as Record<string, unknown>,
+          projectRoot ?? process.cwd(),
+          scope.sessionId,
+        );
+      }
+    } else {
       if (
         currentAutopilotChildPhase === 'deep-interview'
         && isForwardAutopilotPhase(currentAutopilotChildPhase, nextAutopilotChildPhase)
@@ -355,13 +396,12 @@ export async function updateModeState(
         currentAutopilotChildPhase === 'ralplan'
         && isNextAutopilotPhase(currentAutopilotChildPhase, nextAutopilotChildPhase)
       ) {
-        const gate = canAdvanceAutopilotRalplanToUltragoal({
-          cwd: projectRoot ?? process.cwd(),
-          sessionId: scope.sessionId,
-          currentState: current as Record<string, unknown>,
-          nextState: normalizedBase as Record<string, unknown>,
-        });
-        if (!gate.allowed) throw new Error(buildAutopilotRalplanUltragoalGateError(gate));
+        assertAutopilotRalplanUltragoalGate(
+          current as Record<string, unknown>,
+          normalizedBase as Record<string, unknown>,
+          projectRoot ?? process.cwd(),
+          scope.sessionId,
+        );
       }
     }
   }
