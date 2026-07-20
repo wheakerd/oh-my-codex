@@ -3091,7 +3091,14 @@ async function buildCompletedGoalCleanupStopOutput(payload: CodexHookPayload, cw
   };
 }
 
-async function findActiveGoalWorkflowReconciliationRequirement(cwd: string): Promise<{ workflow: string; command: string; remediation?: string } | null> {
+interface GoalWorkflowReconciliationRequirement {
+  workflow: string;
+  command?: string;
+  remediation?: string;
+  paused?: boolean;
+}
+
+async function findActiveGoalWorkflowReconciliationRequirement(cwd: string): Promise<GoalWorkflowReconciliationRequirement | null> {
   const ultragoal = await readJsonIfExists(join(cwd, ".omx", "ultragoal", "goals.json"));
   const aggregateCompletion = safeObject(ultragoal?.aggregateCompletion);
   const aggregateProductComplete = safeString(aggregateCompletion.status) === "complete";
@@ -3104,6 +3111,14 @@ async function findActiveGoalWorkflowReconciliationRequirement(cwd: string): Pro
   }
   if (activeUltragoal) {
     const goalId = safeString(activeUltragoal.id) || "<goal-id>";
+    const status = safeString(activeUltragoal.status);
+    if (status === "review_blocked" || status === "needs_user_decision") {
+      return {
+        workflow: "ultragoal",
+        paused: true,
+        remediation: `Ultragoal ${goalId} is paused with status ${status}; preserve its recorded blocker and resume only after the required review resolution or user decision is available.`,
+      };
+    }
     return {
       workflow: "ultragoal",
       command: `omx ultragoal checkpoint --goal-id ${goalId} --status complete --codex-goal-json '<get_goal JSON or path>' --quality-gate-json '<quality-gate JSON or path>' --evidence '<evidence>' --json`,
@@ -3165,6 +3180,7 @@ async function buildGoalWorkflowReconciliationPromptWarning(cwd: string, prompt:
   if (!looksLikeGoalCompletionPrompt(prompt)) return null;
   const requirement = await findActiveGoalWorkflowReconciliationRequirement(cwd);
   if (!requirement) return null;
+  if (requirement.paused) return `OMX ${requirement.remediation}`;
   return [
     `OMX ${requirement.workflow} goal workflow requires Codex goal snapshot reconciliation before completion.`,
     "Call get_goal, pass the resulting JSON or a path with --codex-goal-json, and do not rely on hooks or shell commands to mutate Codex-owned goal state.",
@@ -3183,6 +3199,15 @@ async function buildGoalWorkflowReconciliationStopOutput(
   if (!requirement) return null;
   if (requirement.workflow === "autoresearch-goal" && reportsAutoresearchGoalObjectiveMismatch(lastAssistantMessage)) {
     return null;
+  }
+  if (requirement.paused) {
+    const systemMessage = `OMX ${requirement.remediation} Stop after reporting the paused status; do not retry completion reconciliation until it is resumed.`;
+    return {
+      decision: "block",
+      reason: systemMessage,
+      stopReason: `${requirement.workflow}_paused`,
+      systemMessage,
+    };
   }
   const systemMessage =
     [
@@ -19558,7 +19583,7 @@ async function buildStopHookOutput(
         safeString(goalWorkflowStopOutput.stopReason),
         goalWorkflowStopOutput,
         canonicalSessionId,
-        { allowRepeatDuringStopHook: true },
+        { allowRepeatDuringStopHook: safeString(goalWorkflowStopOutput.stopReason) !== "ultragoal_paused" },
       );
     }
     const ordinaryNoProgressOutput = await maybeBuildOrdinaryStopNoProgressOutput(
