@@ -7504,6 +7504,41 @@ standardMaxRounds = 15
 		}
 	});
 
+	it("gives finite Stop guidance for paused ultragoals", async () => {
+		for (const status of ["review_blocked", "needs_user_decision"]) {
+			const cwd = await mkdtemp(join(tmpdir(), `omx-native-hook-ultragoal-${status}-stop-`));
+			try {
+				await writeJson(join(cwd, ".omx", "ultragoal", "goals.json"), {
+					version: 1,
+					activeGoalId: "G001-paused",
+					goals: [{ id: "G001-paused", status, objective: "Paused goal" }],
+				});
+				const payload = {
+					hook_event_name: "Stop",
+					cwd,
+					session_id: `sess-ultragoal-${status}-stop`,
+					thread_id: `thread-ultragoal-${status}-stop`,
+					turn_id: `turn-ultragoal-${status}-stop`,
+					last_assistant_message: "Goal complete.",
+				};
+
+				const first = await dispatchCodexNativeHook(payload, { cwd });
+				assert.equal(first.outputJson?.decision, "block");
+				assert.equal(first.outputJson?.stopReason, "ultragoal_paused");
+				assert.match(String(first.outputJson?.systemMessage), new RegExp(`status ${status}`));
+				assert.doesNotMatch(JSON.stringify(first.outputJson), /ultragoal checkpoint/);
+
+				const replayed = await dispatchCodexNativeHook(
+					{ ...payload, stop_hook_active: true },
+					{ cwd },
+				);
+				assert.equal(replayed.outputJson, null);
+			} finally {
+				await rm(cwd, { recursive: true, force: true });
+			}
+		}
+	});
+
 	it("does not block ultragoal Stop for ordinary prose about a goal to complete work", async () => {
 		const cwd = await mkdtemp(
 			join(tmpdir(), "omx-native-hook-ultragoal-ordinary-stop-"),
