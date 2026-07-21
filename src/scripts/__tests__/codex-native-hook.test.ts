@@ -256,6 +256,56 @@ async function writeLiveNativeMappedSessionState(
   }
 }
 
+async function writeLiveNativeSessionOwnerSidecar(
+	cwd: string,
+	stateDir: string,
+	sessionId: string,
+): Promise<void> {
+	const selected = JSON.parse(
+		await readFile(join(stateDir, "session.json"), "utf-8"),
+	) as Record<string, unknown>;
+	await writeJson(
+		join(stateDir, "sessions", sessionId, "session-owner.json"),
+		{
+			...selected,
+			session_id: sessionId,
+			native_session_id: sessionId,
+			started_at: new Date().toISOString(),
+			cwd,
+		},
+	);
+}
+
+async function withIndependentNativeSession(
+	suffix: string,
+	run: (fixture: {
+		cwd: string;
+		stateDir: string;
+		sessionId: string;
+		pointerBefore: string;
+	}) => Promise<void>,
+): Promise<void> {
+	const cwd = await mkdtemp(join(tmpdir(), `omx-native-hook-sidecar-${suffix}-`));
+	try {
+		const stateDir = join(cwd, ".omx", "state");
+		const selectedSessionId = `native-selected-${suffix}`;
+		const sessionId = `native-independent-${suffix}`;
+		await writeSessionStart(cwd, selectedSessionId, {
+			nativeSessionId: selectedSessionId,
+			pid: process.pid,
+		});
+		await writeLiveNativeSessionOwnerSidecar(cwd, stateDir, sessionId);
+		await run({
+			cwd,
+			stateDir,
+			sessionId,
+			pointerBefore: await readFile(join(stateDir, "session.json"), "utf-8"),
+		});
+	} finally {
+		await rm(cwd, { recursive: true, force: true });
+	}
+}
+
 async function writeSessionSkillActiveState(
 	stateDir: string,
 	sessionId: string,
@@ -3984,6 +4034,15 @@ PY`,
       assert.equal(sessionState.native_session_id, "sess-start-1");
       assert.equal(sessionState.pid, 43210);
       assert.equal(sessionState.launch_lineage_token, undefined, 'native SessionStart must never mint or backfill wrapper lineage authority');
+      const ownerState = JSON.parse(
+        await readFile(
+          join(cwd, ".omx", "state", "sessions", "sess-start-1", "session-owner.json"),
+          "utf-8",
+        ),
+      ) as { session_id?: string; native_session_id?: string; pid?: number };
+      assert.equal(ownerState.session_id, "sess-start-1");
+      assert.equal(ownerState.native_session_id, "sess-start-1");
+      assert.equal(ownerState.pid, 43210);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -4591,6 +4650,248 @@ PY`,
       if (typeof previousPath === "string") process.env.PATH = previousPath;
       else delete process.env.PATH;
       await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("authorizes a live unmatched Stop from its exact session owner sidecar without changing the selected pointer", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-sidecar-stop-"));
+    try {
+      const stateDir = join(cwd, ".omx", "state");
+      const selectedSessionId = "native-selected-owner";
+      const independentSessionId = "native-independent-owner";
+      await writeSessionStart(cwd, selectedSessionId, {
+        nativeSessionId: selectedSessionId,
+        pid: process.pid,
+      });
+      await writeLiveNativeSessionOwnerSidecar(cwd, stateDir, independentSessionId);
+      const pointerBefore = await readFile(join(stateDir, "session.json"), "utf-8");
+      const rootGoalPath = join(cwd, ".omx", "ultragoal", "goals.json");
+      await writeJson(rootGoalPath, {
+        version: 1,
+        aggregateCompletion: {
+          status: "complete",
+          completedAt: "2026-05-20T00:00:00.000Z",
+        },
+        goals: [{ id: "G001-done", status: "complete", objective: "Done" }],
+      });
+      const rootGoalBefore = await readFile(rootGoalPath, "utf-8");
+
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "Stop",
+          cwd,
+          session_id: independentSessionId,
+          thread_id: independentSessionId,
+          last_user_message:
+            "get_goal reports a completed Codex goal still attached to this thread; do not call create_goal until cleanup is explicit.",
+          last_assistant_message:
+            "I am starting another run now; create_goal payload follows.",
+        },
+        { cwd },
+      );
+
+      assert.equal(result.outputJson, null);
+      assert.equal(await readFile(join(stateDir, "session.json"), "utf-8"), pointerBefore);
+      assert.equal(await readFile(rootGoalPath, "utf-8"), rootGoalBefore);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("uses the unmatched sidecar session workflow as the Stop blocker", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-sidecar-skill-"));
+    try {
+      const stateDir = join(cwd, ".omx", "state");
+      const selectedSessionId = "native-selected-skill";
+      const independentSessionId = "native-independent-skill";
+      await writeSessionStart(cwd, selectedSessionId, {
+        nativeSessionId: selectedSessionId,
+        pid: process.pid,
+      });
+      await writeLiveNativeSessionOwnerSidecar(cwd, stateDir, independentSessionId);
+      await writeSessionSkillActiveState(stateDir, independentSessionId, "ralplan", "planning");
+      await writeJson(
+        join(stateDir, "sessions", independentSessionId, "ralplan-state.json"),
+        {
+          active: true,
+          current_phase: "planning",
+          session_id: independentSessionId,
+          workingDirectory: cwd,
+        },
+      );
+
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "Stop",
+          cwd,
+          session_id: independentSessionId,
+          thread_id: independentSessionId,
+        },
+        { cwd },
+      );
+
+      assert.equal(result.outputJson?.decision, "block");
+      assert.match(String(result.outputJson?.stopReason ?? ""), /^skill_ralplan_planning_/);
+      assert.notEqual(result.outputJson?.stopReason, "session_scope_unmatched");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  for (const mode of ["autopilot", "ultrawork", "ultraqa"] as const) {
+    it(`uses the unmatched sidecar ${mode} state as the Stop blocker`, async () => {
+      await withIndependentNativeSession(mode, async ({
+        cwd,
+        stateDir,
+        sessionId,
+        pointerBefore,
+      }) => {
+        await writeJson(
+          join(stateDir, "sessions", sessionId, `${mode}-state.json`),
+          {
+            active: true,
+            mode,
+            current_phase: "executing",
+            session_id: sessionId,
+            workingDirectory: cwd,
+          },
+        );
+
+        const result = await dispatchCodexNativeHook(
+          {
+            hook_event_name: "Stop",
+            cwd,
+            session_id: sessionId,
+            thread_id: sessionId,
+          },
+          { cwd },
+        );
+
+        assert.equal(result.outputJson?.decision, "block");
+        assert.match(String(result.outputJson?.stopReason ?? ""), new RegExp(`^${mode}_`));
+        assert.equal(await readFile(join(stateDir, "session.json"), "utf-8"), pointerBefore);
+        assert.equal(existsSync(join(stateDir, "native-stop-state.json")), false);
+      });
+    });
+  }
+
+  it("uses the unmatched sidecar team state as the Stop blocker", async () => {
+    await withIndependentNativeSession("team", async ({
+      cwd,
+      stateDir,
+      sessionId,
+      pointerBefore,
+    }) => {
+      await writeJson(
+        join(stateDir, "sessions", sessionId, "team-state.json"),
+        {
+          active: true,
+          mode: "team",
+          team_name: "sidecar-team",
+          current_phase: "team-exec",
+          session_id: sessionId,
+          owner_codex_thread_id: sessionId,
+        },
+      );
+
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "Stop",
+          cwd,
+          session_id: sessionId,
+          thread_id: sessionId,
+        },
+        { cwd },
+      );
+
+      assert.equal(result.outputJson?.decision, "block");
+      assert.equal(result.outputJson?.stopReason, "team_team-exec");
+      assert.equal(await readFile(join(stateDir, "session.json"), "utf-8"), pointerBefore);
+      assert.equal(existsSync(join(stateDir, "native-stop-state.json")), false);
+    });
+  });
+
+  it("uses the unmatched sidecar deep-interview question state as the Stop blocker", async () => {
+    await withIndependentNativeSession("deep-interview", async ({
+      cwd,
+      stateDir,
+      sessionId,
+      pointerBefore,
+    }) => {
+      await writeSessionSkillActiveState(
+        stateDir,
+        sessionId,
+        "deep-interview",
+        "intent-first",
+      );
+      await writeJson(
+        join(stateDir, "sessions", sessionId, "deep-interview-state.json"),
+        {
+          active: true,
+          mode: "deep-interview",
+          current_phase: "intent-first",
+          session_id: sessionId,
+          thread_id: sessionId,
+          question_enforcement: {
+            obligation_id: "sidecar-question",
+            source: "omx-question",
+            status: "pending",
+            requested_at: "2026-07-18T00:00:00.000Z",
+          },
+        },
+      );
+
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "Stop",
+          cwd,
+          session_id: sessionId,
+          thread_id: sessionId,
+        },
+        { cwd },
+      );
+
+      assert.equal(result.outputJson?.decision, "block");
+      assert.equal(result.outputJson?.stopReason, "deep_interview_question_required");
+      assert.equal(await readFile(join(stateDir, "session.json"), "utf-8"), pointerBefore);
+      assert.equal(existsSync(join(stateDir, "native-stop-state.json")), false);
+    });
+  });
+
+  it("uses a live parent sidecar when a nested selected pointer is stale-dead", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-sidecar-stale-root-"));
+    try {
+      const stateDir = join(cwd, ".omx", "state");
+      const parentSessionId = "native-live-parent";
+      await writeSessionStart(cwd, parentSessionId, {
+        nativeSessionId: parentSessionId,
+        pid: process.pid,
+      });
+      await writeLiveNativeSessionOwnerSidecar(cwd, stateDir, parentSessionId);
+      await writeJson(join(stateDir, "session.json"), {
+        session_id: "native-dead-nested",
+        native_session_id: "native-dead-nested",
+        started_at: "2026-01-01T00:00:00.000Z",
+        cwd,
+        pid: 999_999,
+        platform: process.platform,
+      });
+      const pointerBefore = await readFile(join(stateDir, "session.json"), "utf-8");
+
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "Stop",
+          cwd,
+          session_id: parentSessionId,
+          thread_id: parentSessionId,
+        },
+        { cwd },
+      );
+
+      assert.equal(result.outputJson, null);
+      assert.equal(await readFile(join(stateDir, "session.json"), "utf-8"), pointerBefore);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
     }
   });
 

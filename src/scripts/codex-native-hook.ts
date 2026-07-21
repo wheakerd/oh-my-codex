@@ -40,12 +40,14 @@ import {
   isSessionStale,
   isSessionStateUsable,
   normalizeSessionId,
+  readNativeSessionOwner,
   readSessionPointer,
   readSessionState,
   readUsableSessionState,
   reconcileNativeSessionStart,
   resolveSessionPointerContext,
   type SessionStartOptions,
+  writeNativeSessionOwner,
   type SessionState,
 } from "../hooks/session.js";
 import {
@@ -2830,7 +2832,15 @@ async function readModeStateWithStopSource(
   mode: "autopilot" | "ultrawork" | "ultraqa",
   cwd: string,
   sessionId?: string,
+  options: { sessionScopedOnly?: boolean } = {},
 ): Promise<{ state: Record<string, unknown>; path: string } | null> {
+  if (options.sessionScopedOnly) {
+    const normalizedSessionId = safeString(sessionId).trim();
+    if (!normalizedSessionId) return null;
+    const path = getStateFilePath(`${mode}-state.json`, cwd, normalizedSessionId);
+    const state = await readJsonIfExists(path);
+    return state ? { state, path } : null;
+  }
   const paths = await getAuthoritativeActiveStatePaths(mode, cwd, sessionId?.trim() || undefined).catch(() => [] as string[]);
   const path = paths[0];
   if (!path) return null;
@@ -2900,6 +2910,7 @@ async function buildModeBasedStopOutput(
   mode: "autopilot" | "ultrawork" | "ultraqa",
   cwd: string,
   sessionId?: string,
+  options: { sessionScopedOnly?: boolean } = {},
 ): Promise<Record<string, unknown> | null> {
   if (await readCanonicalTerminalRunStateForStop(cwd, sessionId, mode)) {
     return null;
@@ -2907,10 +2918,12 @@ async function buildModeBasedStopOutput(
   if (mode === "autopilot" && await readAutopilotDeepInterviewQuestionWaitState(cwd, sessionId)) {
     return null;
   }
-  const sourcedState = await readModeStateWithStopSource(mode, cwd, sessionId);
+  const sourcedState = await readModeStateWithStopSource(mode, cwd, sessionId, options);
   const state = sourcedState?.state ?? null;
   if (!state || !shouldContinueRun(state)) return null;
-  const rootCanonicalState = await readRawSkillActiveState(getSkillActiveStatePathsForStateDir(getBaseStateDir(cwd)).rootPath);
+  const rootCanonicalState = options.sessionScopedOnly
+    ? null
+    : await readRawSkillActiveState(getSkillActiveStatePathsForStateDir(getBaseStateDir(cwd)).rootPath);
   const canonicalDisagreement = rootCanonicalState
     ? canonicalStopDisagreement(state, rootCanonicalState, mode, sessionId)
     : "canonical_state_missing";
@@ -3247,6 +3260,7 @@ async function readTeamModeStateForStop(
   stateDir: string,
   sessionId?: string,
   threadId?: string,
+  options: { sessionScopedOnly?: boolean } = {},
 ): Promise<TeamModeStateForStop | null> {
   const normalizedSessionId = safeString(sessionId).trim();
   if (!normalizedSessionId) return null;
@@ -3257,6 +3271,7 @@ async function readTeamModeStateForStop(
       ? { state: scopedState, scope: "session" }
       : null;
   }
+  if (options.sessionScopedOnly) return null;
 
   const rootState = await readJsonIfExists(join(stateDir, "team-state.json"));
   if (rootState?.active !== true) return null;
@@ -3271,21 +3286,37 @@ async function readTeamModeStateForStop(
   return { state: rootState, scope: "root" };
 }
 
-async function buildTeamStopOutput(cwd: string, sessionId?: string, threadId?: string): Promise<Record<string, unknown> | null> {
+async function buildTeamStopOutput(
+  cwd: string,
+  sessionId?: string,
+  threadId?: string,
+  options: { sessionScopedOnly?: boolean } = {},
+): Promise<Record<string, unknown> | null> {
   if (await readCanonicalTerminalRunStateForStop(cwd, sessionId, "team")) {
     return null;
   }
-  const teamStateForStop = await readTeamModeStateForStop(cwd, getBaseStateDir(cwd), sessionId, threadId);
+  const teamStateForStop = await readTeamModeStateForStop(
+    cwd,
+    getBaseStateDir(cwd),
+    sessionId,
+    threadId,
+    options,
+  );
   if (!teamStateForStop || teamStateForStop.state.active !== true) return null;
   const teamState = teamStateForStop.state;
   const teamName = safeString(teamState.team_name).trim();
+  const coarsePhase = teamState.current_phase;
+  if (options.sessionScopedOnly) {
+    return isNonTerminalPhase(coarsePhase)
+      ? buildTeamStopOutputForPhase(teamName, formatPhase(coarsePhase))
+      : null;
+  }
   if (teamName) {
     const canonicalTeamDir = join(resolveCanonicalTeamStateRoot(cwd), "team", teamName);
     if (!existsSync(canonicalTeamDir)) {
       return null;
     }
   }
-  const coarsePhase = teamState.current_phase;
   const canonicalPhaseState = teamName ? await readTeamPhase(teamName, cwd) : null;
   if (teamStateForStop.scope === "root" && !canonicalPhaseState) return null;
   const canonicalPhase = canonicalPhaseState?.current_phase ?? coarsePhase;
@@ -18599,6 +18630,7 @@ async function readBlockingSkillForStop(
   sessionId: string,
   threadId: string,
   requiredSkill?: string,
+  options: { sessionScopedOnly?: boolean } = {},
 ): Promise<{ skill: string; phase: string; latestPlanPath?: string; planningComplete?: boolean; runOutcome?: string } | null> {
   const canonicalState = await readVisibleSkillActiveStateForStateDir(stateDir, sessionId);
   const visibleEntries = canonicalState ? listActiveSkills(canonicalState) : [];
@@ -18617,7 +18649,7 @@ async function readBlockingSkillForStop(
     const modeSnapshot = getRunContinuationSnapshot(modeState);
     if (modeSnapshot?.terminal === true) continue;
 
-    if (await shouldIgnoreSessionSkillBlockerForCanonicalInactiveRoot(
+    if (!options.sessionScopedOnly && await shouldIgnoreSessionSkillBlockerForCanonicalInactiveRoot(
       cwd,
       stateDir,
       skill,
@@ -18958,8 +18990,11 @@ async function buildDeepInterviewQuestionStopOutput(
   stateDir: string,
   sessionId: string,
   threadId: string,
+  options: { sessionScopedOnly?: boolean } = {},
 ): Promise<{ output: Record<string, unknown>; obligationId: string } | null> {
-  await reconcileDeepInterviewQuestionEnforcementFromAnsweredRecords(cwd, sessionId);
+  if (!options.sessionScopedOnly) {
+    await reconcileDeepInterviewQuestionEnforcementFromAnsweredRecords(cwd, sessionId);
+  }
   if (await readAutopilotDeepInterviewQuestionWaitState(cwd, sessionId)) {
     return null;
   }
@@ -19351,11 +19386,21 @@ async function buildSkillStopOutput(
   stateDir: string,
   sessionId: string,
   threadId: string,
+  options: { sessionScopedOnly?: boolean } = {},
 ): Promise<Record<string, unknown> | null> {
-  const blocker = await readBlockingSkillForStop(cwd, stateDir, sessionId, threadId);
+  const blocker = await readBlockingSkillForStop(
+    cwd,
+    stateDir,
+    sessionId,
+    threadId,
+    undefined,
+    options,
+  );
   if (!blocker) return null;
 
-  const subagentSummary = await readSubagentSessionSummary(cwd, sessionId).catch(() => null);
+  const subagentSummary = options.sessionScopedOnly
+    ? null
+    : await readSubagentSessionSummary(cwd, sessionId).catch(() => null);
   const activeSubagentCount = subagentSummary?.activeSubagentThreadIds.length ?? 0;
 
   if (blocker.skill === "ralplan") {
@@ -19489,7 +19534,13 @@ async function buildStopHookOutput(
   payload: CodexHookPayload,
   cwd: string,
   stateDir: string,
-  options: { skipAutoNudge?: boolean; skipRalphStopBlock?: boolean; canonicalSessionId?: string; teamWorkerOnly?: boolean } = {},
+  options: {
+    skipAutoNudge?: boolean;
+    skipRalphStopBlock?: boolean;
+    canonicalSessionId?: string;
+    teamWorkerOnly?: boolean;
+    sessionScopedOnly?: boolean;
+  } = {},
 ): Promise<Record<string, unknown> | null> {
   if (isStopExempt(payload)) {
     return null;
@@ -19532,6 +19583,40 @@ async function buildStopHookOutput(
     ?? await resolveInternalSessionIdForPayload(cwd, sessionId);
   const threadId = readPayloadThreadId(payload);
   const suppressParentWorkflowStop = shouldSuppressParentWorkflowStopForSideConversation(payload);
+  if (options.sessionScopedOnly) {
+    if (!canonicalSessionId || suppressParentWorkflowStop) return null;
+    for (const mode of ["autopilot", "ultrawork", "ultraqa"] as const) {
+      const modeOutput = await buildModeBasedStopOutput(
+        mode,
+        cwd,
+        canonicalSessionId,
+        { sessionScopedOnly: true },
+      );
+      if (modeOutput) return modeOutput;
+    }
+    const teamOutput = await buildTeamStopOutput(
+      cwd,
+      canonicalSessionId,
+      threadId,
+      { sessionScopedOnly: true },
+    );
+    if (teamOutput) return teamOutput;
+    const deepInterviewQuestionOutput = await buildDeepInterviewQuestionStopOutput(
+      cwd,
+      stateDir,
+      canonicalSessionId,
+      threadId,
+      { sessionScopedOnly: true },
+    );
+    if (deepInterviewQuestionOutput) return deepInterviewQuestionOutput.output;
+    return await buildSkillStopOutput(
+      cwd,
+      stateDir,
+      canonicalSessionId,
+      threadId,
+      { sessionScopedOnly: true },
+    );
+  }
   if (canonicalSessionId) {
     await reconcileStaleRootSkillActiveStateForStop(cwd, stateDir, canonicalSessionId);
     if (await hasAuthoritativeInactiveSkillStopState(cwd, stateDir, "ralplan", canonicalSessionId, threadId)) {
@@ -19964,7 +20049,7 @@ export async function dispatchCodexNativeHook(
   if (promptTurnContext?.status === "authorized") {
     canonicalSessionId = promptTurnContext.authorization.targetSessionId;
   }
-  const allowPromptGlobalSideEffects = promptTurnContext?.status !== "authorized"
+  let allowGlobalSideEffects = promptTurnContext?.status !== "authorized"
     || promptTurnContext.authorization.globalSideEffects === "allow";
   let resolvedNativeSessionId = nativeSessionId;
   let skipCanonicalSessionStartContext = false;
@@ -20052,11 +20137,16 @@ export async function dispatchCodexNativeHook(
         allowImplicitSessionSideEffects = false;
       }
     } else {
-      const ownerOmxSessionId = await resolveVerifiedOwnerOmxSessionId();
+      let ownerState: SessionState | null = null;
       try {
+        const sessionOwnerPid = options.sessionOwnerPid ?? resolveSessionOwnerPid(payload);
+        ownerState = await writeNativeSessionOwner(cwd, nativeSessionId, {
+          pid: sessionOwnerPid,
+        });
+        const ownerOmxSessionId = await resolveVerifiedOwnerOmxSessionId();
         const sessionState = await reconcileNativeSessionStart(cwd, nativeSessionId, {
           context: pointerContext,
-          pid: options.sessionOwnerPid ?? resolveSessionOwnerPid(payload),
+          pid: sessionOwnerPid,
           ...options.sessionStartOptions,
           ...(ownerOmxSessionId
             ? { ownerOmxSessionId, ownerAliasVerified: true }
@@ -20074,15 +20164,28 @@ export async function dispatchCodexNativeHook(
         // leader PreToolUse path below, which fires before the first in-turn role-intent
         // write. Fail closed here rather than risk a false-leader adoption.
       } catch (error) {
-        if (!isSessionPointerLaunchAbort(error)) throw error;
-        canonicalSessionId = "";
-        resolvedNativeSessionId = nativeSessionId;
-        skipCanonicalSessionStartContext = true;
-        allowImplicitSessionSideEffects = false;
-        stopAuthorizationFailure = {
-          stopReason: "session_pointer_unusable",
-          reason: `OMX cannot authorize Stop while the selected session pointer is ${pointer.status}; repair the pointer evidence before continuing.`,
-        };
+        if (
+          ownerState
+          && isSessionPointerLaunchAbort(error)
+          && error.code === "session_pointer_owner_conflict"
+        ) {
+          canonicalSessionId = ownerState.session_id;
+          resolvedNativeSessionId = ownerState.native_session_id ?? nativeSessionId;
+          allowImplicitSessionSideEffects = true;
+          allowGlobalSideEffects = false;
+          skipCanonicalSessionStartContext = true;
+          stopAuthorizationFailure = null;
+        } else {
+          if (!isSessionPointerLaunchAbort(error)) throw error;
+          canonicalSessionId = "";
+          resolvedNativeSessionId = nativeSessionId;
+          skipCanonicalSessionStartContext = true;
+          allowImplicitSessionSideEffects = false;
+          stopAuthorizationFailure = {
+            stopReason: "session_pointer_unusable",
+            reason: `OMX cannot authorize Stop while the selected session pointer is ${pointer.status}; repair the pointer evidence before continuing.`,
+          };
+        }
       }
     }
   } else if (!canonicalSessionId) {
@@ -20105,18 +20208,32 @@ export async function dispatchCodexNativeHook(
           : pointer.status === "absent",
       );
     if ((declaredTeamWorker && !authorizedWorkerStopSessionId) || (stopPayloadSessionId && !stopCanonicalSessionId)) {
-      canonicalSessionId = "";
-      allowImplicitSessionSideEffects = false;
-      if (declaredTeamWorker && !authorizedWorkerStopSessionId) {
-        stopAuthorizationFailure = {
-          stopReason: "session_scope_unmatched",
-          reason: "OMX cannot authorize Team worker Stop without exactly one valid explicit session id.",
-        };
-      } else if (!stopAuthorizationFailure) {
-        stopAuthorizationFailure = {
-          stopReason: "session_scope_unmatched",
-          reason: `OMX cannot authorize Stop for unmatched session id ${stopPayloadSessionId}; the selected session pointer remains authoritative.`,
-        };
+      const ownerState = !declaredTeamWorker && stopPayloadSessionId
+        ? await readNativeSessionOwner(cwd, stopPayloadSessionId)
+        : null;
+      if (
+        ownerState
+        && (pointer.status === "usable" || pointer.status === "stale-dead")
+      ) {
+        canonicalSessionId = ownerState.session_id;
+        resolvedNativeSessionId = ownerState.native_session_id ?? stopPayloadSessionId;
+        allowImplicitSessionSideEffects = true;
+        allowGlobalSideEffects = false;
+        stopAuthorizationFailure = null;
+      } else {
+        canonicalSessionId = "";
+        allowImplicitSessionSideEffects = false;
+        if (declaredTeamWorker && !authorizedWorkerStopSessionId) {
+          stopAuthorizationFailure = {
+            stopReason: "session_scope_unmatched",
+            reason: "OMX cannot authorize Team worker Stop without exactly one valid explicit session id.",
+          };
+        } else if (!stopAuthorizationFailure) {
+          stopAuthorizationFailure = {
+            stopReason: "session_scope_unmatched",
+            reason: `OMX cannot authorize Stop for unmatched session id ${stopPayloadSessionId}; the selected session pointer remains authoritative.`,
+          };
+        }
       }
     } else if (stopCanonicalSessionId) {
       canonicalSessionId = stopCanonicalSessionId;
@@ -20184,11 +20301,11 @@ export async function dispatchCodexNativeHook(
     if (!isSubagentPromptSubmit) {
       promptClassification = classifyKeywordInput(prompt);
     }
-    goalWorkflowAdditionalContext = allowPromptGlobalSideEffects
+    goalWorkflowAdditionalContext = allowGlobalSideEffects
       ? await buildCompletedGoalCleanupPromptWarning(cwd, prompt).catch(() => null)
         ?? await buildGoalWorkflowReconciliationPromptWarning(cwd, prompt).catch(() => null)
       : null;
-    ultragoalSteeringAdditionalContext = prompt && !isSubagentPromptSubmit && allowImplicitSessionSideEffects && allowPromptGlobalSideEffects
+    ultragoalSteeringAdditionalContext = prompt && !isSubagentPromptSubmit && allowImplicitSessionSideEffects && allowGlobalSideEffects
       ? await applyUserPromptUltragoalSteering(cwd, prompt).catch((error) => `OMX native UserPromptSubmit rejected bounded .omx/ultragoal steering for G002-cli-and-prompt-submit-bridge: ${error instanceof Error ? error.message : String(error)}`)
       : null;
     let suppressActivationSeeding = !allowImplicitSessionSideEffects;
@@ -20238,7 +20355,7 @@ export async function dispatchCodexNativeHook(
       prompt
       && skillState === null
       && !isSubagentPromptSubmit
-      && allowPromptGlobalSideEffects
+      && allowGlobalSideEffects
       && promptClassification?.reservedInput === null
       && promptClassification.hasExplicitLikeInvocation === false
       && promptClassification.matches.length === 0
@@ -20318,7 +20435,7 @@ export async function dispatchCodexNativeHook(
     const skipHudReconcileForDoctorSmoke = process.env.OMX_NATIVE_HOOK_DOCTOR_SMOKE === "1";
     const skipHudReconcileForTeamWorkerPane = !isSubagentPromptSubmit
       && await isConfirmedTeamWorkerPromptSubmitPane(cwd).catch(() => false);
-    if (allowImplicitSessionSideEffects && allowPromptGlobalSideEffects && !skipHudReconcileForDoctorSmoke && !skipHudReconcileForTeamWorkerPane) {
+    if (allowImplicitSessionSideEffects && allowGlobalSideEffects && !skipHudReconcileForDoctorSmoke && !skipHudReconcileForTeamWorkerPane) {
       const reconcileHudForPromptSubmitFn = options.reconcileHudForPromptSubmitFn ?? reconcileHudForPromptSubmit;
       const hudSessionId = resolveHudReconcileSessionId(
         currentSessionState,
@@ -20335,7 +20452,7 @@ export async function dispatchCodexNativeHook(
     }
   }
 
-  if (omxEventName && allowImplicitSessionSideEffects && allowPromptGlobalSideEffects && !skipCanonicalSessionStartContext && !suppressNoisySubagentLifecycleDispatch) {
+  if (omxEventName && allowImplicitSessionSideEffects && allowGlobalSideEffects && !skipCanonicalSessionStartContext && !suppressNoisySubagentLifecycleDispatch) {
     const baseContext = buildBaseContext(cwd, payload, hookEventName!, canonicalSessionId);
     if (resolvedNativeSessionId) {
       baseContext.native_session_id = resolvedNativeSessionId;
@@ -20622,11 +20739,17 @@ export async function dispatchCodexNativeHook(
     if (declaredTeamWorkerStopOnly) {
       outputJson = await buildStopHookOutput(payload, cwd, stateDir, { teamWorkerOnly: true });
     } else if (allowImplicitSessionSideEffects) {
-      outputJson = await buildStopHookOutput(payload, cwd, stateDir, {
+      const stopOutput = await buildStopHookOutput(payload, cwd, stateDir, {
         canonicalSessionId: canonicalSessionId || undefined,
         skipRalphStopBlock: isSubagentStop,
         skipAutoNudge: isSubagentStop,
-      }) ?? await buildCompletedGoalCleanupStopOutput(payload, cwd);
+        sessionScopedOnly: !allowGlobalSideEffects,
+      });
+      outputJson = stopOutput ?? (
+        allowGlobalSideEffects
+          ? await buildCompletedGoalCleanupStopOutput(payload, cwd)
+          : null
+      );
     } else {
       const failure = stopAuthorizationFailure ?? {
         stopReason: "session_pointer_unusable",
