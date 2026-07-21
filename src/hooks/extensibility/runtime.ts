@@ -10,6 +10,7 @@ async function handleNativeStopTeamLeaderAttention(input: HookRuntimeDispatchInp
   await markOwnedTeamsLeaderStopObserved(input.cwd, sessionId, input.event.timestamp, 'native_stop');
 }
 
+
 export async function dispatchHookEventRuntime(input: HookRuntimeDispatchInput): Promise<HookRuntimeDispatchResult> {
   const enabled = input.event.source === 'native' || input.event.source === 'derived'
     ? true
