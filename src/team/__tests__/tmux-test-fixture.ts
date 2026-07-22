@@ -1,7 +1,8 @@
 import { spawnSync } from 'node:child_process';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { delimiter, join } from 'node:path';
 
 const TMUX_COMMAND_TIMEOUT_MS = 5_000;
 const NULL_TMUX_CONFIG = process.platform === 'win32' ? 'NUL' : '/dev/null';
@@ -23,6 +24,10 @@ export interface TempTmuxSessionFixture {
     TMUX_PANE: string;
   };
   sessionExists: (targetSessionName?: string) => boolean;
+  run: (args: string[]) => string;
+  runResult: (args: string[]) => { status: number | null; stdout: string; stderr: string; error: string };
+  createPathShim: (directory: string, commandLogPath?: string) => Promise<string>;
+  triggerClientResize: (targetSession: string) => void;
 }
 
 export interface TempTmuxSessionOptions {
@@ -44,10 +49,10 @@ function applyTmuxEnv(snapshot: TmuxEnvSnapshot): void {
   else delete process.env.TMUX_PANE;
 }
 
-function runTmux(
+function runTmuxResult(
   args: string[],
   options: { ignoreTmuxEnv?: boolean; env?: NodeJS.ProcessEnv; serverName?: string; configFile?: string } = {},
-): string {
+): { status: number | null; stdout: string; stderr: string; error: string } {
   const env = options.env
     ?? (options.ignoreTmuxEnv ? { ...process.env, TMUX: undefined, TMUX_PANE: undefined } : process.env);
   const argv = [
@@ -62,22 +67,44 @@ function runTmux(
     timeout: TMUX_COMMAND_TIMEOUT_MS,
     killSignal: 'SIGKILL',
   });
+  return {
+    status: result.status,
+    stdout: result.stdout || '',
+    stderr: result.stderr || '',
+    error: result.error?.message || '',
+  };
+}
+
+function runTmux(
+  args: string[],
+  options: { ignoreTmuxEnv?: boolean; env?: NodeJS.ProcessEnv; serverName?: string; configFile?: string } = {},
+): string {
+  const result = runTmuxResult(args, options);
   if (result.error) {
+    throw new Error(result.error);
+  }
+  if (result.status !== 0) {
+    throw new Error(result.stderr.trim() || `tmux exited ${result.status}`);
+  }
+  return result.stdout.trim();
+}
+
+export function isRealTmuxAvailable(): boolean {
+  const result = spawnSync('tmux', ['-V'], {
+    encoding: 'utf-8',
+    env: { ...process.env, TMUX: undefined, TMUX_PANE: undefined },
+    stdio: ['ignore', 'pipe', 'pipe'],
+    timeout: TMUX_COMMAND_TIMEOUT_MS,
+    killSignal: 'SIGKILL',
+  });
+  if (result.error) {
+    if ((result.error as NodeJS.ErrnoException).code === 'ENOENT') return false;
     throw result.error;
   }
   if (result.status !== 0) {
     throw new Error((result.stderr || '').trim() || `tmux exited ${result.status}`);
   }
-  return (result.stdout || '').trim();
-}
-
-export function isRealTmuxAvailable(): boolean {
-  try {
-    runTmux(['-V'], { ignoreTmuxEnv: true });
-    return true;
-  } catch {
-    return false;
-  }
+  return true;
 }
 
 export function tmuxSessionExists(sessionName: string, serverName?: string): boolean {
@@ -90,6 +117,14 @@ export function tmuxSessionExists(sessionName: string, serverName?: string): boo
   } catch {
     return false;
   }
+}
+
+function resolveTmuxExecutable(): string {
+  for (const directory of (process.env.PATH ?? '').split(delimiter)) {
+    const candidate = join(directory || '.', 'tmux');
+    if (existsSync(candidate)) return candidate;
+  }
+  throw new Error('tmux executable disappeared after availability probe');
 }
 
 function uniqueTmuxIdentifier(prefix: string): string {
@@ -120,6 +155,34 @@ export async function withTempTmuxSession<T>(
     serverName: serverName || undefined,
     configFile: serverKind === 'synthetic' ? NULL_TMUX_CONFIG : undefined,
   } as const;
+  const tmuxExecutable = resolveTmuxExecutable();
+  const createPathShim = async (directory: string, commandLogPath?: string): Promise<string> => {
+    if (serverKind !== 'synthetic') throw new Error('private tmux PATH shim requires a synthetic server');
+    const shimPath = join(directory, 'tmux');
+    const logCommand = commandLogPath ? `printf '%s\\n' 'tmux argv:' >> ${JSON.stringify(commandLogPath)}\nfor argument do printf '%s\\n' "$argument"; done >> ${JSON.stringify(commandLogPath)}\nprintf '%s\\n' 'end tmux argv' >> ${JSON.stringify(commandLogPath)}\n` : '';
+    await writeFile(
+      shimPath,
+      `#!/bin/sh\n${logCommand}exec ${JSON.stringify(tmuxExecutable)} -f ${JSON.stringify(NULL_TMUX_CONFIG)} -L ${JSON.stringify(serverName)} "$@"\n`,
+    );
+    await chmod(shimPath, 0o755);
+    runTmux(['set-environment', '-g', 'PATH', `${directory}${delimiter}${process.env.PATH ?? ''}`], tmuxOptions);
+    return shimPath;
+  };
+  const triggerClientResize = (targetSession: string): void => {
+    const script = `(sleep 0.1; stty rows 41 cols 121) & exec env TERM=xterm timeout 1 tmux -f ${JSON.stringify(NULL_TMUX_CONFIG)} -L ${JSON.stringify(serverName)} attach-session -t ${JSON.stringify(targetSession)}`;
+    const result = spawnSync('script', ['-q', '-e', '-c', script, '/dev/null'], {
+      encoding: 'utf-8',
+      env: { ...process.env, TMUX: undefined, TMUX_PANE: undefined },
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: TMUX_COMMAND_TIMEOUT_MS,
+      killSignal: 'SIGKILL',
+    });
+    if (result.error) throw result.error;
+    if (result.status !== 124) {
+      throw new Error(`client resize trigger result: ${JSON.stringify({ status: result.status, stdout: result.stdout || '', stderr: result.stderr || '', error: '' })}`);
+    }
+  };
+
 
   const created = runTmux([
     'new-session',
@@ -162,18 +225,49 @@ export async function withTempTmuxSession<T>(
       TMUX_PANE: leaderPaneId,
     },
     sessionExists: (targetSessionName = sessionName) => tmuxSessionExists(targetSessionName, serverName || undefined),
+    run: (args) => runTmux(args, tmuxOptions),
+    runResult: (args) => runTmuxResult(args, tmuxOptions),
+    createPathShim,
+    triggerClientResize,
   };
 
   try {
     return await fn(fixture);
   } finally {
-    try {
-      if (serverKind === 'synthetic') {
+    if (serverKind === 'synthetic') {
+      try {
         runTmux(['kill-server'], tmuxOptions);
-      } else {
-        runTmux(['kill-session', '-t', sessionName], tmuxOptions);
+      } catch {}
+      const expectedNoServerMessages = [
+        `no server running on ${socketPath}`,
+        `error connecting to ${socketPath} (No such file or directory)`,
+      ];
+      let probe = runTmuxResult(['list-sessions'], tmuxOptions);
+      for (let attempt = 0; attempt < 10 && !(
+        probe.status === 1
+        && probe.stdout === ''
+        && expectedNoServerMessages.includes(probe.stderr.trim())
+      ); attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        probe = runTmuxResult(['list-sessions'], tmuxOptions);
       }
-    } catch {}
+      if (
+        probe.error
+        || probe.status !== 1
+        || probe.stdout !== ''
+        || !expectedNoServerMessages.includes(probe.stderr.trim())
+      ) {
+        applyTmuxEnv(previousEnv);
+        await rm(fixtureCwd, { recursive: true, force: true });
+        throw new Error(
+          `private tmux fixture cleanup did not prove private server termination: ${serverName}; ${JSON.stringify(probe)}`,
+        );
+      }
+    } else {
+      try {
+        runTmux(['kill-session', '-t', sessionName], tmuxOptions);
+      } catch {}
+    }
     applyTmuxEnv(previousEnv);
     await rm(fixtureCwd, { recursive: true, force: true });
   }

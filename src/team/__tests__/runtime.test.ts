@@ -5915,7 +5915,7 @@ exit 0
           assert.equal(tmuxLog.match(/set-hook -t leader:0 client-resized\[\d+\]/g)?.length ?? 0, 2);
           assert.equal(tmuxLog.match(/set-hook -t leader:0 client-attached\[\d+\]/g)?.length ?? 0, 2);
           assert.match(tmuxLog, /snapshot=\$\(tmux list-panes -a -F/);
-          assert.ok((tmuxLog.match(/list-panes -a -F '#\{pane_id\}\\t#\{pane_dead\}\\t#\{pane_pid\}'/g)?.length ?? 0) >= 6);
+          assert.ok((tmuxLog.match(/list-panes -a -F '#\{pane_id\}\t#\{pane_dead\}\t#\{pane_pid\}'/g)?.length ?? 0) >= 6);
           assert.ok((tmuxLog.match(/select-layout -t @1 main-vertical/g)?.length ?? 0) >= 2);
           assert.equal(tmuxLog.match(/kill-pane -t %3/g)?.length ?? 0, 2);
         },
