@@ -4479,6 +4479,7 @@ case "\${1:-}" in
       *"pane_current_command"*)
         printf "%%1\\tnode\\t'codex'\\n"
         [ ! -f "${logPath}.worker" ] || printf "%%2\\tgemini\\t'gemini'\\n"
+        [ ! -f "${logPath}.hud" ] || printf "%%3\\tnode\\t'omx hud --watch'\\n"
         ;;
       *)
         printf "%%1\\n"
@@ -4512,7 +4513,35 @@ exit 0
               process.env.OMX_TEAM_WORKER_CLI = 'gemini';
               assert.throws(
                 () => createTeamSession(`Multiple ${scenario.name} IDs`, 1, cwd),
-                /tmux source authority changed before split effect/,
+                (error: unknown) => {
+                  assert.ok(
+                    error instanceof CreateTeamSessionPartialError,
+                    error instanceof Error
+                      ? `${error.name}: ${error.message} ${JSON.stringify(error)}`
+                      : String(error),
+                  );
+                  assert.equal(
+                    error.originalError instanceof Error ? error.originalError.message : '',
+                    'tmux_split_window_output_ambiguous',
+                  );
+                  if (scenario.name === 'worker') {
+                    assert.deepEqual(error.partialSession.workerPaneIds, ['%2']);
+                    assert.deepEqual(error.partialSession.workerPaneIdsByIndex, ['%2']);
+                    assert.deepEqual(error.partialSession.workerPanePidsByIndex, [null]);
+                    assert.equal(error.partialSession.hudPaneId, null);
+                  } else {
+                    assert.deepEqual(error.partialSession.workerPaneIds, []);
+                    assert.deepEqual(error.partialSession.workerPaneIdsByIndex, [null]);
+                    assert.equal(error.partialSession.hudPaneId, '%3');
+                    assert.equal(error.partialSession.hudPanePid, null);
+                  }
+                  return true;
+                },
+              );
+              assert.equal(
+                fs.existsSync(`${logPath}.${scenario.name}`),
+                true,
+                'ambiguous unowned pane must remain as cleanup debt rather than being killed',
               );
             },
           );

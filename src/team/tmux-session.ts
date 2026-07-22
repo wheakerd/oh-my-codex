@@ -120,6 +120,16 @@ class ExactPaneProofUnavailableError extends Error {
   }
 }
 
+class AmbiguousSplitWindowOutputError extends Error {
+  constructor(
+    readonly newlyObservedPaneIds: string[],
+    readonly reconciliationError: string | null = null,
+  ) {
+    super('tmux_split_window_output_ambiguous');
+    this.name = 'AmbiguousSplitWindowOutputError';
+  }
+}
+
 export interface CreateTeamSessionOptions {
   /**
    * Stable logical leader id forwarded to HUD/hook runtime and the generic
@@ -342,6 +352,12 @@ function runSourceAuthorizedTmux(source: SourcePaneAuthority, effect: string, re
 }
 
 function runSourceAuthorizedSplit(source: SourcePaneAuthority, effect: string): string {
+  const windowTarget = `${source.sessionName}:${source.windowIndex}`;
+  const beforeTopology = listPanesResult(windowTarget);
+  if (beforeTopology.error) {
+    throw new Error(`failed to read tmux pane topology before split: ${beforeTopology.error}`);
+  }
+  const beforePaneIds = new Set(beforeTopology.panes.map((pane) => pane.paneId));
   const receipt = sourceTransactionReceipt();
   const result = runTmux([
     'if-shell', '-F', '-t', source.paneId, sourceAuthorityPredicate(source),
@@ -351,7 +367,13 @@ function runSourceAuthorizedSplit(source: SourcePaneAuthority, effect: string): 
   if (!result.ok) throw new Error(`tmux source authority transaction failed: ${result.stderr}`);
   const paneId = parseSplitWindowPaneId(result.stdout, receipt);
   if (!paneId) {
-    throw new Error('tmux source authority changed before split effect');
+    const afterTopology = listPanesResult(windowTarget);
+    const newlyObservedPaneIds = afterTopology.error
+      ? []
+      : afterTopology.panes
+        .map((pane) => pane.paneId)
+        .filter((candidate) => !beforePaneIds.has(candidate));
+    throw new AmbiguousSplitWindowOutputError(newlyObservedPaneIds, afterTopology.error);
   }
   return paneId;
 }
@@ -2471,10 +2493,24 @@ export function createTeamSession(
       );
 
       const splitSource = captureSourcePaneAuthority(splitTarget, teamPaneOwnerId);
-      const paneId = runSourceAuthorizedSplit(
-        splitSource,
-        `split-window ${splitDirection} -t ${splitTarget} -d -P -F '#{pane_id}' -c ${shellQuoteSingle(tmuxWorkerCwd)} ${shellQuoteSingle(cmd)}`,
-      );
+      let paneId: string;
+      try {
+        paneId = runSourceAuthorizedSplit(
+          splitSource,
+          `split-window ${splitDirection} -t ${splitTarget} -d -P -F '#{pane_id}' -c ${shellQuoteSingle(tmuxWorkerCwd)} ${shellQuoteSingle(cmd)}`,
+        );
+      } catch (error) {
+        if (error instanceof AmbiguousSplitWindowOutputError) {
+          for (const candidatePaneId of error.newlyObservedPaneIds) {
+            rollbackPanes.set(candidatePaneId, null);
+            partialWorkerPaneIds.push(candidatePaneId);
+          }
+          if (error.newlyObservedPaneIds.length === 1) {
+            partialWorkerPaneIdsByIndex[i - 1] = error.newlyObservedPaneIds[0]!;
+          }
+        }
+        throw error;
+      }
 
       // The pane exists once split-window returns its concrete ID. Persist it in
       // rollback/partial state before its first proof: a malformed or unavailable
@@ -2548,10 +2584,24 @@ export function createTeamSession(
       const hudSplitTarget = leaderPaneId;
 
       const hudSource = captureSourcePaneAuthority(hudSplitTarget, teamPaneOwnerId);
-      const id = runSourceAuthorizedSplit(
-        hudSource,
-        `split-window -v -f -l ${HUD_TMUX_TEAM_HEIGHT_LINES} -t ${hudSplitTarget} -d -P -F '#{pane_id}' -c ${shellQuoteSingle(hudCwd)} ${shellQuoteSingle(hudCmd)}`,
-      );
+      let id: string;
+      try {
+        id = runSourceAuthorizedSplit(
+          hudSource,
+          `split-window -v -f -l ${HUD_TMUX_TEAM_HEIGHT_LINES} -t ${hudSplitTarget} -d -P -F '#{pane_id}' -c ${shellQuoteSingle(hudCwd)} ${shellQuoteSingle(hudCmd)}`,
+        );
+      } catch (error) {
+        if (error instanceof AmbiguousSplitWindowOutputError) {
+          for (const candidatePaneId of error.newlyObservedPaneIds) {
+            rollbackPanes.set(candidatePaneId, null);
+          }
+          if (error.newlyObservedPaneIds.length === 1) {
+            partialHudPaneId = error.newlyObservedPaneIds[0]!;
+            partialHudPanePid = null;
+          }
+        }
+        throw error;
+      }
       {
 
           // split-window has created a concrete pane even though no proof has
