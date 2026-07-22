@@ -2953,6 +2953,7 @@ export function restoreStandaloneHudPane(
     runTmux(['select-pane', '-t', requireAuthorizedLeaderPane()]);
     return existingHudPaneId;
   }
+  const beforeSplitPaneIds = new Set(paneListResult.panes.map((pane) => pane.paneId));
 
   const hudCmd = `exec env ${formatHudEnvAssignments(process.env, { sessionId: options.sessionId, leaderPaneId: normalizedLeaderPaneId })} ${shellQuoteSingle(translatePathForMsys(resolveLeaderNodePath()))} ${shellQuoteSingle(translatePathForMsys(omxEntry))} hud --watch`;
   let hudResult: ReturnType<typeof runTmux> | null = null;
@@ -2985,7 +2986,28 @@ export function restoreStandaloneHudPane(
   if (!hudResult?.ok) return null;
 
   const paneId = parseSplitWindowPaneId(hudResult.stdout);
-  if (!paneId) return null;
+  if (!paneId) {
+    const afterTopology = listPanesResult(normalizedLeaderPaneId);
+    if (afterTopology.error) {
+      throw new Error('restored_hud_split_topology_reconciliation_failed');
+    }
+    const newlyObservedPaneIds = afterTopology.panes
+      .map((pane) => pane.paneId)
+      .filter((candidate) => !beforeSplitPaneIds.has(candidate));
+    if (newlyObservedPaneIds.length === 1) {
+      persistRestoredHudCleanupDebtSync(cwd, {
+        schema_version: 1,
+        operation: 'restored_hud_cleanup',
+        pane_id: newlyObservedPaneIds[0]!,
+        pane_pid: null,
+        leader_pane_id: normalizedLeaderPaneId,
+        leader_pane_pid: options.expectedLeaderPanePid ?? leaderPanePid,
+        leader_pane_owner_id: options.expectedLeaderPaneOwnerId?.trim() || null,
+        hud_owner_leader_pane_id: normalizedLeaderPaneId,
+      }, options.stateRoot);
+    }
+    throw new Error('restored_hud_split_output_ambiguous');
+  }
   persistRestoredHudCleanupDebtSync(cwd, {
     schema_version: 1,
     operation: 'restored_hud_cleanup',

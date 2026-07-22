@@ -6839,6 +6839,58 @@ esac
     }
   });
 
+  it('retains PID-less restored HUD debt when successful split output is ambiguous', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-restored-hud-ambiguous-output-'));
+    try {
+      await withMockTmuxFixture(
+        'omx-restored-hud-ambiguous-output-',
+        (logPath) => `#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "${logPath}"
+case "$1" in
+  list-panes)
+    if [ "$2" = "-a" ]; then
+      printf '%%11\t0\t2000000011\n'
+      [ ! -f "${logPath}.created" ] || printf '%%44\t0\t2000000044\n'
+    else
+      printf '%%11\tzsh\tzsh\n'
+      [ ! -f "${logPath}.created" ] || printf "%%44\tnode\texec env OMX_TMUX_HUD_OWNER=1 OMX_TMUX_HUD_LEADER_PANE='%%11' /node /omx.js hud --watch\n"
+    fi
+    ;;
+  split-window)
+    : > "${logPath}.created"
+    printf '%%44\n%%99\n'
+    ;;
+  *) exit 0 ;;
+esac
+`,
+        async ({ logPath }) => {
+          assert.throws(
+            () => restoreStandaloneHudPane('%11', cwd),
+            /restored_hud_split_output_ambiguous/,
+          );
+
+          const debtPath = join(cwd, '.omx', 'state', '.restored-hud-cleanup-debt.json');
+          const debt = JSON.parse(await readFile(debtPath, 'utf-8')) as Record<string, unknown>;
+          assert.deepEqual(debt, {
+            schema_version: 1,
+            operation: 'restored_hud_cleanup',
+            pane_id: '%44',
+            pane_pid: null,
+            leader_pane_id: '%11',
+            leader_pane_pid: 2000000011,
+            leader_pane_owner_id: null,
+            hud_owner_leader_pane_id: '%11',
+          });
+          const commands = await readFile(logPath, 'utf-8');
+          assert.doesNotMatch(commands, /kill-pane/);
+        },
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it('rejects restored HUD debt roots outside the canonical direct Team root before splitting', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-restored-hud-debt-root-'));
     const canonicalTeamsRoot = join(cwd, '.omx', 'state', 'team');
