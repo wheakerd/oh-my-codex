@@ -1,16 +1,18 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, writeFileSync } from 'node:fs';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { createHash } from 'node:crypto';
+import { existsSync } from 'node:fs';
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
 import {
   isInstallVersionBump,
   isNewerVersion,
   maybeCheckAndPromptUpdate,
   readUserInstallStamp,
   resolveAutoUpdateMode,
-  resolveGlobalInstallRoot,
   resolveInstalledCliEntry,
   formatDeferredSetupCommand,
   resolveSetupRefreshArgs,
@@ -21,8 +23,21 @@ import {
   spawnInstalledSetupRefresh,
   writeUserInstallStamp,
 } from '../update.js';
+import {
+  resolveBunGlobalBin,
+  resolvePackageManagerOwnership,
+  type PackageManagerOwnership,
+} from '../package-manager-ownership.js';
 
 const PACKAGE_NAME = 'oh-my-codex';
+const frozenNpmOwnership: PackageManagerOwnership = {
+  manager: 'npm',
+  npmCommand: { kind: 'node-script', command: process.execPath, commandArgs: ['/configured/npm-cli.js'] },
+  npmPrefix: '/configured',
+  globalInstallRoot: '/configured/node_modules',
+  packageRoot: '/configured/node_modules/oh-my-codex',
+  environment: { OMX_UPDATE_TEST: '1' },
+};
 
 describe('isNewerVersion', () => {
   it('returns true when latest has higher major', () => {
@@ -592,218 +607,55 @@ describe('maybeCheckAndPromptUpdate', () => {
   });
 });
 
-describe('direct npm spawn fallback', () => {
-  function spawnErrorResult(code: string) {
-    const error = Object.assign(new Error(`spawnSync npm ${code}`), { code });
-    return { status: null, signal: null, error, stdout: '', stderr: '', output: [null, '', ''], pid: 0 };
-  }
-
-  function enoentResult() {
-    return spawnErrorResult('ENOENT');
-  }
-
-  function einvalResult() {
-    return spawnErrorResult('EINVAL');
-  }
-
+describe('frozen package-manager update ownership', () => {
   function okResult(stdout = '') {
     return { status: 0, signal: null, error: undefined, stdout, stderr: '', output: [null, stdout, ''], pid: 0 };
   }
 
-  it('falls back to npm.cmd for win32 global installs when direct npm spawn returns ENOENT', () => {
-    const calls: Array<{ command: string; args: string[] }> = [];
-
-    const result = runGlobalUpdate(
-      ((command: string, args: readonly string[]) => {
-        calls.push({ command, args: args as string[] });
-        return command === 'npm' ? enoentResult() : okResult();
-      }) as unknown as typeof import('node:child_process').spawnSync,
-      'win32',
-    );
-
-    assert.equal(result.ok, true);
-    assert.deepEqual(calls.map((call) => call.command), ['npm', 'npm.cmd']);
-    assert.deepEqual(calls[0].args, ['install', '-g', 'oh-my-codex@latest']);
-    assert.deepEqual(calls[1].args, ['install', '-g', 'oh-my-codex@latest']);
-  });
-
-  it('falls back through cmd.exe when win32 npm.cmd cannot be spawned', () => {
-    const calls: Array<{ command: string; args: string[] }> = [];
-
-    const result = runGlobalUpdate(
-      ((command: string, args: readonly string[]) => {
-        calls.push({ command, args: args as string[] });
-        if (command === 'npm') return enoentResult();
-        if (command === 'npm.cmd') return einvalResult();
-        return okResult();
-      }) as unknown as typeof import('node:child_process').spawnSync,
-      'win32',
-    );
-
-    assert.equal(result.ok, true);
-    assert.deepEqual(calls.map((call) => call.command), ['npm', 'npm.cmd', 'cmd.exe']);
-    assert.deepEqual(calls[0].args, ['install', '-g', 'oh-my-codex@latest']);
-    assert.deepEqual(calls[1].args, ['install', '-g', 'oh-my-codex@latest']);
-    assert.deepEqual(calls[2].args, ['/d', '/s', '/c', 'npm', 'install', '-g', 'oh-my-codex@latest']);
-  });
-
-  it('uses cmd.exe for win32 global installs when direct npm returns EINVAL', () => {
-    const calls: Array<{ command: string; args: string[] }> = [];
-
-    const result = runGlobalUpdate(
-      ((command: string, args: readonly string[]) => {
-        calls.push({ command, args: args as string[] });
-        return command === 'npm' ? einvalResult() : okResult();
-      }) as unknown as typeof import('node:child_process').spawnSync,
-      'win32',
-    );
-
-    assert.equal(result.ok, true);
-    assert.deepEqual(calls.map((call) => call.command), ['npm', 'cmd.exe']);
-    assert.deepEqual(calls[1].args, ['/d', '/s', '/c', 'npm', 'install', '-g', 'oh-my-codex@latest']);
-  });
-
-  it('does not shell-wrap non-target win32 npm operations when npm.cmd returns EINVAL', () => {
-    const calls: Array<{ command: string; args: string[] }> = [];
-
-    const root = resolveGlobalInstallRoot(
-      ((command: string, args: readonly string[]) => {
-        calls.push({ command, args: args as string[] });
-        if (command === 'npm') return enoentResult();
-        if (command === 'npm.cmd') return einvalResult();
-        return okResult('unexpected');
-      }) as unknown as typeof import('node:child_process').spawnSync,
-      'win32',
-    );
-
-    assert.equal(root, null);
-    assert.deepEqual(calls.map((call) => call.command), ['npm', 'npm.cmd']);
-    assert.deepEqual(calls[0].args, ['root', '-g']);
-    assert.deepEqual(calls[1].args, ['root', '-g']);
-  });
-
-  it('keeps the direct npm path when it succeeds', () => {
-    const calls: Array<{ command: string; args: string[] }> = [];
-
-    const result = runGlobalUpdate(
-      ((command: string, args: readonly string[]) => {
-        calls.push({ command, args: args as string[] });
-        return okResult();
-      }) as unknown as typeof import('node:child_process').spawnSync,
-      'win32',
-    );
-
-    assert.equal(result.ok, true);
-    assert.deepEqual(calls.map((call) => call.command), ['npm']);
-    assert.deepEqual(calls[0].args, ['install', '-g', 'oh-my-codex@latest']);
-  });
-
-  it('does not fall back to npm.cmd for non-Windows ENOENT failures', () => {
+  it('rejects legacy unowned update calls without selecting an ambient manager', () => {
     const calls: string[] = [];
-
-    const result = runGlobalUpdate(
-      ((command: string) => {
-        calls.push(command);
-        return enoentResult();
-      }) as unknown as typeof import('node:child_process').spawnSync,
-      'linux',
-    );
+    const result = runGlobalUpdate(((command: string) => {
+      calls.push(command);
+      return okResult();
+    }) as unknown as typeof import('node:child_process').spawnSync);
 
     assert.equal(result.ok, false);
-    assert.match(result.stderr, /ENOENT/);
-    assert.deepEqual(calls, ['npm']);
+    assert.match(result.stderr, /validated package-manager ownership/);
+    assert.deepEqual(calls, []);
   });
 
+  it('requires ownership when the native updater remains selected beside an explicit setup seam', async () => {
+    const result = await runImmediateUpdate('/tmp/omx-unowned-update', {
+      getCurrentVersion: async () => '0.14.0',
+      fetchLatestVersion: async () => '0.14.1',
+      resolvePackageManagerOwnership: async () => null,
+      runSetupRefresh: async () => ({ ok: true, stderr: '' }),
+    });
 
-  it('packs the dev branch from a local checkout instead of globally installing the git dependency spec', () => {
-    const originalNpmLocation = process.env.npm_config_location;
-    const calls: Array<{ command: string; args: string[]; cwd?: string; env?: NodeJS.ProcessEnv }> = [];
+    assert.equal(result.status, 'failed');
+  });
 
-    process.env.npm_config_location = 'global';
+  it('uses only the selected frozen npm command for dev packaging and installation', () => {
+    const calls: Array<{ command: string; args: string[] }> = [];
+    const owner: PackageManagerOwnership = {
+      ...frozenNpmOwnership,
+      npmCommand: { kind: 'node-script', command: '/configured/node', commandArgs: ['/configured/npm-cli.js'] },
+    };
+    const result = runGlobalUpdate('github:Yeachan-Heo/oh-my-codex#dev', ((command: string, args: readonly string[]) => {
+      calls.push({ command, args: [...args] });
+      return command === 'git' ? { ...okResult(), stdout: args[0] === 'rev-parse' ? '1234567890abcdef\n' : '' } : okResult();
+    }) as typeof import('node:child_process').spawnSync, 'win32', owner);
 
-    try {
-      const result = runGlobalUpdate(
-        'github:Yeachan-Heo/oh-my-codex#dev',
-        ((command: string, args: readonly string[], options?: { cwd?: string; env?: NodeJS.ProcessEnv }) => {
-          calls.push({ command, args: args as string[], cwd: options?.cwd, env: options?.env });
-          if (command === 'git' && args[0] === 'clone') {
-            mkdirSync(String(args[args.length - 1]), { recursive: true });
-          }
-          if (command === 'git' && args[0] === 'rev-parse') {
-            return okResult('1234567890abcdef\n');
-          }
-          if (command === 'npm' && args[0] === 'pack') {
-            writeFileSync(join(options?.cwd ?? process.cwd(), 'oh-my-codex-0.18.9.tgz'), 'packed');
-            return okResult(JSON.stringify([{ filename: 'oh-my-codex-0.18.9.tgz' }]));
-          }
-          return okResult();
-        }) as unknown as typeof import('node:child_process').spawnSync,
-        'linux',
-      );
-
-      assert.equal(result.ok, true);
-      assert.deepEqual(calls.map((call) => [call.command, ...call.args.slice(0, 3)]), [
-        ['git', 'clone', '--depth', '1'],
-        ['git', 'rev-parse', 'HEAD'],
-        ['npm', 'install', '--global=false', '--location=project'],
-        ['npm', 'run', 'prepack'],
-        ['npm', 'pack', '--ignore-scripts', '--json'],
-        ['npm', 'install', '-g', join(calls[2].cwd ?? '', 'oh-my-codex-0.18.9.tgz')],
-      ]);
-      const dependencyInstall = calls.find((call) => call.command === 'npm' && call.args[0] === 'install' && call.args.includes('--include=dev'));
-      assert.equal(dependencyInstall?.env?.npm_config_global, 'false');
-      assert.equal(dependencyInstall?.env?.npm_config_location, 'project');
-      assert.equal(calls.some((call) => call.args.includes('github:Yeachan-Heo/oh-my-codex#dev')), false);
-    } finally {
-      if (typeof originalNpmLocation === 'string') {
-        process.env.npm_config_location = originalNpmLocation;
-      } else {
-        delete process.env.npm_config_location;
-      }
+    assert.equal(result.ok, false);
+    assert.match(result.stderr, /npm pack did not produce/);
+    assert.deepEqual(calls.map((call) => call.command), [
+      'git', 'git', '/configured/node', '/configured/node', '/configured/node',
+    ]);
+    for (const call of calls.slice(2)) {
+      assert.deepEqual(call.args.slice(0, 1), ['/configured/npm-cli.js']);
     }
   });
 
-  it('does not use cmd.exe for win32 dev-channel npm packaging when npm.cmd returns EINVAL', () => {
-    const calls: Array<{ command: string; args: string[] }> = [];
-
-    const result = runGlobalUpdate(
-      'github:Yeachan-Heo/oh-my-codex#dev',
-      ((command: string, args: readonly string[]) => {
-        calls.push({ command, args: args as string[] });
-        if (command === 'git' && args[0] === 'clone') {
-          mkdirSync(String(args[args.length - 1]), { recursive: true });
-          return okResult();
-        }
-        if (command === 'git' && args[0] === 'rev-parse') return okResult('1234567890abcdef\n');
-        if (command === 'npm') return enoentResult();
-        if (command === 'npm.cmd') return einvalResult();
-        return okResult();
-      }) as unknown as typeof import('node:child_process').spawnSync,
-      'win32',
-    );
-
-    assert.equal(result.ok, false);
-    assert.match(result.stderr, /EINVAL/);
-    assert.deepEqual(calls.map((call) => call.command), ['git', 'git', 'npm', 'npm.cmd']);
-    assert.equal(calls.some((call) => call.command === 'cmd.exe'), false);
-  });
-
-  it('falls back to npm.cmd for win32 global-root lookup when direct npm spawn returns ENOENT', () => {
-    const calls: Array<{ command: string; args: string[] }> = [];
-
-    const root = resolveGlobalInstallRoot(
-      ((command: string, args: readonly string[]) => {
-        calls.push({ command, args: args as string[] });
-        return command === 'npm' ? enoentResult() : okResult('C:\\Users\\alice\\AppData\\Roaming\\npm\\node_modules\r\n');
-      }) as unknown as typeof import('node:child_process').spawnSync,
-      'win32',
-    );
-
-    assert.equal(root, 'C:\\Users\\alice\\AppData\\Roaming\\npm\\node_modules');
-    assert.deepEqual(calls.map((call) => call.command), ['npm', 'npm.cmd']);
-    assert.deepEqual(calls[0].args, ['root', '-g']);
-    assert.deepEqual(calls[1].args, ['root', '-g']);
-  });
 });
 
 describe('runImmediateUpdate', () => {
@@ -1235,9 +1087,9 @@ describe('runImmediateUpdate failure diagnostics', () => {
 
       assert.equal(result.status, 'failed');
       assert.equal(refreshCalls, 0);
-      assert.match(logs.join('\n'), /Update failed while running npm install -g oh-my-codex@latest/);
+      assert.match(logs.join('\n'), /Update failed while running the selected npm transaction \(npm install -g oh-my-codex@latest\)/);
       assert.match(logs.join('\n'), /npm stderr: EPERM: file is locked/);
-      assert.match(logs.join('\n'), /npm install -g oh-my-codex@latest && omx setup/);
+      assert.match(logs.join('\n'), /ownership-safe recovery command: omx update/);
     } finally {
       console.log = originalLog;
       await rm(cwd, { recursive: true, force: true });
@@ -1247,7 +1099,7 @@ describe('runImmediateUpdate failure diagnostics', () => {
 
 
 describe('runDeferredGlobalUpdate', () => {
-  it('launches a detached Windows PowerShell updater that waits for the parent and runs setup after npm', async () => {
+  it('launches a detached Node worker with a frozen ownership payload on Windows', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-deferred-update-'));
     const calls: Array<{ command: string; args: string[]; options: Record<string, unknown> }> = [];
     const listeners: string[] = [];
@@ -1267,24 +1119,64 @@ describe('runDeferredGlobalUpdate', () => {
         }) as typeof import('node:child_process').spawn,
         'win32',
         12345,
+        frozenNpmOwnership,
       );
 
       assert.equal(result.ok, true);
       assert.match(result.logPath ?? '', /\.omx[\\/]logs[\\/]update-/);
       assert.equal(calls.length, 1);
-      assert.equal(calls[0].command, 'powershell.exe');
-      assert.deepEqual(calls[0].args.slice(0, 4), ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command']);
+      assert.equal(calls[0]?.command, process.execPath);
+      assert.match(calls[0]?.args[0] ?? '', /update-worker\.js$/);
+      const payloadPath = calls[0]?.args[1];
+      assert.equal(typeof payloadPath, 'string');
+      const payload = JSON.parse(await readFile(String(payloadPath), 'utf-8')) as {
+        cwd: string;
+        parentPid: number;
+        ownership: PackageManagerOwnership;
+        setupArgs: string[];
+      };
+      assert.deepEqual(payload, {
+        cwd,
+        logPath: result.logPath,
+        parentPid: 12345,
+        ownership: frozenNpmOwnership,
+        setupArgs: ['setup'],
+      });
       assert.deepEqual(listeners, ['error']);
-      assert.equal(calls[0].options.detached, true);
-      assert.equal(calls[0].options.stdio, 'ignore');
-      assert.equal(calls[0].options.windowsHide, true);
-      assert.equal(calls[0].options.cwd, cwd);
-      assert.equal((calls[0].options.env as NodeJS.ProcessEnv | undefined)?.OMX_DEFERRED_UPDATE_PARENT_PID, '12345');
-      assert.equal((calls[0].options.env as NodeJS.ProcessEnv | undefined)?.OMX_DEFERRED_UPDATE_LOG, result.logPath);
-      assert.equal((calls[0].options.env as NodeJS.ProcessEnv | undefined)?.OMX_SKIP_NATIVE_AGENT_REFRESH, '1');
-      assert.match(calls[0].args[4], /Get-Process -Id \$parentPid/);
-      assert.match(calls[0].args[4], /npm install -g oh-my-codex@latest/);
-      assert.match(calls[0].args[4], /& 'omx' 'setup'/);
+      assert.equal(calls[0]?.options.detached, true);
+      assert.equal(calls[0]?.options.stdio, 'ignore');
+      assert.equal(calls[0]?.options.windowsHide, true);
+      assert.equal(calls[0]?.options.cwd, cwd);
+      assert.deepEqual(calls[0]?.options.env, { OMX_UPDATE_TEST: '1', OMX_SKIP_NATIVE_AGENT_REFRESH: '1' });
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('removes the frozen staged payload when the detached launcher emits an error', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-deferred-update-launcher-error-'));
+    let payloadPath = '';
+
+    try {
+      const result = runDeferredGlobalUpdate(
+        cwd,
+        ((_command, args) => {
+          payloadPath = String((args as readonly string[])[1]);
+          return {
+            once(event: string, listener: (error: Error) => void) {
+              if (event === 'error') listener(new Error('launcher failed'));
+              return this;
+            },
+            unref() {},
+          } as unknown as ReturnType<typeof import('node:child_process').spawn>;
+        }) as typeof import('node:child_process').spawn,
+        'linux',
+        12345,
+        frozenNpmOwnership,
+      );
+
+      assert.equal(result.ok, true);
+      assert.equal(existsSync(payloadPath), false);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -1314,11 +1206,13 @@ describe('runDeferredGlobalUpdate', () => {
         }) as typeof import('node:child_process').spawn,
         'linux',
         12345,
+        frozenNpmOwnership,
       );
 
       assert.equal(result.ok, true);
       assert.equal(calls.length, 1);
-      assert.match(calls[0].args[1], /'omx' 'setup' '--scope' 'user' '--plugin' '--mcp' 'none' '--disable-team'/);
+      const payload = JSON.parse(await readFile(calls[0]?.args[1] ?? '', 'utf-8')) as { setupArgs: string[] };
+      assert.deepEqual(payload.setupArgs, ['setup', '--scope', 'user', '--plugin', '--mcp', 'none', '--disable-team']);
       assert.equal((calls[0].options as { env?: NodeJS.ProcessEnv } | undefined)?.env?.OMX_SKIP_NATIVE_AGENT_REFRESH, '1');
     } finally {
       await rm(cwd, { recursive: true, force: true });
@@ -1350,6 +1244,7 @@ describe('runDeferredGlobalUpdate', () => {
         }) as typeof import('node:child_process').spawn,
         'linux',
         12345,
+        frozenNpmOwnership,
       );
 
       await writeFile(
@@ -1359,9 +1254,8 @@ describe('runDeferredGlobalUpdate', () => {
 
       assert.equal(result.ok, true);
       assert.equal(calls.length, 1);
-      assert.match(calls[0].args[1], /'omx' 'setup' '--scope' 'user' '--plugin' '--mcp' 'none' '--disable-team'/);
-      assert.doesNotMatch(calls[0].args[1], /compat/);
-      assert.doesNotMatch(calls[0].args[1], /legacy/);
+      const payload = JSON.parse(await readFile(calls[0]?.args[1] ?? '', 'utf-8')) as { setupArgs: string[] };
+      assert.deepEqual(payload.setupArgs, ['setup', '--scope', 'user', '--plugin', '--mcp', 'none', '--disable-team']);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -1379,6 +1273,197 @@ describe('runDeferredGlobalUpdate', () => {
       "& 'omx tool' 'setup' '--scope' 'user project' '--mcp' 'none''; echo pwned #' '--flag' ''",
     );
   });
+
+
+describe('deferred update worker', () => {
+  it('retains refresh suppression and removes the verified staging directory after execution', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'omx-update-worker-'));
+    const globalRoot = join(root, 'global');
+    const packageRoot = join(globalRoot, PACKAGE_NAME);
+    const stage = join(root, 'omx-update-stage');
+
+    const payloadPath = join(stage, 'transaction.json');
+    const capturePath = join(root, 'setup-capture.json');
+    const codexHome = join(root, 'codex-home');
+    const stampPath = join(codexHome, '.omx', 'install-state.json');
+    const npmCliPath = join(root, 'npm-cli.js');
+    const cliPath = join(packageRoot, 'dist', 'cli.js');
+    const workerPath = join(dirname(fileURLToPath(import.meta.url)), '..', 'update-worker.js');
+
+    try {
+      await mkdir(dirname(cliPath), { recursive: true });
+      await writeFile(join(packageRoot, 'package.json'), JSON.stringify({ name: PACKAGE_NAME, version: '0.14.1', bin: { omx: 'dist/cli.js' } }));
+      await writeFile(cliPath, [
+        "import { existsSync, writeFileSync } from 'node:fs';",
+        "writeFileSync(process.env.OMX_UPDATE_CAPTURE_PATH, JSON.stringify({ args: process.argv.slice(2), skip: process.env.OMX_SKIP_NATIVE_AGENT_REFRESH, stampPresent: existsSync(process.env.OMX_UPDATE_STAMP_PATH) }));",
+      ].join('\n'));
+      await writeFile(npmCliPath, [
+        "const args = process.argv.slice(2);",
+        "if (args[0] === 'root') process.stdout.write(process.env.OMX_UPDATE_GLOBAL_ROOT + '\\n');",
+        "else if (args[0] === 'prefix') process.stdout.write(process.env.OMX_UPDATE_PREFIX + '\\n');",
+      ].join('\n'));
+      await mkdir(stage, { recursive: true });
+      await chmod(stage, 0o700);
+      const ownership: PackageManagerOwnership = {
+        manager: 'npm',
+        npmCommand: { kind: 'node-script', command: process.execPath, commandArgs: [npmCliPath] },
+        npmPrefix: root,
+        globalInstallRoot: globalRoot,
+        packageRoot,
+        environment: {
+          OMX_UPDATE_CAPTURE_PATH: capturePath,
+          OMX_UPDATE_GLOBAL_ROOT: globalRoot,
+          OMX_UPDATE_PREFIX: root,
+          CODEX_HOME: codexHome,
+          OMX_UPDATE_STAMP_PATH: stampPath,
+        },
+      };
+      const serialized = JSON.stringify({ cwd: root, logPath: join(root, 'update.log'), parentPid: 999999, ownership, setupArgs: ['setup', '--scope', 'project'] });
+      await writeFile(payloadPath, serialized, { mode: 0o600 });
+      const digest = (contents: string | Buffer) => createHash('sha256').update(contents).digest('hex');
+      const result = spawnSync(process.execPath, [workerPath, payloadPath, digest(serialized), digest(await readFile(workerPath))], {
+        encoding: 'utf-8',
+        timeout: 10000,
+      });
+
+      assert.equal(result.status, 0, result.stderr);
+      assert.deepEqual(JSON.parse(await readFile(capturePath, 'utf-8')), {
+        args: ['setup', '--scope', 'project'],
+        skip: '1',
+        stampPresent: false,
+      });
+      const stamp = JSON.parse(await readFile(stampPath, 'utf-8')) as {
+        installed_version: string;
+        setup_completed_version: string;
+        install_channel: string;
+        install_source: string;
+        package_manager: string;
+        updated_at: string;
+      };
+      assert.deepEqual({ ...stamp, updated_at: undefined }, {
+        installed_version: '0.14.1',
+        setup_completed_version: '0.14.1',
+        install_channel: 'stable',
+        install_source: 'oh-my-codex@latest',
+        package_manager: 'npm',
+        updated_at: undefined,
+      });
+      assert.match(stamp.updated_at, /^\d{4}-\d{2}-\d{2}T/);
+      await assert.rejects(readFile(payloadPath), { code: 'ENOENT' });
+      await assert.rejects(readFile(stage), { code: 'ENOENT' });
+      await writeFile(join(packageRoot, 'package.json'), JSON.stringify({ name: 'unexpected-package', version: '0.14.1', bin: { omx: 'dist/cli.js' } }));
+      await mkdir(stage, { recursive: true });
+      await chmod(stage, 0o700);
+      await writeFile(payloadPath, serialized, { mode: 0o600 });
+      const rejected = spawnSync(process.execPath, [workerPath, payloadPath, digest(serialized), digest(await readFile(workerPath))], {
+        encoding: 'utf-8',
+        timeout: 10000,
+      });
+      assert.equal(rejected.status, 1, rejected.stderr);
+      await assert.rejects(readFile(stage), { code: 'ENOENT' });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a worker whose frozen identity digest no longer matches', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'omx-update-worker-integrity-'));
+    const stage = join(root, 'omx-update-integrity');
+
+    const payloadPath = join(stage, 'transaction.json');
+    const workerPath = join(dirname(fileURLToPath(import.meta.url)), '..', 'update-worker.js');
+
+    try {
+      await mkdir(stage, { recursive: true });
+      await chmod(stage, 0o700);
+      const serialized = '{}';
+      await writeFile(payloadPath, serialized, { mode: 0o600 });
+      const digest = (contents: string) => createHash('sha256').update(contents).digest('hex');
+      const result = spawnSync(process.execPath, [workerPath, payloadPath, digest(serialized), digest('different worker')], {
+        encoding: 'utf-8',
+        timeout: 10000,
+      });
+
+      assert.equal(result.status, 1);
+      assert.equal(existsSync(join(root, 'update.log')), false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a signed deferred payload with an invalid parent transaction boundary', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'omx-update-worker-payload-'));
+    const stage = join(root, 'omx-update-payload');
+
+    const payloadPath = join(stage, 'transaction.json');
+    const workerPath = join(dirname(fileURLToPath(import.meta.url)), '..', 'update-worker.js');
+
+    try {
+      await mkdir(stage, { recursive: true });
+      await chmod(stage, 0o700);
+      const serialized = JSON.stringify({ cwd: root, logPath: join(root, 'update.log'), parentPid: 0, setupArgs: [], ownership: frozenNpmOwnership });
+      await writeFile(payloadPath, serialized, { mode: 0o600 });
+      const digest = (contents: string | Buffer) => createHash('sha256').update(contents).digest('hex');
+      const result = spawnSync(process.execPath, [workerPath, payloadPath, digest(serialized), digest(await readFile(workerPath))], {
+        encoding: 'utf-8',
+        timeout: 10000,
+      });
+
+      assert.equal(result.status, 1, result.stderr);
+      assert.equal(await readFile(payloadPath, 'utf-8'), serialized);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a noncanonical payload path without removing its owner-only directory', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'omx-update-worker-noncanonical-'));
+    const stage = join(root, 'omx-update-noncanonical');
+    const payloadPath = join(stage, 'unrelated.json');
+    const workerPath = join(dirname(fileURLToPath(import.meta.url)), '..', 'update-worker.js');
+
+    try {
+      await mkdir(stage, { recursive: true });
+      await chmod(stage, 0o700);
+      const serialized = '{}';
+      await writeFile(payloadPath, serialized, { mode: 0o600 });
+      const digest = (contents: string | Buffer) => createHash('sha256').update(contents).digest('hex');
+      const result = spawnSync(process.execPath, [workerPath, payloadPath, digest(serialized), digest(await readFile(workerPath))], {
+        encoding: 'utf-8',
+        timeout: 10000,
+      });
+
+      assert.equal(result.status, 1, result.stderr);
+      assert.equal(await readFile(payloadPath, 'utf-8'), serialized);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves an owner-only directory outside the scheduler staging namespace', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'omx-update-worker-foreign-stage-'));
+    const stage = join(root, 'foreign-stage');
+    const payloadPath = join(stage, 'transaction.json');
+    const workerPath = join(dirname(fileURLToPath(import.meta.url)), '..', 'update-worker.js');
+
+    try {
+      await mkdir(stage, { recursive: true });
+      await chmod(stage, 0o700);
+      const serialized = '{}';
+      await writeFile(payloadPath, serialized, { mode: 0o600 });
+      const digest = (contents: string | Buffer) => createHash('sha256').update(contents).digest('hex');
+      const result = spawnSync(process.execPath, [workerPath, payloadPath, digest(serialized), digest(await readFile(workerPath))], {
+        encoding: 'utf-8',
+        timeout: 10000,
+      });
+
+      assert.equal(result.status, 1, result.stderr);
+      assert.equal(await readFile(payloadPath, 'utf-8'), serialized);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
 });
 
 describe('post-update setup refresh handoff', () => {
@@ -1441,6 +1526,29 @@ describe('post-update setup refresh handoff', () => {
 
     assert.equal(result.ok, true);
     assert.equal(receivedTimeout, undefined);
+  });
+
+  it('passes only the frozen ownership environment to the immediate setup child', () => {
+    const frozenEnvironment: NodeJS.ProcessEnv = {
+      CODEX_HOME: '/frozen/codex-home',
+      OMX_SKIP_NATIVE_AGENT_REFRESH: '1',
+    };
+    let receivedEnvironment: NodeJS.ProcessEnv | undefined;
+
+    const result = spawnInstalledSetupRefresh(
+      '/tmp/omx.js',
+      '/tmp/project',
+      ((_command, _args, options) => {
+        receivedEnvironment = options?.env;
+        return { status: 0, error: undefined };
+      }) as typeof import('node:child_process').spawnSync,
+      process.execPath,
+      frozenEnvironment,
+    );
+
+    assert.equal(result.ok, true);
+    assert.deepEqual(receivedEnvironment, frozenEnvironment);
+    assert.equal(receivedEnvironment?.OMX_SKIP_NATIVE_AGENT_REFRESH, '1');
   });
 
   it('passes persisted plugin setup choices to the updated CLI refresh', async () => {
@@ -1551,7 +1659,7 @@ describe('persisted merge policy update replay', () => {
     }
   });
 
-  it('snapshots the same merge-policy argv for deferred POSIX and PowerShell commands', async () => {
+  it('snapshots merge-policy argv in the detached Node-worker payload on every platform', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-update-merge-policy-snapshot-'));
     const calls: Array<{ args: string[] }> = [];
     try {
@@ -1562,10 +1670,423 @@ describe('persisted merge policy update replay', () => {
         const result = runDeferredGlobalUpdate(cwd, ((_, args) => {
           calls.push({ args: args as string[] });
           return { once() { return this; }, unref() {} } as unknown as ReturnType<typeof import('node:child_process').spawn>;
-        }) as typeof import('node:child_process').spawn, platform, 12345);
+        }) as typeof import('node:child_process').spawn, platform, 12345, frozenNpmOwnership);
         assert.equal(result.ok, true);
-        assert.match(calls[0]?.args.at(-1) ?? '', /--no-merge-agents/);
-        assert.doesNotMatch(calls[0]?.args.at(-1) ?? '', /--force/);
+        const payload = JSON.parse(await readFile(calls[0]?.args[1] ?? '', 'utf-8')) as { setupArgs: string[] };
+        assert.deepEqual(payload.setupArgs, ['setup', '--scope', 'user', '--no-merge-agents']);
+      }
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('package-manager ownership', () => {
+  const executable = '/configured/node_modules/oh-my-codex/dist/cli/omx.js';
+  const packageRoot = '/configured/node_modules/oh-my-codex';
+
+  function ownershipDependencies(stamp: 'npm' | 'bun' | undefined, roots: { npm?: string; bunBin?: string }) {
+    return {
+      currentExecutable: executable,
+      currentPackageRoot: packageRoot,
+      readInstallStamp: async () => stamp
+        ? { installed_version: '0.20.3', updated_at: '2026-07-22T00:00:00.000Z', package_manager: stamp }
+        : null,
+      realpath: (path: string) => path,
+      resolveNpmGlobalInstallRoot: () => roots.npm ?? null,
+      resolveBunGlobalBin: () => roots.bunBin ?? null,
+      resolveBunCommand: () => '/configured/runtime/bun',
+      resolveNpmCommand: () => ({ kind: 'node-script' as const, command: '/canonical/node', commandArgs: ['/canonical/npm-cli.js'] }),
+      resolveNpmPrefix: () => '/configured',
+      environment: { OMX_UPDATE_TEST: '1' },
+    };
+  }
+
+  it('selects a validated npm owner from isolated roots', async () => {
+    assert.deepEqual(await resolvePackageManagerOwnership(ownershipDependencies('npm', {
+      npm: '/configured/node_modules',
+    })), {
+      manager: 'npm',
+      npmCommand: { kind: 'node-script', command: '/canonical/node', commandArgs: ['/canonical/npm-cli.js'] },
+      npmPrefix: '/configured',
+      globalInstallRoot: '/configured/node_modules',
+      packageRoot: '/configured/node_modules/oh-my-codex',
+      environment: {},
+    });
+  });
+
+  it('recovers an npm owner from a stale Bun stamp without deleting the stamp', async () => {
+    const ownership = await resolvePackageManagerOwnership(ownershipDependencies('bun', {
+      npm: '/configured/node_modules',
+    }));
+
+    assert.equal(ownership?.manager, 'npm');
+  });
+
+  it('freezes CODEX_HOME for deferred setup and update finalization', async () => {
+    const ownership = await resolvePackageManagerOwnership({
+      ...ownershipDependencies('npm', { npm: '/configured/node_modules' }),
+      environment: { CODEX_HOME: '/configured/codex-home' },
+    });
+    assert.deepEqual(ownership?.environment, { CODEX_HOME: '/configured/codex-home' });
+  });
+
+  it('resolves a normal npm Node-shebang launch from its installed npm CLI without lifecycle provenance', async () => {
+    let npmCommand: Extract<PackageManagerOwnership, { manager: 'npm' }>['npmCommand'] | undefined;
+    const ownership = await resolvePackageManagerOwnership({
+      ...ownershipDependencies('npm', { npm: '/fake/npm/lib/node_modules' }),
+      currentExecutable: '/fake/npm/lib/node_modules/oh-my-codex/dist/cli/omx.js',
+      currentPackageRoot: '/fake/npm/lib/node_modules/oh-my-codex',
+      currentNodeExecutable: '/fake/npm/bin/node',
+      resolveNpmCommand: () => null,
+      resolveNpmGlobalInstallRoot: (command) => {
+        npmCommand = command;
+        return '/fake/npm/lib/node_modules';
+      },
+      resolveNpmPrefix: () => '/fake/npm',
+      environment: {},
+    });
+    assert.deepEqual(npmCommand, {
+      kind: 'node-script', command: '/fake/npm/bin/node', commandArgs: ['/fake/npm/lib/node_modules/npm/bin/npm-cli.js'],
+    });
+    assert.deepEqual(ownership, {
+      manager: 'npm',
+      npmCommand: npmCommand!,
+      npmPrefix: '/fake/npm',
+      globalInstallRoot: '/fake/npm/lib/node_modules',
+      packageRoot: '/fake/npm/lib/node_modules/oh-my-codex',
+      environment: {},
+    });
+    assert.equal(await resolvePackageManagerOwnership({
+      ...ownershipDependencies('npm', { npm: '/fake/npm/lib/node_modules' }),
+      currentExecutable: '/fake/npm/lib/node_modules/oh-my-codex/dist/cli/omx.js',
+      currentPackageRoot: '/fake/npm/lib/node_modules/oh-my-codex',
+      currentNodeExecutable: '/fake/npm/bin/node',
+      resolveNpmCommand: () => null,
+      realpath: (path) => {
+        if (path.endsWith('/npm/bin/npm-cli.js')) throw new Error('missing npm CLI');
+        return path;
+      },
+      environment: {},
+    }), null, 'missing installed npm CLI must fail closed');
+  });
+
+  it('resolves npm from the selected global OMX root before a Node runtime sibling on Windows', async () => {
+    let npmCommand: Extract<PackageManagerOwnership, { manager: 'npm' }>['npmCommand'] | undefined;
+    const ownership = await resolvePackageManagerOwnership({
+      ...ownershipDependencies('npm', { npm: 'C:\\Users\\alice\\AppData\\Roaming\\npm\\node_modules' }),
+      platform: 'win32',
+      currentExecutable: 'C:\\Users\\alice\\AppData\\Roaming\\npm\\node_modules\\oh-my-codex\\dist\\cli\\omx.js',
+      currentPackageRoot: 'C:\\Users\\alice\\AppData\\Roaming\\npm\\node_modules\\oh-my-codex',
+      currentNodeExecutable: 'C:\\Program Files\\nodejs\\node.exe',
+      resolveNpmCommand: () => null,
+      resolveNpmGlobalInstallRoot: (command) => {
+        npmCommand = command;
+        return 'C:\\Users\\alice\\AppData\\Roaming\\npm\\node_modules';
+      },
+      resolveNpmPrefix: () => 'C:\\Users\\alice\\AppData\\Roaming\\npm',
+      environment: {},
+    });
+
+    assert.deepEqual(npmCommand, {
+      kind: 'node-script',
+      command: 'C:\\Program Files\\nodejs\\node.exe',
+      commandArgs: ['C:\\Users\\alice\\AppData\\Roaming\\npm\\node_modules\\npm\\bin\\npm-cli.js'],
+    });
+    assert.equal(ownership?.manager, 'npm');
+  });
+
+  it('resolves a normal Bun Node-shebang launch only from its configured install root and matching shim', async () => {
+    const ownership = await resolvePackageManagerOwnership({
+      ...ownershipDependencies('bun', { bunBin: '/fake/bun/bin' }),
+      currentExecutable: '/fake/bun/install/global/node_modules/oh-my-codex/dist/cli/omx.js',
+      currentPackageRoot: '/fake/bun/install/global/node_modules/oh-my-codex',
+      bunInstallRoot: '/fake/bun',
+      resolveBunCommand: () => null,
+      environment: {},
+      realpath: (path) => (({
+        '/fake/bun/bin/omx': '/fake/bun/install/global/node_modules/oh-my-codex/dist/cli/omx.js',
+      } as Record<string, string>)[path] ?? path),
+    });
+    assert.deepEqual(ownership, {
+      manager: 'bun',
+      bunCommand: '/fake/bun/bin/bun',
+      bunGlobalBin: '/fake/bun/bin',
+      bunShim: '/fake/bun/bin/omx',
+      bunInstallRoot: '/fake/bun',
+      npmPrefix: '/fake/bun/install/global/node_modules',
+      globalInstallRoot: '/fake/bun/install/global/node_modules',
+      packageRoot: '/fake/bun/install/global/node_modules/oh-my-codex',
+      environment: { BUN_INSTALL: '/fake/bun' },
+    });
+    assert.equal(await resolvePackageManagerOwnership({
+      ...ownershipDependencies('bun', { bunBin: '/fake/bun/bin' }),
+      currentExecutable: '/fake/bun/install/global/node_modules/oh-my-codex/dist/cli/omx.js',
+      currentPackageRoot: '/fake/bun/install/global/node_modules/oh-my-codex',
+      resolveBunCommand: () => null,
+      bunInstallRoot: undefined,
+      environment: {},
+    }), null, 'missing Bun command provenance must fail closed');
+  });
+
+  it('queries Bun global-bin under the frozen configured environment', () => {
+    const calls: Array<{ command: string; args: string[]; environment: NodeJS.ProcessEnv | undefined }> = [];
+    const bin = resolveBunGlobalBin(
+      '/fake/bun/bin/bun',
+      { BUN_INSTALL: '/fake/bun', PATH: '/frozen/path' },
+      ((command, args, options) => {
+        calls.push({ command, args: args as string[], environment: options?.env });
+        return { status: 0, stdout: '/fake/bun/bin\n', stderr: '', error: undefined } as ReturnType<typeof import('node:child_process').spawnSync>;
+      }) as typeof import('node:child_process').spawnSync,
+    );
+
+    assert.equal(bin, '/fake/bun/bin');
+    assert.deepEqual(calls, [{
+      command: '/fake/bun/bin/bun',
+      args: ['pm', 'bin', '-g'],
+      environment: { BUN_INSTALL: '/fake/bun', PATH: '/frozen/path' },
+    }]);
+  });
+
+  it('resolves an unstamped Bun install after confirming its canonical shim and configured root', async () => {
+    const ownership = await resolvePackageManagerOwnership({
+      ...ownershipDependencies(undefined, { bunBin: '/fake/bun/bin' }),
+      currentExecutable: '/fake/bun/install/global/node_modules/oh-my-codex/dist/cli/omx.js',
+      currentPackageRoot: '/fake/bun/install/global/node_modules/oh-my-codex',
+      bunInstallRoot: '/fake/bun',
+      resolveBunCommand: () => '/fake/bun/bin/bun',
+      environment: {},
+      realpath: (path) => (({
+        '/fake/bun/bin/omx': '/fake/bun/install/global/node_modules/oh-my-codex/dist/cli/omx.js',
+      } as Record<string, string>)[path] ?? path),
+    });
+
+    assert.deepEqual(ownership, {
+      manager: 'bun',
+      bunCommand: '/fake/bun/bin/bun',
+      bunGlobalBin: '/fake/bun/bin',
+      bunShim: '/fake/bun/bin/omx',
+      bunInstallRoot: '/fake/bun',
+      npmPrefix: '/fake/bun/install/global/node_modules',
+      globalInstallRoot: '/fake/bun/install/global/node_modules',
+      packageRoot: '/fake/bun/install/global/node_modules/oh-my-codex',
+      environment: { BUN_INSTALL: '/fake/bun' },
+    });
+  });
+
+  it('recovers a Bun owner from a stale npm stamp without deleting the stamp', async () => {
+    const ownership = await resolvePackageManagerOwnership({
+      ...ownershipDependencies('npm', { bunBin: '/fake/bun/bin' }),
+      currentExecutable: '/fake/bun/install/global/node_modules/oh-my-codex/dist/cli/omx.js',
+      currentPackageRoot: '/fake/bun/install/global/node_modules/oh-my-codex',
+      bunInstallRoot: '/fake/bun',
+      resolveBunCommand: () => '/fake/bun/bin/bun',
+      environment: {},
+      realpath: (path) => (({
+        '/fake/bun/bin/omx': '/fake/bun/install/global/node_modules/oh-my-codex/dist/cli/omx.js',
+      } as Record<string, string>)[path] ?? path),
+    });
+
+    assert.equal(ownership?.manager, 'bun');
+  });
+
+  it('fails closed when npm and Bun ownership both validate, even with a manager stamp', async () => {
+    for (const stamp of [undefined, 'npm', 'bun'] as const) {
+      const ownership = await resolvePackageManagerOwnership({
+        ...ownershipDependencies(stamp, {
+          npm: '/fake/bun/install/global/node_modules',
+          bunBin: '/fake/bun/bin',
+        }),
+        currentExecutable: '/fake/bun/install/global/node_modules/oh-my-codex/dist/cli/omx.js',
+        currentPackageRoot: '/fake/bun/install/global/node_modules/oh-my-codex',
+        bunInstallRoot: '/fake/bun',
+        resolveBunCommand: () => '/fake/bun/bin/bun',
+        resolveNpmPrefix: () => '/fake/bun/install/global',
+        environment: {},
+        realpath: (path) => (({
+          '/fake/bun/bin/omx': '/fake/bun/install/global/node_modules/oh-my-codex/dist/cli/omx.js',
+        } as Record<string, string>)[path] ?? path),
+      });
+
+      assert.equal(ownership, null);
+    }
+  });
+
+  it('uses platform-correct canonical paths for a Windows Bun .cmd shim', async () => {
+    const ownership = await resolvePackageManagerOwnership({
+      ...ownershipDependencies('bun', { bunBin: 'C:\\Users\\alice\\.bun\\bin' }),
+      platform: 'win32',
+      bunInstallRoot: 'C:\\Users\\alice\\.bun',
+      currentExecutable: 'C:\\Users\\alice\\.bun\\install\\global\\node_modules\\oh-my-codex\\dist\\cli\\omx.js',
+      currentPackageRoot: 'C:\\Users\\alice\\.bun\\install\\global\\node_modules\\oh-my-codex',
+      resolveBunCommand: () => null,
+      environment: {},
+      realpath: (path) => path,
+    });
+    assert.deepEqual(ownership, {
+      manager: 'bun',
+      bunCommand: 'C:\\Users\\alice\\.bun\\bin\\bun.exe',
+      bunGlobalBin: 'C:\\Users\\alice\\.bun\\bin',
+      bunShim: 'C:\\Users\\alice\\.bun\\bin\\omx.cmd',
+      bunInstallRoot: 'C:\\Users\\alice\\.bun',
+      npmPrefix: 'C:\\Users\\alice\\.bun\\install\\global\\node_modules',
+      globalInstallRoot: 'C:\\Users\\alice\\.bun\\install\\global\\node_modules',
+      packageRoot: 'C:\\Users\\alice\\.bun\\install\\global\\node_modules\\oh-my-codex',
+      environment: { BUN_INSTALL: 'C:\\Users\\alice\\.bun' },
+    });
+  });
+
+  it('derives a fresh Bun installation root from its canonical executable without ambient PATH lookup', async () => {
+    const ownership = await resolvePackageManagerOwnership({
+      ...ownershipDependencies('bun', { bunBin: 'C:\\Users\\alice\\.bun\\bin' }),
+      platform: 'win32',
+      currentExecutable: 'C:\\Users\\alice\\.bun\\install\\global\\node_modules\\oh-my-codex\\dist\\cli\\omx.js',
+      currentPackageRoot: 'C:\\Users\\alice\\.bun\\install\\global\\node_modules\\oh-my-codex',
+      bunInstallRoot: undefined,
+      resolveBunCommand: () => 'C:\\Users\\alice\\.bun\\bin\\bun.exe',
+      environment: {},
+      realpath: (path) => path,
+    });
+
+    assert.deepEqual(ownership, {
+      manager: 'bun',
+      bunCommand: 'C:\\Users\\alice\\.bun\\bin\\bun.exe',
+      bunGlobalBin: 'C:\\Users\\alice\\.bun\\bin',
+      bunShim: 'C:\\Users\\alice\\.bun\\bin\\omx.cmd',
+      bunInstallRoot: 'C:\\Users\\alice\\.bun',
+      npmPrefix: 'C:\\Users\\alice\\.bun\\install\\global\\node_modules',
+      globalInstallRoot: 'C:\\Users\\alice\\.bun\\install\\global\\node_modules',
+      packageRoot: 'C:\\Users\\alice\\.bun\\install\\global\\node_modules\\oh-my-codex',
+      environment: { BUN_INSTALL: 'C:\\Users\\alice\\.bun' },
+    });
+  });
+
+  it('rejects Bun shim evidence when BUN_INSTALL cannot bind the command and global target', async () => {
+    let npmCalls = 0;
+    const ownership = await resolvePackageManagerOwnership({
+      ...ownershipDependencies('bun', { bunBin: '/configured/bun/bin' }),
+      bunInstallRoot: '/missing/developer-bun',
+      currentExecutable: '/links/omx.js',
+      currentPackageRoot: '/links/package',
+      realpath: (path: string) => {
+        if (path === '/missing/developer-bun') throw new Error('missing BUN_INSTALL');
+        return path;
+      },
+      resolveNpmGlobalInstallRoot: () => { npmCalls += 1; return null; },
+    });
+    assert.equal(ownership, null);
+    assert.equal(npmCalls, 1, 'A stale stamp cannot suppress independent live ownership validation.');
+  });
+
+  it('fails closed for missing, ambiguous, stale, or non-shim Bun ownership evidence', async () => {
+    assert.equal(await resolvePackageManagerOwnership(ownershipDependencies(undefined, {})), null);
+    assert.equal((await resolvePackageManagerOwnership(ownershipDependencies('bun', {
+      npm: '/configured/node_modules',
+    })))?.manager, 'npm', 'a stale Bun stamp must yield to one uniquely validated npm owner');
+    assert.equal(await resolvePackageManagerOwnership({
+      ...ownershipDependencies('bun', { bunBin: '/configured/bun/bin' }),
+      resolveBunGlobalBin: () => '/configured/bun/bin',
+      realpath: (path) => path,
+    }), null);
+    assert.equal(await resolvePackageManagerOwnership({
+      ...ownershipDependencies('bun', { bunBin: '/fake/bun/bin' }),
+      currentExecutable: '/fake/bun/install/global/node_modules/oh-my-codex/dist/cli/omx.js',
+      currentPackageRoot: '/fake/bun/install/global/node_modules/oh-my-codex',
+      bunInstallRoot: '/fake/bun',
+      resolveBunCommand: () => '/other/bun',
+      environment: {},
+    }), null, 'Bun executable provenance must bind to the configured installation target.');
+  });
+
+  it('uses the frozen Bun command for stable and deferred updates and rejects Bun dev before spawning', async () => {
+    const owner: PackageManagerOwnership = {
+      manager: 'bun',
+      bunCommand: '/configured/runtime/bun',
+      bunGlobalBin: '/configured/bun/bin',
+      bunShim: '/configured/bun/bin/omx',
+      bunInstallRoot: '/configured/bun',
+      globalInstallRoot: '/configured/node_modules',
+      packageRoot: '/configured/node_modules/oh-my-codex',
+      npmPrefix: '/configured',
+      environment: { OMX_UPDATE_TEST: '1', BUN_INSTALL: '/configured/bun' },
+    };
+    const calls: Array<{ command: string; args: string[] }> = [];
+    const spawnProcess = ((command: string, args: string[]) => {
+      calls.push({ command, args });
+      return { status: 0, stdout: '', stderr: '' };
+    }) as typeof import('node:child_process').spawnSync;
+    assert.deepEqual(runGlobalUpdate('oh-my-codex@latest', spawnProcess, 'linux', owner), { ok: true, stderr: '' });
+    assert.deepEqual(calls, [{ command: '/configured/runtime/bun', args: ['add', '--global', '--ignore-scripts', 'oh-my-codex@latest'] }]);
+    calls.length = 0;
+    const incompleteOwner: PackageManagerOwnership = {
+      ...owner,
+      bunInstallRoot: undefined,
+      environment: { OMX_UPDATE_TEST: '1' },
+    };
+    assert.deepEqual(runGlobalUpdate('oh-my-codex@latest', spawnProcess, 'linux', incompleteOwner), {
+      ok: false,
+      stderr: 'The package-manager ownership transaction is incomplete.',
+    });
+    assert.deepEqual(calls, []);
+    assert.deepEqual(runGlobalUpdate('github:Yeachan-Heo/oh-my-codex#dev', spawnProcess, 'linux', owner), {
+      ok: false, stderr: 'Bun dev updates are not yet supported',
+    });
+    assert.deepEqual(calls, []);
+
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-deferred-bun-'));
+    try {
+      const deferredCalls: Array<{ command: string; args: string[] }> = [];
+      const deferred = runDeferredGlobalUpdate(cwd, ((command, args) => {
+        deferredCalls.push({ command, args: args as string[] });
+        return { once() { return this; }, unref() {} } as unknown as ReturnType<typeof import('node:child_process').spawn>;
+      }) as typeof import('node:child_process').spawn, 'linux', 12345, owner);
+      assert.equal(deferred.ok, true);
+      assert.equal(deferredCalls[0]?.command, process.execPath);
+      assert.match(deferredCalls[0]?.args[0] ?? '', /update-worker\.js$/);
+      const payload = JSON.parse(await readFile(deferredCalls[0]?.args[1] ?? '', 'utf-8')) as { ownership: PackageManagerOwnership; setupArgs: string[] };
+      assert.deepEqual(payload.ownership, owner);
+      assert.deepEqual(payload.setupArgs, ['setup']);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects malformed frozen npm and Bun ownership before spawning a manager or deferred worker', async () => {
+    const malformedOwners: PackageManagerOwnership[] = [
+      {
+        ...frozenNpmOwnership,
+        npmCommand: { kind: 'node-script', command: '/untrusted/npm-launcher', commandArgs: [] },
+      },
+      {
+        manager: 'bun',
+        bunCommand: '/untrusted/bun-launcher',
+        bunGlobalBin: '',
+        bunShim: '',
+        bunInstallRoot: '/configured/bun',
+        globalInstallRoot: '/configured/node_modules',
+        packageRoot: '/configured/node_modules/oh-my-codex',
+        npmPrefix: '/configured',
+        environment: { BUN_INSTALL: '/configured/bun' },
+      },
+    ];
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-malformed-frozen-ownership-'));
+    try {
+      for (const ownership of malformedOwners) {
+        const managerCalls: string[] = [];
+        const result = runGlobalUpdate('oh-my-codex@latest', ((command: string) => {
+          managerCalls.push(command);
+          return { status: 0, signal: null, error: undefined, stdout: '', stderr: '', output: [null, '', ''], pid: 0 };
+        }) as typeof import('node:child_process').spawnSync, 'linux', ownership);
+        assert.deepEqual(result, { ok: false, stderr: 'The package-manager ownership transaction is incomplete.' });
+        assert.deepEqual(managerCalls, []);
+
+        const workerCalls: string[] = [];
+        const deferred = runDeferredGlobalUpdate(cwd, ((command) => {
+          workerCalls.push(command);
+          return { once() { return this; }, unref() {} } as unknown as ReturnType<typeof import('node:child_process').spawn>;
+        }) as typeof import('node:child_process').spawn, 'linux', 12345, ownership);
+        assert.deepEqual(deferred.ok, false);
+        assert.deepEqual(workerCalls, []);
       }
     } finally {
       await rm(cwd, { recursive: true, force: true });

@@ -6,7 +6,7 @@ import {
   readUserInstallStamp,
   type UserInstallStamp,
   writeUserInstallStamp,
-} from "../cli/update.js";
+} from './postinstall-advisory.js';
 import { getPackageRoot } from "../utils/package.js";
 
 type PostinstallStatus =
