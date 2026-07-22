@@ -974,7 +974,13 @@ async function inspectSessionPointerLockAtContext(context: SessionPointerContext
     status,
     lockPath: context.lockPath,
     evidenceSource,
-    safeToRecover: status === 'dead' && evidenceSource === 'owner-temp',
+    // Recoverable only on positively dead evidence (ESRCH), for canonical
+    // owner.json and pre-rename temp evidence alike; the atomic
+    // claim/quarantine protocol revalidates the exact entry, still-dead
+    // status, and owner token before quarantining. Live, reused,
+    // identity-indeterminate, ambiguous, symlink, malformed, unexpected,
+    // and io-error states stay fail-closed.
+    safeToRecover: status === 'dead',
   };
 }
 
