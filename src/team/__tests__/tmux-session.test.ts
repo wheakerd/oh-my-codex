@@ -62,6 +62,7 @@ import {
   waitForWorkerReady,
   waitForWorkerReadyAsync,
   paneIsBootstrapping,
+  parseSplitWindowPaneId,
   classifyWorkerStartupInjectSafety,
   checkWorkerStartupInjectSafety,
   dismissTrustPromptIfPresent,
@@ -289,7 +290,11 @@ if [ "${'$'}1" = "if-shell" ] && [ "${'$'}{2:-}" = "-F" ] && [ "${'$'}{3:-}" = "
   output="$($0 "${'$'}@")" || exit 1
   case "${'$'}1" in
     split-window)
-      created_pane="$(printf '%s' "$output" | awk -F '\t' 'NR == 1 { print ${'$'}1 }')"
+      created_pane="$output"
+      if ! printf '%s' "$created_pane" | grep -Eq '^%[0-9]+${'$'}'; then
+        printf '%s' "$output"
+        exit 0
+      fi
       created_pid="$($fixture list-panes -a -F '#{pane_id}\t#{pane_dead}\t#{pane_pid}' 2>/dev/null | awk -F '\t' -v pane="$created_pane" '${'$'}1 == pane && ${'$'}2 == "0" && ${'$'}3 ~ /^[1-9][0-9]*${'$'}/ { print ${'$'}3; exit }')"
       [ -n "$created_pane" ] && [ -n "$created_pid" ] && {
         mkdir -p "$source_state"
@@ -4418,6 +4423,113 @@ esac
 });
 
 describe('createTeamSession tmux instance tagging', () => {
+  it('rejects split-window output unless it contains one canonical pane id and optional expected receipt', () => {
+    for (const [stdout, receipt, expected] of [
+      ['%2', undefined, '%2'],
+      ['%2\n', undefined, '%2'],
+      ['%2\r\n', undefined, '%2'],
+      ['%2\tomx_source_receipt', 'omx_source_receipt', '%2'],
+      ['%2\tomx_source_receipt\n', 'omx_source_receipt', '%2'],
+      ['notice\n%2\n', undefined, null],
+      ['%2\nnotice\n', undefined, null],
+      ['%2\n%3\n', undefined, null],
+      ['\n%2\n', undefined, null],
+      ['%2\n\n', undefined, null],
+      ['%2 warning\n', undefined, null],
+      [' %2\n', undefined, null],
+      ['%2\tomx_source_other\n', 'omx_source_receipt', null],
+      ['%2\tomx_source_receipt\n%3\tomx_source_receipt\n', 'omx_source_receipt', null],
+      ['notice only\n', undefined, null],
+    ] as const) {
+      assert.equal(parseSplitWindowPaneId(stdout, receipt), expected);
+    }
+  });
+
+  it('fails closed on multi-row worker and HUD split-window output', async () => {
+    const prevTmux = process.env.TMUX;
+    const prevTmuxPane = process.env.TMUX_PANE;
+    const prevWorkerCli = process.env.OMX_TEAM_WORKER_CLI;
+    try {
+      for (const scenario of [
+        { name: 'worker', workerOutput: '%%2\\n%%9\\n', hudOutput: '%%3\\n' },
+        { name: 'hud', workerOutput: '%%2\\n', hudOutput: '%%3\\n%%9\\n' },
+      ]) {
+        const cwd = await mkdtemp(join(tmpdir(), `omx-team-${scenario.name}-split-output-`));
+        try {
+          await withMockTmuxFixture(
+            `omx-tmux-${scenario.name}-split-output-`,
+            (logPath) => `#!/bin/sh
+set -eu
+case "\${1:-}" in
+  -V) echo "tmux 3.4" ;;
+  display-message)
+    case "$*" in
+      *"#{window_width}"*) echo "120" ;;
+      *"#{pane_id}"*"#{pane_dead}"*"#{pane_pid}"*) printf "%%1\\t0\\t2000000001\\n" ;;
+      *) echo "shared:0 %1" ;;
+    esac
+    ;;
+  list-panes)
+    case "$*" in
+      *"#{pane_id}"*"#{pane_dead}"*"#{pane_pid}"*)
+        printf "%%1\\t0\\t2000000001\\n"
+        [ ! -f "${logPath}.worker" ] || printf "%%2\\t0\\t2000000002\\n"
+        [ ! -f "${logPath}.hud" ] || printf "%%3\\t0\\t2000000003\\n"
+        ;;
+      *"pane_current_command"*)
+        printf "%%1\\tnode\\t'codex'\\n"
+        [ ! -f "${logPath}.worker" ] || printf "%%2\\tgemini\\t'gemini'\\n"
+        ;;
+      *)
+        printf "%%1\\n"
+        [ ! -f "${logPath}.worker" ] || printf "%%2\\n"
+        [ ! -f "${logPath}.hud" ] || printf "%%3\\n"
+        ;;
+    esac
+    ;;
+  split-window)
+    case "$*" in
+      *" -h "*) : > "${logPath}.worker"; printf "${scenario.workerOutput}" ;;
+      *) : > "${logPath}.hud"; printf "${scenario.hudOutput}" ;;
+    esac
+    ;;
+  kill-pane)
+    case "$*" in
+      *"%2"*) rm -f "${logPath}.worker" ;;
+      *"%3"*) rm -f "${logPath}.hud" ;;
+    esac
+    ;;
+  *) ;;
+esac
+exit 0
+`,
+            async ({ logPath }) => {
+              const geminiPath = join(dirname(logPath), 'gemini');
+              await writeFile(geminiPath, '#!/bin/sh\nexit 0\n');
+              await chmod(geminiPath, 0o755);
+              process.env.TMUX = 'shared-session,stub,0';
+              process.env.TMUX_PANE = '%1';
+              process.env.OMX_TEAM_WORKER_CLI = 'gemini';
+              assert.throws(
+                () => createTeamSession(`Multiple ${scenario.name} IDs`, 1, cwd),
+                /tmux source authority changed before split effect/,
+              );
+            },
+          );
+        } finally {
+          await rm(cwd, { recursive: true, force: true });
+        }
+      }
+    } finally {
+      if (typeof prevTmux === 'string') process.env.TMUX = prevTmux;
+      else delete process.env.TMUX;
+      if (typeof prevTmuxPane === 'string') process.env.TMUX_PANE = prevTmuxPane;
+      else delete process.env.TMUX_PANE;
+      if (typeof prevWorkerCli === 'string') process.env.OMX_TEAM_WORKER_CLI = prevWorkerCli;
+      else delete process.env.OMX_TEAM_WORKER_CLI;
+    }
+  });
+
   it('rejects incompatible non-Codex and mixed Codex plans before any direct tmux mutation', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-team-direct-policy-preflight-'));
     const previousTmux = process.env.TMUX;

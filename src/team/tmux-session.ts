@@ -227,7 +227,7 @@ interface TmuxPaneInfo {
 
 type SpawnSyncLike = typeof spawnSync;
 
-function runTmux(args: string[]): { ok: true; stdout: string } | { ok: false; stderr: string } {
+function runTmux(args: string[], preserveStdout = false): { ok: true; stdout: string } | { ok: false; stderr: string } {
   const { result } = spawnPlatformCommandSync('tmux', args, { encoding: 'utf-8' });
   if (result.error) {
     return { ok: false, stderr: result.error.message };
@@ -235,7 +235,16 @@ function runTmux(args: string[]): { ok: true; stdout: string } | { ok: false; st
   if (result.status !== 0) {
     return { ok: false, stderr: (result.stderr || '').trim() || `tmux exited ${result.status}` };
   }
-  return { ok: true, stdout: (result.stdout || '').trim() };
+  const stdout = result.stdout || '';
+  return { ok: true, stdout: preserveStdout ? stdout : stdout.trim() };
+}
+
+export function parseSplitWindowPaneId(stdout: string, expectedReceipt?: string): string | null {
+  const match = expectedReceipt === undefined
+    ? /^(%\d+)(?:\r?\n)?$/.exec(stdout)
+    : /^(%\d+)\t([^\r\n\t]+)(?:\r?\n)?$/.exec(stdout);
+  if (!match || (expectedReceipt !== undefined && match[2] !== expectedReceipt)) return null;
+  return match[1];
 }
 
 /** Preserve structured tmux fields, including an empty final field. */
@@ -338,10 +347,10 @@ function runSourceAuthorizedSplit(source: SourcePaneAuthority, effect: string): 
     'if-shell', '-F', '-t', source.paneId, sourceAuthorityPredicate(source),
     effect.replace("-F '#{pane_id}'", `-F '#{pane_id}\\t${receipt}'`),
     "display-message -p ''",
-  ]);
+  ], true);
   if (!result.ok) throw new Error(`tmux source authority transaction failed: ${result.stderr}`);
-  const [paneId, observedReceipt, ...extra] = result.stdout.split('\t');
-  if (!paneId || !/^%[0-9]+$/.test(paneId) || observedReceipt !== receipt || extra.length !== 0) {
+  const paneId = parseSplitWindowPaneId(result.stdout, receipt);
+  if (!paneId) {
     throw new Error('tmux source authority changed before split effect');
   }
   return paneId;
@@ -2913,7 +2922,7 @@ export function restoreStandaloneHudPane(
       '-c',
       translatePathForMsys(restoreCwd.rawPath),
       hudCmd,
-    ]);
+    ], true);
     if (candidateResult.ok) {
       hudResult = candidateResult;
       break;
@@ -2921,8 +2930,8 @@ export function restoreStandaloneHudPane(
   }
   if (!hudResult?.ok) return null;
 
-  const paneId = hudResult.stdout.split('\n')[0]?.trim() ?? '';
-  if (!paneId.startsWith('%')) return null;
+  const paneId = parseSplitWindowPaneId(hudResult.stdout);
+  if (!paneId) return null;
   persistRestoredHudCleanupDebtSync(cwd, {
     schema_version: 1,
     operation: 'restored_hud_cleanup',
