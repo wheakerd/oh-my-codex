@@ -4451,8 +4451,10 @@ describe('createTeamSession tmux instance tagging', () => {
     const prevWorkerCli = process.env.OMX_TEAM_WORKER_CLI;
     try {
       for (const scenario of [
-        { name: 'worker', workerOutput: '%%2\\n%%9\\n', hudOutput: '%%3\\n' },
-        { name: 'hud', workerOutput: '%%2\\n', hudOutput: '%%3\\n%%9\\n' },
+        { name: 'worker', ambiguousPane: 'worker', reconciliationFailure: null, workerOutput: '%%2\\n%%9\\n', hudOutput: '%%3\\n' },
+        { name: 'hud', ambiguousPane: 'hud', reconciliationFailure: null, workerOutput: '%%2\\n', hudOutput: '%%3\\n%%9\\n' },
+        { name: 'worker-reconciliation', ambiguousPane: 'worker', reconciliationFailure: 'worker', workerOutput: '%%2\\n%%9\\n', hudOutput: '%%3\\n' },
+        { name: 'hud-reconciliation', ambiguousPane: 'hud', reconciliationFailure: 'hud', workerOutput: '%%2\\n', hudOutput: '%%3\\n%%9\\n' },
       ]) {
         const cwd = await mkdtemp(join(tmpdir(), `omx-team-${scenario.name}-split-output-`));
         try {
@@ -4477,6 +4479,14 @@ case "\${1:-}" in
         [ ! -f "${logPath}.hud" ] || printf "%%3\\t0\\t2000000003\\n"
         ;;
       *"pane_current_command"*)
+        if [ "${scenario.reconciliationFailure ?? ''}" = "worker" ] && [ -f "${logPath}.worker" ]; then
+          echo "forced worker topology reconciliation failure" >&2
+          exit 1
+        fi
+        if [ "${scenario.reconciliationFailure ?? ''}" = "hud" ] && [ -f "${logPath}.hud" ]; then
+          echo "forced HUD topology reconciliation failure" >&2
+          exit 1
+        fi
         printf "%%1\\tnode\\t'codex'\\n"
         [ ! -f "${logPath}.worker" ] || printf "%%2\\tgemini\\t'gemini'\\n"
         [ ! -f "${logPath}.hud" ] || printf "%%3\\tnode\\t'omx hud --watch'\\n"
@@ -4524,7 +4534,15 @@ exit 0
                     error.originalError instanceof Error ? error.originalError.message : '',
                     'tmux_split_window_output_ambiguous',
                   );
-                  if (scenario.name === 'worker') {
+                  if (scenario.reconciliationFailure) {
+                    assert.deepEqual(error.partialSession.workerPaneIds, []);
+                    assert.deepEqual(error.partialSession.workerPaneIdsByIndex, [null]);
+                    assert.deepEqual(error.partialSession.workerPanePidsByIndex, [null]);
+                    assert.equal(error.partialSession.hudPaneId, null);
+                    assert.deepEqual(error.cleanupErrors, [
+                      'failed to reconcile tmux pane topology after ambiguous split output',
+                    ]);
+                  } else if (scenario.ambiguousPane === 'worker') {
                     assert.deepEqual(error.partialSession.workerPaneIds, ['%2']);
                     assert.deepEqual(error.partialSession.workerPaneIdsByIndex, ['%2']);
                     assert.deepEqual(error.partialSession.workerPanePidsByIndex, [null]);
@@ -4539,7 +4557,7 @@ exit 0
                 },
               );
               assert.equal(
-                fs.existsSync(`${logPath}.${scenario.name}`),
+                fs.existsSync(`${logPath}.${scenario.ambiguousPane}`),
                 true,
                 'ambiguous unowned pane must remain as cleanup debt rather than being killed',
               );

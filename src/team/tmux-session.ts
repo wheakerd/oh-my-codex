@@ -2778,6 +2778,9 @@ export function createTeamSession(
     };
   } catch (error) {
     const cleanupErrors: string[] = [];
+    if (error instanceof AmbiguousSplitWindowOutputError && error.reconciliationError) {
+      cleanupErrors.push('failed to reconcile tmux pane topology after ambiguous split output');
+    }
     const unregisterAuthorizedHook = (
       hook: RegisteredHudHook,
       unregister: (target: string, name: string) => string[],
@@ -2847,7 +2850,8 @@ export function createTeamSession(
       : null;
     const hasRecoverablePartialArtifact = unresolvedPaneIds.size > 0
       || registeredResizeHook !== null
-      || registeredClientAttachedHook !== null;
+      || registeredClientAttachedHook !== null
+      || (error instanceof AmbiguousSplitWindowOutputError && error.reconciliationError !== null);
 
     if (hasRecoverablePartialArtifact && partialTeamTarget && partialLeaderPaneId) {
       throw new CreateTeamSessionPartialError(
