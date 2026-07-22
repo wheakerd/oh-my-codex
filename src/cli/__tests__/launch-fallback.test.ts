@@ -1,4 +1,4 @@
-import { describe, it } from 'node:test';
+import { describe, it, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
 import { chmod, mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
@@ -6,7 +6,7 @@ import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { HUD_TMUX_HEIGHT_LINES } from '../../hud/constants.js';
+import { HUD_RESIZE_RECONCILE_DELAY_SECONDS, HUD_TMUX_HEIGHT_LINES } from '../../hud/constants.js';
 import { DETACHED_TMUX_HISTORY_LIMIT } from '../index.js';
 import {
   closeLaunchSessionBindingOnce,
@@ -15,9 +15,9 @@ import {
   writeSessionStart,
   type LaunchSessionBinding,
 } from '../../hooks/session.js';
+import { isRealTmuxAvailable, withTempTmuxSession } from '../../team/__tests__/tmux-test-fixture.js';
 
 const CLI_SPAWN_TIMEOUT_MS = 60_000;
-
 function buildRunOmxEnv(envOverrides: Record<string, string>): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env };
   for (const key of Object.keys(env)) {
@@ -75,7 +75,6 @@ function shouldSkipForSpawnPermissions(_err: string): false {
   // not a pass. Node's test runner has no portable dynamic skip here.
   return false;
 }
-
 
 async function createGitRepo(wd: string): Promise<string> {
   const repo = join(wd, 'repo');
@@ -273,6 +272,19 @@ async function waitForPath(path: string, expectedLines: number = 1): Promise<voi
   throw new Error(`timed out waiting for ${path}`);
 }
 
+function parseShimTmuxArgv(contents: string): string[][] {
+  return contents
+    .split('tmux argv:\n')
+    .slice(1)
+    .map((record) => record.split('\nend tmux argv')[0]!.split('\n').filter(Boolean));
+}
+
+async function assertShimLogQuiescent(path: string, quietPeriodMs: number, message: string): Promise<void> {
+  const before = await readFile(path, 'utf-8').catch(() => '');
+  await new Promise((resolve) => setTimeout(resolve, quietPeriodMs));
+  assert.equal(await readFile(path, 'utf-8').catch(() => ''), before, message);
+}
+
 async function stopHeldOmx(child: ReturnType<typeof spawn>, releasePath: string): Promise<void> {
   await rm(releasePath, { force: true });
   await new Promise<void>((resolve, reject) => {
@@ -316,6 +328,13 @@ while [ -f "${releasePath}" ]; do sleep 1; done
       TMUX_PANE: '',
     },
   };
+}
+
+function skipUnlessPrivateRealTmux(t: TestContext): boolean {
+  if (isRealTmuxAvailable()) return true;
+  assert.equal(process.env.CI, undefined, 'CI must provide tmux for the private-server detached launch regression');
+  t.skip('tmux is not installed');
+  return false;
 }
 
 describe('omx launch fallback when tmux is unavailable', () => {
@@ -913,6 +932,117 @@ exit 0
 });
 
 describe('omx launcher when tmux is available', () => {
+  it('captures the compiled detached parser transport and stored hook on a private tmux server', async (t) => {
+    if (!skipUnlessPrivateRealTmux(t)) return;
+    const wd = await mkdtemp(join(tmpdir(), 'omx-launch-private-real-tmux-'));
+    try {
+      await withTempTmuxSession(async (fixture) => {
+        const home = join(wd, 'home');
+        const bin = join(wd, 'bin');
+        const foreignSession = 'foreign-control';
+        await mkdir(home, { recursive: true });
+        await mkdir(bin, { recursive: true });
+        await writeExecutable(join(bin, 'codex'), '#!/bin/sh\nsleep 300\n');
+        const shimLogPath = join(wd, 'private-tmux-shim.log');
+        await fixture.createPathShim(bin, shimLogPath);
+        fixture.run(['new-session', '-d', '-s', foreignSession, 'sleep 300']);
+        const foreignBefore = fixture.run(['list-panes', '-t', foreignSession, '-F', '#{pane_id}\t#{pane_pid}\t#{pane_height}']);
+
+        const result = runOmx(wd, ['--madmax', '--tmux'], {
+          HOME: home,
+          PATH: `${bin}:${process.env.PATH ?? ''}`,
+          OMX_AUTO_UPDATE: '0',
+          OMX_NOTIFY_FALLBACK: '0',
+          OMX_HOOK_DERIVED_SIGNALS: '0',
+          OMX_HERMES_MCP_BRIDGE: '1',
+          OMX_LAUNCH_POLICY: 'direct',
+          TMUX: '',
+          TMUX_PANE: '',
+        });
+        assert.equal(result.status, 0, result.error || result.stderr || result.stdout);
+
+        const launchedSession = fixture.run(['list-sessions', '-F', '#{session_name}'])
+          .split('\n')
+          .find((name) => name.startsWith('omx-') && name !== fixture.sessionName);
+        assert.ok(launchedSession, 'compiled launcher must create its detached session on the private server');
+        const panes = fixture.run(['list-panes', '-t', launchedSession, '-F', '#{pane_id}\t#{pane_height}\t#{pane_start_command}'])
+          .split('\n')
+          .map((line) => line.split('\t'));
+        const hud = panes.find(([, , command]) => command.includes('OMX_DETACHED_HUD_OPERATION='));
+        assert.ok(hud, 'HUD split must carry its operation marker');
+        assert.equal(Number(hud[1]), HUD_TMUX_HEIGHT_LINES, 'authorized direct reconciliation must resize the HUD');
+        assert.equal(
+          fixture.run(['show-options', '-v', '-t', launchedSession, 'history-limit']),
+          String(DETACHED_TMUX_HISTORY_LIMIT),
+          'direct leader mutation must receive its receipt and set session history',
+        );
+
+        const hooks = fixture.run(['show-hooks', '-t', launchedSession]);
+        assert.match(hooks, /client-resized\[[0-9]+\].*run-shell -b/);
+        assert.match(hooks, /tmux if-shell -F -t/);
+        assert.match(hooks, /OMX_DETACHED_HUD_OPERATION=/);
+        const storedPaneFormat = hooks.match(/##\{pane_id\}\\t##\{pane_dead\}\\t##\{pane_pid\}/)?.[0] ?? '';
+        assert.equal(storedPaneFormat, '##{pane_id}\\t##{pane_dead}\\t##{pane_pid}', 'stored hook display must retain one outer format escape and encode TAB bytes');
+        const executablePaneFormat = storedPaneFormat.replaceAll('##{', '#{').replaceAll('\\t', '\t');
+        assert.equal(executablePaneFormat, '#{pane_id}\t#{pane_dead}\t#{pane_pid}', 'one outer tmux format pass must decode the stored format into the executable nested argv');
+
+        const clientAttachedHookSlots = [...hooks.matchAll(/client-attached\[[0-9]+\]/g)].map(([slot]) => slot);
+        for (const hookSlot of clientAttachedHookSlots) {
+          fixture.run(['set-hook', '-u', '-t', launchedSession, hookSlot]);
+        }
+        const installedHooks = fixture.run(['show-hooks', '-t', launchedSession]);
+        const storedResizeHookSlots = [...installedHooks.matchAll(/client-resized\[[0-9]+\]/g)].map(([slot]) => slot);
+        assert.equal(storedResizeHookSlots.length, 1, 'exactly one installed client-resized hook must remain for the natural resize trigger');
+        assert.match(installedHooks, /client-resized\[[0-9]+\].*run-shell -b/);
+        assert.doesNotMatch(installedHooks, /client-attached\[[0-9]+\]/, 'the resize trigger must not be conflated with client-attached hook execution');
+
+        await new Promise((resolve) => setTimeout(resolve, (HUD_RESIZE_RECONCILE_DELAY_SECONDS * 1_000) + 250));
+        const launchPaneSnapshots = parseShimTmuxArgv(await readFile(shimLogPath, 'utf-8'))
+          .filter((argv) => argv[0] === 'list-panes' && argv[1] === '-a');
+        assert.ok(
+          launchPaneSnapshots.length >= 2,
+          'the direct and delayed launch reconciliations must both complete before the stored-hook baseline is cleared',
+        );
+        await assertShimLogQuiescent(
+          shimLogPath,
+          250,
+          'launch and delayed reconciliation must settle before clearing the stored-hook baseline',
+        );
+        await writeFile(shimLogPath, '');
+        assert.equal(await readFile(shimLogPath, 'utf-8'), '', 'the shim baseline must start after launch and reconciliation activity settles');
+
+        fixture.triggerClientResize(launchedSession);
+        await new Promise((resolve) => setTimeout(resolve, (HUD_RESIZE_RECONCILE_DELAY_SECONDS * 1_000) + 250));
+        await assertShimLogQuiescent(
+          shimLogPath,
+          250,
+          'the stored client-resized hook must finish both its immediate and delayed passes before assertions',
+        );
+
+        const nestedArgv = parseShimTmuxArgv(await readFile(shimLogPath, 'utf-8'));
+        const paneSnapshots = nestedArgv.filter((argv) => argv[0] === 'list-panes' && argv[1] === '-a');
+        assert.equal(
+          paneSnapshots.length,
+          2,
+          'only the explicitly triggered stored client-resized hook may produce the post-baseline immediate and delayed pane snapshots',
+        );
+        for (const argv of paneSnapshots) {
+          assert.deepEqual(
+            argv,
+            ['list-panes', '-a', '-F', executablePaneFormat],
+            'post-baseline stored client-resized hook execution must preserve the exact executable TAB-delimited nested argv',
+          );
+        }
+
+        fixture.run(['set-option', '-t', launchedSession, '@omx_instance_id', 'foreign-owner']);
+        assert.equal(Number(fixture.run(['display-message', '-p', '-t', hud[0]!, '#{pane_height}'])), HUD_TMUX_HEIGHT_LINES, 'foreign owner must not receive a deferred mutation without an authority receipt');
+        assert.equal(fixture.run(['list-panes', '-t', foreignSession, '-F', '#{pane_id}\t#{pane_pid}\t#{pane_height}']), foreignBefore);
+      });
+    } finally {
+      await rm(wd, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+    }
+  });
+
   it('does not let the outer launcher fabricate leader-owned active records', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-launch-madmax-reuse-'));
     try {

@@ -470,6 +470,21 @@ describe('HUD resize hook command builders', () => {
     assert.match(args[4] ?? '', /set-hook -u -t my-session:0 client-attached\[\d+\]/);
   });
 
+  it('preserves literal formats and TAB-delimited authoritative snapshots across all HUD callers', () => {
+    const finalSnapshot = "#{pane_id}\t#{pane_dead}\t#{pane_pid}";
+    const commands = [
+      buildRegisterResizeHookArgs('my-session:0', 'omx_resize_team_session_0_1', '%1'),
+      buildRegisterClientAttachedReconcileArgs('my-session:0', 'omx_attached_team_session_0_1', '%1'),
+      buildScheduleDelayedHudResizeArgs('%1'),
+      buildReconcileHudResizeArgs('%1'),
+    ].map((args) => args.at(-1) ?? '');
+    for (const command of commands) {
+      assert.ok(command.includes(finalSnapshot));
+      assert.equal([...finalSnapshot].filter((character) => character === '\t').length, 2);
+      assert.doesNotMatch(finalSnapshot, /\\t/);
+    }
+  });
+
   it('pins Team hook and delayed HUD reconciliation to the created pane PID and owner', () => {
     const expectedPid = 2000000123;
     const expectedOwner = 'team:exact-owner';

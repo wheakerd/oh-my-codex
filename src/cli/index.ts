@@ -1542,7 +1542,7 @@ function detachedAuthorityReceipt(): string {
 
 function runDetachedLeaderMutation(authority: DetachedLeaderAuthority, args: string[], requireOwner = true): void {
   const receipt = detachedAuthorityReceipt();
-  const success = `${args.map(quoteShellArg).join(" ")} \\; display-message -p ${quoteShellArg(receipt)}`;
+  const success = `${args.map(quoteShellArg).join(" ")} ; display-message -p ${quoteShellArg(receipt)}`;
   const output = execTmuxFileSync([
     "if-shell", "-F", "-t", authority.paneId, detachedLeaderAuthorityCondition(authority, requireOwner),
     success, "display-message -p ''",
@@ -1556,7 +1556,7 @@ function runDetachedHudMutation(
   args: string[],
 ): void {
   const receipt = detachedAuthorityReceipt();
-  const success = `${args.map(quoteShellArg).join(" ")} \\; display-message -p ${quoteShellArg(receipt)}`;
+  const success = `${args.map(quoteShellArg).join(" ")} ; display-message -p ${quoteShellArg(receipt)}`;
   const hudGuard = `if-shell -F -t ${quoteShellArg(hudAuthority.paneId)} ${quoteShellArg(detachedHudAuthorityCondition(hudAuthority))} ${quoteShellArg(success)} ${quoteShellArg("display-message -p ''")}`;
   const output = execTmuxFileSync([
     "if-shell", "-F", "-t", leaderAuthority.paneId, detachedLeaderAuthorityCondition(leaderAuthority),
@@ -1572,11 +1572,15 @@ function buildDeferredDetachedHudGuard(
 ): string {
   const deferredReceipt = detachedAuthorityReceipt();
   const guardedResize = (match: string): string => {
-    const success = `${match} \\; display-message -p ${quoteShellArg(deferredReceipt)}`;
+    const success = `${match} ; display-message -p ${quoteShellArg(deferredReceipt)}`;
     const hudGuard = `if-shell -F -t ${quoteShellArg(hudAuthority.paneId)} ${quoteShellArg(detachedHudAuthorityCondition(hudAuthority))} ${quoteShellArg(success)} ${quoteShellArg("")}`;
     return `tmux if-shell -F -t ${quoteShellArg(leaderAuthority.paneId)} ${quoteShellArg(detachedLeaderAuthorityCondition(leaderAuthority))} ${quoteShellArg(hudGuard)} ${quoteShellArg("")}`;
   };
-  const guardedCommand = command.replace(
+  const outerFormatEscapedCommand = command
+    .replaceAll('#{pane_id}', '##{pane_id}')
+    .replaceAll('#{pane_dead}', '##{pane_dead}')
+    .replaceAll('#{pane_pid}', '##{pane_pid}');
+  const guardedCommand = outerFormatEscapedCommand.replace(
     /tmux resize-pane -t %[0-9]+ -y [1-9][0-9]*/g,
     guardedResize,
   );

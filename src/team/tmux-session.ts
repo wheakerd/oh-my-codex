@@ -1324,7 +1324,7 @@ function buildAuthoritativeHudResizeShellCommand(
   effectCommand: string = buildNestedTmuxShellCommand(buildHudResizeCommand(buildHudPaneTarget(hudPaneId), heightLines)),
 ): string {
   const target = buildHudPaneTarget(hudPaneId);
-  const snapshot = buildNestedTmuxShellCommand("list-panes -a -F '#{pane_id}\\t#{pane_dead}\\t#{pane_pid}'");
+  const snapshot = buildNestedTmuxShellCommand("list-panes -a -F '#{pane_id}\t#{pane_dead}\t#{pane_pid}'");
   const expectedPid = typeof expectedPanePid === 'number' && Number.isSafeInteger(expectedPanePid) && expectedPanePid > 0
     ? ` && $3 == "${expectedPanePid}"`
     : '';
