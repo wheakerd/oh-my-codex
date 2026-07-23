@@ -4757,6 +4757,110 @@ esac
     }
   });
 
+  it('startTeam preserves the proof-unavailable contract for an ambiguous worker split whose reconciled pane proof is unavailable', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-ambiguous-split-proof-'));
+    const previousTmux = process.env.TMUX;
+    const previousTmuxPane = process.env.TMUX_PANE;
+    const previousLaunchMode = process.env.OMX_TEAM_WORKER_LAUNCH_MODE;
+    const previousWorkerCli = process.env.OMX_TEAM_WORKER_CLI;
+
+    try {
+      await withMockTmuxFixture(
+        {
+          dirPrefix: 'omx-runtime-ambiguous-split-proof-bin-',
+          tmuxScript: () => `#!/bin/sh
+set -eu
+${tmuxOwnerProofShim}
+case "$1" in
+  -V)
+    echo "tmux 3.4"
+    exit 0
+    ;;
+  display-message)
+    case "$*" in
+      *"#{window_width}"*) echo "120" ;;
+      *) echo "leader:0 %1" ;;
+    esac
+    exit 0
+    ;;
+  list-panes)
+    case "$*" in
+      *"-a -F #{pane_id}"*)
+        if [ -f "${cwd}/ambiguous-w1" ]; then
+          echo "forced exact proof query failure" >&2
+          exit 1
+        fi
+        printf "%%1\t0\t2000000001\n"
+        ;;
+      *"pane_current_command"*)
+        printf "%%1\tnode\t'codex'\n"
+        if [ -f "${cwd}/ambiguous-w1" ]; then printf "%%2\tcodex\tcodex\n"; fi
+        ;;
+      *)
+        printf "%%1\n"
+        if [ -f "${cwd}/ambiguous-w1" ]; then printf "%%2\n"; fi
+        ;;
+    esac
+    exit 0
+    ;;
+  capture-pane)
+    exit 0
+    ;;
+  split-window)
+    case "$*" in
+      *" -h "*) : > "${cwd}/ambiguous-w1"; printf "%%2\\n%%9\\n" ;;
+      *) printf "%%3\\n" ;;
+    esac
+    exit 0
+    ;;
+  set-hook|run-shell|select-layout|set-window-option|select-pane|send-keys|kill-pane|kill-session|resize-pane)
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`,
+          binaries: [{ name: 'codex', content: fakeCodexNodeScript('process.stdin.resume();\n') }],
+        },
+        async () => {
+          delete process.env.TMUX;
+          process.env.TMUX_PANE = '%1';
+          process.env.OMX_TEAM_WORKER_LAUNCH_MODE = 'interactive';
+          process.env.OMX_TEAM_WORKER_CLI = 'codex';
+
+          await assert.rejects(
+            () => withoutTeamWorkerEnv(() =>
+              startTeam(
+                'team-ambiguous-split-proof',
+                'ambiguous reconciled worker proof must stay fail-closed',
+                'executor',
+                1,
+                [{ subject: 's', description: 'd', owner: 'worker-1' }],
+                cwd,
+              )),
+            /startup_rollback_pane_proof_unavailable:%2:query_failed/,
+          );
+
+          const runtimeTeamName = await resolveRuntimeTeamName(cwd, 'team-ambiguous-split-proof');
+          const preservedConfig = await readTeamConfig(runtimeTeamName, cwd);
+          assert.ok(preservedConfig, 'proof-unavailable ambiguous split must preserve retry state');
+          assert.equal(preservedConfig?.workers[0]?.pane_id, '%2');
+        },
+      );
+    } finally {
+      if (typeof previousTmux === 'string') process.env.TMUX = previousTmux;
+      else delete process.env.TMUX;
+      if (typeof previousTmuxPane === 'string') process.env.TMUX_PANE = previousTmuxPane;
+      else delete process.env.TMUX_PANE;
+      if (typeof previousLaunchMode === 'string') process.env.OMX_TEAM_WORKER_LAUNCH_MODE = previousLaunchMode;
+      else delete process.env.OMX_TEAM_WORKER_LAUNCH_MODE;
+      if (typeof previousWorkerCli === 'string') process.env.OMX_TEAM_WORKER_CLI = previousWorkerCli;
+      else delete process.env.OMX_TEAM_WORKER_CLI;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it('startTeam persists partial create-session metadata when rollback proof is unavailable', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-partial-create-proof-'));
     const previousTmux = process.env.TMUX;
