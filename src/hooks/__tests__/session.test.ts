@@ -1059,6 +1059,35 @@ describe('session pointer transaction', () => {
     }
   });
 
+  it('preserves foreign claim bytes swapped in after the initial recovery link', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-session-lock-recovery-post-link-claim-swap-'));
+    try {
+      const context = resolveSessionPointerContext(cwd);
+      const ownerPath = join(context.lockPath, 'owner.json');
+      const claimPath = join(context.lockPath, `owner.${TEST_TOKEN}.${SUCCESSOR_TOKEN}.recovery`);
+      const originalClaimPath = `${claimPath}.original`;
+      const foreignMarker = 'foreign post-link claim bytes';
+      await writeLockOwner(cwd, validLockOwner());
+      let swapped = false;
+      await withPointerDependencies({ token: () => SUCCESSOR_TOKEN, probePid: () => 'dead', fs: { link: async (from, to) => {
+        await link(from, to);
+        if (!swapped && to === claimPath) {
+          swapped = true;
+          await rename(claimPath, originalClaimPath);
+          await writeFile(claimPath, foreignMarker, 'utf-8');
+        }
+      } } }, async () => {
+        const recovered = await recoverSessionPointerLock(cwd);
+        assert.equal(recovered.recovered, false);
+        assert.match(recovered.reason, /foreign evidence.*left untouched/i);
+      });
+      assert.equal(swapped, true);
+      assert.equal(await readFile(claimPath, 'utf-8'), foreignMarker);
+      assert.equal(await readFile(originalClaimPath, 'utf-8'), JSON.stringify(validLockOwner()));
+      assert.equal(await readFile(ownerPath, 'utf-8'), JSON.stringify(validLockOwner()));
+    } finally { await rm(cwd, { recursive: true, force: true }); }
+  });
+
   it('live canonical successor survives a refused recovery claim and stays recognizable, releasable, and acquirable', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-session-lock-recovery-live-successor-'));
     try {

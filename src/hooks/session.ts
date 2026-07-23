@@ -1234,8 +1234,15 @@ export async function recoverSessionPointerLock(cwd: string): Promise<SessionPoi
   };
   try {
     const [currentLock, currentEvidence, currentClaim] = await Promise.all([transactionDependencies.fs.lstat(context.lockPath), transactionDependencies.fs.lstat(evidencePath), transactionDependencies.fs.lstat(claimPath)]);
-    if (currentLock.isSymbolicLink() || !currentLock.isDirectory() || currentLock.dev !== preClaim.lockStat.dev || currentLock.ino !== preClaim.lockStat.ino || currentEvidence.isSymbolicLink() || !currentEvidence.isFile() || currentEvidence.dev !== preClaim.evidenceStat.dev || currentEvidence.ino !== preClaim.evidenceStat.ino || currentClaim.isSymbolicLink() || !currentClaim.isFile() || currentClaim.dev !== preClaim.evidenceStat.dev || currentClaim.ino !== preClaim.evidenceStat.ino) {
-      return { ...inspection, action: 'none', recovered: false, reason: `Session pointer lock evidence changed before recovery claim. ${await cleanupClaim(currentClaim)}` };
+    const claimMatchesOriginal = !currentClaim.isSymbolicLink() && currentClaim.isFile() && currentClaim.dev === preClaim.evidenceStat.dev && currentClaim.ino === preClaim.evidenceStat.ino;
+    const claimMatchesCurrentEvidence = !currentClaim.isSymbolicLink() && currentClaim.isFile() && !currentEvidence.isSymbolicLink() && currentEvidence.isFile() && currentClaim.dev === currentEvidence.dev && currentClaim.ino === currentEvidence.ino;
+    if (currentLock.isSymbolicLink() || !currentLock.isDirectory() || currentLock.dev !== preClaim.lockStat.dev || currentLock.ino !== preClaim.lockStat.ino || currentEvidence.isSymbolicLink() || !currentEvidence.isFile() || currentEvidence.dev !== preClaim.evidenceStat.dev || currentEvidence.ino !== preClaim.evidenceStat.ino || !claimMatchesOriginal) {
+      const cleanup = claimMatchesOriginal
+        ? await cleanupClaim()
+        : claimMatchesCurrentEvidence
+          ? await cleanupClaim(currentClaim)
+          : 'The recovery claim path contains foreign evidence and was left untouched.';
+      return { ...inspection, action: 'none', recovered: false, reason: `Session pointer lock evidence changed before recovery claim. ${cleanup}` };
     }
   } catch {
     return { ...inspection, action: 'none', recovered: false, reason: `Session pointer lock evidence changed before recovery claim. ${await cleanupClaim()}` };
