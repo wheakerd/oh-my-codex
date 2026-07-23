@@ -7,6 +7,7 @@
  */
 import {
   appendFile,
+  link as nodeLink,
   lstat as nodeLstat,
   mkdir as nodeMkdir,
   open,
@@ -22,7 +23,7 @@ import {
 import { readFileSync } from 'fs';
 import type { FileHandle } from 'fs/promises';
 import { createHash, randomUUID } from 'crypto';
-import { dirname, join } from 'path';
+import { basename, dirname, join } from 'path';
 import { omxRoot, omxLogsDir, sameFilePath } from '../utils/paths.js';
 import {
   getBaseStateDirWithSource,
@@ -396,6 +397,8 @@ export interface SessionPointerFsDependencies {
   mkdir(path: string, options?: { recursive?: boolean }): Promise<void>;
   readdir(path: string): Promise<string[]>;
   lstat(path: string): Promise<{
+    dev: number;
+    ino: number;
     isDirectory(): boolean;
     isFile(): boolean;
     isSymbolicLink(): boolean;
@@ -408,6 +411,7 @@ export interface SessionPointerFsDependencies {
     regularFileSync?: SessionStartOptions['regularFileSync'],
   ): Promise<RegularFileSyncOutcome>;
   rename(from: string, to: string): Promise<void>;
+  link(path: string, dest: string): Promise<void>;
   unlink(path: string): Promise<void>;
   rmdir(path: string): Promise<void>;
 }
@@ -464,6 +468,9 @@ const defaultFsDependencies: SessionPointerFsDependencies = {
   },
   rename: async (from, to) => {
     await nodeRename(from, to);
+  },
+  link: async (path, dest) => {
+    await nodeLink(path, dest);
   },
   unlink: async (path) => {
     await nodeUnlink(path);
@@ -974,7 +981,13 @@ async function inspectSessionPointerLockAtContext(context: SessionPointerContext
     status,
     lockPath: context.lockPath,
     evidenceSource,
-    safeToRecover: status === 'dead' && evidenceSource === 'owner-temp',
+    // Recoverable only on positively dead evidence (ESRCH), for canonical
+    // owner.json and pre-rename temp evidence alike; the atomic
+    // claim/quarantine protocol revalidates the exact entry, still-dead
+    // status, and owner token before quarantining. Live, reused,
+    // identity-indeterminate, ambiguous, symlink, malformed, unexpected,
+    // and io-error states stay fail-closed.
+    safeToRecover: status === 'dead',
   };
 }
 
@@ -983,86 +996,251 @@ export async function inspectSessionPointerLock(cwd: string): Promise<SessionPoi
   return await inspectSessionPointerLockAtContext(resolveSessionPointerContext(cwd));
 }
 
+async function revalidateRecoveryEvidence(lockPath: string, evidenceName: string): Promise<
+  | { ok: true; lockStat: { dev: number; ino: number }; evidenceStat: { dev: number; ino: number } }
+  | { ok: false; reason: string }
+> {
+  try {
+    const lockStat = await transactionDependencies.fs.lstat(lockPath);
+    const evidenceStat = await transactionDependencies.fs.lstat(join(lockPath, evidenceName));
+    if (lockStat.isSymbolicLink() || !lockStat.isDirectory() || evidenceStat.isSymbolicLink() || !evidenceStat.isFile()) return { ok: false, reason: 'Session pointer lock evidence changed before recovery claim.' };
+    return { ok: true, lockStat, evidenceStat };
+  } catch {
+    return { ok: false, reason: 'Session pointer lock evidence changed before recovery claim.' };
+  }
+}
+
+/**
+ * Atomically park a pathname at an unpredictable sibling of the lock directory
+ * and delete the parked object only when it still holds the captured dev/ino
+ * identity. The park rename cannot overwrite existing bytes (unpredictable,
+ * preflighted destination), so a replaced or foreign target is preserved as
+ * exact residue instead of being unlinked after a stale observation.
+ */
+async function removeIfIdentityMatches(
+  path: string,
+  identity: { dev: number; ino: number },
+  kind: 'file' | 'directory',
+  parkPrefix: string,
+  parkPathOverride?: string,
+): Promise<{ removed: boolean; reason?: string; code?: string; residuePath?: string }> {
+  const parkPath = parkPathOverride ?? `${parkPrefix}.parked-${transactionDependencies.token()}`;
+  try {
+    await transactionDependencies.fs.lstat(parkPath);
+    return { removed: false, reason: 'a park destination unexpectedly exists' };
+  } catch (error) {
+    if (!isNotFound(error)) return { removed: false, reason: 'unable to inspect a park destination', code: errorCode(error) };
+  }
+  const park = async (): Promise<void> => await transactionDependencies.fs.rename(path, parkPath);
+  try {
+    await park();
+  } catch (error) {
+    if (errorCode(error) === 'EBUSY') {
+      try {
+        await park();
+      } catch (retryError) {
+        if (isNotFound(retryError)) return { removed: true };
+        return { removed: false, reason: `unable to park the exact pathname (${errorCode(retryError) ?? 'unknown'})`, code: errorCode(retryError) };
+      }
+    } else {
+      if (isNotFound(error)) return { removed: true };
+      return { removed: false, reason: `unable to park the exact pathname (${errorCode(error) ?? 'unknown'})`, code: errorCode(error) };
+    }
+  }
+  let parkedStat: Awaited<ReturnType<SessionPointerFsDependencies['lstat']>>;
+  try {
+    parkedStat = await transactionDependencies.fs.lstat(parkPath);
+  } catch (error) {
+    if (isNotFound(error)) return { removed: true };
+    return { removed: false, reason: 'unable to verify the parked pathname', code: errorCode(error), residuePath: parkPath };
+  }
+  const identityMatches = parkedStat.dev === identity.dev && parkedStat.ino === identity.ino
+    && (kind === 'directory' ? !parkedStat.isSymbolicLink() && parkedStat.isDirectory() : true);
+  if (!identityMatches) return { removed: false, reason: 'the parked pathname no longer holds the validated identity; it was preserved as residue', residuePath: parkPath };
+  const removeParked = async (): Promise<void> => {
+    if (kind === 'directory') await transactionDependencies.fs.rmdir(parkPath);
+    else await transactionDependencies.fs.unlink(parkPath);
+  };
+  try {
+    await removeParked();
+  } catch (error) {
+    if (errorCode(error) !== 'EBUSY') {
+      if (isNotFound(error)) return { removed: true };
+      return { removed: false, reason: `unable to remove the verified parked pathname (${errorCode(error) ?? 'unknown'})`, code: errorCode(error), residuePath: parkPath };
+    }
+    try {
+      const retryStat = await transactionDependencies.fs.lstat(parkPath);
+      if (retryStat.dev !== identity.dev || retryStat.ino !== identity.ino) return { removed: false, reason: 'the parked pathname no longer holds the validated identity; it was preserved as residue', residuePath: parkPath };
+      await removeParked();
+    } catch (retryError) {
+      if (isNotFound(retryError)) return { removed: true };
+      return { removed: false, reason: `unable to remove the verified parked pathname (${errorCode(retryError) ?? 'unknown'})`, code: errorCode(retryError), residuePath: parkPath };
+    }
+  }
+  try {
+    await transactionDependencies.fs.lstat(path);
+    return { removed: false, reason: 'the original pathname reappeared after its validated object was parked and removed', residuePath: path };
+  } catch (error) {
+    if (isNotFound(error)) return { removed: true };
+    return { removed: false, reason: 'unable to verify the original pathname after removing its parked object', code: errorCode(error), residuePath: path };
+  }
+}
+
+async function rollbackRecoveryClaim(lockPath: string, evidenceName: string, claimName: string, claimIdentity: { dev: number; ino: number }): Promise<{ ok: boolean; reason?: string; residuePath?: string }> {
+  const evidencePath = join(lockPath, evidenceName);
+  const claimPath = join(lockPath, claimName);
+  try { await transactionDependencies.fs.lstat(evidencePath); return { ok: false, reason: 'the original evidence name reappeared' }; } catch (error) { if (!isNotFound(error)) return { ok: false, reason: 'unable to inspect the original evidence name' }; }
+  try { await transactionDependencies.fs.link(claimPath, evidencePath); } catch (error) {
+    if (isAlreadyExists(error)) return { ok: false, reason: 'the original evidence name reappeared during rollback' };
+    return { ok: false, reason: `the exact claim cannot be restored on this filesystem (${errorCode(error) ?? 'unknown'}); it was left in place under its recovery name` };
+  }
+  let restoredStat: Awaited<ReturnType<SessionPointerFsDependencies['lstat']>>;
+  try {
+    restoredStat = await transactionDependencies.fs.lstat(evidencePath);
+  } catch {
+    return { ok: false, reason: 'unable to verify the restored evidence name' };
+  }
+  if (restoredStat.dev !== claimIdentity.dev || restoredStat.ino !== claimIdentity.ino) {
+    const foreign = await removeIfIdentityMatches(evidencePath, claimIdentity, 'file', lockPath);
+    return { ok: false, reason: 'claim identity changed before rollback; the exact claim was left in place under its recovery name', residuePath: foreign.residuePath };
+  }
+  const removal = await removeIfIdentityMatches(claimPath, claimIdentity, 'file', lockPath);
+  if (removal.removed) return { ok: true, residuePath: removal.residuePath };
+  if (removal.residuePath) return { ok: true, residuePath: removal.residuePath };
+  return { ok: false, reason: removal.reason };
+}
+
+function recoveryRollbackReason(prefix: string, rollback: { ok: boolean; reason?: string; residuePath?: string }): string {
+  const residue = rollback.residuePath ? ` Residue preserved at ${rollback.residuePath}; inspect and remove it manually.` : '';
+  return rollback.ok
+    ? `${prefix}; the exact claim was rolled back to its original evidence name without modifying any other bytes.${residue}`
+    : `${prefix}; rollback was not possible: ${rollback.reason}.${residue || ' The exact claim was left in place under its recovery name.'}`;
+}
+
 /** Explicitly quarantine only a dead, atomically claimed pointer lock; never force recovery. */
 export async function recoverSessionPointerLock(cwd: string): Promise<SessionPointerLockRecovery> {
   const context = resolveSessionPointerContext(cwd);
+  const checkpointPrefix = `${basename(context.lockPath)}.recovery.`;
+  let checkpointNames: string[];
+  try {
+    checkpointNames = (await transactionDependencies.fs.readdir(dirname(context.lockPath))).filter((name) => name.startsWith(checkpointPrefix) && name.endsWith('.json'));
+  } catch {
+    checkpointNames = [];
+  }
+  if (checkpointNames.length > 1) return { status: 'unexpected', lockPath: context.lockPath, evidenceSource: 'none', safeToRecover: false, action: 'none', recovered: false, reason: 'Multiple recovery checkpoints exist.' };
+  if (checkpointNames.length === 1) {
+    const checkpointPath = join(dirname(context.lockPath), checkpointNames[0]!);
+    const match = new RegExp(`^${basename(context.lockPath).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\.recovery\\.([A-Za-z0-9_-]{16,128})\\.([A-Za-z0-9_-]{16,128})\\.json$`).exec(checkpointNames[0]!);
+    try {
+      const checkpoint = JSON.parse(await transactionDependencies.fs.readFile(checkpointPath, 'utf8')) as { version: number; sourcePath: string; parkPath: string; identity: { dev: number; ino: number }; phase: string };
+      if (!match || checkpoint.version !== 1 || checkpoint.phase !== 'evidence-pending' || (checkpoint.sourcePath !== join(context.lockPath, 'owner.json') && checkpoint.sourcePath !== join(context.lockPath, `owner.${match[1]}.tmp`))) throw new Error('invalid checkpoint');
+      const parked = await transactionDependencies.fs.lstat(checkpoint.parkPath);
+      if (parked.isSymbolicLink() || !parked.isFile() || parked.dev !== checkpoint.identity.dev || parked.ino !== checkpoint.identity.ino) throw new Error('checkpoint identity mismatch');
+      const claimPath = join(context.lockPath, `owner.${match[1]}.${match[2]}.recovery`);
+      const claim = await transactionDependencies.fs.lstat(claimPath);
+      if (claim.isSymbolicLink() || !claim.isFile() || claim.dev !== parked.dev || claim.ino !== parked.ino) throw new Error('checkpoint claim mismatch');
+      const quarantinePath = `${context.lockPath}.quarantine.${match[1]}.${match[2]}`;
+      await transactionDependencies.fs.rename(checkpoint.parkPath, quarantinePath);
+      try {
+        await transactionDependencies.fs.unlink(join(context.lockPath, `owner.${match[1]}.${match[2]}.recovery`));
+      } catch (error) {
+        await transactionDependencies.fs.rename(quarantinePath, checkpoint.parkPath);
+        throw error;
+      }
+      await transactionDependencies.fs.rmdir(context.lockPath);
+      await transactionDependencies.fs.unlink(checkpointPath);
+      return { status: 'dead', lockPath: context.lockPath, evidenceSource: 'owner.json', safeToRecover: true, action: 'quarantined', recovered: true, reason: 'Dead session pointer lock recovery checkpoint resumed.', quarantinePath };
+    } catch {
+      return { status: 'unexpected', lockPath: context.lockPath, evidenceSource: 'none', safeToRecover: false, action: 'none', recovered: false, reason: 'Recovery checkpoint is malformed or no longer identifies its recorded parked evidence.' };
+    }
+  }
   const inspection = await inspectSessionPointerLockAtContext(context);
-  if (!inspection.safeToRecover) {
-    return { ...inspection, action: 'none', recovered: false, reason: inspection.status === 'absent' ? 'No session pointer lock exists.' : `Session pointer lock is not safe to recover (${inspection.status}).` };
-  }
-
+  if (!inspection.safeToRecover) return { ...inspection, action: 'none', recovered: false, reason: inspection.status === 'absent' ? 'No session pointer lock exists.' : `Session pointer lock is not safe to recover (${inspection.status}).` };
   let entries: string[];
-  try {
-    entries = await transactionDependencies.fs.readdir(context.lockPath);
-  } catch {
-    return { ...inspection, action: 'none', recovered: false, reason: 'Unable to re-read session pointer lock evidence.' };
-  }
+  try { entries = await transactionDependencies.fs.readdir(context.lockPath); } catch { return { ...inspection, action: 'none', recovered: false, reason: 'Unable to re-read session pointer lock evidence.' }; }
   const evidenceName = inspection.evidenceSource === 'owner.json' ? 'owner.json' : entries.find((entry) => /^owner\.([A-Za-z0-9_-]{16,128})\.tmp$/.test(entry));
-  if (!evidenceName || entries.length !== 1) {
-    return { ...inspection, action: 'none', recovered: false, reason: 'Session pointer lock evidence changed before recovery claim.' };
-  }
+  if (!evidenceName || entries.length !== 1) return { ...inspection, action: 'none', recovered: false, reason: 'Session pointer lock evidence changed before recovery claim.' };
+  const evidence = await revalidateRecoveryEvidence(context.lockPath, evidenceName);
+  if (!evidence.ok) return { ...inspection, action: 'none', recovered: false, reason: evidence.reason };
   const owner = await inspectLockOwnerFile(join(context.lockPath, evidenceName));
-  if (owner.status !== 'dead' || !owner.owner) {
-    return { ...inspection, action: 'none', recovered: false, reason: 'Session pointer lock evidence changed before recovery claim.' };
-  }
-
+  if (owner.status !== 'dead' || !owner.owner || (inspection.evidenceSource === 'owner-temp' && owner.owner.token !== /^owner\.([A-Za-z0-9_-]{16,128})\.tmp$/.exec(evidenceName)?.[1])) return { ...inspection, action: 'none', recovered: false, reason: 'Session pointer lock evidence changed before recovery claim.' };
   let claimToken: string;
-  try {
-    claimToken = transactionDependencies.token();
-  } catch {
-    return { ...inspection, action: 'none', recovered: false, reason: 'Unable to create recovery claim token.' };
-  }
+  try { claimToken = transactionDependencies.token(); } catch { return { ...inspection, action: 'none', recovered: false, reason: 'Unable to create recovery claim token.' }; }
   if (!isValidToken(claimToken)) return { ...inspection, action: 'none', recovered: false, reason: 'Recovery claim token is invalid.' };
   const claimName = `owner.${owner.owner.token}.${claimToken}.recovery`;
+  const evidencePath = join(context.lockPath, evidenceName);
   const claimPath = join(context.lockPath, claimName);
+  try { await transactionDependencies.fs.lstat(claimPath); return { ...inspection, action: 'none', recovered: false, reason: 'Recovery claim path already exists.' }; } catch (error) { if (!isNotFound(error)) return { ...inspection, action: 'none', recovered: false, reason: 'Unable to inspect recovery claim path.' }; }
+  const preClaim = await revalidateRecoveryEvidence(context.lockPath, evidenceName);
+  if (!preClaim.ok) return { ...inspection, action: 'none', recovered: false, reason: preClaim.reason };
+  try { await transactionDependencies.fs.link(evidencePath, claimPath); } catch (error) { return { ...inspection, action: 'none', recovered: false, reason: isAlreadyExists(error) ? 'Session pointer lock evidence changed before recovery claim.' : `Unable to create exact recovery claim (${errorCode(error) ?? 'unknown'}).` }; }
+  let postLinkClaim: Awaited<ReturnType<SessionPointerFsDependencies['lstat']>>;
+  const cleanupClaim = async (): Promise<string> => {
+    const cleanup = await removeIfIdentityMatches(claimPath, preClaim.evidenceStat, 'file', context.lockPath);
+    return cleanup.removed
+      ? 'The recovery claim was removed.'
+      : `The recovery claim could not be removed (${cleanup.reason})${cleanup.residuePath ? `; residue preserved at ${cleanup.residuePath}` : '; it was left in place under its recovery name'}.`;
+  };
   try {
-    await transactionDependencies.fs.lstat(claimPath);
-    return { ...inspection, action: 'none', recovered: false, reason: 'Recovery claim path already exists.' };
-  } catch (error) {
-    if (!isNotFound(error)) return { ...inspection, action: 'none', recovered: false, reason: 'Unable to inspect recovery claim path.' };
-  }
-  try {
-    await transactionDependencies.fs.rename(join(context.lockPath, evidenceName), claimPath);
-  } catch {
-    return { ...inspection, action: 'none', recovered: false, reason: 'Session pointer lock evidence changed before recovery claim.' };
-  }
-
-  const claimed = await inspectSessionPointerLockAtContext(context);
-  let claimedEntries: string[];
-  try {
-    claimedEntries = await transactionDependencies.fs.readdir(context.lockPath);
-  } catch {
-    return { ...claimed, action: 'none', recovered: false, reason: 'Unable to revalidate recovery claim.' };
-  }
-  const claimOwner = await inspectLockOwnerFile(claimPath);
-  if (claimedEntries.length !== 1 || claimedEntries[0] !== claimName || claimOwner.status !== 'dead' || claimOwner.owner?.token !== owner.owner.token || claimed.status !== 'unexpected') {
-    return { ...claimed, action: 'none', recovered: false, reason: 'Recovery claim revalidation failed.' };
-  }
-
-  const quarantinePath = `${context.lockPath}.quarantine.${owner.owner.token}.${claimToken}`;
-  try {
-    await transactionDependencies.fs.lstat(quarantinePath);
-    return { ...claimed, action: 'none', recovered: false, reason: 'Recovery quarantine path already exists.' };
-  } catch (error) {
-    if (!isNotFound(error)) return { ...claimed, action: 'none', recovered: false, reason: 'Unable to inspect recovery quarantine path.' };
-  }
-  try {
-    await transactionDependencies.fs.rename(claimPath, quarantinePath);
-  } catch {
-    return { ...claimed, action: 'none', recovered: false, reason: 'Unable to quarantine the exact session pointer recovery claim.' };
-  }
-  try {
-    await transactionDependencies.fs.rmdir(context.lockPath);
-  } catch (error) {
-    if (!isNotFound(error)) {
-      return {
-        ...claimed,
-        action: 'none',
-        recovered: false,
-        reason: 'The exact recovery claim was quarantined, but the canonical lock directory was not empty.',
-        quarantinePath,
-      };
+    const [currentEvidence, currentClaim] = await Promise.all([transactionDependencies.fs.lstat(evidencePath), transactionDependencies.fs.lstat(claimPath)]);
+    postLinkClaim = currentClaim;
+    if (currentEvidence.dev !== preClaim.evidenceStat.dev || currentEvidence.ino !== preClaim.evidenceStat.ino || currentClaim.dev !== preClaim.evidenceStat.dev || currentClaim.ino !== preClaim.evidenceStat.ino) {
+      return { ...inspection, action: 'none', recovered: false, reason: `Session pointer lock evidence changed before recovery claim. ${await cleanupClaim()}` };
     }
+  } catch {
+    return { ...inspection, action: 'none', recovered: false, reason: `Session pointer lock evidence changed before recovery claim. ${await cleanupClaim()}` };
+  }
+  const evidenceParkPath = `${context.lockPath}.parked-${transactionDependencies.token()}`;
+  const evidenceCheckpointPath = `${context.lockPath}.recovery.${owner.owner.token}.${claimToken}.json`;
+  try {
+    await transactionDependencies.fs.writeFile(evidenceCheckpointPath, JSON.stringify({
+      version: 1,
+      sourcePath: evidencePath,
+      parkPath: evidenceParkPath,
+      identity: { dev: preClaim.evidenceStat.dev, ino: preClaim.evidenceStat.ino },
+      phase: 'evidence-pending',
+    }), { flag: 'wx' });
+  } catch (error) {
+    const cleanup = await cleanupClaim();
+    return { ...inspection, action: 'none', recovered: false, reason: `Unable to create recovery checkpoint (${errorCode(error) ?? 'unknown'}). ${cleanup}` };
+  }
+  const evidenceRemoval = await removeIfIdentityMatches(evidencePath, preClaim.evidenceStat, 'file', context.lockPath, evidenceParkPath);
+  if (!evidenceRemoval.removed) {
+    const cleanup = await cleanupClaim();
+    try { await transactionDependencies.fs.unlink(evidenceCheckpointPath); } catch { /* Preserve the checkpoint if cleanup cannot remove it. */ }
+    return { ...inspection, action: 'none', recovered: false, reason: `The exact recovery claim was created, but its original evidence name could not be removed (${evidenceRemoval.reason}). ${cleanup}${evidenceRemoval.residuePath ? ` Residue preserved at ${evidenceRemoval.residuePath}; inspect and remove it manually.` : ''}` };
+  }
+  try { await transactionDependencies.fs.unlink(evidenceCheckpointPath); } catch (error) { if (!isNotFound(error)) return { ...inspection, action: 'none', recovered: false, reason: 'The exact recovery evidence checkpoint could not be removed.' }; }
+  const claimIdentity = { dev: postLinkClaim.dev, ino: postLinkClaim.ino };
+  const claimed = await inspectSessionPointerLockAtContext(context);
+  if (claimed.status !== 'unexpected') {
+    const rollback = await rollbackRecoveryClaim(context.lockPath, evidenceName, claimName, claimIdentity);
+    return { ...claimed, action: 'none', recovered: false, reason: recoveryRollbackReason('Recovery claim revalidation failed', rollback) };
+  }
+  let claimedEntries: string[] | undefined;
+  let claimedClaimLstat: Awaited<ReturnType<SessionPointerFsDependencies['lstat']>> | undefined;
+  try { claimedEntries = await transactionDependencies.fs.readdir(context.lockPath); } catch { /* Roll back below. */ }
+  try { claimedClaimLstat = await transactionDependencies.fs.lstat(claimPath); } catch { /* Roll back below. */ }
+  const claimOwner = claimedClaimLstat && !claimedClaimLstat.isSymbolicLink() && claimedClaimLstat.isFile() ? await inspectLockOwnerFile(claimPath) : { status: 'unexpected' as const };
+  if (!claimedEntries || claimedEntries.length !== 1 || claimedEntries[0] !== claimName || claimOwner.status !== 'dead' || claimOwner.owner?.token !== owner.owner.token || !claimedClaimLstat || claimedClaimLstat.isSymbolicLink() || !claimedClaimLstat.isFile() || claimedClaimLstat.dev !== claimIdentity.dev || claimedClaimLstat.ino !== claimIdentity.ino) {
+    const rollback = await rollbackRecoveryClaim(context.lockPath, evidenceName, claimName, claimIdentity);
+    return { ...claimed, action: 'none', recovered: false, reason: recoveryRollbackReason('Recovery claim revalidation failed', rollback) };
+  }
+  const quarantinePath = `${context.lockPath}.quarantine.${owner.owner.token}.${claimToken}`;
+  let quarantineFailure: string | undefined;
+  try {
+    const [lockStat, claimStat] = await Promise.all([transactionDependencies.fs.lstat(context.lockPath), transactionDependencies.fs.lstat(claimPath)]);
+    if (lockStat.isSymbolicLink() || !lockStat.isDirectory() || lockStat.dev !== preClaim.lockStat.dev || lockStat.ino !== preClaim.lockStat.ino || claimStat.isSymbolicLink() || !claimStat.isFile() || claimStat.dev !== claimIdentity.dev || claimStat.ino !== claimIdentity.ino) quarantineFailure = 'Unable to quarantine the exact session pointer recovery claim';
+  } catch { quarantineFailure = 'Unable to quarantine the exact session pointer recovery claim'; }
+  if (!quarantineFailure) try { await transactionDependencies.fs.lstat(quarantinePath); quarantineFailure = 'Recovery quarantine path already exists.'; } catch (error) { if (!isNotFound(error)) quarantineFailure = 'Unable to inspect recovery quarantine path.'; }
+  if (quarantineFailure) { const rollback = await rollbackRecoveryClaim(context.lockPath, evidenceName, claimName, claimIdentity); return { ...claimed, action: 'none', recovered: false, reason: recoveryRollbackReason(quarantineFailure, rollback) }; }
+  try { await transactionDependencies.fs.link(claimPath, quarantinePath); } catch (error) { const rollback = await rollbackRecoveryClaim(context.lockPath, evidenceName, claimName, claimIdentity); return { ...claimed, action: 'none', recovered: false, reason: recoveryRollbackReason(isAlreadyExists(error) ? 'Recovery quarantine path already exists.' : `Unable to quarantine the exact session pointer recovery claim (${errorCode(error) ?? 'unknown'})`, rollback) }; }
+  const claimRemoval = await removeIfIdentityMatches(claimPath, claimIdentity, 'file', context.lockPath);
+  if (!claimRemoval.removed) return { ...claimed, action: 'none', recovered: false, reason: `The exact recovery claim was quarantined, but its recovery name could not be removed (${claimRemoval.reason}).${claimRemoval.residuePath ? ` Residue preserved at ${claimRemoval.residuePath}; inspect and remove it manually.` : ''}`, quarantinePath };
+  const lockRemoval = await removeIfIdentityMatches(context.lockPath, preClaim.lockStat, 'directory', context.lockPath);
+  if (!lockRemoval.removed) {
+    const residue = lockRemoval.residuePath ? ` Residue preserved at ${lockRemoval.residuePath}; inspect and remove it manually.` : '';
+    return { ...claimed, action: 'none', recovered: false, reason: lockRemoval.code === 'ENOTEMPTY' ? `The exact recovery claim was quarantined, but the canonical lock directory was not empty.${residue}` : `The exact recovery claim was quarantined, but the canonical lock directory was replaced before removal.${residue}`, quarantinePath };
   }
   return { ...inspection, action: 'quarantined', recovered: true, reason: 'Dead session pointer lock was atomically claimed and quarantined.', quarantinePath };
 }
@@ -1361,6 +1539,11 @@ async function releasePointerLock(lock: HeldPointerLock): Promise<SessionPointer
       evidencePath: releasePath,
     }];
   }
+}
+
+/** @internal Test-only release of a held pointer lock; do not use outside session tests. */
+export async function __releasePointerLockForTests(cwd: string, token: string): Promise<SessionPointerSecondaryFailure[]> {
+  return await releasePointerLock({ context: resolveSessionPointerContext(cwd), token });
 }
 
 function recoveryAbort(
