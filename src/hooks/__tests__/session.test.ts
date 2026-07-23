@@ -1176,27 +1176,35 @@ describe('session pointer transaction', () => {
     }
   });
 
-  it('records a token-bound checkpoint when evidence parking is transiently busy', async () => {
+  it('rolls back a claim when checkpoint creation fails', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-session-lock-recovery-checkpoint-write-fail-'));
+    try {
+      const context = resolveSessionPointerContext(cwd);
+      await writeLockOwner(cwd, validLockOwner());
+      let fail = true;
+      await withPointerDependencies({ token: () => SUCCESSOR_TOKEN, probePid: () => 'dead', fs: { writeFile: async (path, data, options) => { if (fail && path.includes('.recovery.')) { fail = false; throw codedError('EBUSY'); } await writeFile(path, data, options); } } }, async () => {
+        assert.equal((await recoverSessionPointerLock(cwd)).recovered, false);
+        assert.deepEqual(await readdir(context.lockPath), ['owner.json']);
+        assert.equal((await recoverSessionPointerLock(cwd)).recovered, true);
+      });
+    } finally { await rm(cwd, { recursive: true, force: true }); }
+  });
+
+  it('rolls back a double-EBUSY evidence park failure so a normal retry succeeds', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-session-lock-recovery-checkpoint-'));
     try {
       const context = resolveSessionPointerContext(cwd);
       const ownerPath = join(context.lockPath, 'owner.json');
       await writeLockOwner(cwd, validLockOwner());
-      await withPointerDependencies({
-        token: () => SUCCESSOR_TOKEN,
-        probePid: () => 'dead',
-        fs: { rename: async (from, to) => {
-          if (from === ownerPath) throw codedError('EBUSY');
-          await rename(from, to);
-        } },
-      }, async () => assert.equal((await recoverSessionPointerLock(cwd)).recovered, false));
-      const checkpointPath = `${context.lockPath}.recovery.${TEST_TOKEN}.${SUCCESSOR_TOKEN}.json`;
-      const checkpoint = JSON.parse(await readFile(checkpointPath, 'utf-8')) as { sourcePath: string; parkPath: string; identity: { dev: number; ino: number }; phase: string };
-      assert.equal(checkpoint.sourcePath, ownerPath);
-      assert.equal(checkpoint.parkPath, `${context.lockPath}.parked-${SUCCESSOR_TOKEN}`);
-      assert.equal(checkpoint.phase, 'evidence-pending');
-      assert.equal(typeof checkpoint.identity.dev, 'number');
-      assert.equal(typeof checkpoint.identity.ino, 'number');
+      let failures = 2;
+      await withPointerDependencies({ token: () => SUCCESSOR_TOKEN, probePid: () => 'dead', fs: { rename: async (from, to) => {
+        if (from === ownerPath && failures-- > 0) throw codedError('EBUSY');
+        await rename(from, to);
+      } } }, async () => {
+        assert.equal((await recoverSessionPointerLock(cwd)).recovered, false);
+        assert.deepEqual(await readdir(context.lockPath), ['owner.json']);
+        assert.equal((await recoverSessionPointerLock(cwd)).recovered, true);
+      });
     } finally { await rm(cwd, { recursive: true, force: true }); }
   });
 

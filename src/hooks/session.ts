@@ -1199,10 +1199,15 @@ export async function recoverSessionPointerLock(cwd: string): Promise<SessionPoi
       phase: 'evidence-pending',
     }), { flag: 'wx' });
   } catch (error) {
-    return { ...inspection, action: 'none', recovered: false, reason: `Unable to create recovery checkpoint (${errorCode(error) ?? 'unknown'}).` };
+    const cleanup = await cleanupClaim();
+    return { ...inspection, action: 'none', recovered: false, reason: `Unable to create recovery checkpoint (${errorCode(error) ?? 'unknown'}). ${cleanup}` };
   }
   const evidenceRemoval = await removeIfIdentityMatches(evidencePath, preClaim.evidenceStat, 'file', context.lockPath);
-  if (!evidenceRemoval.removed) return { ...inspection, action: 'none', recovered: false, reason: `The exact recovery claim was created, but its original evidence name could not be removed (${evidenceRemoval.reason}).${evidenceRemoval.residuePath ? ` Residue preserved at ${evidenceRemoval.residuePath}; inspect and remove it manually.` : ''}` };
+  if (!evidenceRemoval.removed) {
+    const cleanup = await cleanupClaim();
+    try { await transactionDependencies.fs.unlink(evidenceCheckpointPath); } catch { /* Preserve the checkpoint if cleanup cannot remove it. */ }
+    return { ...inspection, action: 'none', recovered: false, reason: `The exact recovery claim was created, but its original evidence name could not be removed (${evidenceRemoval.reason}). ${cleanup}${evidenceRemoval.residuePath ? ` Residue preserved at ${evidenceRemoval.residuePath}; inspect and remove it manually.` : ''}` };
+  }
   try { await transactionDependencies.fs.unlink(evidenceCheckpointPath); } catch (error) { if (!isNotFound(error)) return { ...inspection, action: 'none', recovered: false, reason: 'The exact recovery evidence checkpoint could not be removed.' }; }
   const claimIdentity = { dev: postLinkClaim.dev, ino: postLinkClaim.ino };
   const claimed = await inspectSessionPointerLockAtContext(context);
