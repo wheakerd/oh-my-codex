@@ -2995,11 +2995,25 @@ export function restoreStandaloneHudPane(
       .map((pane) => pane.paneId)
       .filter((candidate) => !beforeSplitPaneIds.has(candidate));
     if (newlyObservedPaneIds.length === 1) {
+      const reconciledPaneId = newlyObservedPaneIds[0]!;
       persistRestoredHudCleanupDebtSync(cwd, {
         schema_version: 1,
         operation: 'restored_hud_cleanup',
-        pane_id: newlyObservedPaneIds[0]!,
+        pane_id: reconciledPaneId,
         pane_pid: null,
+        leader_pane_id: normalizedLeaderPaneId,
+        leader_pane_pid: options.expectedLeaderPanePid ?? leaderPanePid,
+        leader_pane_owner_id: options.expectedLeaderPaneOwnerId?.trim() || null,
+        hud_owner_leader_pane_id: normalizedLeaderPaneId,
+      }, options.stateRoot);
+      const reconciledProof = readExactPaneProofSync(reconciledPaneId);
+      if (reconciledProof.status === 'unavailable') throw new ExactPaneProofUnavailableError(reconciledProof);
+      if (reconciledProof.status === 'gone') throw new Error(`tmux pane is not proven live: ${reconciledPaneId}`);
+      persistRestoredHudCleanupDebtSync(cwd, {
+        schema_version: 1,
+        operation: 'restored_hud_cleanup',
+        pane_id: reconciledPaneId,
+        pane_pid: reconciledProof.pid,
         leader_pane_id: normalizedLeaderPaneId,
         leader_pane_pid: options.expectedLeaderPanePid ?? leaderPanePid,
         leader_pane_owner_id: options.expectedLeaderPaneOwnerId?.trim() || null,

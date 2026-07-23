@@ -6839,34 +6839,48 @@ esac
     }
   });
 
-  it('retains PID-less restored HUD debt when successful split output is ambiguous', async () => {
+  it('pins and replays restored HUD debt when successful split output is ambiguous', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-restored-hud-ambiguous-output-'));
     try {
       await withMockTmuxFixture(
         'omx-restored-hud-ambiguous-output-',
-        (logPath) => `#!/bin/sh
+        (logPath) => {
+          const killedPath = `${logPath}.killed`;
+          return `#!/bin/sh
 set -eu
 printf '%s\n' "$*" >> "${logPath}"
 case "$1" in
   list-panes)
     if [ "$2" = "-a" ]; then
       printf '%%11\t0\t2000000011\n'
-      [ ! -f "${logPath}.created" ] || printf '%%44\t0\t2000000044\n'
+      if [ -f "${logPath}.created" ] && [ ! -f "${killedPath}" ]; then printf '%%44\t0\t2000000044\n'; fi
     else
       printf '%%11\tzsh\tzsh\n'
-      [ ! -f "${logPath}.created" ] || printf "%%44\tnode\texec env OMX_TMUX_HUD_OWNER=1 OMX_TMUX_HUD_LEADER_PANE='%%11' /node /omx.js hud --watch\n"
+      if [ -f "${logPath}.created" ] && [ ! -f "${killedPath}" ]; then printf "%%44\tnode\texec env OMX_TMUX_HUD_OWNER=1 OMX_TMUX_HUD_LEADER_PANE='%%11' /node /omx.js hud --watch\n"; fi
     fi
     ;;
   split-window)
     : > "${logPath}.created"
     printf '%%44\n%%99\n'
     ;;
+  show-option)
+    if [ "$5" = "%11" ] && [ "$6" = "@omx_team_pane_owner_id" ]; then
+      printf 'team:ambiguous-output\n'
+    else
+      exit 1
+    fi
+    ;;
+  kill-pane) : > "${killedPath}" ;;
   *) exit 0 ;;
 esac
-`,
+`;
+        },
         async ({ logPath }) => {
           assert.throws(
-            () => restoreStandaloneHudPane('%11', cwd),
+            () => restoreStandaloneHudPane('%11', cwd, {
+              expectedLeaderPanePid: 2000000011,
+              expectedLeaderPaneOwnerId: 'team:ambiguous-output',
+            }),
             /restored_hud_split_output_ambiguous/,
           );
 
@@ -6876,14 +6890,17 @@ esac
             schema_version: 1,
             operation: 'restored_hud_cleanup',
             pane_id: '%44',
-            pane_pid: null,
+            pane_pid: 2000000044,
             leader_pane_id: '%11',
             leader_pane_pid: 2000000011,
-            leader_pane_owner_id: null,
+            leader_pane_owner_id: 'team:ambiguous-output',
             hud_owner_leader_pane_id: '%11',
           });
+
+          reconcileRestoredHudCleanupDebtSync(cwd);
+          await assert.rejects(() => readFile(debtPath, 'utf-8'));
           const commands = await readFile(logPath, 'utf-8');
-          assert.doesNotMatch(commands, /kill-pane/);
+          assert.match(commands, /kill-pane -t %44/);
         },
       );
     } finally {
