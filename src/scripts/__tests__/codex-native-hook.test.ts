@@ -845,7 +845,7 @@ describe("codex native hook config", () => {
 	});
 });
 
-describe("codex native hook dispatch", () => {
+describe("codex native hook dispatch", { concurrency: false }, () => {
 	it("treats space-containing argv entry paths as the main module", () => {
 		const entryPath = "/tmp/omx native/codex-native-hook.js";
 
@@ -12832,8 +12832,43 @@ exit 0
 					delete process.env.OMX_QUESTION_RETURN_PANE;
 				}
 			})(), /OMX_QUESTION_RETURN_PANE=\$TMUX_PANE/);
-			await assertAllowed("direct documented cancellation", await bash("omx cancel", "omx-cancel"));
+			await assertAllowed("direct documented cancellation", await withCleanRunnerNodeEnvironment(async () => {
+				const workspacePackageCli = realpathSync(resolve(process.cwd(), "dist", "cli", "omx.js"));
+				const trustedBinDir = await mkdtemp(join(tmpdir(), "omx-di-trusted-bin-"));
+				await symlink(workspacePackageCli, join(trustedBinDir, "omx"));
+				const inheritedPath = process.env.PATH;
+				process.env.PATH = `${trustedBinDir}:${dirname(process.execPath)}`;
+				try {
+					return await bash("omx cancel", "omx-cancel");
+				} finally {
+					if (inheritedPath === undefined) delete process.env.PATH;
+					else process.env.PATH = inheritedPath;
+					await rm(trustedBinDir, { recursive: true, force: true });
+				}
+			}));
 			await assertDenied("chained cancellation is not documented direct cancellation", await bash("printf ready && omx cancel", "omx-cancel-chained"), /Deep-interview is active|write intent|handoff|direct/);
+			await assertDenied("force cancellation is ralplan/conductor-only", await bash("omx cancel --force", "omx-cancel-force"), /Deep-interview is active|write intent|handoff|direct/);
+			await assertDenied("bom lookalike is not direct cancellation", await bash("\ufeffomx cancel", "omx-cancel-bom"), /Deep-interview is active|write intent|handoff|direct/);
+			await assertDenied("inherited bash startup poisons direct cancellation", await (async () => {
+				const previousBashEnv = process.env.BASH_ENV;
+				process.env.BASH_ENV = "/tmp/prelude.sh";
+				try {
+					return await bash("omx cancel", "omx-cancel-bash-env");
+				} finally {
+					if (previousBashEnv === undefined) delete process.env.BASH_ENV;
+					else process.env.BASH_ENV = previousBashEnv;
+				}
+			})(), /Deep-interview is active|write intent|handoff|direct/);
+			await assertDenied("inherited node coverage output poisons direct cancellation", await (async () => {
+				const previousCoverage = process.env.NODE_V8_COVERAGE;
+				process.env.NODE_V8_COVERAGE = "/tmp/coverage-out";
+				try {
+					return await bash("omx cancel", "omx-cancel-coverage");
+				} finally {
+					if (previousCoverage === undefined) delete process.env.NODE_V8_COVERAGE;
+					else process.env.NODE_V8_COVERAGE = previousCoverage;
+				}
+			})(), /Deep-interview is active|write intent|handoff|direct/);
 
 			for (const [label, command] of [
 				["omx-help", "omx --help"],
@@ -20849,6 +20884,392 @@ PY`,
     }
   });
 
+  // Direct-cancel positives must prove behavior in a clean execution context,
+  // but the test runner itself may inherit Node startup/output instrumentation
+  // (e.g. NODE_V8_COVERAGE from the coverage lane). Clear only the runner's
+  // baseline values around clean-context assertions; per-case injected values
+  // in denial tests are set explicitly afterwards and still exercise the
+  // product predicate. Mirrors DIRECT_OMX_CANCEL_UNSAFE_INHERITED_ENV_NAMES
+  // and CONDUCTOR_NODE_OUTPUT_ENVIRONMENT_NAMES in the hook.
+  const RUNNER_BASELINE_NODE_ENV_NAMES = [
+    "NODE_OPTIONS",
+    "NODE_EXTRA_CA_CERTS",
+    "OPENSSL_CONF",
+    "NODE_V8_COVERAGE",
+    "NODE_COMPILE_CACHE",
+    "NODE_REDIRECT_WARNINGS",
+    "NODE_REPORT_DIRECTORY",
+    "NODE_REPORT_FILENAME",
+  ];
+  const withCleanRunnerNodeEnvironment = async <T>(run: () => Promise<T>): Promise<T> => {
+    const previous = new Map<string, string | undefined>();
+    for (const name of RUNNER_BASELINE_NODE_ENV_NAMES) {
+      previous.set(name, process.env[name]);
+      delete process.env[name];
+    }
+    try {
+      return await run();
+    } finally {
+      for (const [name, value] of previous) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
+  };
+  const writeFlattenedCollaborationRalplanFixture = async (cwd: string) => {
+    const stateDir = join(cwd, ".omx", "state");
+    const sessionId = "sess-flattened-collab-ralplan";
+    const leaderThreadId = "thread-flattened-collab-ralplan-leader";
+    const sessionDir = join(stateDir, "sessions", sessionId);
+    await mkdir(sessionDir, { recursive: true });
+    await writeJson(join(stateDir, "session.json"), {
+      session_id: sessionId,
+      native_session_id: leaderThreadId,
+      cwd,
+    });
+    await writeJson(join(sessionDir, "skill-active-state.json"), {
+      version: 1,
+      active: true,
+      skill: "autopilot",
+      phase: "ralplan",
+      session_id: sessionId,
+      thread_id: leaderThreadId,
+      active_skills: [{
+        skill: "autopilot",
+        phase: "ralplan",
+        active: true,
+        session_id: sessionId,
+        thread_id: leaderThreadId,
+      }],
+    });
+    await writeJson(join(sessionDir, "autopilot-state.json"), {
+      active: true,
+      mode: "autopilot",
+      current_phase: "ralplan",
+      started_at: "2026-07-22T00:00:00.000Z",
+      updated_at: "2026-07-22T00:10:00.000Z",
+      session_id: sessionId,
+      thread_id: leaderThreadId,
+    });
+    await writeJson(join(stateDir, "subagent-tracking.json"), {
+      schemaVersion: 1,
+      sessions: {
+        [sessionId]: {
+          session_id: sessionId,
+          leader_thread_id: leaderThreadId,
+          updated_at: "2026-07-22T00:10:00.000Z",
+          threads: {
+            [leaderThreadId]: {
+              thread_id: leaderThreadId,
+              kind: "leader",
+              first_seen_at: "2026-07-22T00:00:00.000Z",
+              last_seen_at: "2026-07-22T00:10:00.000Z",
+              turn_count: 1,
+            },
+          },
+        },
+      },
+    });
+    return { sessionId, leaderThreadId, stateDir };
+  };
+
+  it("allows flattened known collaboration tools under active ralplan while unknown flattened names stay blocked", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-flattened-collab-ralplan-"));
+    try {
+      const { sessionId, leaderThreadId } = await writeFlattenedCollaborationRalplanFixture(cwd);
+      for (const [tool_name, tool_input] of [
+        ["collaborationspawn_agent", { agent_type: "planner", message: "draft the plan" }],
+        ["collaborationlist_agents", {}],
+        ["collaborationfollowup_task", {}],
+        ["collaborationwait_agent", {}],
+        ["collaborationsend_message", {}],
+        ["collaborationinterrupt_agent", {}],
+        ["collaborationclose_agent", {}],
+      ] as const) {
+        const result = await dispatchCodexNativeHook({
+          hook_event_name: "PreToolUse",
+          cwd,
+          session_id: sessionId,
+          thread_id: leaderThreadId,
+          tool_name,
+          tool_input,
+        }, { cwd });
+        assert.equal(result.outputJson, null, tool_name);
+      }
+
+      const blocked = await dispatchCodexNativeHook({
+        hook_event_name: "PreToolUse",
+        cwd,
+        session_id: sessionId,
+        thread_id: leaderThreadId,
+        tool_name: "collaborationbogus_thing",
+        tool_input: {},
+      }, { cwd });
+      assert.equal(blocked.outputJson?.decision, "block");
+      const reason = String(blocked.outputJson?.reason ?? "");
+      assert.match(reason, /not a recognized read-only or explicitly authorized planning mutation transport/);
+      assert.match(reason, /collaborationbogus_thing/);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("denies unknown typed roles dispatched through flattened spawn names", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-flattened-collab-unknown-role-"));
+    try {
+      const { sessionId, leaderThreadId } = await writeFlattenedCollaborationRalplanFixture(cwd);
+      const result = await dispatchCodexNativeHook({
+        hook_event_name: "PreToolUse",
+        cwd,
+        session_id: sessionId,
+        thread_id: leaderThreadId,
+        tool_name: "collaborationspawn_agent",
+        tool_input: { agent_type: "definitely-not-an-installed-role", message: "x" },
+      }, { cwd });
+      assert.equal(result.outputJson?.decision, "block");
+      assert.match(String(result.outputJson?.reason ?? ""), /unknown or not installed/);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("records native blockers from flattened collaboration spawn failures with the original tool name", async () => {
+    const capacityCwd = await mkdtemp(join(tmpdir(), "omx-native-hook-flattened-collab-capacity-"));
+    try {
+      const result = await dispatchCodexNativeHook({
+        hook_event_name: "PostToolUse",
+        cwd: capacityCwd,
+        session_id: "sess-flattened-capacity",
+        thread_id: "thread-flattened-capacity",
+        turn_id: "turn-flattened-capacity",
+        tool_name: "collaborationspawn_agent",
+        tool_response: "collab spawn failed: agent thread limit reached",
+      }, { cwd: capacityCwd });
+      assert.equal(result.outputJson, null);
+      const blocker = JSON.parse(
+        await readFile(join(capacityCwd, ".omx", "state", "native-subagent-capacity-blocker.json"), "utf-8"),
+      ) as Record<string, unknown>;
+      assert.equal(blocker.tool_name, "collaborationspawn_agent");
+      assert.match(String(blocker.error_summary), /agent thread limit reached/);
+    } finally {
+      await rm(capacityCwd, { recursive: true, force: true });
+    }
+
+    const supportCwd = await mkdtemp(join(tmpdir(), "omx-native-hook-flattened-collab-support-"));
+    try {
+      await dispatchCodexNativeHook({
+        hook_event_name: "PostToolUse",
+        cwd: supportCwd,
+        session_id: "sess-flattened-support",
+        thread_id: "thread-flattened-support",
+        turn_id: "turn-flattened-support",
+        tool_name: "collaborationspawn_agent",
+        tool_response: { error: "unknown tool: collaborationspawn_agent is unavailable" },
+      }, { cwd: supportCwd });
+      const blocker = JSON.parse(
+        await readFile(join(supportCwd, ".omx", "state", "native-subagent-support.json"), "utf-8"),
+      ) as Record<string, unknown>;
+      assert.equal(blocker.tool_name, "collaborationspawn_agent");
+    } finally {
+      await rm(supportCwd, { recursive: true, force: true });
+    }
+  });
+
+  it("does not persist support or capacity poison from successful flattened collaboration child output", async () => {
+    for (const toolName of [
+      "collaborationspawn_agent",
+      "collaborationlist_agents",
+      "collaborationfollowup_task",
+      "collaborationwait_agent",
+    ]) {
+      const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-flattened-collab-success-"));
+      try {
+        await dispatchCodexNativeHook({
+          hook_event_name: "PostToolUse",
+          cwd,
+          session_id: "sess-flattened-success",
+          thread_id: "thread-flattened-success",
+          tool_name: toolName,
+          tool_response: {
+            success: true,
+            status: "completed",
+            output: "Child completed. Optional packed plugin was unavailable, unsupported, and not found.",
+          },
+        }, { cwd });
+        const stateDir = join(cwd, ".omx", "state");
+        assert.equal(existsSync(join(stateDir, "native-subagent-support.json")), false, toolName);
+        assert.equal(existsSync(join(stateDir, "native-subagent-capacity-blocker.json")), false, toolName);
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it("blocks flattened close_agent cleanup after recent native subagent capacity exhaustion", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-flattened-collab-capacity-close-block-"));
+    try {
+      await dispatchCodexNativeHook({
+        hook_event_name: "PostToolUse",
+        cwd,
+        session_id: "sess-flattened-capacity-close-block",
+        thread_id: "thread-flattened-capacity-close-block",
+        turn_id: "turn-flattened-capacity-close-block",
+        tool_name: "collaborationspawn_agent",
+        tool_response: "collab spawn failed: agent thread limit reached",
+      }, { cwd });
+
+      const result = await dispatchCodexNativeHook({
+        hook_event_name: "PreToolUse",
+        cwd,
+        session_id: "sess-flattened-capacity-close-block",
+        thread_id: "thread-flattened-capacity-close-block",
+        tool_name: "collaborationclose_agent",
+        tool_input: { target: "019ecc36-stale" },
+      }, { cwd });
+
+      assert.equal(result.outputJson?.decision, "block");
+      assert.match(JSON.stringify(result.outputJson), /capacity/);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("allows session-scoped omx cancel under active ralplan without weakening state guards", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-flattened-collab-ralplan-cancel-"));
+    try {
+      const { sessionId, leaderThreadId } = await writeFlattenedCollaborationRalplanFixture(cwd);
+      const bash = (command: string) => dispatchCodexNativeHook({
+        hook_event_name: "PreToolUse",
+        cwd,
+        session_id: sessionId,
+        thread_id: leaderThreadId,
+        tool_name: "Bash",
+        tool_input: { command },
+      }, { cwd });
+
+      // The exemption also requires the bare `omx` token to resolve to the
+      // hook package's canonical CLI under the inherited PATH, so positives
+      // and impostor denials run under a proven-trusted resolution to stay
+      // discriminating (a denial must not pass merely because the ambient
+      // PATH was untrusted).
+      const workspacePackageCli = realpathSync(resolve(process.cwd(), "dist", "cli", "omx.js"));
+      const trustedPackageBin = join(cwd, "node_modules", ".bin", "omx");
+      await mkdir(dirname(trustedPackageBin), { recursive: true });
+      await symlink(workspacePackageCli, trustedPackageBin);
+      const trustedPackagePath = `${dirname(trustedPackageBin)}:${dirname(process.execPath)}`;
+      const bashTrusted = async (command: string) => {
+        const inheritedPath = process.env.PATH;
+        process.env.PATH = trustedPackagePath;
+        try {
+          return await bash(command);
+        } finally {
+          if (inheritedPath === undefined) delete process.env.PATH;
+          else process.env.PATH = inheritedPath;
+        }
+      };
+
+      const cleanPositives = await withCleanRunnerNodeEnvironment(async () => ({
+        plain: await bashTrusted("omx cancel"),
+        force: await bashTrusted("omx cancel --force"),
+      }));
+      assert.equal(cleanPositives.plain.outputJson, null);
+      assert.equal(cleanPositives.force.outputJson, null);
+      assert.equal((await bash("omx cancel")).outputJson?.decision, "block",
+        "ambient non-package omx resolution is not trusted");
+
+      const chained = await bash("omx cancel --force && rm -rf x");
+      assert.equal(chained.outputJson?.decision, "block");
+
+      const unknownFlag = await bash("omx cancel --json");
+      assert.equal(unknownFlag.outputJson?.decision, "block");
+
+      // The direct-cancel grammar admits no leading environment assignments at
+      // all: runtime startup/configuration variables are an open-ended
+      // namespace (PATH, NODE_OPTIONS, OPENSSL_CONF, OMX_* state selectors),
+      // so every prefixed form is denied rather than denylisted one by one.
+      for (const [label, command] of [
+        ["benign-looking env prefix", "FOO=bar omx cancel --force"],
+        ["multi env prefix", "A=1 B=2 omx cancel"],
+        ["openssl config injection", "OPENSSL_CONF=/tmp/evil.cnf omx cancel"],
+        ["path override", "PATH=/tmp/attacker omx cancel"],
+        ["node preload override", "NODE_OPTIONS=--require=./payload.cjs omx cancel"],
+        ["path-qualified impostor", "/tmp/omx cancel --force"],
+        ["relative-path impostor", "./omx cancel"],
+        ["quoted pseudo-assignment", "'X=./payload' omx cancel"],
+        ["escaped pseudo-assignment", "X\\=./payload omx cancel"],
+        ["omx root override", "OMX_ROOT=/tmp/other omx cancel"],
+        ["omx state root override", "OMX_STATE_ROOT=/tmp/other omx cancel"],
+        ["omx team state root override", "OMX_TEAM_STATE_ROOT=/tmp/other omx cancel"],
+        ["omx session override", "OMX_SESSION_ID=other-session omx cancel"],
+        ["quoted executable", "\"omx\" cancel"],
+        ["semicolon operator in assignment", "FOO=bar;./payload omx cancel"],
+        ["command substitution in assignment", "FOO=$(./payload) omx cancel"],
+        ["backtick substitution in assignment", "FOO=`./payload` omx cancel"],
+        ["redirection in assignment", "FOO=bar>src/pwned omx cancel"],
+        ["and-operator in assignment", "FOO=bar&&./payload omx cancel"],
+        ["uppercase executable", "OMX cancel"],
+        ["unicode nbsp separator", "omx\u00a0cancel"],
+        ["newline between words", "omx\ncancel"],
+        // Byte-form lookalikes: the raw payload command is not byte-identical
+        // to the trim-normalized command, so the direct-cancel exemption can
+        // never fire and the omx-mutation analysis denies the command. This
+        // asserts observable denial, not merely failure of one helper.
+        ["byte-order-mark lookalike executable", "\ufeffomx cancel"],
+        ["carriage-return suffix lookalike", "omx cancel\r"],
+      ] as const) {
+        const impostor = await bashTrusted(command);
+        assert.equal(impostor.outputJson?.decision, "block", label);
+      }
+
+      // Inherited execution-context overrides must deny even the byte-exact
+      // command: the exemption proves the text, not the runtime that will
+      // execute it (Bash sources $BASH_ENV first, imported functions shadow
+      // the omx executable, and Node loader env preloads code).
+      for (const [label, envName, envValue] of [
+        ["inherited bash startup file", "BASH_ENV", "/tmp/prelude.sh"],
+        ["imported omx function shadow", "BASH_FUNC_omx%%", "() { printf owned > src/pwned.ts; }"],
+        ["inherited node loader override", "NODE_OPTIONS", "--require=./payload.cjs"],
+        ["inherited openssl config", "OPENSSL_CONF", "/tmp/evil.cnf"],
+        ["inherited dynamic loader preload", "LD_PRELOAD", "/tmp/payload.so"],
+        ["inherited node coverage output", "NODE_V8_COVERAGE", "/tmp/coverage-out"],
+      ] as const) {
+        const previousValue = process.env[envName];
+        process.env[envName] = envValue;
+        try {
+          const poisoned = await bashTrusted("omx cancel");
+          assert.equal(poisoned.outputJson?.decision, "block", label);
+        } finally {
+          if (previousValue === undefined) delete process.env[envName];
+          else process.env[envName] = previousValue;
+        }
+      }
+
+      // A PATH-shadowed omx (a different executable resolving first) is not
+      // the validated cancellation program and must deny even byte-exact text.
+      const shadowBinDir = join(cwd, "shadow-bin");
+      await mkdir(shadowBinDir, { recursive: true });
+      await writeFile(join(shadowBinDir, "omx"), "#!/bin/sh\ntouch src/path-shadow-owned.ts\n", "utf-8");
+      await chmod(join(shadowBinDir, "omx"), 0o755);
+      {
+        const inheritedPath = process.env.PATH;
+        process.env.PATH = `${shadowBinDir}:${trustedPackagePath}`;
+        try {
+          const shadowed = await bash("omx cancel");
+          assert.equal(shadowed.outputJson?.decision, "block", "PATH-shadowed omx executable");
+        } finally {
+          if (inheritedPath === undefined) delete process.env.PATH;
+          else process.env.PATH = inheritedPath;
+        }
+      }
+
+      const stateClear = await bash("omx state clear --force --mode ralplan --json");
+      assert.equal(stateClear.outputJson?.decision, "block");
+      assert.match(String(stateClear.outputJson?.reason ?? ""), /Autopilot planning is active \(phase: ralplan\)/);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("does not persist native blockers from structured failures on unrelated tools", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-unrelated-structured-failure-"));
     try {
@@ -20983,6 +21404,45 @@ PY`,
 
       assert.equal((result.outputJson as { decision?: string } | null)?.decision, "block");
       assert.match(JSON.stringify(result.outputJson), /Do not call multi_agent_v1\.close_agent/);
+      assert.match(JSON.stringify(result.outputJson), /do not batch close_agent through multi_tool_use\.parallel/);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks parallel close_agent cleanup with flattened nested recipients after native capacity exhaustion", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-subagent-capacity-parallel-close-flattened-"));
+    try {
+      await dispatchCodexNativeHook(
+        {
+          hook_event_name: "PostToolUse",
+          cwd,
+          session_id: "sess-subagent-capacity-parallel-close-flattened",
+          thread_id: "thread-subagent-capacity-parallel-close-flattened",
+          tool_name: "collaborationspawn_agent",
+          tool_response: "agent thread limit reached",
+        },
+        { cwd },
+      );
+
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "PreToolUse",
+          cwd,
+          session_id: "sess-subagent-capacity-parallel-close-flattened",
+          thread_id: "thread-subagent-capacity-parallel-close-flattened",
+          tool_name: "multi_tool_use.parallel",
+          tool_input: {
+            tool_uses: [
+              { recipient_name: "collaborationclose_agent", parameters: { target: "stale-1" } },
+              { recipient_name: "collaborationclose_agent", parameters: { target: "stale-2" } },
+            ],
+          },
+        },
+        { cwd },
+      );
+
+      assert.equal((result.outputJson as { decision?: string } | null)?.decision, "block");
       assert.match(JSON.stringify(result.outputJson), /do not batch close_agent through multi_tool_use\.parallel/);
     } finally {
       await rm(cwd, { recursive: true, force: true });
@@ -31117,6 +31577,117 @@ PY`,
 
       assert.equal(result.outputJson?.decision, "block");
       assert.match(String(result.outputJson?.reason ?? ""), /Main-root Conductor mode is active \(ultragoal phase: planning\)/);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("allows session-scoped omx cancel under active ultragoal conductor while impostors stay blocked", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-ultragoal-conductor-cancel-"));
+    try {
+      const stateDir = join(cwd, ".omx", "state");
+      const sessionId = "sess-ultragoal-conductor-cancel";
+      const leaderThreadId = "thread-ultragoal-conductor-cancel";
+      await mkdir(join(stateDir, "sessions", sessionId), { recursive: true });
+      await writeJson(join(stateDir, "session.json"), {
+        session_id: sessionId,
+        native_session_id: leaderThreadId,
+      });
+      await writeJson(join(stateDir, "subagent-tracking.json"), { schemaVersion: 1, sessions: { [sessionId]: { session_id: sessionId, leader_thread_id: leaderThreadId, threads: { [leaderThreadId]: { thread_id: leaderThreadId, kind: "leader" } } } } });
+      await writeSessionSkillActiveState(stateDir, sessionId, "ultragoal", "planning");
+      await writeJson(join(stateDir, "sessions", sessionId, "ultragoal-state.json"), {
+        active: true,
+        mode: "ultragoal",
+        current_phase: "planning",
+        session_id: sessionId,
+      });
+
+      const bash = (command: string) => dispatchCodexNativeHook({
+        hook_event_name: "PreToolUse",
+        cwd,
+        session_id: sessionId,
+        thread_id: leaderThreadId,
+        agent_id: leaderThreadId,
+        tool_name: "Bash",
+        tool_input: { command },
+      }, { cwd });
+
+      const workspacePackageCli = realpathSync(resolve(process.cwd(), "dist", "cli", "omx.js"));
+      const trustedPackageBin = join(cwd, "node_modules", ".bin", "omx");
+      await mkdir(dirname(trustedPackageBin), { recursive: true });
+      await symlink(workspacePackageCli, trustedPackageBin);
+      const trustedPackagePath = `${dirname(trustedPackageBin)}:${dirname(process.execPath)}`;
+      const bashTrusted = async (command: string) => {
+        const inheritedPath = process.env.PATH;
+        process.env.PATH = trustedPackagePath;
+        try {
+          return await bash(command);
+        } finally {
+          if (inheritedPath === undefined) delete process.env.PATH;
+          else process.env.PATH = inheritedPath;
+        }
+      };
+
+      const cleanPositives = await withCleanRunnerNodeEnvironment(async () => ({
+        plain: await bashTrusted("omx cancel"),
+        force: await bashTrusted("omx cancel --force"),
+      }));
+      assert.equal(cleanPositives.plain.outputJson, null);
+      assert.equal(cleanPositives.force.outputJson, null);
+      assert.equal((await bash("omx cancel")).outputJson?.decision, "block",
+        "ambient non-package omx resolution is not trusted");
+
+      for (const [label, command] of [
+        ["openssl config injection", "OPENSSL_CONF=/tmp/evil.cnf omx cancel"],
+        ["path override", "PATH=/tmp/attacker omx cancel"],
+        ["path-qualified impostor", "/tmp/omx cancel --force"],
+        ["chained cancellation", "omx cancel --force && rm -rf x"],
+        ["omx root override", "OMX_ROOT=/tmp/other omx cancel"],
+        ["byte-order-mark lookalike executable", "\ufeffomx cancel"],
+        ["carriage-return suffix lookalike", "omx cancel\r"],
+        ["unicode nbsp separator", "omx\u00a0cancel"],
+      ] as const) {
+        const impostor = await bashTrusted(command);
+        assert.equal(impostor.outputJson?.decision, "block", label);
+      }
+
+      for (const [label, envName, envValue] of [
+        ["inherited bash startup file", "BASH_ENV", "/tmp/prelude.sh"],
+        ["imported omx function shadow", "BASH_FUNC_omx%%", "() { printf owned > src/pwned.ts; }"],
+        ["inherited node loader override", "NODE_OPTIONS", "--require=./payload.cjs"],
+        ["inherited openssl config", "OPENSSL_CONF", "/tmp/evil.cnf"],
+        ["inherited dynamic loader preload", "LD_PRELOAD", "/tmp/payload.so"],
+        ["inherited node coverage output", "NODE_V8_COVERAGE", "/tmp/coverage-out"],
+      ] as const) {
+        const previousValue = process.env[envName];
+        process.env[envName] = envValue;
+        try {
+          const poisoned = await bashTrusted("omx cancel");
+          assert.equal(poisoned.outputJson?.decision, "block", label);
+        } finally {
+          if (previousValue === undefined) delete process.env[envName];
+          else process.env[envName] = previousValue;
+        }
+      }
+
+      const shadowBinDir = join(cwd, "shadow-bin");
+      await mkdir(shadowBinDir, { recursive: true });
+      await writeFile(join(shadowBinDir, "omx"), "#!/bin/sh\ntouch src/path-shadow-owned.ts\n", "utf-8");
+      await chmod(join(shadowBinDir, "omx"), 0o755);
+      {
+        const inheritedPath = process.env.PATH;
+        process.env.PATH = `${shadowBinDir}:${trustedPackagePath}`;
+        try {
+          const shadowed = await bash("omx cancel");
+          assert.equal(shadowed.outputJson?.decision, "block", "PATH-shadowed omx executable");
+        } finally {
+          if (inheritedPath === undefined) delete process.env.PATH;
+          else process.env.PATH = inheritedPath;
+        }
+      }
+
+      const stateClear = await bash("omx state clear --force --mode ultragoal --json");
+      assert.equal(stateClear.outputJson?.decision, "block");
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
