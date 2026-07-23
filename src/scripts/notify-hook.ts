@@ -550,6 +550,66 @@ async function resolveLeaderNotifyWriteDecision(
   };
 }
 
+async function dispatchTurnCompleteHookEvents(
+  payload: Record<string, any>,
+  cwd: string,
+  payloadSessionId: string,
+  sessionIdForHooks: string,
+): Promise<void> {
+  try {
+    const { buildNativeHookEvent, buildDerivedHookEvent } = await import('../hooks/extensibility/events.js');
+    const { dispatchHookEvent } = await import('../hooks/extensibility/dispatcher.js');
+    const threadIdForHooks = safeString(payload['thread-id'] || payload.thread_id || '');
+    const turnIdForHooks = safeString(payload['turn-id'] || payload.turn_id || '');
+    const modeForHooks = safeString(payload.mode || '');
+    const outputPreview = safeString(payload['last-assistant-message'] || payload.last_assistant_message || '').slice(0, 400);
+    const event = buildNativeHookEvent('turn-complete', {
+      source: safeString(payload.source || 'native'),
+      type: safeString(payload.type || 'agent-turn-complete'),
+      input_messages: normalizeInputMessages(payload),
+      output_preview: outputPreview,
+      native_session_id: payloadSessionId || null,
+      omx_session_id: sessionIdForHooks || null,
+      ...readRepositoryMetadata(cwd),
+      session_name: resolveOperationalSessionName(cwd, sessionIdForHooks),
+      project_path: cwd,
+      project_name: safeString(payload.project_name || ''),
+    }, {
+      session_id: sessionIdForHooks,
+      thread_id: threadIdForHooks,
+      turn_id: turnIdForHooks,
+      mode: modeForHooks,
+    });
+    await dispatchHookEvent(event, { cwd });
+
+    for (const signal of deriveAssistantSignalEvents(outputPreview)) {
+      const derivedEvent = buildDerivedHookEvent(signal.event, buildOperationalContext({
+        cwd,
+        normalizedEvent: signal.normalized_event,
+        sessionId: sessionIdForHooks,
+        text: outputPreview,
+        status: signal.normalized_event,
+        errorSummary: signal.error_summary,
+        extra: {
+          native_session_id: payloadSessionId || null,
+          omx_session_id: sessionIdForHooks || null,
+          source_event: safeString(payload.type || 'agent-turn-complete'),
+        },
+      }), {
+        session_id: sessionIdForHooks,
+        thread_id: threadIdForHooks,
+        turn_id: turnIdForHooks,
+        mode: modeForHooks,
+        confidence: signal.confidence,
+        parser_reason: signal.parser_reason,
+      });
+      await dispatchHookEvent(derivedEvent, { cwd });
+    }
+  } catch {
+    // Non-fatal: extensibility modules may not be built yet
+  }
+}
+
 async function main() {
   const rawPayload = process.argv[process.argv.length - 1];
   if (!rawPayload || rawPayload.startsWith('-')) {
@@ -967,6 +1027,7 @@ async function main() {
     if (activationResult?.skill === 'autopilot'
       && activationResult.active === false
       && activationResult.error === 'documented_host_consensus_receipt_unavailable') {
+      await dispatchTurnCompleteHookEvents(payload, cwd, payloadSessionId, getEffectiveSessionId());
       return;
     }
 
@@ -1035,59 +1096,7 @@ async function main() {
   }
 
   // 7. Dispatch native turn-complete hook event (best effort, post-dedupe)
-  try {
-    const { buildNativeHookEvent, buildDerivedHookEvent } = await import('../hooks/extensibility/events.js');
-    const { dispatchHookEvent } = await import('../hooks/extensibility/dispatcher.js');
-    const sessionIdForHooks = getEffectiveSessionId();
-    const threadIdForHooks = safeString(payload['thread-id'] || payload.thread_id || '');
-    const turnIdForHooks = safeString(payload['turn-id'] || payload.turn_id || '');
-    const modeForHooks = safeString(payload.mode || '');
-    const outputPreview = safeString(payload['last-assistant-message'] || payload.last_assistant_message || '').slice(0, 400);
-    const event = buildNativeHookEvent('turn-complete', {
-      source: safeString(payload.source || 'native'),
-      type: safeString(payload.type || 'agent-turn-complete'),
-      input_messages: normalizeInputMessages(payload),
-      output_preview: outputPreview,
-      native_session_id: payloadSessionId || null,
-      omx_session_id: sessionIdForHooks || null,
-      ...readRepositoryMetadata(cwd),
-      session_name: resolveOperationalSessionName(cwd, sessionIdForHooks),
-      project_path: cwd,
-      project_name: safeString(payload.project_name || ''),
-    }, {
-      session_id: sessionIdForHooks,
-      thread_id: threadIdForHooks,
-      turn_id: turnIdForHooks,
-      mode: modeForHooks,
-    });
-    await dispatchHookEvent(event, { cwd });
-
-    for (const signal of deriveAssistantSignalEvents(outputPreview)) {
-      const derivedEvent = buildDerivedHookEvent(signal.event, buildOperationalContext({
-        cwd,
-        normalizedEvent: signal.normalized_event,
-        sessionId: sessionIdForHooks,
-        text: outputPreview,
-        status: signal.normalized_event,
-        errorSummary: signal.error_summary,
-        extra: {
-          native_session_id: payloadSessionId || null,
-          omx_session_id: sessionIdForHooks || null,
-          source_event: safeString(payload.type || 'agent-turn-complete'),
-        },
-      }), {
-        session_id: sessionIdForHooks,
-        thread_id: threadIdForHooks,
-        turn_id: turnIdForHooks,
-        mode: modeForHooks,
-        confidence: signal.confidence,
-        parser_reason: signal.parser_reason,
-      });
-      await dispatchHookEvent(derivedEvent, { cwd });
-    }
-  } catch {
-    // Non-fatal: extensibility modules may not be built yet
-  }
+  await dispatchTurnCompleteHookEvents(payload, cwd, payloadSessionId, getEffectiveSessionId());
 
   // 8. Dispatch session-idle lifecycle notification (lead session only, best effort)
   if (!isTeamWorker) {

@@ -3170,11 +3170,18 @@ exit 0
       const logsDir = join(omxDir, 'logs');
       const codexHome = join(cwd, 'codex-home');
       const fakeBinDir = join(cwd, 'fake-bin');
+      const hookEventsPath = join(cwd, 'hook-events.jsonl');
+      const tmuxLogPath = join(cwd, 'tmux.log');
 
       await mkdir(logsDir, { recursive: true });
       await mkdir(stateDir, { recursive: true });
       await mkdir(codexHome, { recursive: true });
       await mkdir(fakeBinDir, { recursive: true });
+      await mkdir(join(omxDir, 'hooks'), { recursive: true });
+      await writeFile(join(omxDir, 'hooks', 'capture.mjs'), [
+        "import { appendFileSync } from 'node:fs';",
+        `export function onHookEvent(event) { appendFileSync(${JSON.stringify(hookEventsPath)}, JSON.stringify(event) + '\\n'); }`,
+      ].join('\n'));
 
       await writeJson(join(codexHome, '.omx-config.json'), {
         autoNudge: { enabled: true, delaySec: 0, stallMs: 0 },
@@ -3182,12 +3189,12 @@ exit 0
       await writeManagedSessionState(stateDir, cwd);
       const sessionStateDir = join(stateDir, 'sessions', 'sess-managed');
 
-      await writeFile(join(fakeBinDir, 'tmux'), buildFakeTmux(join(cwd, 'tmux.log')));
+      await writeFile(join(fakeBinDir, 'tmux'), buildFakeTmux(tmuxLogPath));
       await chmod(join(fakeBinDir, 'tmux'), 0o755);
 
       const result = runNotifyHook(cwd, fakeBinDir, codexHome, {
         'input-messages': ['$autopilot handle this task'],
-        'last-assistant-message': 'Here is the plan I will follow.',
+        'last-assistant-message': 'A handoff is required.',
       });
       assert.equal(result.status, 0, `hook failed: ${result.stderr || result.stdout}`);
 
@@ -3207,6 +3214,18 @@ exit 0
       assert.equal(skillState.active, false);
       assert.equal(skillState.error, 'documented_host_consensus_receipt_unavailable');
       assert.deepEqual(skillState.active_skills, []);
+      const hookEvents = (await readFile(hookEventsPath, 'utf-8')).trim().split('\n')
+        .map((line) => JSON.parse(line) as { event: string; source: string });
+      assert.deepEqual(
+        hookEvents.map(({ event, source }) => ({ event, source })),
+        [
+          { event: 'turn-complete', source: 'native' },
+          { event: 'handoff-needed', source: 'derived' },
+        ],
+        'denied fresh Autopilot must dispatch each required terminal lifecycle event exactly once',
+      );
+      assert.doesNotMatch(await readFile(tmuxLogPath, 'utf-8').catch(() => ''), /(?:send-keys|capture-pane|set-buffer|paste-buffer)/, 'denied fresh Autopilot must not inject or continue');
+      assert.equal(existsSync(join(sessionStateDir, 'ralplan-state.json')), false);
       assert.equal(existsSync(join(sessionStateDir, 'deep-interview-state.json')), false);
       assert.equal(existsSync(join(sessionStateDir, 'ultragoal-state.json')), false);
     });
