@@ -38,6 +38,7 @@ import {
   assignTask,
   sendWorkerMessage,
   applyCreatedInteractiveSessionToConfig,
+  reconcileStartupCleanupPanes,
   resolveWorkerLaunchArgsFromEnv,
   resolveTeamWorkerCliForResolvedLaunchArgs,
   shouldPrekillInteractiveShutdownProcessTrees,
@@ -3062,6 +3063,10 @@ esac
         workerPaneIds: ['%30'],
         workerPaneIdsByIndex: [null, '%30'],
         workerPanePidsByIndex: [null, 2000000030],
+        startupCleanupPanes: [
+          { paneId: '%40', panePid: 2000000040 },
+          { paneId: '%41', panePid: 2000000041 },
+        ],
         leaderPanePid: 2000000001,
         hudPanePid: 2000000004,
 
@@ -3077,6 +3082,83 @@ esac
       assert.equal(config.workers[1]?.pid, 2000000030);
       assert.equal(config.leader_pane_pid, 2000000001);
       assert.equal(config.hud_pane_pid, 2000000004);
+      assert.deepEqual(config.startup_cleanup_panes, [
+        { pane_id: '%40', pid: 2000000040 },
+        { pane_id: '%41', pid: 2000000041 },
+      ]);
+      await saveTeamConfig(config, cwd);
+      const durablePartialConfig = await readTeamConfig('team-pane-persist-race', cwd);
+      assert.ok(durablePartialConfig);
+      assert.deepEqual(durablePartialConfig.startup_cleanup_panes, config.startup_cleanup_panes);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('replays durable startup cleanup panes by exact PID and Team owner', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-startup-cleanup-replay-'));
+    try {
+      const config = await initTeamState('startup-cleanup-replay', 'replay startup pane cleanup debt', 'executor', 1, cwd);
+      applyCreatedInteractiveSessionToConfig(config, {
+        name: 'leader:0',
+        workerCount: 1,
+        cwd,
+        workerPaneIds: [],
+        workerPaneIdsByIndex: [null],
+        workerPanePidsByIndex: [null],
+        startupCleanupPanes: [
+          { paneId: '%40', panePid: 2000044440 },
+          { paneId: '%41', panePid: 2000045551 },
+        ],
+        leaderPaneId: '%1',
+        leaderPanePid: 2000000001,
+        hudPaneId: null,
+        hudPanePid: null,
+        resizeHookName: null,
+        resizeHookTarget: null,
+        teamPaneOwnerId: 'team:startup-cleanup-replay',
+      }, [undefined]);
+      await saveTeamConfig(config, cwd);
+
+      await withMockTmuxFixture(
+        {
+          dirPrefix: 'omx-runtime-startup-cleanup-replay-',
+          tmuxScript: (tmuxLogPath) => `#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "${tmuxLogPath}"
+case "\${1:-}" in
+  list-panes)
+    case "$*" in
+      *'-a -F #{pane_id}'*)
+        [ -f "${tmuxLogPath}.killed-40" ] || printf '%%40\\t0\\t2000044440\\n'
+        [ -f "${tmuxLogPath}.killed-41" ] || printf '%%41\\t0\\t2000045551\\n'
+        ;;
+    esac
+    ;;
+  show-option) printf 'team:startup-cleanup-replay\\n' ;;
+  kill-pane)
+    case "$*" in
+      *"%40"*) : > "${tmuxLogPath}.killed-40" ;;
+      *"%41"*) : > "${tmuxLogPath}.killed-41" ;;
+    esac
+    ;;
+  *) ;;
+esac
+`,
+        },
+        async ({ tmuxLogPath }) => {
+          const durable = await readTeamConfig('startup-cleanup-replay', cwd);
+          assert.ok(durable);
+          const reconciled = await reconcileStartupCleanupPanes(durable, cwd);
+          assert.equal(reconciled.startup_cleanup_panes, undefined);
+          const persisted = await readTeamConfig('startup-cleanup-replay', cwd);
+          assert.ok(persisted);
+          assert.equal(persisted.startup_cleanup_panes, undefined);
+          const log = await readFile(tmuxLogPath, 'utf-8');
+          assert.match(log, /kill-pane -t %40/);
+          assert.match(log, /kill-pane -t %41/);
+        },
+      );
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -4753,6 +4835,110 @@ esac
       } else {
         delete process.env.OMX_TEAM_STARTUP_DISPATCH_RETRY_DELAY_MS;
       }
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('startTeam preserves the proof-unavailable contract for an ambiguous worker split whose reconciled pane proof is unavailable', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-ambiguous-split-proof-'));
+    const previousTmux = process.env.TMUX;
+    const previousTmuxPane = process.env.TMUX_PANE;
+    const previousLaunchMode = process.env.OMX_TEAM_WORKER_LAUNCH_MODE;
+    const previousWorkerCli = process.env.OMX_TEAM_WORKER_CLI;
+
+    try {
+      await withMockTmuxFixture(
+        {
+          dirPrefix: 'omx-runtime-ambiguous-split-proof-bin-',
+          tmuxScript: () => `#!/bin/sh
+set -eu
+${tmuxOwnerProofShim}
+case "$1" in
+  -V)
+    echo "tmux 3.4"
+    exit 0
+    ;;
+  display-message)
+    case "$*" in
+      *"#{window_width}"*) echo "120" ;;
+      *) echo "leader:0 %1" ;;
+    esac
+    exit 0
+    ;;
+  list-panes)
+    case "$*" in
+      *"-a -F #{pane_id}"*)
+        if [ -f "${cwd}/ambiguous-w1" ]; then
+          echo "forced exact proof query failure" >&2
+          exit 1
+        fi
+        printf "%%1\t0\t2000000001\n"
+        ;;
+      *"pane_current_command"*)
+        printf "%%1\tnode\t'codex'\n"
+        if [ -f "${cwd}/ambiguous-w1" ]; then printf "%%2\tcodex\tcodex\n"; fi
+        ;;
+      *)
+        printf "%%1\n"
+        if [ -f "${cwd}/ambiguous-w1" ]; then printf "%%2\n"; fi
+        ;;
+    esac
+    exit 0
+    ;;
+  capture-pane)
+    exit 0
+    ;;
+  split-window)
+    case "$*" in
+      *" -h "*) : > "${cwd}/ambiguous-w1"; printf "%%2\\n%%9\\n" ;;
+      *) printf "%%3\\n" ;;
+    esac
+    exit 0
+    ;;
+  set-hook|run-shell|select-layout|set-window-option|select-pane|send-keys|kill-pane|kill-session|resize-pane)
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`,
+          binaries: [{ name: 'codex', content: fakeCodexNodeScript('process.stdin.resume();\n') }],
+        },
+        async () => {
+          delete process.env.TMUX;
+          process.env.TMUX_PANE = '%1';
+          process.env.OMX_TEAM_WORKER_LAUNCH_MODE = 'interactive';
+          process.env.OMX_TEAM_WORKER_CLI = 'codex';
+
+          await assert.rejects(
+            () => withoutTeamWorkerEnv(() =>
+              startTeam(
+                'team-ambiguous-split-proof',
+                'ambiguous reconciled worker proof must stay fail-closed',
+                'executor',
+                1,
+                [{ subject: 's', description: 'd', owner: 'worker-1' }],
+                cwd,
+              )),
+            /startup_rollback_pane_proof_unavailable:%2:query_failed/,
+          );
+
+          const runtimeTeamName = await resolveRuntimeTeamName(cwd, 'team-ambiguous-split-proof');
+          const preservedConfig = await readTeamConfig(runtimeTeamName, cwd);
+          assert.ok(preservedConfig, 'proof-unavailable ambiguous split must preserve retry state');
+          assert.equal(preservedConfig?.workers[0]?.pane_id, '%2');
+        },
+      );
+    } finally {
+      if (typeof previousTmux === 'string') process.env.TMUX = previousTmux;
+      else delete process.env.TMUX;
+      if (typeof previousTmuxPane === 'string') process.env.TMUX_PANE = previousTmuxPane;
+      else delete process.env.TMUX_PANE;
+      if (typeof previousLaunchMode === 'string') process.env.OMX_TEAM_WORKER_LAUNCH_MODE = previousLaunchMode;
+      else delete process.env.OMX_TEAM_WORKER_LAUNCH_MODE;
+      if (typeof previousWorkerCli === 'string') process.env.OMX_TEAM_WORKER_CLI = previousWorkerCli;
+      else delete process.env.OMX_TEAM_WORKER_CLI;
       await rm(cwd, { recursive: true, force: true });
     }
   });

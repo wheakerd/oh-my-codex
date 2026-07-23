@@ -62,6 +62,7 @@ import {
   waitForWorkerReady,
   waitForWorkerReadyAsync,
   paneIsBootstrapping,
+  parseSplitWindowPaneId,
   classifyWorkerStartupInjectSafety,
   checkWorkerStartupInjectSafety,
   dismissTrustPromptIfPresent,
@@ -289,7 +290,11 @@ if [ "${'$'}1" = "if-shell" ] && [ "${'$'}{2:-}" = "-F" ] && [ "${'$'}{3:-}" = "
   output="$($0 "${'$'}@")" || exit 1
   case "${'$'}1" in
     split-window)
-      created_pane="$(printf '%s' "$output" | awk -F '\t' 'NR == 1 { print ${'$'}1 }')"
+      created_pane="$output"
+      if ! printf '%s' "$created_pane" | grep -Eq '^%[0-9]+${'$'}'; then
+        printf '%s' "$output"
+        exit 0
+      fi
       created_pid="$($fixture list-panes -a -F '#{pane_id}\t#{pane_dead}\t#{pane_pid}' 2>/dev/null | awk -F '\t' -v pane="$created_pane" '${'$'}1 == pane && ${'$'}2 == "0" && ${'$'}3 ~ /^[1-9][0-9]*${'$'}/ { print ${'$'}3; exit }')"
       [ -n "$created_pane" ] && [ -n "$created_pid" ] && {
         mkdir -p "$source_state"
@@ -4418,6 +4423,519 @@ esac
 });
 
 describe('createTeamSession tmux instance tagging', () => {
+  it('rejects split-window output unless it contains one canonical pane id and optional expected receipt', () => {
+    for (const [stdout, receipt, expected] of [
+      ['%2', undefined, '%2'],
+      ['%2\n', undefined, '%2'],
+      ['%2\r\n', undefined, '%2'],
+      ['%2\tomx_source_receipt', 'omx_source_receipt', '%2'],
+      ['%2\tomx_source_receipt\n', 'omx_source_receipt', '%2'],
+      ['notice\n%2\n', undefined, null],
+      ['%2\nnotice\n', undefined, null],
+      ['%2\n%3\n', undefined, null],
+      ['\n%2\n', undefined, null],
+      ['%2\n\n', undefined, null],
+      ['%2 warning\n', undefined, null],
+      [' %2\n', undefined, null],
+      ['%2\tomx_source_other\n', 'omx_source_receipt', null],
+      ['%2\tomx_source_receipt\n%3\tomx_source_receipt\n', 'omx_source_receipt', null],
+      ['notice only\n', undefined, null],
+    ] as const) {
+      assert.equal(parseSplitWindowPaneId(stdout, receipt), expected);
+    }
+  });
+
+  it('fails closed on multi-row worker and HUD split-window output', async () => {
+    const prevTmux = process.env.TMUX;
+    const prevTmuxPane = process.env.TMUX_PANE;
+    const prevWorkerCli = process.env.OMX_TEAM_WORKER_CLI;
+    try {
+      for (const scenario of [
+        { name: 'worker', ambiguousPane: 'worker', reconciliationFailure: null, extraWorkerPane: null, workerOutput: '%%2\\n%%9\\n', hudOutput: '%%3\\n' },
+        { name: 'worker-concurrent', ambiguousPane: 'worker', reconciliationFailure: null, extraWorkerPane: 'foreign', workerOutput: '%%2\\n%%9\\n', hudOutput: '%%3\\n' },
+        { name: 'worker-multi-owned', ambiguousPane: 'worker', reconciliationFailure: null, extraWorkerPane: 'owned', workerOutput: '%%2\\n%%9\\n', hudOutput: '%%3\\n' },
+        { name: 'hud', ambiguousPane: 'hud', reconciliationFailure: null, extraWorkerPane: null, workerOutput: '%%2\\n', hudOutput: '%%3\\n%%9\\n' },
+        { name: 'worker-reconciliation', ambiguousPane: 'worker', reconciliationFailure: 'worker', extraWorkerPane: null, workerOutput: '%%2\\n%%9\\n', hudOutput: '%%3\\n' },
+        { name: 'hud-reconciliation', ambiguousPane: 'hud', reconciliationFailure: 'hud', extraWorkerPane: null, workerOutput: '%%2\\n', hudOutput: '%%3\\n%%9\\n' },
+      ]) {
+        const cwd = await mkdtemp(join(tmpdir(), `omx-team-${scenario.name}-split-output-`));
+        try {
+          await withMockTmuxFixture(
+            `omx-tmux-${scenario.name}-split-output-`,
+            (logPath) => `#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "${logPath}"
+case "\${1:-}" in
+  -V) echo "tmux 3.4" ;;
+  display-message)
+    case "$*" in
+      *"#{window_width}"*) echo "120" ;;
+      *"#{pane_id}"*"#{pane_dead}"*"#{pane_pid}"*) printf "%%1\\t0\\t2000000001\\n" ;;
+      *) echo "shared:0 $4" ;;
+    esac
+    ;;
+  list-panes)
+    case "$*" in
+      *"#{pane_id}"*"#{pane_dead}"*"#{pane_pid}"*)
+        printf "%%1\\t0\\t2000000001\\n"
+        [ ! -f "${logPath}.worker" ] || printf "%%2\\t0\\t2000000002\\n"
+        [ ! -f "${logPath}.worker-extra" ] || printf "%%9\\t0\\t2000000009\\n"
+        [ ! -f "${logPath}.hud" ] || printf "%%3\\t0\\t2000000003\\n"
+        ;;
+      *"pane_current_command"*)
+        if [ "${scenario.reconciliationFailure ?? ''}" = "worker" ] && [ -f "${logPath}.worker" ]; then
+          echo "forced worker topology reconciliation failure" >&2
+          exit 1
+        fi
+        if [ "${scenario.reconciliationFailure ?? ''}" = "hud" ] && [ -f "${logPath}.hud" ]; then
+          echo "forced HUD topology reconciliation failure" >&2
+          exit 1
+        fi
+        printf "%%1\\tnode\\t'codex'\\n"
+        [ ! -f "${logPath}.worker" ] || printf "%%2\\tgemini\\t%s\\n" "$(cat "${logPath}.worker-start")"
+        [ ! -f "${logPath}.worker-extra" ] || printf "%%9\\tgemini\\t%s\\n" "$(cat "${logPath}.worker-extra-start")"
+        [ ! -f "${logPath}.hud" ] || printf "%%3\\tnode\\t%s\\n" "$(cat "${logPath}.hud-start")"
+        ;;
+      *)
+        printf "%%1\\n"
+        [ ! -f "${logPath}.worker" ] || printf "%%2\\n"
+        [ ! -f "${logPath}.worker-extra" ] || printf "%%9\\n"
+        [ ! -f "${logPath}.hud" ] || printf "%%3\\n"
+        ;;
+    esac
+    ;;
+  split-window)
+    case "$*" in
+      *" -h "*)
+        : > "${logPath}.worker"
+        printf '%s' "$*" > "${logPath}.worker-start"
+        if [ "${scenario.extraWorkerPane ?? ''}" = "owned" ]; then
+          : > "${logPath}.worker-extra"
+          cp "${logPath}.worker-start" "${logPath}.worker-extra-start"
+        elif [ "${scenario.extraWorkerPane ?? ''}" = "foreign" ]; then
+          : > "${logPath}.worker-extra"
+          printf 'foreign concurrent pane' > "${logPath}.worker-extra-start"
+        fi
+        printf "${scenario.workerOutput}"
+        ;;
+      *)
+        : > "${logPath}.hud"
+        printf '%s' "$*" > "${logPath}.hud-start"
+        printf "${scenario.hudOutput}"
+        ;;
+    esac
+    ;;
+  kill-pane)
+    case "$*" in
+      *"%2"*)
+        if [ "${scenario.ambiguousPane}" = "worker" ] \
+          && [ -z "${scenario.reconciliationFailure ?? ''}" ] \
+          && [ ! -f "${logPath}.worker-rollback-attempted" ]; then
+          : > "${logPath}.worker-rollback-attempted"
+          echo "forced initial worker rollback failure" >&2
+          exit 91
+        fi
+        rm -f "${logPath}.worker"
+        ;;
+      *"%9"*)
+        if [ "${scenario.name}" = "worker-multi-owned" ] && [ ! -f "${logPath}.worker-extra-rollback-attempted" ]; then
+          : > "${logPath}.worker-extra-rollback-attempted"
+          echo "forced initial extra worker rollback failure" >&2
+          exit 92
+        fi
+        rm -f "${logPath}.worker-extra"
+        ;;
+      *"%3"*)
+        if [ "${scenario.ambiguousPane}" = "hud" ] \
+          && [ -z "${scenario.reconciliationFailure ?? ''}" ] \
+          && [ ! -f "${logPath}.hud-rollback-attempted" ]; then
+          : > "${logPath}.hud-rollback-attempted"
+          echo "forced initial HUD rollback failure" >&2
+          exit 93
+        fi
+        rm -f "${logPath}.hud"
+        ;;
+    esac
+    ;;
+  *) ;;
+esac
+exit 0
+`,
+            async ({ logPath }) => {
+              const geminiPath = join(dirname(logPath), 'gemini');
+              await writeFile(geminiPath, '#!/bin/sh\nexit 0\n');
+              await chmod(geminiPath, 0o755);
+              process.env.TMUX = 'shared-session,stub,0';
+              process.env.TMUX_PANE = '%1';
+              process.env.OMX_TEAM_WORKER_CLI = 'gemini';
+              let reconciledWorkerPid: number | null = null;
+              assert.throws(
+                () => createTeamSession(`Multiple ${scenario.name} IDs`, 1, cwd),
+                (error: unknown) => {
+                  assert.ok(
+                    error instanceof CreateTeamSessionPartialError,
+                    error instanceof Error
+                      ? `${error.name}: ${error.message} ${JSON.stringify(error)}`
+                      : String(error),
+                  );
+                  assert.equal(
+                    error.originalError instanceof Error ? error.originalError.message : '',
+                    'tmux_split_window_output_ambiguous',
+                  );
+                  if (scenario.reconciliationFailure) {
+                    assert.deepEqual(error.partialSession.workerPaneIds, []);
+                    assert.deepEqual(error.partialSession.workerPaneIdsByIndex, [null]);
+                    assert.deepEqual(error.partialSession.workerPanePidsByIndex, [null]);
+                    assert.equal(error.partialSession.hudPaneId, null);
+                    assert.deepEqual(error.cleanupErrors, [
+                      'failed to reconcile tmux pane topology after ambiguous split output',
+                    ]);
+                  } else if (scenario.name === 'worker-multi-owned') {
+                    assert.deepEqual(error.partialSession.workerPaneIds, ['%2', '%9']);
+                    assert.deepEqual(error.partialSession.workerPaneIdsByIndex, [null]);
+                    assert.deepEqual(error.partialSession.workerPanePidsByIndex, [null]);
+                    assert.deepEqual(error.partialSession.startupCleanupPanes, [
+                      { paneId: '%2', panePid: 2000000002 },
+                      { paneId: '%9', panePid: 2000000009 },
+                    ]);
+                    assert.equal(error.partialSession.hudPaneId, null);
+                  } else if (scenario.ambiguousPane === 'worker') {
+                    assert.deepEqual(error.partialSession.workerPaneIds, ['%2']);
+                    assert.deepEqual(error.partialSession.workerPaneIdsByIndex, ['%2']);
+                    assert.deepEqual(error.partialSession.workerPanePidsByIndex, [2000000002]);
+                    assert.deepEqual(error.partialSession.startupCleanupPanes, []);
+                    assert.equal(error.partialSession.hudPaneId, null);
+                    assert.ok(error.cleanupErrors.some((message) => /failed to kill tmux pane %2/.test(message)));
+                    reconciledWorkerPid = error.partialSession.workerPanePidsByIndex?.[0] ?? null;
+                  } else {
+                    assert.deepEqual(error.partialSession.workerPaneIds, []);
+                    assert.deepEqual(error.partialSession.workerPaneIdsByIndex, [null]);
+                    assert.equal(error.partialSession.hudPaneId, '%3');
+                    assert.equal(error.partialSession.hudPanePid, 2000000003);
+                  }
+                  return true;
+                },
+              );
+              const tmuxLog = await readFile(logPath, 'utf-8');
+              assert.match(tmuxLog, /list-panes -t @0 -F /);
+              if (scenario.name === 'worker-multi-owned') {
+                const teardown = await teardownWorkerPanes(['%2', '%9'], {
+                  graceMs: 1,
+                  expectedPanePids: { '%2': 2000000002, '%9': 2000000009 },
+                  authorizePaneKill: (paneId, proof) => (
+                    (paneId === '%2' && proof.pid === 2000000002)
+                    || (paneId === '%9' && proof.pid === 2000000009)
+                  ),
+                });
+                assert.deepEqual(teardown.killedPaneIds, ['%2', '%9']);
+                assert.equal(fs.existsSync(`${logPath}.worker`), false);
+                assert.equal(fs.existsSync(`${logPath}.worker-extra`), false);
+              } else if (scenario.ambiguousPane === 'worker' && !scenario.reconciliationFailure) {
+                assert.equal(reconciledWorkerPid, 2000000002);
+                const teardown = await teardownWorkerPanes(['%2'], {
+                  graceMs: 1,
+                  expectedPanePids: { '%2': reconciledWorkerPid },
+                  authorizePaneKill: (paneId, proof) => paneId === '%2' && proof.pid === reconciledWorkerPid,
+                });
+                assert.deepEqual(teardown.killedPaneIds, ['%2']);
+                assert.deepEqual(teardown.proofUnavailable, []);
+                assert.equal(teardown.kill.failed, 0);
+                assert.equal(fs.existsSync(`${logPath}.worker`), false);
+                if (scenario.extraWorkerPane === 'foreign') {
+                  assert.equal(fs.existsSync(`${logPath}.worker-extra`), true);
+                  assert.doesNotMatch(tmuxLog, /kill-pane -t %9/);
+                }
+              } else {
+                assert.equal(
+                  fs.existsSync(`${logPath}.${scenario.ambiguousPane}`),
+                  true,
+                  'unresolved ambiguous pane must remain as cleanup debt rather than being killed',
+                );
+              }
+            },
+          );
+        } finally {
+          await rm(cwd, { recursive: true, force: true });
+        }
+      }
+    } finally {
+      if (typeof prevTmux === 'string') process.env.TMUX = prevTmux;
+      else delete process.env.TMUX;
+      if (typeof prevTmuxPane === 'string') process.env.TMUX_PANE = prevTmuxPane;
+      else delete process.env.TMUX_PANE;
+      if (typeof prevWorkerCli === 'string') process.env.OMX_TEAM_WORKER_CLI = prevWorkerCli;
+      else delete process.env.OMX_TEAM_WORKER_CLI;
+    }
+  });
+
+  it('rejects pane-ID reuse of the pinned ambiguous worker PID during rollback and later teardown', async () => {
+    const prevTmux = process.env.TMUX;
+    const prevTmuxPane = process.env.TMUX_PANE;
+    const prevWorkerCli = process.env.OMX_TEAM_WORKER_CLI;
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-team-worker-split-recycled-pid-'));
+    try {
+      await withMockTmuxFixture(
+        'omx-tmux-worker-split-recycled-pid-',
+        (logPath) => `#!/bin/sh
+set -eu
+case "\${1:-}" in
+  -V) echo "tmux 3.4" ;;
+  display-message)
+    case "$*" in
+      *"#{window_width}"*) echo "120" ;;
+      *"#{pane_id}"*"#{pane_dead}"*"#{pane_pid}"*) printf "%%1\\t0\\t2000000001\\n" ;;
+      *) echo "shared:0 $4" ;;
+    esac
+    ;;
+  list-panes)
+    case "$*" in
+      *'-a -F #{pane_id}'*)
+        printf "%%1\\t0\\t2000000001\\n"
+        if [ -f "${logPath}.worker" ]; then
+          # Preserve the original PID through exact proof and owner tagging,
+          # then model pane-ID reuse before immediate rollback/retry proof.
+          if [ -f "${logPath}.worker-owner-tagged" ]; then
+            printf "%%2\\t0\\t2000000999\\n"
+          else
+            printf "%%2\\t0\\t2000000002\\n"
+          fi
+        fi
+        ;;
+      *"pane_current_command"*)
+        printf "%%1\\tnode\\t'codex'\\n"
+        [ ! -f "${logPath}.worker" ] || printf "%%2\\tgemini\\t%s\\n" "$(cat "${logPath}.worker-start")"
+        ;;
+      *)
+        printf "%%1\\n"
+        [ ! -f "${logPath}.worker" ] || printf "%%2\\n"
+        ;;
+    esac
+    ;;
+  split-window)
+    case "$*" in
+      *" -h "*)
+        : > "${logPath}.worker"
+        last=''
+        for arg in "$@"; do last="$arg"; done
+        printf '%s' "$last" > "${logPath}.worker-start"
+        printf "%%2\\n%%9\\n"
+        ;;
+      *) printf "%%3\\n" ;;
+    esac
+    ;;
+  set-option)
+    case "$*" in
+      *"-t %2"*"@omx_team_pane_owner_id"*) : > "${logPath}.worker-owner-tagged" ;;
+    esac
+    ;;
+  kill-pane) printf '%s\\n' "$*" >> "${logPath}.kills" ;;
+  *) ;;
+esac
+exit 0
+`,
+        async ({ logPath }) => {
+          const geminiPath = join(dirname(logPath), 'gemini');
+          await writeFile(geminiPath, '#!/bin/sh\nexit 0\n');
+          await chmod(geminiPath, 0o755);
+          process.env.TMUX = 'shared-session,stub,0';
+          process.env.TMUX_PANE = '%1';
+          process.env.OMX_TEAM_WORKER_CLI = 'gemini';
+          let pinnedPid: number | null = null;
+          assert.throws(
+            () => createTeamSession('Recycled Worker Pane', 1, cwd),
+            (error: unknown) => {
+              assert.ok(error instanceof CreateTeamSessionPartialError, String(error));
+              assert.deepEqual(error.partialSession.workerPaneIds, ['%2']);
+              assert.deepEqual(
+                error.partialSession.workerPanePidsByIndex,
+                [2000000002],
+                JSON.stringify({
+                  cleanupErrors: error.cleanupErrors,
+                  proofUnavailable: error.proofUnavailable,
+                  originalError: error.originalError instanceof Error
+                    ? `${error.originalError.name}:${error.originalError.message}`
+                    : String(error.originalError),
+                  tmuxLog: fs.existsSync(logPath) ? fs.readFileSync(logPath, 'utf-8') : '',
+                  partialSession: error.partialSession,
+                }),
+              );
+              assert.ok(
+                error.cleanupErrors.some((message) => /tmux pane identity changed: %2/.test(message)),
+                JSON.stringify(error.cleanupErrors),
+              );
+              pinnedPid = error.partialSession.workerPanePidsByIndex?.[0] ?? null;
+              return true;
+            },
+          );
+          assert.equal(pinnedPid, 2000000002);
+          // The pinned PID never authorized a kill: neither the immediate
+          // rollback nor any later path may have issued kill-pane for %2.
+          assert.equal(fs.existsSync(`${logPath}.kills`), false, 'recycled %2 must never be killed');
+          assert.equal(fs.existsSync(`${logPath}.worker`), true, 'recycled pane remains as unresolved debt');
+          const teardown = await teardownWorkerPanes(['%2'], {
+            graceMs: 1,
+            expectedPanePids: { '%2': pinnedPid },
+            authorizePaneKill: (paneId, proof) => paneId === '%2' && proof.pid === pinnedPid,
+          });
+          assert.deepEqual(teardown.killedPaneIds, []);
+          assert.equal(teardown.kill.attempted, 0);
+          assert.ok(
+            teardown.proofUnavailable.some((proof) => proof.paneId === '%2' && proof.reason === 'pane_pid_changed'),
+            JSON.stringify(teardown.proofUnavailable),
+          );
+          assert.equal(fs.existsSync(`${logPath}.kills`), false, 'later teardown must not kill recycled %2');
+          assert.equal(fs.existsSync(`${logPath}.worker`), true);
+        },
+      );
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+      if (typeof prevTmux === 'string') process.env.TMUX = prevTmux;
+      else delete process.env.TMUX;
+      if (typeof prevTmuxPane === 'string') process.env.TMUX_PANE = prevTmuxPane;
+      else delete process.env.TMUX_PANE;
+      if (typeof prevWorkerCli === 'string') process.env.OMX_TEAM_WORKER_CLI = prevWorkerCli;
+      else delete process.env.OMX_TEAM_WORKER_CLI;
+    }
+  });
+
+  it('covers unavailable, gone, and fully-cleaned outcomes for a uniquely reconciled ambiguous worker pane', async () => {
+    const prevTmux = process.env.TMUX;
+    const prevTmuxPane = process.env.TMUX_PANE;
+    const prevWorkerCli = process.env.OMX_TEAM_WORKER_CLI;
+    try {
+      for (const scenario of [
+        { name: 'unavailable', proof: 'unavailable' },
+        { name: 'gone', proof: 'gone' },
+        { name: 'clean-rollback', proof: 'live' },
+      ] as const) {
+        const cwd = await mkdtemp(join(tmpdir(), `omx-team-worker-split-${scenario.name}-`));
+        try {
+          await withMockTmuxFixture(
+            `omx-tmux-worker-split-${scenario.name}-`,
+            (logPath) => `#!/bin/sh
+set -eu
+case "\${1:-}" in
+  -V) echo "tmux 3.4" ;;
+  display-message)
+    case "$*" in
+      *"#{window_width}"*) echo "120" ;;
+      *"#{pane_id}"*"#{pane_dead}"*"#{pane_pid}"*) printf "%%1\\t0\\t2000000001\\n" ;;
+      *) echo "shared:0 $4" ;;
+    esac
+    ;;
+  list-panes)
+    case "$*" in
+      *'-a -F #{pane_id}'*)
+        if [ "${scenario.proof}" = "unavailable" ] && [ -f "${logPath}.worker" ]; then
+          echo "forced exact proof query failure" >&2
+          exit 1
+        fi
+        printf "%%1\\t0\\t2000000001\\n"
+        if [ "${scenario.proof}" != "gone" ]; then
+          [ ! -f "${logPath}.worker" ] || printf "%%2\\t0\\t2000000002\\n"
+        fi
+        ;;
+      *"pane_current_command"*)
+        printf "%%1\\tnode\\t'codex'\\n"
+        [ ! -f "${logPath}.worker" ] || printf "%%2\\tgemini\\t%s\\n" "$(cat "${logPath}.worker-start")"
+        ;;
+      *)
+        printf "%%1\\n"
+        [ ! -f "${logPath}.worker" ] || printf "%%2\\n"
+        ;;
+    esac
+    ;;
+  split-window)
+    case "$*" in
+      *" -h "*)
+        : > "${logPath}.worker"
+        last=''
+        for arg in "$@"; do last="$arg"; done
+        printf '%s' "$last" > "${logPath}.worker-start"
+        printf "%%2\\n%%9\\n"
+        ;;
+      *) printf "%%3\\n" ;;
+    esac
+    ;;
+  kill-pane)
+    printf '%s\\n' "$*" >> "${logPath}.kills"
+    case "$*" in
+      *"%2"*) rm -f "${logPath}.worker" ;;
+    esac
+    ;;
+  *) ;;
+esac
+exit 0
+`,
+            async ({ logPath }) => {
+              const geminiPath = join(dirname(logPath), 'gemini');
+              await writeFile(geminiPath, '#!/bin/sh\nexit 0\n');
+              await chmod(geminiPath, 0o755);
+              process.env.TMUX = 'shared-session,stub,0';
+              process.env.TMUX_PANE = '%1';
+              process.env.OMX_TEAM_WORKER_CLI = 'gemini';
+              if (scenario.proof === 'unavailable') {
+                assert.throws(
+                  () => createTeamSession(`Worker Proof ${scenario.name}`, 1, cwd),
+                  (error: unknown) => {
+                    assert.ok(error instanceof CreateTeamSessionPartialError, String(error));
+                    assert.ok(error.originalError instanceof Error && error.originalError.name === 'ExactPaneProofUnavailableError', String(error.originalError));
+                    assert.deepEqual(error.partialSession.workerPaneIds, ['%2']);
+                    assert.deepEqual(error.partialSession.workerPaneIdsByIndex, ['%2']);
+                    assert.deepEqual(error.partialSession.workerPanePidsByIndex, [null]);
+                    assert.ok(
+                      error.proofUnavailable.some((proof) => proof.paneId === '%2' && proof.reason === 'query_failed'),
+                      JSON.stringify(error.proofUnavailable),
+                    );
+                    return true;
+                  },
+                );
+                // Null-PID debt authorizes no kill and the pane remains.
+                assert.equal(fs.existsSync(`${logPath}.kills`), false);
+                assert.equal(fs.existsSync(`${logPath}.worker`), true);
+              } else if (scenario.proof === 'gone') {
+                assert.throws(
+                  () => createTeamSession(`Worker Proof ${scenario.name}`, 1, cwd),
+                  (error: unknown) => {
+                    assert.ok(!(error instanceof CreateTeamSessionPartialError), String(error));
+                    assert.ok(error instanceof Error && error.message === 'tmux_split_window_output_ambiguous', String(error));
+                    return true;
+                  },
+                );
+                // A proven-gone pane is dropped from rollback state: no phantom
+                // kill and no retained debt.
+                assert.equal(fs.existsSync(`${logPath}.kills`), false);
+                assert.equal(fs.existsSync(`${logPath}.worker`), true);
+              } else {
+                // Live proof plus a fully successful immediate rollback removes
+                // all recoverable artifacts, so the raw ambiguous error surfaces.
+                assert.throws(
+                  () => createTeamSession(`Worker Proof ${scenario.name}`, 1, cwd),
+                  (error: unknown) => {
+                    assert.ok(!(error instanceof CreateTeamSessionPartialError), String(error));
+                    assert.ok(error instanceof Error && error.message === 'tmux_split_window_output_ambiguous', String(error));
+                    return true;
+                  },
+                );
+                assert.match(await readFile(`${logPath}.kills`, 'utf-8'), /kill-pane -t %2/);
+                assert.equal(fs.existsSync(`${logPath}.worker`), false);
+              }
+            },
+          );
+        } finally {
+          await rm(cwd, { recursive: true, force: true });
+        }
+      }
+    } finally {
+      if (typeof prevTmux === 'string') process.env.TMUX = prevTmux;
+      else delete process.env.TMUX;
+      if (typeof prevTmuxPane === 'string') process.env.TMUX_PANE = prevTmuxPane;
+      else delete process.env.TMUX_PANE;
+      if (typeof prevWorkerCli === 'string') process.env.OMX_TEAM_WORKER_CLI = prevWorkerCli;
+      else delete process.env.OMX_TEAM_WORKER_CLI;
+    }
+  });
+
   it('rejects incompatible non-Codex and mixed Codex plans before any direct tmux mutation', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-team-direct-policy-preflight-'));
     const previousTmux = process.env.TMUX;
@@ -6676,6 +7194,87 @@ esac
       else delete process.env.WSL_DISTRO_NAME;
       if (typeof prevWslInterop === 'string') process.env.WSL_INTEROP = prevWslInterop;
       else delete process.env.WSL_INTEROP;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('pins and replays restored HUD debt when successful split output is ambiguous', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-restored-hud-ambiguous-output-'));
+    try {
+      await withMockTmuxFixture(
+        'omx-restored-hud-ambiguous-output-',
+        (logPath) => {
+          const killedPath = `${logPath}.killed`;
+          return `#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "${logPath}"
+case "$1" in
+  list-panes)
+    if [ "$2" = "-a" ]; then
+      printf '%%11\t0\t2000000011\n'
+      if [ -f "${logPath}.created" ] && [ ! -f "${killedPath}" ]; then printf '%%44\t0\t2000000044\n'; fi
+      printf '%%99\t0\t2000000099\n'
+    else
+      printf '%%11\tzsh\tzsh\n'
+      if [ -f "${logPath}.created" ] && [ ! -f "${killedPath}" ]; then printf "%%44\tnode\t%s\n" "$(cat "${logPath}.start")"; fi
+      printf '%%99\tbash\tforeign concurrent pane\n'
+    fi
+    ;;
+  split-window)
+    : > "${logPath}.created"
+    last=''
+    for arg in "$@"; do last="$arg"; done
+    printf '%s' "$last" > "${logPath}.start"
+    printf '%%44\n%%99\n'
+    ;;
+  show-option)
+    if [ "$5" = "%11" ] && [ "$6" = "@omx_team_pane_owner_id" ]; then
+      printf 'team:ambiguous-output\n'
+    else
+      exit 1
+    fi
+    ;;
+  kill-pane)
+    case "$*" in
+      *"%44"*) : > "${killedPath}" ;;
+      *"%99"*) : > "${logPath}.killed-foreign"; exit 99 ;;
+    esac
+    ;;
+  *) exit 0 ;;
+esac
+`;
+        },
+        async ({ logPath }) => {
+          assert.throws(
+            () => restoreStandaloneHudPane('%11', cwd, {
+              expectedLeaderPanePid: 2000000011,
+              expectedLeaderPaneOwnerId: 'team:ambiguous-output',
+            }),
+            /restored_hud_split_output_ambiguous/,
+          );
+
+          const debtPath = join(cwd, '.omx', 'state', '.restored-hud-cleanup-debt.json');
+          const debt = JSON.parse(await readFile(debtPath, 'utf-8')) as Record<string, unknown>;
+          assert.deepEqual(debt, {
+            schema_version: 1,
+            operation: 'restored_hud_cleanup',
+            pane_id: '%44',
+            pane_pid: 2000000044,
+            leader_pane_id: '%11',
+            leader_pane_pid: 2000000011,
+            leader_pane_owner_id: 'team:ambiguous-output',
+            hud_owner_leader_pane_id: '%11',
+          });
+
+          reconcileRestoredHudCleanupDebtSync(cwd);
+          await assert.rejects(() => readFile(debtPath, 'utf-8'));
+          const commands = await readFile(logPath, 'utf-8');
+          assert.match(commands, /kill-pane -t %44/);
+          assert.doesNotMatch(commands, /kill-pane -t %99/);
+          assert.equal(fs.existsSync(`${logPath}.killed-foreign`), false);
+        },
+      );
+    } finally {
       await rm(cwd, { recursive: true, force: true });
     }
   });
