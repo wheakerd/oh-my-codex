@@ -1230,6 +1230,25 @@ describe('session pointer transaction', () => {
     } finally { await rm(cwd, { recursive: true, force: true }); }
   });
 
+  it('resumes the actual distinct-token evidence park path after an interruption', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-session-lock-recovery-distinct-park-token-'));
+    try {
+      const context = resolveSessionPointerContext(cwd);
+      const ownerPath = join(context.lockPath, 'owner.json');
+      const claimToken = 'claim_token_123456789';
+      const parkToken = 'park_token_123456789';
+      const claimPath = join(context.lockPath, `owner.${TEST_TOKEN}.${claimToken}.recovery`);
+      const parkPath = `${context.lockPath}.parked-${parkToken}`;
+      await writeLockOwner(cwd, validLockOwner());
+      await link(ownerPath, claimPath);
+      await rename(ownerPath, parkPath);
+      const parked = await lstat(parkPath);
+      await writeFile(`${context.lockPath}.recovery.${TEST_TOKEN}.${claimToken}.json`, JSON.stringify({ version: 1, sourcePath: ownerPath, parkPath, identity: { dev: parked.dev, ino: parked.ino }, phase: 'evidence-pending' }));
+      await withPointerDependencies({ token: () => { throw new Error('resume must not mint a replacement token'); }, probePid: () => 'dead' }, async () => assert.equal((await recoverSessionPointerLock(cwd)).recovered, true));
+      assert.equal(await readFile(`${context.lockPath}.quarantine.${TEST_TOKEN}.${claimToken}`, 'utf-8'), JSON.stringify(validLockOwner()));
+    } finally { await rm(cwd, { recursive: true, force: true }); }
+  });
+
   it('fails closed for malformed checkpoint JSON without minting a recovery token', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-session-lock-recovery-malformed-checkpoint-'));
     try {
