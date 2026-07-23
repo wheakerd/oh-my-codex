@@ -919,7 +919,7 @@ describe('session pointer transaction', () => {
       const context = resolveSessionPointerContext(cwd);
       await writeLockOwner(cwd, validLockOwner());
       const links: Array<[string, string]> = [];
-      const unlinks: string[] = [];
+      const renames: Array<[string, string]> = [];
       await withPointerDependencies({
         token: () => SUCCESSOR_TOKEN,
         probePid: () => 'dead',
@@ -928,9 +928,9 @@ describe('session pointer transaction', () => {
             links.push([from, to]);
             await link(from, to);
           },
-          unlink: async (path) => {
-            unlinks.push(path);
-            await rm(path);
+          rename: async (from, to) => {
+            renames.push([from, to]);
+            await rename(from, to);
           },
         },
       }, async () => {
@@ -952,8 +952,9 @@ describe('session pointer transaction', () => {
       assert.match(links[0]![1], new RegExp(`owner\\.${TEST_TOKEN}\\.${SUCCESSOR_TOKEN}\\.recovery$`));
       assert.match(links[1]![0], new RegExp(`owner\\.${TEST_TOKEN}\\.${SUCCESSOR_TOKEN}\\.recovery$`));
       assert.equal(links[1]![1].includes('.quarantine.'), true);
-      assert.match(unlinks[0]!, /owner\.json$/);
-      assert.match(unlinks[1]!, new RegExp(`owner\\.${TEST_TOKEN}\\.${SUCCESSOR_TOKEN}\\.recovery$`));
+      assert.match(renames[0]![0], /owner\.json$/);
+      assert.match(renames[1]![0], new RegExp(`owner\\.${TEST_TOKEN}\\.${SUCCESSOR_TOKEN}\\.recovery$`));
+      assert.equal(renames[2]![0], context.lockPath);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -1213,9 +1214,9 @@ describe('session pointer transaction', () => {
         token: () => SUCCESSOR_TOKEN,
         probePid: () => 'dead',
         fs: {
-          unlink: async (path) => {
-            await rm(path, { force: false });
-            if (path === ownerPath) armed = true;
+          rename: async (from, to) => {
+            await rename(from, to);
+            if (from === ownerPath) armed = true;
           },
           readdir: async (path) => {
             const entries = await readdir(path);
@@ -1241,7 +1242,7 @@ describe('session pointer transaction', () => {
     }
   });
 
-  it('never unlinks a quarantine claim whose identity changed after the no-clobber quarantine link', async () => {
+  it('preserves a swapped parked quarantine claim rather than unlinking it', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-session-lock-recovery-claim-swap-'));
     try {
       const context = resolveSessionPointerContext(cwd);
@@ -1249,32 +1250,36 @@ describe('session pointer transaction', () => {
       await writeLockOwner(cwd, validLockOwner());
       const claimPath = join(context.lockPath, `owner.${TEST_TOKEN}.${SUCCESSOR_TOKEN}.recovery`);
       const quarantinePath = `${context.lockPath}.quarantine.${TEST_TOKEN}.${SUCCESSOR_TOKEN}`;
-      const foreignMarker = 'foreign swapped claim';
-      let armed = false;
+      const foreignMarker = 'foreign parked claim';
+      let parkedPath: string | undefined;
+      let parkedIdentity: { dev: number; ino: number } | undefined;
       await withPointerDependencies({
         token: () => SUCCESSOR_TOKEN,
         probePid: () => 'dead',
         fs: {
-          link: async (from, to) => {
-            await link(from, to);
-            if (to === quarantinePath) armed = true;
-          },
-          lstat: async (path) => {
-            if (armed && path === claimPath) {
-              await rm(claimPath);
-              await writeFile(claimPath, foreignMarker, 'utf-8');
+          rename: async (from, to) => {
+            await rename(from, to);
+            if (from === claimPath) {
+              parkedPath = to;
+              await rename(to, `${to}.original`);
+              await writeFile(to, foreignMarker, 'utf-8');
+              const stat = await lstat(to);
+              parkedIdentity = { dev: stat.dev, ino: stat.ino };
             }
-            return await lstat(path);
           },
         },
       }, async () => {
         const recovered = await recoverSessionPointerLock(cwd);
         assert.equal(recovered.recovered, false);
         assert.equal(recovered.action, 'none');
-        assert.match(recovered.reason, /identity changed/i);
+        assert.match(recovered.reason, /parked pathname no longer holds the validated identity/i);
         assert.equal(recovered.quarantinePath, quarantinePath);
       });
-      assert.equal(await readFile(claimPath, 'utf-8'), foreignMarker);
+      assert.ok(parkedPath);
+      assert.ok(parkedIdentity);
+      const parkedStat = await lstat(parkedPath);
+      assert.deepEqual({ dev: parkedStat.dev, ino: parkedStat.ino }, parkedIdentity);
+      assert.equal(await readFile(parkedPath, 'utf-8'), foreignMarker);
       assert.equal(await readFile(quarantinePath, 'utf-8'), staleOwner);
     } finally {
       await rm(cwd, { recursive: true, force: true });
@@ -1326,9 +1331,9 @@ describe('session pointer transaction', () => {
         token: () => SUCCESSOR_TOKEN,
         probePid: () => 'dead',
         fs: {
-          unlink: async (path) => {
-            await rm(path, { force: false });
-            if (path === ownerPath) armed = true;
+          rename: async (from, to) => {
+            await rename(from, to);
+            if (from === ownerPath) armed = true;
           },
           lstat: async (path) => {
             if (armed && path === quarantinePath) throw codedError('EACCES');
@@ -1349,7 +1354,7 @@ describe('session pointer transaction', () => {
     }
   });
 
-  it('never removes an empty replacement lock directory whose identity differs from the validated one', async () => {
+  it('preserves a swapped parked lock directory rather than removing it', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-session-lock-recovery-empty-replace-'));
     try {
       const context = resolveSessionPointerContext(cwd);
@@ -1357,32 +1362,37 @@ describe('session pointer transaction', () => {
       await writeLockOwner(cwd, validLockOwner());
       const claimPath = join(context.lockPath, `owner.${TEST_TOKEN}.${SUCCESSOR_TOKEN}.recovery`);
       const quarantinePath = `${context.lockPath}.quarantine.${TEST_TOKEN}.${SUCCESSOR_TOKEN}`;
-      let armed = false;
+      const foreignMarker = 'foreign parked lock directory';
+      let parkedPath: string | undefined;
+      let parkedIdentity: { dev: number; ino: number } | undefined;
       await withPointerDependencies({
         token: () => SUCCESSOR_TOKEN,
         probePid: () => 'dead',
         fs: {
-          unlink: async (path) => {
-            await rm(path, { force: false });
-            if (path === claimPath) armed = true;
-          },
-          lstat: async (path) => {
-            if (armed && path === context.lockPath) {
-              const replacementPath = `${context.lockPath}.replacement`;
-              await mkdir(replacementPath);
-              await rename(replacementPath, context.lockPath);
+          rename: async (from, to) => {
+            await rename(from, to);
+            if (from === context.lockPath) {
+              parkedPath = to;
+              await rename(to, `${to}.original`);
+              await mkdir(to);
+              await writeFile(join(to, 'marker'), foreignMarker, 'utf-8');
+              const stat = await lstat(to);
+              parkedIdentity = { dev: stat.dev, ino: stat.ino };
             }
-            return await lstat(path);
           },
         },
       }, async () => {
         const recovered = await recoverSessionPointerLock(cwd);
         assert.equal(recovered.recovered, false);
         assert.equal(recovered.action, 'none');
-        assert.match(recovered.reason, /replaced before removal/i);
+        assert.match(recovered.reason, /canonical lock directory was replaced before removal/i);
         assert.equal(recovered.quarantinePath, quarantinePath);
       });
-      assert.deepEqual(await readdir(context.lockPath), []);
+      assert.ok(parkedPath);
+      assert.ok(parkedIdentity);
+      const parkedStat = await lstat(parkedPath);
+      assert.deepEqual({ dev: parkedStat.dev, ino: parkedStat.ino }, parkedIdentity);
+      assert.equal(await readFile(join(parkedPath, 'marker'), 'utf-8'), foreignMarker);
       assert.equal(await readFile(quarantinePath, 'utf-8'), staleOwner);
     } finally {
       await rm(cwd, { recursive: true, force: true });
@@ -1465,7 +1475,7 @@ describe('session pointer transaction', () => {
       await mkdir(context.lockPath, { recursive: true });
       await writeFile(join(context.lockPath, `owner.${TEST_TOKEN}.tmp`), JSON.stringify(validLockOwner()), 'utf-8');
       const links: Array<[string, string]> = [];
-      const unlinks: string[] = [];
+      const renames: Array<[string, string]> = [];
       let successorBlocked = false;
       await withPointerDependencies({
         token: () => SUCCESSOR_TOKEN,
@@ -1479,9 +1489,9 @@ describe('session pointer transaction', () => {
               successorBlocked = true;
             }
           },
-          unlink: async (path) => {
-            unlinks.push(path);
-            await rm(path);
+          rename: async (from, to) => {
+            renames.push([from, to]);
+            await rename(from, to);
           },
         },
       }, async () => {
@@ -1493,8 +1503,9 @@ describe('session pointer transaction', () => {
       assert.match(links[0]![1], new RegExp(`owner\\.${TEST_TOKEN}\\.${SUCCESSOR_TOKEN}\\.recovery$`));
       assert.match(links[1]![0], new RegExp(`owner\\.${TEST_TOKEN}\\.${SUCCESSOR_TOKEN}\\.recovery$`));
       assert.equal(links[1]![1].includes('.quarantine.'), true);
-      assert.match(unlinks[0]!, /owner\.transaction_token_123456\.tmp$/);
-      assert.match(unlinks[1]!, new RegExp(`owner\\.${TEST_TOKEN}\\.${SUCCESSOR_TOKEN}\\.recovery$`));
+      assert.match(renames[0]![0], /owner\.transaction_token_123456\.tmp$/);
+      assert.match(renames[1]![0], new RegExp(`owner\\.${TEST_TOKEN}\\.${SUCCESSOR_TOKEN}\\.recovery$`));
+      assert.equal(renames[2]![0], context.lockPath);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -1538,13 +1549,12 @@ describe('session pointer transaction', () => {
     }
   });
 
-  it('does not quarantine a successor live lock displaced into the canonical path after claim revalidation', async () => {
+  it('does not report recovery after a successor live lock appears during parked-lock removal', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-session-lock-recovery-post-claim-race-'));
     try {
       const context = resolveSessionPointerContext(cwd);
       const staleTemp = join(context.lockPath, `owner.${TEST_TOKEN}.tmp`);
       const successorTemp = join(context.lockPath, `owner.${SUCCESSOR_TOKEN}.tmp`);
-      const displacedPath = `${context.lockPath}.claimed-displaced`;
       await mkdir(context.lockPath, { recursive: true });
       await writeFile(staleTemp, JSON.stringify(validLockOwner()), 'utf-8');
       let displaced = false;
@@ -1552,21 +1562,20 @@ describe('session pointer transaction', () => {
         token: () => SUCCESSOR_TOKEN,
         probePid: () => 'dead',
         fs: {
-          rmdir: async (path) => {
-            if (!displaced && path === context.lockPath) {
+          rename: async (from, to) => {
+            await rename(from, to);
+            if (!displaced && from === context.lockPath) {
               displaced = true;
-              await rename(context.lockPath, displacedPath);
               await mkdir(context.lockPath);
               await writeFile(successorTemp, JSON.stringify(validLockOwner({ token: SUCCESSOR_TOKEN })), 'utf-8');
             }
-            await rmdir(path);
           },
         },
       }, async () => {
         const recovered = await recoverSessionPointerLock(cwd);
         assert.equal(recovered.recovered, false);
         assert.equal(recovered.action, 'none');
-        assert.match(recovered.reason, /canonical lock directory was not empty/i);
+        assert.match(recovered.reason, /canonical lock directory was replaced before removal/i);
         assert.ok(recovered.quarantinePath);
       });
       assert.equal(displaced, true);
