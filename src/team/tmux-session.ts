@@ -2506,7 +2506,20 @@ export function createTeamSession(
             partialWorkerPaneIds.push(candidatePaneId);
           }
           if (error.newlyObservedPaneIds.length === 1) {
-            partialWorkerPaneIdsByIndex[i - 1] = error.newlyObservedPaneIds[0]!;
+            const reconciledPaneId = error.newlyObservedPaneIds[0]!;
+            partialWorkerPaneIdsByIndex[i - 1] = reconciledPaneId;
+            const reconciledProof = readExactPaneProofSync(reconciledPaneId);
+            if (reconciledProof.status === 'unavailable') {
+              throw new ExactPaneProofUnavailableError(reconciledProof);
+            }
+            if (reconciledProof.status === 'gone') {
+              rollbackPanes.delete(reconciledPaneId);
+              partialWorkerPaneIds.splice(partialWorkerPaneIds.lastIndexOf(reconciledPaneId), 1);
+              partialWorkerPaneIdsByIndex[i - 1] = null;
+            } else {
+              rollbackPanes.set(reconciledPaneId, reconciledProof.pid);
+              partialWorkerPanePidsByIndex[i - 1] = reconciledProof.pid;
+            }
           }
         }
         throw error;

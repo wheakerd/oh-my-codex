@@ -4506,7 +4506,16 @@ case "\${1:-}" in
     ;;
   kill-pane)
     case "$*" in
-      *"%2"*) rm -f "${logPath}.worker" ;;
+      *"%2"*)
+        if [ "${scenario.ambiguousPane}" = "worker" ] \
+          && [ -z "${scenario.reconciliationFailure ?? ''}" ] \
+          && [ ! -f "${logPath}.worker-rollback-attempted" ]; then
+          : > "${logPath}.worker-rollback-attempted"
+          echo "forced initial worker rollback failure" >&2
+          exit 91
+        fi
+        rm -f "${logPath}.worker"
+        ;;
       *"%3"*) rm -f "${logPath}.hud" ;;
     esac
     ;;
@@ -4521,6 +4530,7 @@ exit 0
               process.env.TMUX = 'shared-session,stub,0';
               process.env.TMUX_PANE = '%1';
               process.env.OMX_TEAM_WORKER_CLI = 'gemini';
+              let reconciledWorkerPid: number | null = null;
               assert.throws(
                 () => createTeamSession(`Multiple ${scenario.name} IDs`, 1, cwd),
                 (error: unknown) => {
@@ -4545,8 +4555,10 @@ exit 0
                   } else if (scenario.ambiguousPane === 'worker') {
                     assert.deepEqual(error.partialSession.workerPaneIds, ['%2']);
                     assert.deepEqual(error.partialSession.workerPaneIdsByIndex, ['%2']);
-                    assert.deepEqual(error.partialSession.workerPanePidsByIndex, [null]);
+                    assert.deepEqual(error.partialSession.workerPanePidsByIndex, [2000000002]);
                     assert.equal(error.partialSession.hudPaneId, null);
+                    assert.ok(error.cleanupErrors.some((message) => /failed to kill tmux pane %2/.test(message)));
+                    reconciledWorkerPid = error.partialSession.workerPanePidsByIndex?.[0] ?? null;
                   } else {
                     assert.deepEqual(error.partialSession.workerPaneIds, []);
                     assert.deepEqual(error.partialSession.workerPaneIdsByIndex, [null]);
@@ -4556,11 +4568,24 @@ exit 0
                   return true;
                 },
               );
-              assert.equal(
-                fs.existsSync(`${logPath}.${scenario.ambiguousPane}`),
-                true,
-                'ambiguous unowned pane must remain as cleanup debt rather than being killed',
-              );
+              if (scenario.ambiguousPane === 'worker' && !scenario.reconciliationFailure) {
+                assert.equal(reconciledWorkerPid, 2000000002);
+                const teardown = await teardownWorkerPanes(['%2'], {
+                  graceMs: 1,
+                  expectedPanePids: { '%2': reconciledWorkerPid },
+                  authorizePaneKill: (paneId, proof) => paneId === '%2' && proof.pid === reconciledWorkerPid,
+                });
+                assert.deepEqual(teardown.killedPaneIds, ['%2']);
+                assert.deepEqual(teardown.proofUnavailable, []);
+                assert.equal(teardown.kill.failed, 0);
+                assert.equal(fs.existsSync(`${logPath}.worker`), false);
+              } else {
+                assert.equal(
+                  fs.existsSync(`${logPath}.${scenario.ambiguousPane}`),
+                  true,
+                  'PID-less ambiguous pane must remain as cleanup debt rather than being killed',
+                );
+              }
             },
           );
         } finally {
