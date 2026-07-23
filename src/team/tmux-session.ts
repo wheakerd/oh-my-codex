@@ -361,6 +361,9 @@ function runSourceAuthorizedSplit(
   source: SourcePaneAuthority,
   buildEffect: (receipt: string) => string,
 ): string {
+  // Reconcile against the immutable window ID, not the mutable session:index
+  // target: a concurrent renumber between the guarded split and the after-read
+  // must never turn an unrelated window's pane into kill authority.
   const windowTarget = source.windowId;
   const beforeTopology = listPanesResult(windowTarget);
   if (beforeTopology.error) {
