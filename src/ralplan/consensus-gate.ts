@@ -14,6 +14,22 @@ export const RALPLAN_CONSENSUS_BLOCKED_REASONS = {
 export type RalplanConsensusBlockedReason =
   typeof RALPLAN_CONSENSUS_BLOCKED_REASONS[keyof typeof RALPLAN_CONSENSUS_BLOCKED_REASONS];
 
+export type RalplanHostConsensusReceiptVerifierCapability = 'available' | 'unavailable';
+
+/**
+ * Reports whether this host can verify the official receipt that authorizes a
+ * Ralplan handoff. Local lifecycle artifacts remain diagnostics either way.
+ */
+export function getRalplanHostConsensusReceiptVerifierCapability(): RalplanHostConsensusReceiptVerifierCapability {
+  return 'unavailable';
+}
+
+export function shouldBlockFreshAutopilotForRalplanReceipt(
+  capability: RalplanHostConsensusReceiptVerifierCapability = getRalplanHostConsensusReceiptVerifierCapability(),
+): boolean {
+  return capability === 'unavailable';
+}
+
 export interface RalplanNativeReviewDiagnostic {
   role: 'architect' | 'critic';
   session_id: string | null;

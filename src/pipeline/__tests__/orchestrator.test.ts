@@ -14,6 +14,8 @@ import {
   createStrictAutopilotStages,
 } from '../orchestrator.js';
 import { createRalplanStage } from '../stages/ralplan.js';
+import { shouldBlockFreshAutopilotForRalplanReceipt } from '../../ralplan/consensus-gate.js';
+
 import type { PipelineConfig, PipelineStage, StageContext, StageResult } from '../types.js';
 
 // ---------------------------------------------------------------------------
@@ -899,6 +901,97 @@ describe('Pipeline Orchestrator', () => {
     it('does not throw when no state exists', async () => {
       await assert.doesNotReject(() => cancelPipeline(tempDir));
     });
+  });
+
+  it('byte-preserves an active non-primary Autopilot session without running pipeline work', async () => {
+    const sessionId = 'non-primary-active-autopilot';
+    const sessionDir = join(tempDir, '.omx', 'state', 'sessions', sessionId);
+    const statePath = join(sessionDir, 'autopilot-state.json');
+    const rawState = '{"active":true,"mode":"autopilot","current_phase":"ralplan","metadata":{"owner":"existing"},"handoff_artifacts":{"ralplan":{"path":".omx/plans/existing.md"}}}\n';
+    await mkdir(sessionDir, { recursive: true });
+    await writeFile(statePath, rawState);
+    let stageRuns = 0;
+    let transitions = 0;
+    const config = createAutopilotPipelineConfig('preserve active session', {
+      cwd: tempDir,
+      sessionId,
+      stages: [{
+        name: 'deep-interview',
+        async run(): Promise<StageResult> {
+          stageRuns += 1;
+          return { status: 'completed', artifacts: {}, duration_ms: 0 };
+        },
+      }],
+      onStageTransition: () => { transitions += 1; },
+    });
+
+    const result = await runPipeline(config);
+
+    assert.equal(result.status, 'cancelled');
+    assert.deepEqual(result.artifacts, { active_autopilot_session_preserved: true });
+    assert.equal(stageRuns, 0);
+    assert.equal(transitions, 0);
+    assert.equal(await readFile(statePath, 'utf-8'), rawState);
+  });
+
+  it('does not borrow conflicting root Autopilot state for a fresh explicit session', async () => {
+    const sessionId = 'fresh-explicit-session';
+    const stateDir = join(tempDir, '.omx', 'state');
+    const rootPath = join(stateDir, 'autopilot-state.json');
+    const sessionPath = join(stateDir, 'sessions', sessionId, 'autopilot-state.json');
+    const rawRoot = '{"active":true,"mode":"autopilot","current_phase":"ralplan","metadata":{"owner":"root"}}\n';
+    await mkdir(stateDir, { recursive: true });
+    await writeFile(rootPath, rawRoot);
+
+    let stageRuns = 0;
+    const result = await runPipeline(createAutopilotPipelineConfig('fresh explicit session', {
+      cwd: tempDir,
+      sessionId,
+      stages: [{
+        name: 'deep-interview',
+        async run(): Promise<StageResult> {
+          stageRuns += 1;
+          return { status: 'completed', artifacts: {}, duration_ms: 0 };
+        },
+      }],
+    }));
+
+    assert.equal(result.status, 'failed');
+    assert.equal(result.error, 'documented_host_consensus_receipt_unavailable');
+    assert.equal(stageRuns, 0);
+    assert.equal(await readFile(rootPath, 'utf-8'), rawRoot);
+    const sessionState = JSON.parse(await readFile(sessionPath, 'utf-8')) as { active?: boolean; current_phase?: string };
+    assert.equal(sessionState.active, false);
+    assert.equal(sessionState.current_phase, 'failed');
+  });
+
+  it('preflights a fresh default Autopilot before any stage or transition callback when receipt verification is unavailable', async () => {
+    let stageRuns = 0;
+    let transitions = 0;
+    const result = await runPipeline(createAutopilotPipelineConfig('preflight receipt verification', {
+      cwd: tempDir,
+      stages: [{
+        name: 'deep-interview',
+        async run(): Promise<StageResult> {
+          stageRuns += 1;
+          return { status: 'completed', artifacts: {}, duration_ms: 0 };
+        },
+      }],
+      onStageTransition: () => { transitions += 1; },
+    }));
+
+    assert.equal(result.status, 'failed');
+    assert.equal(result.error, 'documented_host_consensus_receipt_unavailable');
+    assert.equal(stageRuns, 0);
+    assert.equal(transitions, 0);
+    const state = await readModeState('autopilot', tempDir);
+    assert.equal(state?.active, false);
+    assert.equal(state?.current_phase, 'failed');
+    assert.equal(state?.error, 'documented_host_consensus_receipt_unavailable');
+  });
+
+  it('does not preflight-block the future verifier-capable path', () => {
+    assert.equal(shouldBlockFreshAutopilotForRalplanReceipt('available'), false);
   });
 
   describe('createAutopilotPipelineConfig', () => {

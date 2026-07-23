@@ -4,6 +4,10 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Autopilot host-receipt preflight** — fresh default Autopilot now fails before deep-interview and Architect/Critic review work when the official host consensus receipt verifier is deterministically unavailable, while preserving the exact fail-closed blocker, direct/manual Ralplan diagnostics, active-session resumability, and ADR 3194/3212 authority boundaries (#3270).
+
 ## [0.20.3] - 2026-07-19
 
 Patch release for the reliability and workflow-safety work in `v0.20.2..f967cfed64ec57614af136f75d7cb81509808f7e`, plus one additive, backward-compatible feature. No intentional breaking CLI or package-layout changes.

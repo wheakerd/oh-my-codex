@@ -34,6 +34,8 @@ When lifecycle evidence is present, the gate may render diagnostics for the expe
 
 Every production result remains incomplete until the official verifier is available and validates a receipt. The unavailable result includes `blockedReason: "documented_host_consensus_receipt_unavailable"`.
 
+Fresh default Autopilot checks verifier capability before starting `deep-interview` or Ralplan review lanes. Deterministic verifier absence terminalizes the fresh Autopilot run with the same exact blocker, avoiding review work that cannot advance. The capability check is not receipt verification and never authorizes a transition; direct/manual Ralplan and existing active Autopilot sessions keep their diagnostic and resumability behavior.
+
 ## Future enablement
 
 Enable a positive path only after official documentation specifies a non-user-mintable host receipt channel and OMX implements direct verification for that documented version and surface. Tests must prove that injected local JSON, environment, transcript, tracker, marker, and review artifacts cannot mint or substitute the receipt. Until then, preserve the fail-closed blocker and treat typed routing/lifecycle as non-authoritative.
