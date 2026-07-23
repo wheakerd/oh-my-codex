@@ -3,6 +3,11 @@ import type { TeamDispatchRequestStatus, TeamEventType, TeamTaskStatus } from '.
 import type { TeamReminderIntent } from '../reminder-intents.js';
 import type { WorktreeMode } from '../worktree.js';
 
+export interface StartupCleanupPane {
+  pane_id: string;
+  pid: number | null;
+}
+
 export interface TeamConfig {
   name: string;
   task: string;
@@ -25,6 +30,7 @@ export interface TeamConfig {
   resize_hook_name: string | null;
   resize_hook_target: string | null;
   next_worker_index?: number;
+  startup_cleanup_panes?: StartupCleanupPane[];
 }
 
 export interface WorkerInfo {

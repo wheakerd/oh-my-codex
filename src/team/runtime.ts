@@ -356,6 +356,7 @@ async function mutateShutdownConfig(
           hud_pane_pid: current.hud_pane_pid,
           resize_hook_name: current.resize_hook_name,
           resize_hook_target: current.resize_hook_target,
+          startup_cleanup_panes: current.startup_cleanup_panes,
         }, null, 2),
       },
     });
@@ -363,6 +364,74 @@ async function mutateShutdownConfig(
     if (!committed) throw new Error(`shutdown_config_missing_after_commit:${current.name}`);
     return committed;
   });
+}
+
+export async function reconcileStartupCleanupPanes(
+  config: TeamConfig,
+  cwd: string,
+): Promise<TeamConfig> {
+  const cleanupPanes = config.startup_cleanup_panes ?? [];
+  if (cleanupPanes.length === 0) return config;
+
+  const teamPaneOwnerId = config.tmux_pane_owner_id?.trim() ?? '';
+  if (!teamPaneOwnerId) throw new Error('startup_cleanup_pane_owner_unavailable:missing_team_owner_id');
+
+  const resolvedPaneIds = new Set<string>();
+  const expectedPanePids: Record<string, number> = {};
+  for (const cleanupPane of cleanupPanes) {
+    if (cleanupPane.pane_id === config.leader_pane_id || cleanupPane.pane_id === config.hud_pane_id) {
+      throw new Error(`startup_cleanup_pane_target_invalid:${cleanupPane.pane_id}`);
+    }
+    const proof = readExactPaneProofSync(cleanupPane.pane_id);
+    if (proof.status === 'gone') {
+      resolvedPaneIds.add(cleanupPane.pane_id);
+      continue;
+    }
+    if (proof.status === 'unavailable') {
+      assertPaneTeardownProofsAvailable('startup_cleanup', [proof]);
+      continue;
+    }
+    if (cleanupPane.pid === null) {
+      throw new Error(`startup_cleanup_pane_pid_missing:${cleanupPane.pane_id}`);
+    }
+    if (proof.pid !== cleanupPane.pid) {
+      throw new Error(`startup_cleanup_pane_identity_changed:${cleanupPane.pane_id}`);
+    }
+    const owner = readPaneTeamOwnerTagResult(cleanupPane.pane_id);
+    if (owner.status === 'error') {
+      throw new Error(`startup_cleanup_pane_owner_unavailable:${cleanupPane.pane_id}:${owner.error}`);
+    }
+    if (owner.status !== 'value' || owner.value !== teamPaneOwnerId) {
+      throw new Error(`startup_cleanup_pane_owner_changed:${cleanupPane.pane_id}`);
+    }
+    expectedPanePids[cleanupPane.pane_id] = cleanupPane.pid;
+  }
+
+  const livePaneIds = Object.keys(expectedPanePids);
+  if (livePaneIds.length > 0) {
+    const teardown = await teardownWorkerPanes(livePaneIds, {
+      leaderPaneId: config.leader_pane_id,
+      hudPaneId: config.hud_pane_id,
+      expectedPanePids,
+      authorizePaneKill: (paneId, proof) => {
+        if (expectedPanePids[paneId] !== proof.pid) return false;
+        const owner = readPaneTeamOwnerTagResult(paneId);
+        return owner.status === 'value' && owner.value === teamPaneOwnerId;
+      },
+    });
+    assertPaneTeardownProofsAvailable('startup_cleanup', teardown.proofUnavailable);
+    for (const paneId of teardown.killedPaneIds) resolvedPaneIds.add(paneId);
+  }
+
+  const nextConfig = await mutateShutdownConfig(config, cwd, (current) => {
+    const unresolved = (current.startup_cleanup_panes ?? [])
+      .filter((cleanupPane) => !resolvedPaneIds.has(cleanupPane.pane_id));
+    current.startup_cleanup_panes = unresolved.length > 0 ? unresolved : undefined;
+  });
+  if ((nextConfig.startup_cleanup_panes?.length ?? 0) > 0) {
+    throw new Error(`startup_cleanup_pane_teardown_failed:${nextConfig.startup_cleanup_panes!.map((pane) => pane.pane_id).join(',')}`);
+  }
+  return nextConfig;
 }
 
 async function assertTeamStartupIsNonDestructive(
@@ -439,6 +508,9 @@ export function applyCreatedInteractiveSessionToConfig(
   config.tmux_pane_owner_id = createdSession.teamPaneOwnerId;
   config.resize_hook_name = createdSession.resizeHookName;
   config.resize_hook_target = createdSession.resizeHookTarget;
+  config.startup_cleanup_panes = createdSession.startupCleanupPanes
+    ?.map(({ paneId, panePid }) => ({ pane_id: paneId, pid: panePid }))
+    .filter(({ pane_id }) => /^%[0-9]+$/.test(pane_id));
   const paneIdsByIndex = createdSession.workerPaneIdsByIndex;
   const panePidsByIndex = createdSession.workerPanePidsByIndex;
   if (paneIdsByIndex) {
@@ -4753,6 +4825,7 @@ export async function shutdownTeam(teamName: string, cwd: string, options: Shutd
   await reconcileDetachedSessionDestroyReceipt(sanitized, cwd, config);
   config = await readTeamConfig(sanitized, cwd);
   if (!config) throw new Error(`shutdown_config_missing_after_detached_reconciliation:${sanitized}`);
+  config = await reconcileStartupCleanupPanes(config, cwd);
   const restoredHudDebtRoot = join(config.team_state_root ?? resolveCanonicalTeamStateRoot(cwd), 'team', sanitized);
   const configuredRestoredHudPaneId = typeof config.hud_pane_id === 'string' && /^%[0-9]+$/.test(config.hud_pane_id)
     ? config.hud_pane_id

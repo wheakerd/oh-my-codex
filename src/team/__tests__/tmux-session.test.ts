@@ -4451,10 +4451,12 @@ describe('createTeamSession tmux instance tagging', () => {
     const prevWorkerCli = process.env.OMX_TEAM_WORKER_CLI;
     try {
       for (const scenario of [
-        { name: 'worker', ambiguousPane: 'worker', reconciliationFailure: null, workerOutput: '%%2\\n%%9\\n', hudOutput: '%%3\\n' },
-        { name: 'hud', ambiguousPane: 'hud', reconciliationFailure: null, workerOutput: '%%2\\n', hudOutput: '%%3\\n%%9\\n' },
-        { name: 'worker-reconciliation', ambiguousPane: 'worker', reconciliationFailure: 'worker', workerOutput: '%%2\\n%%9\\n', hudOutput: '%%3\\n' },
-        { name: 'hud-reconciliation', ambiguousPane: 'hud', reconciliationFailure: 'hud', workerOutput: '%%2\\n', hudOutput: '%%3\\n%%9\\n' },
+        { name: 'worker', ambiguousPane: 'worker', reconciliationFailure: null, extraWorkerPane: null, workerOutput: '%%2\\n%%9\\n', hudOutput: '%%3\\n' },
+        { name: 'worker-concurrent', ambiguousPane: 'worker', reconciliationFailure: null, extraWorkerPane: 'foreign', workerOutput: '%%2\\n%%9\\n', hudOutput: '%%3\\n' },
+        { name: 'worker-multi-owned', ambiguousPane: 'worker', reconciliationFailure: null, extraWorkerPane: 'owned', workerOutput: '%%2\\n%%9\\n', hudOutput: '%%3\\n' },
+        { name: 'hud', ambiguousPane: 'hud', reconciliationFailure: null, extraWorkerPane: null, workerOutput: '%%2\\n', hudOutput: '%%3\\n%%9\\n' },
+        { name: 'worker-reconciliation', ambiguousPane: 'worker', reconciliationFailure: 'worker', extraWorkerPane: null, workerOutput: '%%2\\n%%9\\n', hudOutput: '%%3\\n' },
+        { name: 'hud-reconciliation', ambiguousPane: 'hud', reconciliationFailure: 'hud', extraWorkerPane: null, workerOutput: '%%2\\n', hudOutput: '%%3\\n%%9\\n' },
       ]) {
         const cwd = await mkdtemp(join(tmpdir(), `omx-team-${scenario.name}-split-output-`));
         try {
@@ -4462,13 +4464,14 @@ describe('createTeamSession tmux instance tagging', () => {
             `omx-tmux-${scenario.name}-split-output-`,
             (logPath) => `#!/bin/sh
 set -eu
+printf '%s\\n' "$*" >> "${logPath}"
 case "\${1:-}" in
   -V) echo "tmux 3.4" ;;
   display-message)
     case "$*" in
       *"#{window_width}"*) echo "120" ;;
       *"#{pane_id}"*"#{pane_dead}"*"#{pane_pid}"*) printf "%%1\\t0\\t2000000001\\n" ;;
-      *) echo "shared:0 %1" ;;
+      *) echo "shared:0 $4" ;;
     esac
     ;;
   list-panes)
@@ -4476,6 +4479,7 @@ case "\${1:-}" in
       *"#{pane_id}"*"#{pane_dead}"*"#{pane_pid}"*)
         printf "%%1\\t0\\t2000000001\\n"
         [ ! -f "${logPath}.worker" ] || printf "%%2\\t0\\t2000000002\\n"
+        [ ! -f "${logPath}.worker-extra" ] || printf "%%9\\t0\\t2000000009\\n"
         [ ! -f "${logPath}.hud" ] || printf "%%3\\t0\\t2000000003\\n"
         ;;
       *"pane_current_command"*)
@@ -4488,20 +4492,37 @@ case "\${1:-}" in
           exit 1
         fi
         printf "%%1\\tnode\\t'codex'\\n"
-        [ ! -f "${logPath}.worker" ] || printf "%%2\\tgemini\\t'gemini'\\n"
-        [ ! -f "${logPath}.hud" ] || printf "%%3\\tnode\\t'omx hud --watch'\\n"
+        [ ! -f "${logPath}.worker" ] || printf "%%2\\tgemini\\t%s\\n" "$(cat "${logPath}.worker-start")"
+        [ ! -f "${logPath}.worker-extra" ] || printf "%%9\\tgemini\\t%s\\n" "$(cat "${logPath}.worker-extra-start")"
+        [ ! -f "${logPath}.hud" ] || printf "%%3\\tnode\\t%s\\n" "$(cat "${logPath}.hud-start")"
         ;;
       *)
         printf "%%1\\n"
         [ ! -f "${logPath}.worker" ] || printf "%%2\\n"
+        [ ! -f "${logPath}.worker-extra" ] || printf "%%9\\n"
         [ ! -f "${logPath}.hud" ] || printf "%%3\\n"
         ;;
     esac
     ;;
   split-window)
     case "$*" in
-      *" -h "*) : > "${logPath}.worker"; printf "${scenario.workerOutput}" ;;
-      *) : > "${logPath}.hud"; printf "${scenario.hudOutput}" ;;
+      *" -h "*)
+        : > "${logPath}.worker"
+        printf '%s' "$*" > "${logPath}.worker-start"
+        if [ "${scenario.extraWorkerPane ?? ''}" = "owned" ]; then
+          : > "${logPath}.worker-extra"
+          cp "${logPath}.worker-start" "${logPath}.worker-extra-start"
+        elif [ "${scenario.extraWorkerPane ?? ''}" = "foreign" ]; then
+          : > "${logPath}.worker-extra"
+          printf 'foreign concurrent pane' > "${logPath}.worker-extra-start"
+        fi
+        printf "${scenario.workerOutput}"
+        ;;
+      *)
+        : > "${logPath}.hud"
+        printf '%s' "$*" > "${logPath}.hud-start"
+        printf "${scenario.hudOutput}"
+        ;;
     esac
     ;;
   kill-pane)
@@ -4516,7 +4537,24 @@ case "\${1:-}" in
         fi
         rm -f "${logPath}.worker"
         ;;
-      *"%3"*) rm -f "${logPath}.hud" ;;
+      *"%9"*)
+        if [ "${scenario.name}" = "worker-multi-owned" ] && [ ! -f "${logPath}.worker-extra-rollback-attempted" ]; then
+          : > "${logPath}.worker-extra-rollback-attempted"
+          echo "forced initial extra worker rollback failure" >&2
+          exit 92
+        fi
+        rm -f "${logPath}.worker-extra"
+        ;;
+      *"%3"*)
+        if [ "${scenario.ambiguousPane}" = "hud" ] \
+          && [ -z "${scenario.reconciliationFailure ?? ''}" ] \
+          && [ ! -f "${logPath}.hud-rollback-attempted" ]; then
+          : > "${logPath}.hud-rollback-attempted"
+          echo "forced initial HUD rollback failure" >&2
+          exit 93
+        fi
+        rm -f "${logPath}.hud"
+        ;;
     esac
     ;;
   *) ;;
@@ -4552,10 +4590,20 @@ exit 0
                     assert.deepEqual(error.cleanupErrors, [
                       'failed to reconcile tmux pane topology after ambiguous split output',
                     ]);
+                  } else if (scenario.name === 'worker-multi-owned') {
+                    assert.deepEqual(error.partialSession.workerPaneIds, ['%2', '%9']);
+                    assert.deepEqual(error.partialSession.workerPaneIdsByIndex, [null]);
+                    assert.deepEqual(error.partialSession.workerPanePidsByIndex, [null]);
+                    assert.deepEqual(error.partialSession.startupCleanupPanes, [
+                      { paneId: '%2', panePid: 2000000002 },
+                      { paneId: '%9', panePid: 2000000009 },
+                    ]);
+                    assert.equal(error.partialSession.hudPaneId, null);
                   } else if (scenario.ambiguousPane === 'worker') {
                     assert.deepEqual(error.partialSession.workerPaneIds, ['%2']);
                     assert.deepEqual(error.partialSession.workerPaneIdsByIndex, ['%2']);
                     assert.deepEqual(error.partialSession.workerPanePidsByIndex, [2000000002]);
+                    assert.deepEqual(error.partialSession.startupCleanupPanes, []);
                     assert.equal(error.partialSession.hudPaneId, null);
                     assert.ok(error.cleanupErrors.some((message) => /failed to kill tmux pane %2/.test(message)));
                     reconciledWorkerPid = error.partialSession.workerPanePidsByIndex?.[0] ?? null;
@@ -4563,12 +4611,26 @@ exit 0
                     assert.deepEqual(error.partialSession.workerPaneIds, []);
                     assert.deepEqual(error.partialSession.workerPaneIdsByIndex, [null]);
                     assert.equal(error.partialSession.hudPaneId, '%3');
-                    assert.equal(error.partialSession.hudPanePid, null);
+                    assert.equal(error.partialSession.hudPanePid, 2000000003);
                   }
                   return true;
                 },
               );
-              if (scenario.ambiguousPane === 'worker' && !scenario.reconciliationFailure) {
+              const tmuxLog = await readFile(logPath, 'utf-8');
+              assert.match(tmuxLog, /list-panes -t @0 -F /);
+              if (scenario.name === 'worker-multi-owned') {
+                const teardown = await teardownWorkerPanes(['%2', '%9'], {
+                  graceMs: 1,
+                  expectedPanePids: { '%2': 2000000002, '%9': 2000000009 },
+                  authorizePaneKill: (paneId, proof) => (
+                    (paneId === '%2' && proof.pid === 2000000002)
+                    || (paneId === '%9' && proof.pid === 2000000009)
+                  ),
+                });
+                assert.deepEqual(teardown.killedPaneIds, ['%2', '%9']);
+                assert.equal(fs.existsSync(`${logPath}.worker`), false);
+                assert.equal(fs.existsSync(`${logPath}.worker-extra`), false);
+              } else if (scenario.ambiguousPane === 'worker' && !scenario.reconciliationFailure) {
                 assert.equal(reconciledWorkerPid, 2000000002);
                 const teardown = await teardownWorkerPanes(['%2'], {
                   graceMs: 1,
@@ -4579,11 +4641,15 @@ exit 0
                 assert.deepEqual(teardown.proofUnavailable, []);
                 assert.equal(teardown.kill.failed, 0);
                 assert.equal(fs.existsSync(`${logPath}.worker`), false);
+                if (scenario.extraWorkerPane === 'foreign') {
+                  assert.equal(fs.existsSync(`${logPath}.worker-extra`), true);
+                  assert.doesNotMatch(tmuxLog, /kill-pane -t %9/);
+                }
               } else {
                 assert.equal(
                   fs.existsSync(`${logPath}.${scenario.ambiguousPane}`),
                   true,
-                  'PID-less ambiguous pane must remain as cleanup debt rather than being killed',
+                  'unresolved ambiguous pane must remain as cleanup debt rather than being killed',
                 );
               }
             },
@@ -6879,13 +6945,18 @@ case "$1" in
     if [ "$2" = "-a" ]; then
       printf '%%11\t0\t2000000011\n'
       if [ -f "${logPath}.created" ] && [ ! -f "${killedPath}" ]; then printf '%%44\t0\t2000000044\n'; fi
+      printf '%%99\t0\t2000000099\n'
     else
       printf '%%11\tzsh\tzsh\n'
-      if [ -f "${logPath}.created" ] && [ ! -f "${killedPath}" ]; then printf "%%44\tnode\texec env OMX_TMUX_HUD_OWNER=1 OMX_TMUX_HUD_LEADER_PANE='%%11' /node /omx.js hud --watch\n"; fi
+      if [ -f "${logPath}.created" ] && [ ! -f "${killedPath}" ]; then printf "%%44\tnode\t%s\n" "$(cat "${logPath}.start")"; fi
+      printf '%%99\tbash\tforeign concurrent pane\n'
     fi
     ;;
   split-window)
     : > "${logPath}.created"
+    last=''
+    for arg in "$@"; do last="$arg"; done
+    printf '%s' "$last" > "${logPath}.start"
     printf '%%44\n%%99\n'
     ;;
   show-option)
@@ -6895,7 +6966,12 @@ case "$1" in
       exit 1
     fi
     ;;
-  kill-pane) : > "${killedPath}" ;;
+  kill-pane)
+    case "$*" in
+      *"%44"*) : > "${killedPath}" ;;
+      *"%99"*) : > "${logPath}.killed-foreign"; exit 99 ;;
+    esac
+    ;;
   *) exit 0 ;;
 esac
 `;
@@ -6926,6 +7002,8 @@ esac
           await assert.rejects(() => readFile(debtPath, 'utf-8'));
           const commands = await readFile(logPath, 'utf-8');
           assert.match(commands, /kill-pane -t %44/);
+          assert.doesNotMatch(commands, /kill-pane -t %99/);
+          assert.equal(fs.existsSync(`${logPath}.killed-foreign`), false);
         },
       );
     } finally {

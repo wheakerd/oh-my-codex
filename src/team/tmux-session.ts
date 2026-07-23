@@ -76,6 +76,8 @@ export interface TeamSession {
   workerPaneIdsByIndex?: Array<string | null>;
   /** Frozen worker pane process identities aligned with workerPaneIdsByIndex. */
   workerPanePidsByIndex?: Array<number | null>;
+  /** Ambiguous split artifacts that could not be assigned to one worker slot. */
+  startupCleanupPanes?: Array<{ paneId: string; panePid: number | null }>;
   /** Leader's own pane ID — must never be targeted by worker cleanup routines. */
   leaderPaneId: string;
   /** Frozen leader pane process identity for startup and recovery authority. */
@@ -339,6 +341,10 @@ function sourceTransactionReceipt(): string {
   return `omx_source_${process.pid}_${Date.now()}_${randomBytes(16).toString('hex')}`;
 }
 
+function bindSplitReceiptToPaneCommand(command: string, receipt: string): string {
+  return `${command} # ${receipt}`;
+}
+
 /** Queue an effect in the source pane's tmux server only when its exact pane/session/window incarnation still matches. */
 function runSourceAuthorizedTmux(source: SourcePaneAuthority, effect: string, receipt: string = sourceTransactionReceipt()): string {
   const result = runTmux([
@@ -351,14 +357,18 @@ function runSourceAuthorizedTmux(source: SourcePaneAuthority, effect: string, re
   return receipt;
 }
 
-function runSourceAuthorizedSplit(source: SourcePaneAuthority, effect: string): string {
-  const windowTarget = `${source.sessionName}:${source.windowIndex}`;
+function runSourceAuthorizedSplit(
+  source: SourcePaneAuthority,
+  buildEffect: (receipt: string) => string,
+): string {
+  const windowTarget = source.windowId;
   const beforeTopology = listPanesResult(windowTarget);
   if (beforeTopology.error) {
     throw new Error(`failed to read tmux pane topology before split: ${beforeTopology.error}`);
   }
   const beforePaneIds = new Set(beforeTopology.panes.map((pane) => pane.paneId));
   const receipt = sourceTransactionReceipt();
+  const effect = buildEffect(receipt);
   const result = runTmux([
     'if-shell', '-F', '-t', source.paneId, sourceAuthorityPredicate(source),
     effect.replace("-F '#{pane_id}'", `-F '#{pane_id}\\t${receipt}'`),
@@ -371,8 +381,8 @@ function runSourceAuthorizedSplit(source: SourcePaneAuthority, effect: string): 
     const newlyObservedPaneIds = afterTopology.error
       ? []
       : afterTopology.panes
-        .map((pane) => pane.paneId)
-        .filter((candidate) => !beforePaneIds.has(candidate));
+        .filter((pane) => !beforePaneIds.has(pane.paneId) && pane.startCommand.includes(receipt))
+        .map((pane) => pane.paneId);
     throw new AmbiguousSplitWindowOutputError(newlyObservedPaneIds, afterTopology.error);
   }
   return paneId;
@@ -2377,6 +2387,7 @@ export function createTeamSession(
   const partialWorkerPaneIds: string[] = [];
   const partialWorkerPaneIdsByIndex: Array<string | null> = Array.from({ length: workerCount }, () => null);
   const partialWorkerPanePidsByIndex: Array<number | null> = Array.from({ length: workerCount }, () => null);
+  const partialStartupCleanupPanePids = new Map<string, number | null>();
   let partialHudPaneId: string | null = null;
   let partialHudPanePid: number | null = null;
 
@@ -2451,6 +2462,30 @@ export function createTeamSession(
     // same tmux-server transaction as their effect. The initial tag itself is
     // deliberately the sole bootstrap mutation before an owner exists.
     leaderSource = captureSourcePaneAuthority(leaderPaneId, teamPaneOwnerId);
+    const exactProveAndTagReconciledPane = (paneId: string): number | null => {
+      const proof = readExactPaneProofSync(paneId);
+      if (proof.status === 'unavailable') throw new ExactPaneProofUnavailableError(proof);
+      if (proof.status === 'gone') return null;
+
+      const paneSource = captureSourcePaneAuthority(paneId);
+      if (paneSource.panePid !== proof.pid) throw new Error(`tmux pane identity changed: ${paneId}`);
+      if (paneSource.teamPaneOwnerId && paneSource.teamPaneOwnerId !== teamPaneOwnerId) {
+        throw new Error(`tmux pane team owner changed: ${paneId}`);
+      }
+      if (ownerSessionId) {
+        runSourceAuthorizedTmux(
+          paneSource,
+          `set-option -p -t ${paneId} ${OMX_PANE_INSTANCE_OPTION} ${shellQuoteSingle(ownerSessionId)}`,
+        );
+      }
+      rollbackTaggedPaneOwnerIds.set(paneId, teamPaneOwnerId);
+      runSourceAuthorizedTmux(
+        paneSource,
+        `set-option -p -t ${paneId} ${OMX_TEAM_PANE_OWNER_OPTION} ${shellQuoteSingle(teamPaneOwnerId)}`,
+      );
+      rollbackPanes.set(paneId, proof.pid);
+      return proof.pid;
+    };
     if (canRecreateTeamHud) {
       for (const [hudPaneId, hudPanePid] of initialWindowPanePids) {
         if (hudPaneId !== leaderPaneId) killExactPaneSync(hudPaneId, hudPanePid);
@@ -2497,28 +2532,32 @@ export function createTeamSession(
       try {
         paneId = runSourceAuthorizedSplit(
           splitSource,
-          `split-window ${splitDirection} -t ${splitTarget} -d -P -F '#{pane_id}' -c ${shellQuoteSingle(tmuxWorkerCwd)} ${shellQuoteSingle(cmd)}`,
+          (receipt) => `split-window ${splitDirection} -t ${splitTarget} -d -P -F '#{pane_id}' -c ${shellQuoteSingle(tmuxWorkerCwd)} ${shellQuoteSingle(bindSplitReceiptToPaneCommand(cmd, receipt))}`,
         );
       } catch (error) {
         if (error instanceof AmbiguousSplitWindowOutputError) {
+          const isUnassignedAmbiguity = error.newlyObservedPaneIds.length > 1;
           for (const candidatePaneId of error.newlyObservedPaneIds) {
             rollbackPanes.set(candidatePaneId, null);
             partialWorkerPaneIds.push(candidatePaneId);
+            if (isUnassignedAmbiguity) partialStartupCleanupPanePids.set(candidatePaneId, null);
           }
           if (error.newlyObservedPaneIds.length === 1) {
-            const reconciledPaneId = error.newlyObservedPaneIds[0]!;
-            partialWorkerPaneIdsByIndex[i - 1] = reconciledPaneId;
-            const reconciledProof = readExactPaneProofSync(reconciledPaneId);
-            if (reconciledProof.status === 'unavailable') {
-              throw new ExactPaneProofUnavailableError(reconciledProof);
-            }
-            if (reconciledProof.status === 'gone') {
-              rollbackPanes.delete(reconciledPaneId);
-              partialWorkerPaneIds.splice(partialWorkerPaneIds.lastIndexOf(reconciledPaneId), 1);
-              partialWorkerPaneIdsByIndex[i - 1] = null;
+            partialWorkerPaneIdsByIndex[i - 1] = error.newlyObservedPaneIds[0]!;
+          }
+          for (const candidatePaneId of error.newlyObservedPaneIds) {
+            const reconciledPid = exactProveAndTagReconciledPane(candidatePaneId);
+            if (reconciledPid === null) {
+              rollbackPanes.delete(candidatePaneId);
+              partialWorkerPaneIds.splice(partialWorkerPaneIds.lastIndexOf(candidatePaneId), 1);
+              partialStartupCleanupPanePids.delete(candidatePaneId);
+              if (partialWorkerPaneIdsByIndex[i - 1] === candidatePaneId) {
+                partialWorkerPaneIdsByIndex[i - 1] = null;
+              }
+            } else if (isUnassignedAmbiguity) {
+              partialStartupCleanupPanePids.set(candidatePaneId, reconciledPid);
             } else {
-              rollbackPanes.set(reconciledPaneId, reconciledProof.pid);
-              partialWorkerPanePidsByIndex[i - 1] = reconciledProof.pid;
+              partialWorkerPanePidsByIndex[i - 1] = reconciledPid;
             }
           }
         }
@@ -2601,16 +2640,30 @@ export function createTeamSession(
       try {
         id = runSourceAuthorizedSplit(
           hudSource,
-          `split-window -v -f -l ${HUD_TMUX_TEAM_HEIGHT_LINES} -t ${hudSplitTarget} -d -P -F '#{pane_id}' -c ${shellQuoteSingle(hudCwd)} ${shellQuoteSingle(hudCmd)}`,
+          (receipt) => `split-window -v -f -l ${HUD_TMUX_TEAM_HEIGHT_LINES} -t ${hudSplitTarget} -d -P -F '#{pane_id}' -c ${shellQuoteSingle(hudCwd)} ${shellQuoteSingle(bindSplitReceiptToPaneCommand(hudCmd, receipt))}`,
         );
       } catch (error) {
         if (error instanceof AmbiguousSplitWindowOutputError) {
+          const isUnassignedAmbiguity = error.newlyObservedPaneIds.length > 1;
           for (const candidatePaneId of error.newlyObservedPaneIds) {
             rollbackPanes.set(candidatePaneId, null);
+            if (isUnassignedAmbiguity) partialStartupCleanupPanePids.set(candidatePaneId, null);
           }
           if (error.newlyObservedPaneIds.length === 1) {
             partialHudPaneId = error.newlyObservedPaneIds[0]!;
             partialHudPanePid = null;
+          }
+          for (const candidatePaneId of error.newlyObservedPaneIds) {
+            const reconciledPid = exactProveAndTagReconciledPane(candidatePaneId);
+            if (reconciledPid === null) {
+              rollbackPanes.delete(candidatePaneId);
+              partialStartupCleanupPanePids.delete(candidatePaneId);
+              if (partialHudPaneId === candidatePaneId) partialHudPaneId = null;
+            } else if (isUnassignedAmbiguity) {
+              partialStartupCleanupPanePids.set(candidatePaneId, reconciledPid);
+            } else {
+              partialHudPanePid = reconciledPid;
+            }
           }
         }
         throw error;
@@ -2853,6 +2906,9 @@ export function createTeamSession(
       .map((paneId) => paneId && unresolvedPaneIds.has(paneId) ? paneId : null);
     const unresolvedWorkerPanePidsByIndex = partialWorkerPanePidsByIndex
       .map((panePid, index) => partialWorkerPaneIdsByIndex[index] && unresolvedPaneIds.has(partialWorkerPaneIdsByIndex[index]!) ? panePid : null);
+    const unresolvedStartupCleanupPanes = [...partialStartupCleanupPanePids.entries()]
+      .filter(([paneId]) => unresolvedPaneIds.has(paneId))
+      .map(([paneId, panePid]) => ({ paneId, panePid }));
 
     const unresolvedHudPaneId = partialHudPaneId && (
       unresolvedPaneIds.has(partialHudPaneId)
@@ -2875,6 +2931,7 @@ export function createTeamSession(
           workerPaneIds: unresolvedWorkerPaneIds,
           workerPaneIdsByIndex: unresolvedWorkerPaneIdsByIndex,
           workerPanePidsByIndex: unresolvedWorkerPanePidsByIndex,
+          startupCleanupPanes: unresolvedStartupCleanupPanes,
           leaderPanePid: partialLeaderPanePid,
           hudPanePid: unresolvedHudPaneId ? partialHudPanePid : null,
           leaderPaneId: partialLeaderPaneId,
@@ -2968,7 +3025,11 @@ export function restoreStandaloneHudPane(
   }
   const beforeSplitPaneIds = new Set(paneListResult.panes.map((pane) => pane.paneId));
 
-  const hudCmd = `exec env ${formatHudEnvAssignments(process.env, { sessionId: options.sessionId, leaderPaneId: normalizedLeaderPaneId })} ${shellQuoteSingle(translatePathForMsys(resolveLeaderNodePath()))} ${shellQuoteSingle(translatePathForMsys(omxEntry))} hud --watch`;
+  const splitReceipt = sourceTransactionReceipt();
+  const hudCmd = bindSplitReceiptToPaneCommand(
+    `exec env ${formatHudEnvAssignments(process.env, { sessionId: options.sessionId, leaderPaneId: normalizedLeaderPaneId })} ${shellQuoteSingle(translatePathForMsys(resolveLeaderNodePath()))} ${shellQuoteSingle(translatePathForMsys(omxEntry))} hud --watch`,
+    splitReceipt,
+  );
   let hudResult: ReturnType<typeof runTmux> | null = null;
   for (const restoreCwd of resolveStandaloneHudRestoreCwdCandidates(
     normalizedLeaderPaneId,
@@ -3005,8 +3066,8 @@ export function restoreStandaloneHudPane(
       throw new Error('restored_hud_split_topology_reconciliation_failed');
     }
     const newlyObservedPaneIds = afterTopology.panes
-      .map((pane) => pane.paneId)
-      .filter((candidate) => !beforeSplitPaneIds.has(candidate));
+      .filter((pane) => !beforeSplitPaneIds.has(pane.paneId) && pane.startCommand.includes(splitReceipt))
+      .map((pane) => pane.paneId);
     if (newlyObservedPaneIds.length === 1) {
       const reconciledPaneId = newlyObservedPaneIds[0]!;
       persistRestoredHudCleanupDebtSync(cwd, {

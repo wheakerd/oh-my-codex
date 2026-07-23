@@ -38,6 +38,7 @@ import {
   assignTask,
   sendWorkerMessage,
   applyCreatedInteractiveSessionToConfig,
+  reconcileStartupCleanupPanes,
   resolveWorkerLaunchArgsFromEnv,
   resolveTeamWorkerCliForResolvedLaunchArgs,
   shouldPrekillInteractiveShutdownProcessTrees,
@@ -3062,6 +3063,10 @@ esac
         workerPaneIds: ['%30'],
         workerPaneIdsByIndex: [null, '%30'],
         workerPanePidsByIndex: [null, 2000000030],
+        startupCleanupPanes: [
+          { paneId: '%40', panePid: 2000000040 },
+          { paneId: '%41', panePid: 2000000041 },
+        ],
         leaderPanePid: 2000000001,
         hudPanePid: 2000000004,
 
@@ -3077,6 +3082,83 @@ esac
       assert.equal(config.workers[1]?.pid, 2000000030);
       assert.equal(config.leader_pane_pid, 2000000001);
       assert.equal(config.hud_pane_pid, 2000000004);
+      assert.deepEqual(config.startup_cleanup_panes, [
+        { pane_id: '%40', pid: 2000000040 },
+        { pane_id: '%41', pid: 2000000041 },
+      ]);
+      await saveTeamConfig(config, cwd);
+      const durablePartialConfig = await readTeamConfig('team-pane-persist-race', cwd);
+      assert.ok(durablePartialConfig);
+      assert.deepEqual(durablePartialConfig.startup_cleanup_panes, config.startup_cleanup_panes);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('replays durable startup cleanup panes by exact PID and Team owner', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-runtime-startup-cleanup-replay-'));
+    try {
+      const config = await initTeamState('startup-cleanup-replay', 'replay startup pane cleanup debt', 'executor', 1, cwd);
+      applyCreatedInteractiveSessionToConfig(config, {
+        name: 'leader:0',
+        workerCount: 1,
+        cwd,
+        workerPaneIds: [],
+        workerPaneIdsByIndex: [null],
+        workerPanePidsByIndex: [null],
+        startupCleanupPanes: [
+          { paneId: '%40', panePid: 2000044440 },
+          { paneId: '%41', panePid: 2000045551 },
+        ],
+        leaderPaneId: '%1',
+        leaderPanePid: 2000000001,
+        hudPaneId: null,
+        hudPanePid: null,
+        resizeHookName: null,
+        resizeHookTarget: null,
+        teamPaneOwnerId: 'team:startup-cleanup-replay',
+      }, [undefined]);
+      await saveTeamConfig(config, cwd);
+
+      await withMockTmuxFixture(
+        {
+          dirPrefix: 'omx-runtime-startup-cleanup-replay-',
+          tmuxScript: (tmuxLogPath) => `#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "${tmuxLogPath}"
+case "\${1:-}" in
+  list-panes)
+    case "$*" in
+      *'-a -F #{pane_id}'*)
+        [ -f "${tmuxLogPath}.killed-40" ] || printf '%%40\\t0\\t2000044440\\n'
+        [ -f "${tmuxLogPath}.killed-41" ] || printf '%%41\\t0\\t2000045551\\n'
+        ;;
+    esac
+    ;;
+  show-option) printf 'team:startup-cleanup-replay\\n' ;;
+  kill-pane)
+    case "$*" in
+      *"%40"*) : > "${tmuxLogPath}.killed-40" ;;
+      *"%41"*) : > "${tmuxLogPath}.killed-41" ;;
+    esac
+    ;;
+  *) ;;
+esac
+`,
+        },
+        async ({ tmuxLogPath }) => {
+          const durable = await readTeamConfig('startup-cleanup-replay', cwd);
+          assert.ok(durable);
+          const reconciled = await reconcileStartupCleanupPanes(durable, cwd);
+          assert.equal(reconciled.startup_cleanup_panes, undefined);
+          const persisted = await readTeamConfig('startup-cleanup-replay', cwd);
+          assert.ok(persisted);
+          assert.equal(persisted.startup_cleanup_panes, undefined);
+          const log = await readFile(tmuxLogPath, 'utf-8');
+          assert.match(log, /kill-pane -t %40/);
+          assert.match(log, /kill-pane -t %41/);
+        },
+      );
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
