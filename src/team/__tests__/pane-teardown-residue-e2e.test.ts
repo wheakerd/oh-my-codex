@@ -281,18 +281,19 @@ async function exerciseOwnedPaneTeardown(fixture: TerminalFixture): Promise<void
     assert.equal(Number.isSafeInteger(attemptPanePid) && attemptPanePid > 0, true);
     tagPaneTeamOwner(attemptPaneId, ownerId, attemptPanePid);
 
-    const [worker, child, grandchild, capturedResidue] = await Promise.all([
+    // Capture the detached process before awaiting ordinary descendants: a sibling
+    // PID lookup can fail, but finally must still be able to request its owned exit.
+    residue = await recordProcess(
+      processFixture.pidPaths.residue,
+      `${fixture.kind} setsid residue`,
+      processFixture.residueProbe,
+    );
+    const [worker, child, grandchild] = await Promise.all([
       recordProcess(processFixture.pidPaths.worker, `${fixture.kind} worker`),
       recordProcess(processFixture.pidPaths.child, `${fixture.kind} child`),
       recordProcess(processFixture.pidPaths.grandchild, `${fixture.kind} grandchild`),
-      recordProcess(
-        processFixture.pidPaths.residue,
-        `${fixture.kind} setsid residue`,
-        processFixture.residueProbe,
-      ),
     ]);
     ordinaryProcesses.push(worker, child, grandchild);
-    residue = capturedResidue;
 
     const originalKill = process.kill;
     const sharedSignalCalls: Array<{ pid: number; signal?: NodeJS.Signals | number }> = [];
