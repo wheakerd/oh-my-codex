@@ -20,7 +20,6 @@ import {
   unlink as nodeUnlink,
   writeFile as nodeWriteFile,
 } from 'fs/promises';
-import { spawn } from 'node:child_process';
 import { readFileSync } from 'fs';
 import type { FileHandle } from 'fs/promises';
 import { createHash, randomUUID } from 'crypto';
@@ -485,20 +484,12 @@ const defaultFsDependencies: SessionPointerFsDependencies = {
   },
 };
 
-async function defaultRecoveryRenameNoReplace(from: string, to: string): Promise<RecoveryRenameNoReplaceResult> {
-  if (process.platform !== 'linux') return 'unsupported';
-  await new Promise<void>((resolve, reject) => {
-    const child = spawn('mv', ['-n', '--', from, to], { stdio: 'ignore' });
-    child.once('error', reject);
-    child.once('exit', (code) => code === 0 ? resolve() : reject(Object.assign(new Error(`mv exited ${code}`), { code: 'EXDEV' })));
-  });
-  try {
-    await nodeLstat(from);
-    return 'not-moved';
-  } catch (error) {
-    if (isNotFound(error)) return 'moved';
-    throw error;
-  }
+async function defaultRecoveryRenameNoReplace(_from: string, _to: string): Promise<RecoveryRenameNoReplaceResult> {
+  // Node does not expose renameat2(RENAME_NOREPLACE), and OMX does not assume
+  // an external interpreter or architecture-specific syscall ABI. Recovery is
+  // therefore enabled only when a maintained host integration supplies this
+  // seam; otherwise every source and destination pathname remains untouched.
+  return 'unsupported';
 }
 
 /** @internal Exposed only so source-module tests can verify default ESRCH handling. */
@@ -1114,6 +1105,7 @@ async function resumeRecoveryCheckpoint(
     const evidencePath = source && sameRecoveryIdentity(source, evidenceIdentity, 'file') ? checkpoint.sourcePath
       : claim && sameRecoveryIdentity(claim, evidenceIdentity, 'file') ? claimPath : undefined;
     if (!evidencePath) throw new Error('checkpoint evidence is missing or foreign');
+    if (claim && !sameRecoveryIdentity(claim, evidenceIdentity, 'file')) throw new Error('checkpoint claim is foreign');
     // v1/v2 did not persist the directory identity. It is safe to derive only
     // while the original directory still contains the exact recorded evidence.
     const lockIdentity = checkpoint.lockIdentity ?? { dev: lock.dev, ino: lock.ino };
